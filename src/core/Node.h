@@ -14,6 +14,9 @@ enum class NodeType {
 // 节点类型的文本表示。INI 配置与图表示输出共用同一套写法。
 const char* toString(NodeType type);
 
+// 解析节点类型文本；无法识别时返回 false。
+bool parseNodeType(const std::string& text, NodeType& out);
+
 struct Node {
     std::string id;                // 全局唯一 ID
     NodeType    type = NodeType::Delivery;

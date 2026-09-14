@@ -5,24 +5,15 @@
 #include <string>
 
 #include "core/LogisticsGraph.h"
+#include "test_util.h"
 
 using logistics::Edge;
 using logistics::LogisticsGraph;
 using logistics::Node;
 using logistics::NodeType;
+using testutil::check;
 
 namespace {
-
-int g_checks = 0;
-int g_failures = 0;
-
-void check(bool ok, const std::string& what) {
-    ++g_checks;
-    if (!ok) {
-        ++g_failures;
-        std::printf("FAIL  %s\n", what.c_str());
-    }
-}
 
 bool nearlyEqual(double a, double b) {
     return std::fabs(a - b) < 1e-9;
@@ -148,6 +139,5 @@ int main() {
     testAdjacencyListString();
     testEmptyGraphBoundary();
 
-    std::printf("\n%d 项检查，%d 项失败\n", g_checks, g_failures);
-    return g_failures == 0 ? 0 : 1;
+    return testutil::summarize("core_tests");
 }
