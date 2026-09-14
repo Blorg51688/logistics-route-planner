@@ -97,6 +97,11 @@ if(Qt6_FOUND)
     add_test(NAME cli_dump_graph
              COMMAND ${CMAKE_COMMAND} -E env QT_QPA_PLATFORM=offscreen
                      $<TARGET_FILE:app> --dump-graph both)
+    # UI 完整性：工具栏与侧栏必须真的被构造出来。
+    # 曾经交互路径只构造裸 QGraphicsView，工具栏/侧栏在正常启动时完全不存在。
+    add_test(NAME cli_ui_probe
+             COMMAND ${CMAKE_COMMAND} -E env QT_QPA_PLATFORM=offscreen
+                     $<TARGET_FILE:app> --ui-probe)
 else()
     message(STATUS "未找到 Qt6 Widgets，跳过 GUI 目标（app）")
 endif()

@@ -28,8 +28,16 @@ class MainWindow : public QMainWindow {
 public:
     explicit MainWindow(logistics::Config config, QWidget* parent = nullptr);
 
+    // 交互式显示：把窗口尺寸限制在可用屏幕之内，避免默认尺寸大于屏幕
+    // 导致侧栏或工具栏被推到屏幕之外而"看不见"
+    void showInteractive(int preferredWidth, int preferredHeight);
+
     // 供无头渲染验证使用
     void renderToFile(const QString& path, int width, int height);
+
+    // 供 UI 完整性探针使用（--ui-probe）
+    int toolbarActionCount() const;
+    int dockCount() const;
     // 供无头验证交互后的状态：按顺序触发推进 / 路况 / 插单
     void runDemoActions(int rounds);
 

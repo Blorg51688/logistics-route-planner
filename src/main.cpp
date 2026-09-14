@@ -3,6 +3,8 @@
 // 不带 --render 时打开交互窗口；带 --render 时**离屏渲染成 PNG 后退出**，
 // 便于无头环境下验证渲染结果，也用于产出报告配图。
 #include <QApplication>
+#include <QDir>
+#include <QFileInfo>
 #include <QGraphicsView>
 #include <QImage>
 #include <QPainter>
@@ -29,12 +31,13 @@ struct Options {
     std::string            renderPath;
     std::string            windowRenderPath;
     std::string            dumpGraph;      // "" / "list" / "matrix" / "both"
+    bool                   uiProbe = false;
     int                    demoRounds = 0;
     std::string            planStrategy;   // 空表示不高亮任何路线
     bool                   allLabels = false;
     logistics::WeightType  weight = logistics::WeightType::Distance;
-    int                    width = 1400;
-    int                    height = 1000;
+    int                    width = 1360;
+    int                    height = 900;
 };
 
 bool parseWeight(const std::string& text, logistics::WeightType& out) {
@@ -73,6 +76,7 @@ void usage() {
         "  --render-window PATH.png   离屏渲染完整窗口（工具栏+侧栏）成 PNG 后退出\n"
         "  --demo N                   渲染窗口前先自动触发 N 轮交互（验证交互后状态）\n"
         "  --dump-graph [list|matrix|both]  输出邻接表 / 邻接矩阵后退出（B3）\n"
+        "  --ui-probe                 检查工具栏与侧栏是否完整构造后退出\n"
         "  --width N --height N       窗口/图像尺寸\n");
 }
 
@@ -96,6 +100,8 @@ int main(int argc, char** argv) {
             takeNext(opt.renderPath);
         } else if (flag == "--render-window") {
             takeNext(opt.windowRenderPath);
+        } else if (flag == "--ui-probe") {
+            opt.uiProbe = true;
         } else if (flag == "--dump-graph") {
             // 值可省略；省略时取 both
             if (i + 1 < args.size() && !args[i + 1].startsWith(QStringLiteral("--"))) {
@@ -168,45 +174,36 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    if (!opt.windowRenderPath.empty()) {
-        MainWindow window(config);
-        if (opt.demoRounds > 0) {
-            window.runDemoActions(opt.demoRounds);
-        }
-        window.renderToFile(QString::fromStdString(opt.windowRenderPath), opt.width, opt.height);
-        std::printf("已渲染窗口 -> %s\n", opt.windowRenderPath.c_str());
-        return 0;
-    }
-
-    GraphScene scene;
-    scene.build(config.graph, opt.weight);
-    scene.setAllLabelsVisible(opt.allLabels);
-
-    if (!opt.planStrategy.empty()) {
-        logistics::WeightType planWeight = logistics::WeightType::Distance;
-        if (!parseWeight(opt.planStrategy, planWeight)) {
-            std::fprintf(stderr, "未知规划策略: %s\n", opt.planStrategy.c_str());
-            return 2;
-        }
-        if (config.vehicles.empty()) {
-            std::fprintf(stderr, "配置中没有车辆，无法规划\n");
-            return 1;
-        }
-        const logistics::RoutePlan plan =
-            logistics::planRoute(config.graph, config.vehicles.front(), config.orders,
-                                 config.general.serviceTimeMin, planWeight);
-        if (plan.status == logistics::PlanStatus::Ok) {
-            scene.highlightRoute(plan.nodes);
-            std::printf("规划（%s）：距离 %.1fkm  耗时 %.1fmin  成本 %.1f元  "
-                        "penalty %dmin  停靠 %zu 站\n",
-                        weightLabel(planWeight), plan.totalDistanceKm, plan.totalTimeMin,
-                        plan.totalCostYuan, plan.totalPenaltyMin, plan.stops.size());
-        } else {
-            std::fprintf(stderr, "规划不可行: %s\n", plan.reason.c_str());
-        }
-    }
-
+    // ---- 仅图形场景的渲染（报告配图用），不构造窗口 ----
     if (!opt.renderPath.empty()) {
+        GraphScene scene;
+        scene.build(config.graph, opt.weight);
+        scene.setAllLabelsVisible(opt.allLabels);
+
+        if (!opt.planStrategy.empty()) {
+            logistics::WeightType planWeight = logistics::WeightType::Distance;
+            if (!parseWeight(opt.planStrategy, planWeight)) {
+                std::fprintf(stderr, "未知规划策略: %s\n", opt.planStrategy.c_str());
+                return 2;
+            }
+            if (config.vehicles.empty()) {
+                std::fprintf(stderr, "配置中没有车辆，无法规划\n");
+                return 1;
+            }
+            const logistics::RoutePlan plan =
+                logistics::planRoute(config.graph, config.vehicles.front(), config.orders,
+                                     config.general.serviceTimeMin, planWeight);
+            if (plan.status == logistics::PlanStatus::Ok) {
+                scene.highlightRoute(plan.nodes);
+                std::printf("规划（%s）：距离 %.1fkm  耗时 %.1fmin  成本 %.1f元  "
+                            "penalty %dmin  停靠 %zu 站\n",
+                            weightLabel(planWeight), plan.totalDistanceKm, plan.totalTimeMin,
+                            plan.totalCostYuan, plan.totalPenaltyMin, plan.stops.size());
+            } else {
+                std::fprintf(stderr, "规划不可行: %s\n", plan.reason.c_str());
+            }
+        }
+
         const QRectF area = scene.itemsBoundingRect().adjusted(-30, -30, 30, 30);
         QImage image(opt.width, opt.height, QImage::Format_ARGB32);
         image.fill(Qt::white);
@@ -214,18 +211,51 @@ int main(int argc, char** argv) {
         painter.setRenderHint(QPainter::Antialiasing, true);
         scene.render(&painter, QRectF(0, 0, opt.width, opt.height), area);
         painter.end();
+        const QFileInfo info(QString::fromStdString(opt.renderPath));
+        QDir().mkpath(info.absolutePath());
         if (!image.save(QString::fromStdString(opt.renderPath))) {
             std::fprintf(stderr, "渲染保存失败: %s\n", opt.renderPath.c_str());
             return 1;
         }
-        std::printf("已渲染 %dx%d -> %s\n", opt.width, opt.height, opt.renderPath.c_str());
+        std::printf("已渲染图形场景 %dx%d -> %s\n", opt.width, opt.height,
+                    opt.renderPath.c_str());
         return 0;
     }
 
-    QGraphicsView view(&scene);
-    view.setRenderHint(QPainter::Antialiasing, true);
-    view.setWindowTitle(QStringLiteral("电商物流配送路径规划系统"));
-    view.resize(opt.width, opt.height);
-    view.show();
+    // ---- 其余一律走 MainWindow ----
+    //
+    // 交互启动、窗口截图、demo 动作、UI 探针**共用这一处构造**。
+    // 曾经这里的交互路径是另写的一段裸 QGraphicsView，
+    // 结果正常启动时工具栏、四个侧栏、日志、Debug 开关全都不存在——
+    // 而当时的验证只用 --render-window，恰好走的是正确的那条路径，
+    // 因此完全没有发现。把它们合并到同一处，从结构上杜绝再次分叉。
+    MainWindow window(config);
+
+    if (opt.uiProbe) {
+        window.show();
+        QCoreApplication::processEvents();
+        const int actions = window.toolbarActionCount();
+        const int docks = window.dockCount();
+        std::printf("[ui-probe] 工具栏动作 %d 个，停靠面板 %d 个\n", actions, docks);
+        if (actions < 9 || docks < 5) {
+            std::fprintf(stderr,
+                         "[ui-probe] UI 不完整：预期至少 9 个工具栏动作、5 个停靠面板\n");
+            return 1;
+        }
+        std::printf("[ui-probe] 通过\n");
+        return 0;
+    }
+
+    if (opt.demoRounds > 0) {
+        window.runDemoActions(opt.demoRounds);
+    }
+
+    if (!opt.windowRenderPath.empty()) {
+        window.renderToFile(QString::fromStdString(opt.windowRenderPath), opt.width, opt.height);
+        std::printf("已渲染窗口 -> %s\n", opt.windowRenderPath.c_str());
+        return 0;
+    }
+
+    window.showInteractive(opt.width, opt.height);
     return app.exec();
 }

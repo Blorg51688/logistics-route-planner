@@ -5,6 +5,7 @@
 #include <QComboBox>
 #include <QDialog>
 #include <QDir>
+#include <QScreen>
 #include <QFileInfo>
 #include <QDialogButtonBox>
 #include <QFormLayout>
@@ -22,6 +23,8 @@
 #include <QToolBar>
 #include <QVBoxLayout>
 #include <QDockWidget>
+#include <QGuiApplication>
+#include <QToolBar>
 
 #include <algorithm>
 #include <cstdio>
@@ -167,14 +170,17 @@ void MainWindow::buildDocks() {
     logDock->setWidget(logView_);
     addDockWidget(Qt::BottomDockWidgetArea, logDock);
 
-    // 侧栏高度分配：订单表最容易挤占其他面板，给它固定上限
-    resizeDocks({routeDock, vehicleDock, orderDock, lateDock}, {260, 130, 280, 150},
-                Qt::Vertical);
-    resizeDocks({logDock}, {170}, Qt::Vertical);
+    // 订单列表与超时订单叠成标签页：笔记本屏幕高度有限，
+    // 四个面板纵向平铺会把每个都压到不可用
+    tabifyDockWidget(orderDock, lateDock);
+    orderDock->raise();
+
+    resizeDocks({routeDock, vehicleDock}, {240, 110}, Qt::Vertical);
+    resizeDocks({orderDock}, {240}, Qt::Vertical);
+    resizeDocks({logDock}, {140}, Qt::Vertical);
 
     // 右侧栏整体留出足够宽度，避免"总距离：220.1 / km"这种被折断的显示
-    resizeDocks({routeDock, vehicleDock, orderDock, lateDock}, {330, 330, 330, 330},
-                Qt::Horizontal);
+    resizeDocks({routeDock, vehicleDock, orderDock}, {330, 330, 330}, Qt::Horizontal);
 }
 
 std::string MainWindow::currentPositionId() const {
@@ -547,6 +553,39 @@ void MainWindow::runDemoActions(int rounds) {
         }
         QCoreApplication::processEvents();
     }
+}
+
+int MainWindow::toolbarActionCount() const {
+    int total = 0;
+    for (const QToolBar* bar : findChildren<QToolBar*>()) {
+        total += bar->actions().size();
+    }
+    return total;
+}
+
+int MainWindow::dockCount() const {
+    return findChildren<QDockWidget*>().size();
+}
+
+void MainWindow::showInteractive(int preferredWidth, int preferredHeight) {
+    int width = preferredWidth;
+    int height = preferredHeight;
+
+    // 关键：窗口尺寸一旦超过屏幕，侧栏就会被推到可见区域之外，
+    // 用户会以为"这些面板根本不存在"。直接最大化是唯一稳妥的做法——
+    // 不必猜测用户的屏幕有多大，工具栏与五个面板必然全部可见。
+    setMinimumSize(900, 600);
+
+    const QScreen* screen = QGuiApplication::primaryScreen();
+    const QRect available = (screen != nullptr) ? screen->availableGeometry() : QRect();
+    if (available.isValid() && available.width() < preferredWidth + 60) {
+        // 屏幕比期望尺寸还小：退回最大化 + 更宽松的最小尺寸
+        setMinimumSize(640, 480);
+    }
+
+    showMaximized();
+    raise();
+    activateWindow();
 }
 
 void MainWindow::renderToFile(const QString& path, int width, int height) {
