@@ -9,6 +9,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_library(core STATIC
     src/core/Node.cpp
     src/core/LogisticsGraph.cpp
+    src/core/MinHeap.cpp
+    src/core/Dijkstra.cpp
 )
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
@@ -29,9 +31,17 @@ target_link_libraries(config_tests PRIVATE io)
 target_compile_definitions(config_tests PRIVATE
     DEFAULT_CONFIG_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/default.ini")
 
+add_executable(minheap_tests tests/minheap_tests.cpp)
+target_link_libraries(minheap_tests PRIVATE core)
+
+add_executable(dijkstra_tests tests/dijkstra_tests.cpp)
+target_link_libraries(dijkstra_tests PRIVATE core)
+
 enable_testing()
 add_test(NAME core_tests COMMAND core_tests)
 add_test(NAME config_tests COMMAND config_tests)
+add_test(NAME minheap_tests COMMAND minheap_tests)
+add_test(NAME dijkstra_tests COMMAND dijkstra_tests)
 
 # ---- GUI：Qt6 已安装，待 gui 层源码就位后启用 ----
 # find_package(Qt6 REQUIRED COMPONENTS Widgets)
