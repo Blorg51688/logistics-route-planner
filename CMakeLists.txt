@@ -54,6 +54,16 @@ add_test(NAME dijkstra_tests COMMAND dijkstra_tests)
 add_test(NAME routeplanner_tests COMMAND routeplanner_tests)
 add_test(NAME integration_tests COMMAND integration_tests)
 
+# ---- 期望值预言机自检（开发工具，不参与交付程序；缺 python3 时自动跳过）----
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME oracle_selfcheck
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/oracle.py --check)
+else()
+    message(STATUS "未找到 python3，跳过 oracle_selfcheck 测试")
+endif()
+
 # ---- GUI：Qt6 已安装，待 gui 层源码就位后启用 ----
 # find_package(Qt6 REQUIRED COMPONENTS Widgets)
 # add_executable(app src/main.cpp src/gui/MainWindow.cpp)
