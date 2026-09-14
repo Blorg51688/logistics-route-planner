@@ -1,0 +1,20 @@
+# 构建产物
+build/
+cmake-build-*/
+
+# 目标文件
+*.o
+*.a
+*.so
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.user
+*.swp
+
+# 会话临时文件
+.dsh-browser-tmp/
+
+# 系统文件
+.DS_Store
