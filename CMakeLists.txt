@@ -11,6 +11,7 @@ add_library(core STATIC
     src/core/LogisticsGraph.cpp
     src/core/MinHeap.cpp
     src/core/Dijkstra.cpp
+    src/core/RoutePlanner.cpp
 )
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
@@ -37,11 +38,21 @@ target_link_libraries(minheap_tests PRIVATE core)
 add_executable(dijkstra_tests tests/dijkstra_tests.cpp)
 target_link_libraries(dijkstra_tests PRIVATE core)
 
+add_executable(routeplanner_tests tests/routeplanner_tests.cpp)
+target_link_libraries(routeplanner_tests PRIVATE core)
+
+add_executable(integration_tests tests/integration_tests.cpp)
+target_link_libraries(integration_tests PRIVATE io)
+target_compile_definitions(integration_tests PRIVATE
+    DEFAULT_CONFIG_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/default.ini")
+
 enable_testing()
 add_test(NAME core_tests COMMAND core_tests)
 add_test(NAME config_tests COMMAND config_tests)
 add_test(NAME minheap_tests COMMAND minheap_tests)
 add_test(NAME dijkstra_tests COMMAND dijkstra_tests)
+add_test(NAME routeplanner_tests COMMAND routeplanner_tests)
+add_test(NAME integration_tests COMMAND integration_tests)
 
 # ---- GUI：Qt6 已安装，待 gui 层源码就位后启用 ----
 # find_package(Qt6 REQUIRED COMPONENTS Widgets)
