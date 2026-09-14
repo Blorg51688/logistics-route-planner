@@ -214,4 +214,41 @@ RoutePlan planRoute(const LogisticsGraph& graph,
                   vehicle.departTimeMin, serviceTimeMin, weight);
 }
 
+InsertResult insertUrgentOrder(const LogisticsGraph& graph,
+                               const Vehicle& vehicle,
+                               const std::vector<Order>& remainingOrders,
+                               const Order& newOrder,
+                               const std::string& currentPositionId,
+                               int currentTimeMin,
+                               double serviceTimeMin,
+                               WeightType weight) {
+    InsertResult result;
+
+    // 插入的订单一律按紧急处理，调用方传入的 urgent 不作数
+    Order inserted = newOrder;
+    inserted.urgent = true;
+
+    std::vector<Order> all = remainingOrders;
+    all.push_back(inserted);
+
+    // 冲突判定：最早到达时刻始终按耗时维度衡量，与本次规划所选策略无关
+    const PathResult toNew =
+        shortestPath(graph, currentPositionId, inserted.nodeId, WeightType::Time);
+    if (!toNew.found) {
+        result.warning = "紧急订单目标不可达: " + inserted.nodeId;
+    } else {
+        const int earliestArrival =
+            currentTimeMin + static_cast<int>(std::lround(toNew.totalWeight));
+        if (inserted.windowEndMin < earliestArrival) {
+            result.warning = "紧急订单 " + inserted.id + " 无法在窗口内送达（窗口止 "
+                             + std::to_string(inserted.windowEndMin) + "，最早到达 "
+                             + std::to_string(earliestArrival) + "）";
+        }
+    }
+
+    result.plan = replan(graph, vehicle, all, currentPositionId, currentTimeMin,
+                         serviceTimeMin, weight);
+    return result;
+}
+
 } // namespace logistics

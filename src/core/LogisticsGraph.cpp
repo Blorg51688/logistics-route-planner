@@ -83,8 +83,23 @@ bool LogisticsGraph::removeEdge(const std::string& fromId, const std::string& to
     return false;
 }
 
-const Node* LogisticsGraph::findNode(const std::string& id) const {
-    const int idx = indexOf(id);
+bool LogisticsGraph::updateEdgeTime(const std::string& fromId, const std::string& toId,
+                                    double newTimeMin) {
+    const int from = indexOf(fromId);
+    if (from < 0) {
+        return false;
+    }
+    for (Edge& e : out_[static_cast<std::size_t>(from)]) {
+        if (e.toId == toId) {
+            e.timeMin = newTimeMin;
+            e.congested = newTimeMin > e.baseTimeMin;
+            return true;
+        }
+    }
+    return false;
+}
+
+const Node* LogisticsGraph::findNode(const std::string& id) const {    const int idx = indexOf(id);
     return idx < 0 ? nullptr : &nodes_[static_cast<std::size_t>(idx)];
 }
 

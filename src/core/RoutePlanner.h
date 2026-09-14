@@ -62,4 +62,24 @@ RoutePlan replan(const LogisticsGraph& graph,
                  double serviceTimeMin,
                  WeightType weight);
 
+struct InsertResult {
+    RoutePlan   plan;
+    std::string warning;   // 空表示无冲突
+};
+
+// 动态插入紧急订单（§5.3）：
+//   把 newOrder **强制标记为紧急**（无论调用方传入什么）后并入剩余订单，
+//   以车辆当前位置、当前时刻为起点重算路线。
+// 冲突判定：若新订单窗口止早于"从当前位置出发的最早到达时刻"（按耗时维度计算），
+// 则无论怎么排都会超时，此时在 warning 中给出提示。
+// 按 D13（超时不弃、只记 penalty），订单**仍会被纳入规划**。
+InsertResult insertUrgentOrder(const LogisticsGraph& graph,
+                               const Vehicle& vehicle,
+                               const std::vector<Order>& remainingOrders,
+                               const Order& newOrder,
+                               const std::string& currentPositionId,
+                               int currentTimeMin,
+                               double serviceTimeMin,
+                               WeightType weight);
+
 } // namespace logistics

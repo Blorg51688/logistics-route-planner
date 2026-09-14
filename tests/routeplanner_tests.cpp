@@ -22,6 +22,8 @@ namespace {
 
 using fixtures::addTwoWay;
 using fixtures::makeNode;
+using fixtures::makeVehicle;
+using fixtures::makeOrder;
 
 // W(仓库) <-> D1(配送点)：往返各 5.0km / 10min / 4元
 LogisticsGraph makeWtoD1Graph() {
@@ -30,27 +32,6 @@ LogisticsGraph makeWtoD1Graph() {
     g.addNode(makeNode("D1", NodeType::Delivery, "客户1"));
     addTwoWay(g, "W", "D1", 5.0, 10.0, 4.0);
     return g;
-}
-
-Vehicle makeVehicle(const std::string& startId, double capacityKg, int departMin) {
-    Vehicle v;
-    v.id = "V01";
-    v.startNodeId = startId;
-    v.capacityKg = capacityKg;
-    v.departTimeMin = departMin;
-    return v;
-}
-
-Order makeOrder(const std::string& id, const std::string& nodeId, double demandKg,
-                int windowStartMin, int windowEndMin, bool urgent) {
-    Order o;
-    o.id = id;
-    o.nodeId = nodeId;
-    o.demandKg = demandKg;
-    o.windowStartMin = windowStartMin;
-    o.windowEndMin = windowEndMin;
-    o.urgent = urgent;
-    return o;
 }
 
 std::string join(const std::vector<std::string>& nodes) {

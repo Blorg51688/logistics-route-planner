@@ -24,6 +24,11 @@ public:
     bool addEdge(const Edge& edge);
     bool removeEdge(const std::string& fromId, const std::string& toId);
 
+    // 更新某条边的**当前耗时**（路况变化使用）。
+    // baseTimeMin 不受影响；congested 依据 newTimeMin 是否高于 baseTimeMin 自动维护。
+    // 不提供可写的 Edge* —— 避免调用方改写 fromId/toId 等不变量。
+    bool updateEdgeTime(const std::string& fromId, const std::string& toId, double newTimeMin);
+
     // 只读查询；未命中返回 nullptr / 空表
     const Node* findNode(const std::string& id) const;
     const Edge* findEdge(const std::string& fromId, const std::string& toId) const;

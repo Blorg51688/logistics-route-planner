@@ -238,6 +238,21 @@ def self_check():
     return 0 if ok else 1
 
 
+def traffic_count(edge_count, ratio):
+    """路况模拟改动边数的口径：round(ratio*E)；ratio>0 且算得 0 时至少改 1 条。"""
+    if edge_count <= 0 or ratio <= 0:
+        return 0
+    n = int(ratio * edge_count + 0.5)
+    return max(1, min(n, edge_count))
+
+
+def fixture_w_d1_congested(increase):
+    """W<->D1，两条边的耗时统一乘 (1+increase)。"""
+    g = Graph()
+    g.two_way("W", "D1", 5.0, round(10.0 * (1.0 + increase), 6), 4.0)
+    return g
+
+
 def main():
     if "--check" in sys.argv:
         return self_check()
@@ -287,6 +302,43 @@ def main():
 
     show("切片6 replan：已在 D1，时刻 600",
          route_metrics(fixture_w_d1(), "D1", "W", 600, ["D1"], {"D1": (0, 1440)}, 5.0, "distance"))
+
+    # ------------------------------------------------------------ E1 路况
+    print("\n" + "=" * 72)
+    print("E1 路况模拟与重规划（tests/traffic_tests.cpp）")
+    print("=" * 72)
+
+    greedy_edges = len(fixture_greedy().edges)
+    print(f"  fixture_greedy 有向边数 = {greedy_edges}")
+    for ratio in (0.1, 0.5, 1.0):
+        print(f"  traffic_count(E={greedy_edges}, ratio={ratio}) = "
+              f"{traffic_count(greedy_edges, ratio)}")
+
+    show("切片C 全部边 +50% 后重规划（W 480 出发，服务 D1，窗口 540-1080）",
+         route_metrics(fixture_w_d1_congested(0.5), "W", "W", 480, ["D1"],
+                       {"D1": (540, 1080)}, 5.0, "distance"))
+    print("  对照（未拥堵）: totalDistance 10.0  totalTime 75.0")
+
+    # ------------------------------------------------------------ E3 插单
+    print("\n" + "=" * 72)
+    print("E3 动态订单插入（tests/traffic_tests.cpp）")
+    print("=" * 72)
+
+    show("切片D 插入紧急单：从 W 480 出发服务 [D2(紧急), D1]",
+         route_metrics(fixture_greedy(), "W", "W", 480, ["D2", "D1"],
+                       {"D1": (0, 1440), "D2": (0, 1440)}, 5.0, "distance"))
+
+    path, w = shortest(fixture_greedy(), "W", "D2", "time")
+    print(f"\n  切片E 冲突判定：W->D2 最短路 path={path} travel={w}min")
+    print(f"    时刻 600 出发的最早到达 = {600 + w}")
+    print("    新单窗口止 500  < 606 -> 必然超时 -> warning 非空")
+    print("    新单窗口止 1440 >= 606 -> 无冲突 -> warning 为空")
+
+    show("切片E 紧张窗口 [400,500] 的实际结果（超时不弃，仍生成路线）",
+         route_metrics(fixture_greedy(), "W", "W", 600, ["D2"], {"D2": (400, 500)}, 5.0, "distance"))
+
+    show("切片E 对照：窗口 [0,1440]",
+         route_metrics(fixture_greedy(), "W", "W", 600, ["D2"], {"D2": (0, 1440)}, 5.0, "distance"))
 
     return 0
 
