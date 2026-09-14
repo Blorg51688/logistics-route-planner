@@ -28,6 +28,7 @@ struct Options {
     std::string            configPath = DEFAULT_CONFIG_PATH;
     std::string            renderPath;
     std::string            windowRenderPath;
+    std::string            dumpGraph;      // "" / "list" / "matrix" / "both"
     int                    demoRounds = 0;
     std::string            planStrategy;   // 空表示不高亮任何路线
     bool                   allLabels = false;
@@ -71,6 +72,7 @@ void usage() {
         "  --render PATH.png          离屏渲染图形场景成 PNG 后退出\n"
         "  --render-window PATH.png   离屏渲染完整窗口（工具栏+侧栏）成 PNG 后退出\n"
         "  --demo N                   渲染窗口前先自动触发 N 轮交互（验证交互后状态）\n"
+        "  --dump-graph [list|matrix|both]  输出邻接表 / 邻接矩阵后退出（B3）\n"
         "  --width N --height N       窗口/图像尺寸\n");
 }
 
@@ -94,6 +96,17 @@ int main(int argc, char** argv) {
             takeNext(opt.renderPath);
         } else if (flag == "--render-window") {
             takeNext(opt.windowRenderPath);
+        } else if (flag == "--dump-graph") {
+            // 值可省略；省略时取 both
+            if (i + 1 < args.size() && !args[i + 1].startsWith(QStringLiteral("--"))) {
+                takeNext(opt.dumpGraph);
+            } else {
+                opt.dumpGraph = "both";
+            }
+            if (opt.dumpGraph != "list" && opt.dumpGraph != "matrix" && opt.dumpGraph != "both") {
+                std::fprintf(stderr, "--dump-graph 只接受 list / matrix / both\n");
+                return 2;
+            }
         } else if (flag == "--demo") {
             std::string value;
             takeNext(value);
@@ -139,8 +152,21 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "配置加载失败: %s\n", error.c_str());
         return 1;
     }
-    std::printf("已加载 %s：节点 %zu，边 %zu，订单 %zu\n", opt.configPath.c_str(),
-                config.graph.nodeCount(), config.graph.edgeCount(), config.orders.size());
+    // 走 stderr：图表表示要能被管道干净地取用（如 --dump-graph > out.txt）
+    std::fprintf(stderr, "已加载 %s：节点 %zu，边 %zu，订单 %zu\n", opt.configPath.c_str(),
+                 config.graph.nodeCount(), config.graph.edgeCount(), config.orders.size());
+
+    // B3：把图的两种文本表示打印出来。此前这两个函数只有测试在调用，
+    // 程序没有任何入口能让人看到，验收时无法展示。
+    if (!opt.dumpGraph.empty()) {
+        if (opt.dumpGraph == "list" || opt.dumpGraph == "both") {
+            std::printf("%s\n", config.graph.toAdjacencyListString().c_str());
+        }
+        if (opt.dumpGraph == "matrix" || opt.dumpGraph == "both") {
+            std::printf("%s\n", config.graph.toAdjacencyMatrixString(opt.weight).c_str());
+        }
+        return 0;
+    }
 
     if (!opt.windowRenderPath.empty()) {
         MainWindow window(config);

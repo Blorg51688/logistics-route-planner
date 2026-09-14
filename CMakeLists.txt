@@ -93,6 +93,10 @@ if(Qt6_FOUND)
     target_compile_definitions(app PRIVATE
         DEFAULT_CONFIG_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/default.ini")
     set_target_properties(app PROPERTIES AUTOMOC ON)
+    # B3 的暴露入口做冒烟检查：--dump-graph 不应崩溃
+    add_test(NAME cli_dump_graph
+             COMMAND ${CMAKE_COMMAND} -E env QT_QPA_PLATFORM=offscreen
+                     $<TARGET_FILE:app> --dump-graph both)
 else()
     message(STATUS "未找到 Qt6 Widgets，跳过 GUI 目标（app）")
 endif()
