@@ -11,7 +11,8 @@ TrafficReport simulateTrafficChange(LogisticsGraph& graph,
                                     double ratio,
                                     double minRatio,
                                     double maxRatio,
-                                    unsigned int seed) {
+                                    unsigned int seed,
+                                    double clearProbability) {
     TrafficReport report;
     if (ratio <= 0.0) {
         return report;
@@ -47,11 +48,17 @@ TrafficReport simulateTrafficChange(LogisticsGraph& graph,
     const double lo = minRatio < 0.0 ? 0.0 : minRatio;
     const double hi = maxRatio < lo ? lo : maxRatio;
 
+    const double clearChance = clearProbability < 0.0 ? 0.0
+                               : (clearProbability > 1.0 ? 1.0 : clearProbability);
+
     for (std::size_t i = 0; i < count; ++i) {
         const Edge& edge = pool[i];
-        const double increase = lo + (hi - lo) * rng.nextUnit();
 
+        // 畅通还是拥堵：需求把路况定义为"拥堵 / 畅通"两种动态属性，两者都要能出现
+        const bool becomesClear = rng.nextUnit() < clearChance;
+        const double increase = becomesClear ? 0.0 : (lo + (hi - lo) * rng.nextUnit());
         const double newTime = edge.baseTimeMin * (1.0 + increase);
+
         if (!graph.updateEdgeTime(edge.fromId, edge.toId, newTime)) {
             continue;
         }
@@ -60,6 +67,7 @@ TrafficReport simulateTrafficChange(LogisticsGraph& graph,
         change.fromId = edge.fromId;
         change.toId = edge.toId;
         change.increaseRatio = increase;
+        change.congested = !becomesClear;
         report.changes.push_back(change);
     }
 

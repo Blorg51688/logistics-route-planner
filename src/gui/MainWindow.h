@@ -100,4 +100,6 @@ private:
 
     QTimer* debugTimer_ = nullptr;
     bool    debugOn_ = false;
+    int     debugTicks_ = 0;
+    int     debugTickMs_ = 3000;
 };

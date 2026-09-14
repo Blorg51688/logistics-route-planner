@@ -128,13 +128,13 @@ void MainWindow::buildActions() {
 
 void MainWindow::buildDocks() {
     auto* routeDock = new QDockWidget(QStringLiteral("路线信息"), this);
-    routeDock->setMinimumWidth(320);
+    routeDock->setMinimumWidth(360);
     routeInfo_ = new QTextBrowser(routeDock);
     routeDock->setWidget(routeInfo_);
     addDockWidget(Qt::RightDockWidgetArea, routeDock);
 
     auto* vehicleDock = new QDockWidget(QStringLiteral("车辆信息"), this);
-    vehicleDock->setMinimumWidth(320);
+    vehicleDock->setMinimumWidth(360);
     vehicleInfo_ = new QLabel(vehicleDock);
     vehicleInfo_->setTextFormat(Qt::PlainText);
     vehicleInfo_->setMargin(6);
@@ -142,11 +142,13 @@ void MainWindow::buildDocks() {
     addDockWidget(Qt::RightDockWidgetArea, vehicleDock);
 
     auto* orderDock = new QDockWidget(QStringLiteral("订单列表"), this);
-    orderDock->setMinimumWidth(320);
+    orderDock->setMinimumWidth(360);
     orderTable_ = new QTableWidget(0, 5, orderDock);
     orderTable_->setHorizontalHeaderLabels(
         {QStringLiteral("订单"), QStringLiteral("配送点"), QStringLiteral("货量"),
          QStringLiteral("窗口"), QStringLiteral("状态")});
+    // 前 4 列按内容自适应、状态列拉伸，保证"状态"不会被挤到可视区之外
+    orderTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     orderTable_->horizontalHeader()->setStretchLastSection(true);
     orderTable_->verticalHeader()->setVisible(false);
     orderTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -154,11 +156,12 @@ void MainWindow::buildDocks() {
     addDockWidget(Qt::RightDockWidgetArea, orderDock);
 
     auto* lateDock = new QDockWidget(QStringLiteral("超时订单"), this);
-    lateDock->setMinimumWidth(320);
+    lateDock->setMinimumWidth(360);
     lateTable_ = new QTableWidget(0, 4, lateDock);
     lateTable_->setHorizontalHeaderLabels(
         {QStringLiteral("配送点"), QStringLiteral("到达"), QStringLiteral("penalty"),
          QStringLiteral("剩余载重")});
+    lateTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     lateTable_->horizontalHeader()->setStretchLastSection(true);
     lateTable_->verticalHeader()->setVisible(false);
     lateTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -181,7 +184,7 @@ void MainWindow::buildDocks() {
     resizeDocks({logDock}, {140}, Qt::Vertical);
 
     // 右侧栏整体留出足够宽度，避免"总距离：220.1 / km"这种被折断的显示
-    resizeDocks({routeDock, vehicleDock, orderDock}, {330, 330, 330}, Qt::Horizontal);
+    resizeDocks({routeDock, vehicleDock, orderDock}, {380, 380, 380}, Qt::Horizontal);
 }
 
 std::string MainWindow::currentPositionId() const {
@@ -264,7 +267,19 @@ void MainWindow::onSimulateTraffic() {
         config_.graph, config_.general.trafficChangeRatio, config_.general.trafficTimeIncreaseMin,
         config_.general.trafficTimeIncreaseMax, rng_.nextU32());
 
-    appendLog(QStringLiteral("路况变化：改动 %1 条边").arg(report.changes.size()));
+    std::size_t congestedCount = 0;
+    std::size_t clearedCount = 0;
+    for (const logistics::TrafficChange& change : report.changes) {
+        if (change.congested) {
+            ++congestedCount;
+        } else {
+            ++clearedCount;
+        }
+    }
+    appendLog(QStringLiteral("路况变化：改动 %1 条边（新增拥堵 %2 条，转为畅通 %3 条）")
+                  .arg(report.changes.size())
+                  .arg(congestedCount)
+                  .arg(clearedCount));
 
     const bool trigger = logistics::needsReplan(plan_.nodes, report,
                                                 config_.general.trafficTimeIncreaseMin);
@@ -430,11 +445,19 @@ void MainWindow::onDebugToggled(bool on) {
         // 这里按 10 倍速取，下限 1.5 秒。
         const int rawMs = static_cast<int>(config_.general.trafficChangeIntervalSec * 1000.0);
         const int intervalMs = std::max(1500, rawMs / 10);
+        debugTickMs_ = intervalMs;
+        debugTicks_ = 0;
         debugTimer_->start(intervalMs);
+
+        const double tickSec = intervalMs / 1000.0;
+        const int ticksPerUrgent = std::max(
+            1, static_cast<int>(config_.general.urgentOrderIntervalSec / tickSec));
         appendLog(QStringLiteral("Debug 模式开启：每 %1 秒自动模拟一次"
                                  "（配置值 %2 秒，按 10 倍速加速）")
-                      .arg(intervalMs / 1000.0, 0, 'f', 1)
+                      .arg(tickSec, 0, 'f', 1)
                       .arg(config_.general.trafficChangeIntervalSec, 0, 'f', 0));
+        appendLog(QStringLiteral("  紧急订单每 %1 秒最多插入一单，且同时最多 2 单待处理")
+                      .arg(config_.general.urgentOrderIntervalSec, 0, 'f', 0));
     } else {
         debugTimer_->stop();
         appendLog(QStringLiteral("Debug 模式关闭：自动模拟已停止"));
@@ -445,9 +468,28 @@ void MainWindow::onDebugTick() {
     if (!debugOn_) {
         return;   // 定时器必须可随时关闭，且关闭后不再产生任何副作用
     }
+    ++debugTicks_;
     onSimulateTraffic();
-    if (rng_.nextInt(0, 3) == 0) {
-        onInsertUrgentOrder();
+
+    // 紧急订单按配置的 urgent_order_interval_sec **节流**，而不是每个 tick 掷骰子。
+    // 早先用 1/4 概率逐 tick 触发：3 秒一个 tick 意味着平均十几秒就多一单紧急订单，
+    // 连续几单会把整体规划搅乱（人工测试第 15 关的反馈）。
+    const double tickSec = debugTickMs_ / 1000.0;
+    const double interval = config_.general.urgentOrderIntervalSec;
+    const int ticksPerUrgent = std::max(
+        1, static_cast<int>(interval / (tickSec > 0.0 ? tickSec : 1.0)));
+
+    // 同时限制"当前待处理的紧急订单"数量，避免连续堆积干扰规划
+    std::size_t pendingUrgent = 0;
+    for (const Order& order : config_.orders) {
+        if (!order.served && order.urgent) {
+            ++pendingUrgent;
+        }
+    }
+    const std::size_t kMaxPendingUrgent = 2;
+
+    if (debugTicks_ % ticksPerUrgent == 0 && pendingUrgent < kMaxPendingUrgent) {
+        insertUrgentOrderAction();
     }
     onAdvanceStop();
 }
@@ -569,18 +611,34 @@ void MainWindow::updatePanels() {
                                   .arg(load, 0, 'f', 0));
     }
 
-    // 订单列表
-    orderTable_->setRowCount(static_cast<int>(config_.orders.size()));
-    for (int i = 0; i < static_cast<int>(config_.orders.size()); ++i) {
-        const Order& o = config_.orders[i];
-        orderTable_->setItem(i, 0, new QTableWidgetItem(QString::fromStdString(o.id)));
-        orderTable_->setItem(i, 1, new QTableWidgetItem(QString::fromStdString(o.nodeId)));
-        orderTable_->setItem(i, 2, new QTableWidgetItem(QString::number(o.demandKg, 'f', 0)));
-        orderTable_->setItem(i, 3,
+    // 订单列表：按"未送达的紧急 → 未送达普通 → 已送达"排序。
+    // 新插入的紧急订单会立刻出现在**第一行**，不必滚动到表格末尾去找
+    // （早先直接按 config_.orders 的插入顺序显示，紧急单被追加在最底下，
+    //  用户看不见，会以为"根本没有添加这条紧急订单"）。
+    std::vector<std::size_t> order;
+    for (std::size_t pass = 0; pass < 3; ++pass) {
+        for (std::size_t i = 0; i < config_.orders.size(); ++i) {
+            const Order& o = config_.orders[i];
+            const bool wanted = (pass == 0) ? (!o.served && o.urgent)
+                                : (pass == 1) ? (!o.served && !o.urgent)
+                                              : o.served;
+            if (wanted) {
+                order.push_back(i);
+            }
+        }
+    }
+
+    orderTable_->setRowCount(static_cast<int>(order.size()));
+    for (int row = 0; row < static_cast<int>(order.size()); ++row) {
+        const Order& o = config_.orders[order[static_cast<std::size_t>(row)]];
+        orderTable_->setItem(row, 0, new QTableWidgetItem(QString::fromStdString(o.id)));
+        orderTable_->setItem(row, 1, new QTableWidgetItem(QString::fromStdString(o.nodeId)));
+        orderTable_->setItem(row, 2, new QTableWidgetItem(QString::number(o.demandKg, 'f', 0)));
+        orderTable_->setItem(row, 3,
                              new QTableWidgetItem(minutesToClock(o.windowStartMin)
                                                   + QStringLiteral("-")
                                                   + minutesToClock(o.windowEndMin)));
-        orderTable_->setItem(i, 4,
+        orderTable_->setItem(row, 4,
                              new QTableWidgetItem(o.served ? QStringLiteral("已送达")
                                                            : (o.urgent ? QStringLiteral("紧急")
                                                                        : QStringLiteral("待配送"))));

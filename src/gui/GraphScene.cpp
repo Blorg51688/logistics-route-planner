@@ -76,9 +76,33 @@ void GraphScene::setAllLabelsVisible(bool on) {
     update();
 }
 
-// 标签可见性规则：全部显示模式下一律显示；否则只在被高亮的边上显示
+// 标签可见性规则：
+//   1) 全部显示模式下一律显示；否则只在被高亮的边上显示
+//   2) 双向边的两个方向若**同时可见**，它们画在同一段线上、权重又必然相同
+//      （数据集里两个方向的权重一致），标签会完全重叠成"重复显示"。
+//      此时只保留节点 ID 字典序较小的一端显示标签。
+//      注意只在"两端都可见"时抑制：若路径只经过其中一个方向，那一条仍要显示，
+//      否则会把标签整个丢掉。
 void GraphScene::refreshLabelVisibility() {
     for (EdgeItem* edge : edges_) {
-        edge->setLabelVisible(allLabelsVisible_ || edge->highlighted());
+        bool visible = allLabelsVisible_ || edge->highlighted();
+        if (visible) {
+            for (EdgeItem* other : edges_) {
+                if (other == edge) {
+                    continue;
+                }
+                const bool isTwin = other->fromId() == edge->toId()
+                                    && other->toId() == edge->fromId();
+                if (!isTwin) {
+                    continue;
+                }
+                const bool twinVisible = allLabelsVisible_ || other->highlighted();
+                if (twinVisible && edge->fromId() > other->fromId()) {
+                    visible = false;   // 让字典序较小的一端保留标签
+                }
+                break;
+            }
+        }
+        edge->setLabelVisible(visible);
     }
 }

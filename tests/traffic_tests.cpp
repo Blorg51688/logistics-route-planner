@@ -69,7 +69,7 @@ void testTrafficChangeCountMagnitudeAndBasePreserved() {
     const EdgeSnapshot before = snapshot(g);
 
     // ratio 0.5 * 6 边 = 3 条（由 oracle 算出）
-    const TrafficReport report = simulateTrafficChange(g, 0.5, 0.2, 0.5, 12345u);
+    const TrafficReport report = simulateTrafficChange(g, 0.5, 0.2, 0.5, 12345u, 0.0);
     check(report.changes.size() == 3,
           "改动 3 条边，实际 " + std::to_string(report.changes.size()));
 
@@ -106,7 +106,7 @@ void testTrafficChangeCountMagnitudeAndBasePreserved() {
 // 切片 A：ratio = 1.0 时必须改动全部边（与随机种子无关）
 void testTrafficRatioOneTouchesEveryEdge() {
     LogisticsGraph g = makeGreedyGraph();
-    const TrafficReport report = simulateTrafficChange(g, 1.0, 0.2, 0.5, 99u);
+    const TrafficReport report = simulateTrafficChange(g, 1.0, 0.2, 0.5, 99u, 0.0);
 
     check(report.changes.size() == 6,
           "ratio=1.0 时改动全部 6 条边，实际 " + std::to_string(report.changes.size()));
@@ -125,8 +125,8 @@ void testTrafficIsDeterministicForSameSeed() {
     LogisticsGraph g1 = makeGreedyGraph();
     LogisticsGraph g2 = makeGreedyGraph();
 
-    const TrafficReport r1 = simulateTrafficChange(g1, 0.5, 0.2, 0.5, 2024u);
-    const TrafficReport r2 = simulateTrafficChange(g2, 0.5, 0.2, 0.5, 2024u);
+    const TrafficReport r1 = simulateTrafficChange(g1, 0.5, 0.2, 0.5, 2024u, 0.0);
+    const TrafficReport r2 = simulateTrafficChange(g2, 0.5, 0.2, 0.5, 2024u, 0.0);
 
     check(r1.changes.size() == r2.changes.size(), "同种子改动数量一致");
     bool identical = r1.changes.size() == r2.changes.size();
@@ -157,6 +157,59 @@ TrafficReport reportOf(std::initializer_list<logistics::TrafficChange> items) {
         r.changes.push_back(c);
     }
     return r;
+}
+
+
+// 切片：路况变化必须也能"变畅通"。
+// 需求原文把实时路况定义为动态属性"拥堵 / 畅通"，早先只实现了变拥堵。
+// clearProbability = 1.0 时，被选中的边应全部恢复自由通行基准。
+void testTrafficCanAlsoBecomeClear() {
+    LogisticsGraph g = makeGreedyGraph();
+    // 先制造一次拥堵
+    simulateTrafficChange(g, 1.0, 0.4, 0.4, 5u, 0.0);
+    std::size_t congestedBefore = 0;
+    for (const logistics::Edge& e : g.edges()) {
+        if (e.congested) {
+            ++congestedBefore;
+        }
+    }
+    check(congestedBefore == 6, "先让全部 6 条边拥堵，实际 "
+              + std::to_string(congestedBefore));
+
+    // 再全部转为畅通
+    const TrafficReport report = simulateTrafficChange(g, 1.0, 0.2, 0.5, 9u, 1.0);
+    check(report.changes.size() == 6, "畅通时同样改动全部 6 条边");
+
+    bool allClear = true;
+    bool ratioZero = true;
+    bool timeBackToBase = true;
+    for (const logistics::TrafficChange& c : report.changes) {
+        if (c.congested) {
+            allClear = false;
+        }
+        if (c.increaseRatio > 1e-9) {
+            ratioZero = false;
+        }
+        const logistics::Edge* e = g.findEdge(c.fromId, c.toId);
+        if (e == nullptr || !fixtures::nearlyEqual(e->timeMin, e->baseTimeMin)) {
+            timeBackToBase = false;
+        }
+    }
+    check(allClear, "全部标记为畅通而非拥堵");
+    check(ratioZero, "畅通的增幅为 0");
+    check(timeBackToBase, "畅通后耗时恢复到 baseTimeMin");
+
+    std::size_t stillCongested = 0;
+    for (const logistics::Edge& e : g.edges()) {
+        if (e.congested) {
+            ++stillCongested;
+        }
+    }
+    check(stillCongested == 0, "图中不再有拥堵边，实际 " + std::to_string(stillCongested));
+
+    // 畅通不应触发重规划（触发条件是"耗时增加 >= 20%"）
+    check(!needsReplan(std::vector<std::string>{"W", "D1"}, report, 0.2),
+          "畅通不构成重规划触发条件");
 }
 
 // 切片 B：仅当变化边位于当前路径上**且**增幅达到阈值时才需要重规划
@@ -204,7 +257,7 @@ void testCongestionTriggersReplanAndChangesTimes() {
     check(before.stops.size() == 1 && before.stops[0].waitMin == 50, "拥堵前等待 50");
 
     // 所有边耗时 +50%（10 -> 15）
-    const TrafficReport report = simulateTrafficChange(g, 1.0, 0.5, 0.5, 7u);
+    const TrafficReport report = simulateTrafficChange(g, 1.0, 0.5, 0.5, 7u, 0.0);
     check(report.changes.size() == 2,
           "两条边都被改动，实际 " + std::to_string(report.changes.size()));
 
@@ -338,7 +391,7 @@ void testTrafficInvariantsHoldAcrossSeeds() {
     for (unsigned int seed = 1; seed <= kSeeds; ++seed) {
         LogisticsGraph g = makeGreedyGraph();
         const EdgeSnapshot before = snapshot(g);
-        const TrafficReport r = simulateTrafficChange(g, 0.5, 0.2, 0.5, seed);
+        const TrafficReport r = simulateTrafficChange(g, 0.5, 0.2, 0.5, seed, 0.0);
 
         if (r.changes.size() != 3) {
             countOk = false;
@@ -392,6 +445,7 @@ int main() {
     testTrafficChangeCountMagnitudeAndBasePreserved();
     testTrafficRatioOneTouchesEveryEdge();
     testTrafficIsDeterministicForSameSeed();
+    testTrafficCanAlsoBecomeClear();
     testNeedsReplanOnlyForCongestedEdgesOnTheRoute();
     testCongestionTriggersReplanAndChangesTimes();
     testInsertUrgentOrderIsServedFirstAndServedNodesExcluded();
