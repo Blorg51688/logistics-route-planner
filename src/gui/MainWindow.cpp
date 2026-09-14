@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdio>
 #include <cmath>
 #include <utility>
 
@@ -276,46 +277,105 @@ void MainWindow::onSimulateTraffic() {
     }
 }
 
-void MainWindow::onInsertUrgentOrder() {
-    if (config_.orders.empty()) {
-        return;
+std::string MainWindow::nextFreeId(const char* prefix) const {
+    char buf[32];
+    for (int i = 1; i <= 999; ++i) {
+        std::snprintf(buf, sizeof(buf), "%s%03d", prefix, i);
+        bool used = false;
+        for (const Order& order : config_.orders) {
+            if (order.id == buf) {
+                used = true;
+                break;
+            }
+        }
+        if (!used) {
+            return std::string(buf);
+        }
     }
-    // 取一个尚未服务的订单目标作为紧急订单落点
-    const std::vector<Order> remaining = remainingOrders();
-    if (remaining.empty()) {
+    return std::string(prefix) + "999";
+}
+
+std::string MainWindow::insertUrgentOrderAction() {
+    if (config_.orders.empty() || config_.vehicles.empty()) {
+        appendLog(QStringLiteral("配置中没有可插入的配送点"));
+        return std::string();
+    }
+    const std::vector<Order> pending = remainingOrders();
+    if (pending.empty()) {
         appendLog(QStringLiteral("没有未服务的配送点，无法插入紧急订单"));
-        return;
+        return std::string();
     }
-    Order urgent = remaining[rng_.nextInt(0, static_cast<int>(remaining.size()) - 1)];
-    urgent.id = urgent.id + "-URG";
-    urgent.demandKg = 5.0;
-    urgent.windowStartMin = 0;
-    urgent.windowEndMin = 24 * 60;
+    const Order& base = pending[rng_.nextInt(0, static_cast<int>(pending.size()) - 1)];
+
+    Order urgent;
+    urgent.id = nextFreeId("U");
+    urgent.nodeId = base.nodeId;
+    urgent.demandKg = 3.0 + rng_.nextRange(0.0, 7.0);   // 3–10 kg
+    // 需求原文的举例就是「1 小时内送达」：窗口起 = 当前时刻，止 = 当前时刻 + 60 分钟。
+    // （早先这里写的是 0–1440 全天，等于没有时间要求，是错的。）
+    urgent.windowStartMin = currentTimeMin();
+    urgent.windowEndMin = currentTimeMin() + 60;
     urgent.urgent = true;
+    urgent.served = false;
 
     const logistics::InsertResult inserted = logistics::insertUrgentOrder(
-        config_.graph, config_.vehicles.front(), remaining, urgent, currentPositionId(),
+        config_.graph, config_.vehicles.front(), pending, urgent, currentPositionId(),
         currentTimeMin(), config_.general.serviceTimeMin, planWeight_);
 
-    appendLog(QStringLiteral("插入紧急订单 %1 @ %2")
+    // 关键：必须并入 config_.orders。
+    // 否则订单表看不到这一单，且下一次 replan 用 remainingOrders() 重建候选集时
+    // 它会消失——连续插单就只剩最后一单，"所有紧急订单同级、且整体高于普通订单"
+    // 这个性质随之失效。这正是人工测试第 10 关发现的问题。
+    config_.orders.push_back(urgent);
+
+    appendLog(QStringLiteral("插入紧急订单 %1 @ %2（货量 %3kg，要求 %4 前送达）")
                   .arg(QString::fromStdString(urgent.id))
-                  .arg(QString::fromStdString(urgent.nodeId)));
+                  .arg(QString::fromStdString(urgent.nodeId))
+                  .arg(urgent.demandKg, 0, 'f', 1)
+                  .arg(minutesToClock(urgent.windowEndMin)));
     if (!inserted.warning.empty()) {
         appendLog(QStringLiteral("  ⚠ %1").arg(QString::fromStdString(inserted.warning)));
     }
     plan_ = inserted.plan;
     syncScene();
     updatePanels();
+    return urgent.id;
+}
+
+void MainWindow::onInsertUrgentOrder() {
+    insertUrgentOrderAction();
+}
+
+std::string MainWindow::addRandomCustomerAction() {
+    const std::string nodeId = logistics::addRandomCustomer(config_.graph, rng_);
+    if (nodeId.empty()) {
+        appendLog(QStringLiteral("新增客户失败"));
+        return std::string();
+    }
+
+    // 新客户必然带来一个配送需求。
+    // 只加节点而不加订单的话，规划器没有理由访问它——停靠点只由订单决定，
+    // 新节点会永远不出现在路线里。这正是人工测试第 11 关发现的问题。
+    Order order;
+    order.id = nextFreeId("C");
+    order.nodeId = nodeId;
+    order.demandKg = 3.0 + rng_.nextRange(0.0, 12.0);
+    order.windowStartMin = currentTimeMin();
+    order.windowEndMin = 24 * 60;
+    order.urgent = false;
+    order.served = false;
+    config_.orders.push_back(order);
+
+    appendLog(QStringLiteral("模拟新客户：新增配送点 %1 与订单 %2（货量 %3kg）")
+                  .arg(QString::fromStdString(nodeId))
+                  .arg(QString::fromStdString(order.id))
+                  .arg(order.demandKg, 0, 'f', 1));
+    replan();
+    return nodeId;
 }
 
 void MainWindow::onAddRandomCustomer() {
-    const std::string id = logistics::addRandomCustomer(config_.graph, rng_);
-    if (id.empty()) {
-        appendLog(QStringLiteral("新增客户失败"));
-        return;
-    }
-    appendLog(QStringLiteral("模拟新客户：新增配送点 %1").arg(QString::fromStdString(id)));
-    replan();
+    addRandomCustomerAction();
 }
 
 void MainWindow::onCloseRandomRoad() {
@@ -365,11 +425,19 @@ void MainWindow::onDebugToggled(bool on) {
     appendLog(on ? QStringLiteral("Debug 模式开启：自动模拟路况 / 插单 / 推进")
                  : QStringLiteral("Debug 模式关闭"));
     if (on) {
-        const int intervalMs =
-            static_cast<int>(config_.general.trafficChangeIntervalSec * 1000.0);
-        debugTimer_->start(intervalMs > 0 ? intervalMs : 1000);
+        // 配置里的 traffic_change_interval_sec 默认 30 秒，那是对路况模型本身的描述；
+        // Debug 模式是**演示加速**，30 秒一次会让人以为"根本没反应"。
+        // 这里按 10 倍速取，下限 1.5 秒。
+        const int rawMs = static_cast<int>(config_.general.trafficChangeIntervalSec * 1000.0);
+        const int intervalMs = std::max(1500, rawMs / 10);
+        debugTimer_->start(intervalMs);
+        appendLog(QStringLiteral("Debug 模式开启：每 %1 秒自动模拟一次"
+                                 "（配置值 %2 秒，按 10 倍速加速）")
+                      .arg(intervalMs / 1000.0, 0, 'f', 1)
+                      .arg(config_.general.trafficChangeIntervalSec, 0, 'f', 0));
     } else {
         debugTimer_->stop();
+        appendLog(QStringLiteral("Debug 模式关闭：自动模拟已停止"));
     }
 }
 
@@ -586,6 +654,84 @@ void MainWindow::showInteractive(int preferredWidth, int preferredHeight) {
     showMaximized();
     raise();
     activateWindow();
+}
+
+int MainWindow::runActionSelfCheck() {
+    int failures = 0;
+    auto expect = [&failures](bool ok, const QString& what) {
+        const QByteArray line = what.toUtf8();
+        std::printf("[self-check] %s %s\n", ok ? "OK  " : "FAIL", line.constData());
+        if (!ok) {
+            ++failures;
+        }
+    };
+
+    const std::size_t ordersBefore = config_.orders.size();
+    const std::size_t nodesBefore = config_.graph.nodeCount();
+
+    // ① 连续两次插入紧急订单，两单都必须留在订单表里
+    insertUrgentOrderAction();
+    insertUrgentOrderAction();
+    expect(config_.orders.size() == ordersBefore + 2,
+           QStringLiteral("连续两次插单后订单数 +2（不丢单），实际 +%1")
+               .arg(config_.orders.size() - ordersBefore));
+
+    // ② 全部未服务的紧急订单必须整体排在最前（紧急之间同级，整体高于普通订单）
+    std::vector<std::string> urgentNodes;
+    for (const Order& o : config_.orders) {
+        if (o.served || !o.urgent) {
+            continue;
+        }
+        bool dup = false;
+        for (const std::string& n : urgentNodes) {
+            if (n == o.nodeId) {
+                dup = true;
+            }
+        }
+        if (!dup) {
+            urgentNodes.push_back(o.nodeId);
+        }
+    }
+    std::size_t leading = 0;
+    for (const Stop& stop : plan_.stops) {
+        bool isUrgent = false;
+        for (const std::string& n : urgentNodes) {
+            if (n == stop.nodeId) {
+                isUrgent = true;
+            }
+        }
+        if (!isUrgent) {
+            break;
+        }
+        ++leading;
+    }
+    expect(leading == urgentNodes.size(),
+           QStringLiteral("全部 %1 个紧急配送点都排在最前，实际连续 %2 个")
+               .arg(urgentNodes.size())
+               .arg(leading));
+
+    // ③ 模拟新客户：节点 +1、订单 +1，且新节点必须被纳入配送
+    const std::string newNode = addRandomCustomerAction();
+    expect(!newNode.empty(), QStringLiteral("新增客户成功"));
+    expect(config_.graph.nodeCount() == nodesBefore + 1,
+           QStringLiteral("节点数 +1，实际 +%1")
+               .arg(config_.graph.nodeCount() - nodesBefore));
+    expect(config_.orders.size() == ordersBefore + 3,
+           QStringLiteral("新客户带来一个订单，实际 +%1")
+               .arg(config_.orders.size() - ordersBefore));
+
+    bool visited = false;
+    for (const Stop& stop : plan_.stops) {
+        if (stop.nodeId == newNode) {
+            visited = true;
+        }
+    }
+    expect(visited, QStringLiteral("新客户节点 %1 被纳入配送路线")
+                        .arg(QString::fromStdString(newNode)));
+
+    std::printf("[self-check] %s（失败 %d 项）\n",
+                failures == 0 ? "全部通过" : "存在失败", failures);
+    return failures;
 }
 
 void MainWindow::renderToFile(const QString& path, int width, int height) {

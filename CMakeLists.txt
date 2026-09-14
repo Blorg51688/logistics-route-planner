@@ -97,6 +97,11 @@ if(Qt6_FOUND)
     add_test(NAME cli_dump_graph
              COMMAND ${CMAKE_COMMAND} -E env QT_QPA_PLATFORM=offscreen
                      $<TARGET_FILE:app> --dump-graph both)
+    # 人工测试第 10 / 11 关发现的两个缺陷的自动化守卫：
+    # 连续插单不丢单、紧急订单整体优先；新客户必须带来订单并被纳入配送
+    add_test(NAME cli_action_self_check
+             COMMAND ${CMAKE_COMMAND} -E env QT_QPA_PLATFORM=offscreen
+                     $<TARGET_FILE:app> --self-check-actions)
     # UI 完整性：工具栏与侧栏必须真的被构造出来。
     # 曾经交互路径只构造裸 QGraphicsView，工具栏/侧栏在正常启动时完全不存在。
     add_test(NAME cli_ui_probe

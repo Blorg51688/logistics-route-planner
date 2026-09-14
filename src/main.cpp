@@ -32,6 +32,7 @@ struct Options {
     std::string            windowRenderPath;
     std::string            dumpGraph;      // "" / "list" / "matrix" / "both"
     bool                   uiProbe = false;
+    bool                   selfCheckActions = false;
     int                    demoRounds = 0;
     std::string            planStrategy;   // 空表示不高亮任何路线
     bool                   allLabels = false;
@@ -77,6 +78,7 @@ void usage() {
         "  --demo N                   渲染窗口前先自动触发 N 轮交互（验证交互后状态）\n"
         "  --dump-graph [list|matrix|both]  输出邻接表 / 邻接矩阵后退出（B3）\n"
         "  --ui-probe                 检查工具栏与侧栏是否完整构造后退出\n"
+        "  --self-check-actions       自动验证插单不丢单 / 新客户会被配送后退出\n"
         "  --width N --height N       窗口/图像尺寸\n");
 }
 
@@ -102,6 +104,8 @@ int main(int argc, char** argv) {
             takeNext(opt.windowRenderPath);
         } else if (flag == "--ui-probe") {
             opt.uiProbe = true;
+        } else if (flag == "--self-check-actions") {
+            opt.selfCheckActions = true;
         } else if (flag == "--dump-graph") {
             // 值可省略；省略时取 both
             if (i + 1 < args.size() && !args[i + 1].startsWith(QStringLiteral("--"))) {
@@ -230,6 +234,10 @@ int main(int argc, char** argv) {
     // 而当时的验证只用 --render-window，恰好走的是正确的那条路径，
     // 因此完全没有发现。把它们合并到同一处，从结构上杜绝再次分叉。
     MainWindow window(config);
+
+    if (opt.selfCheckActions) {
+        return window.runActionSelfCheck() == 0 ? 0 : 1;
+    }
 
     if (opt.uiProbe) {
         window.show();

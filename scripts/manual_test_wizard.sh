@@ -569,21 +569,24 @@ main() {
     say "本关在命令行完成，向导直接运行给你看。"
     say ""
     if "$APP" --dump-graph both >/tmp/wizard_dump.txt 2>/dev/null; then
-        dim "输出已保存到 /tmp/wizard_dump.txt"
-        say ""
-        head1 "邻接表（前 3 行）："
-        sed -n '1,3p' /tmp/wizard_dump.txt
-        say ""
-        head1 "邻接矩阵（表头一行，已截断显示）："
-        sed -n '4p' /tmp/wizard_dump.txt | cut -c1-120
-        say ""
+        local dump_lines
+        dump_lines="$(wc -l < /tmp/wizard_dump.txt)"
         head1 "预期："
         want "邻接表：30 行，每行形如 W01(warehouse,中央仓库A): -> T01(7.6km,7.6min,12.2元) …"
         want "邻接矩阵：1 行列标 + 30 行数据，共 31×31 个单元格"
         want "矩阵中缺边位置显示 -，对角线也全是 -（无自环）"
         want "数值与画布上看到的边一致"
         say ""
-        printf '%s完整内容可执行：%s less /tmp/wizard_dump.txt\n' "$DIM" "$RESET"
+        dim "完整输出共 $dump_lines 行，下一步会**整屏显示全文**给你核对"
+        dim "（在分页器里可用方向键/空格上下翻页，按 q 退出返回向导）。"
+        pause
+        if command -v less >/dev/null 2>&1; then
+            less -R /tmp/wizard_dump.txt
+        else
+            cat /tmp/wizard_dump.txt
+        fi
+        say ""
+        dim "以上是完整输出，无需再手动打开任何文件。"
         pause
         ask_result "图表示输出（B3）"
     else

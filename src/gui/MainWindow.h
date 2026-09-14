@@ -38,6 +38,12 @@ public:
     // 供 UI 完整性探针使用（--ui-probe）
     int toolbarActionCount() const;
     int dockCount() const;
+
+    // 供 --self-check-actions 使用：自动验证两个由人工测试发现的缺陷不再复现
+    //   ① 连续插入多个紧急订单不得丢单，且它们必须整体优先于普通订单
+    //   ② 模拟新客户必须带来订单，且新节点必须被纳入配送
+    // 返回失败项数，0 表示全部通过。
+    int runActionSelfCheck();
     // 供无头验证交互后的状态：按顺序触发推进 / 路况 / 插单
     void runDemoActions(int rounds);
 
@@ -57,6 +63,10 @@ private slots:
 private:
     void buildActions();
     void buildDocks();
+
+    std::string insertUrgentOrderAction();
+    std::string addRandomCustomerAction();
+    std::string nextFreeId(const char* prefix) const;
 
     void replan();
     void syncScene();
