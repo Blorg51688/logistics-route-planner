@@ -4,17 +4,9 @@
 #include <vector>
 
 #include "core/LogisticsGraph.h"
+#include "core/WeightType.h"
 
 namespace logistics {
-
-// Dijkstra 可用的权重维度。
-// 两种策略（最短距离 / 最低成本）共用同一份实现，只在这里切换权重来源，
-// 不重复写三份最短路。
-enum class WeightType {
-    Distance,
-    Time,
-    Cost
-};
 
 struct PathResult {
     bool                     found = false;

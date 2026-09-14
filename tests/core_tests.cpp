@@ -128,6 +128,104 @@ void testEmptyGraphBoundary() {
     check(!g.removeNode("N01"), "空图删点返回 false");
     check(!g.removeEdge("N01", "N02"), "空图删边返回 false");
     check(!g.toAdjacencyListString().empty(), "空图邻接表输出不崩溃");
+    check(!g.toAdjacencyMatrixString().empty(), "空图邻接矩阵输出不崩溃");
+}
+
+// ---- 邻接矩阵 ----
+// 断言单元格的**语义**（第 i 行第 j 列是否等于边 weights[i-1][j-1]），
+// 而不是空格排版 —— 否则任何对齐格式微调都会让测试变红。
+
+std::vector<std::vector<std::string>> splitGrid(const std::string& text) {
+    std::vector<std::vector<std::string>> rows;
+    std::size_t start = 0;
+    while (start <= text.size()) {
+        const std::size_t nl = text.find('\n', start);
+        const std::string line =
+            (nl == std::string::npos) ? text.substr(start) : text.substr(start, nl - start);
+        std::vector<std::string> cells;
+        std::size_t i = 0;
+        while (i < line.size()) {
+            while (i < line.size() && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r')) {
+                ++i;
+            }
+            const std::size_t b = i;
+            while (i < line.size() && !(line[i] == ' ' || line[i] == '\t' || line[i] == '\r')) {
+                ++i;
+            }
+            if (i > b) {
+                cells.push_back(line.substr(b, i - b));
+            }
+        }
+        if (!cells.empty()) {
+            rows.push_back(cells);
+        }
+        if (nl == std::string::npos) {
+            break;
+        }
+        start = nl + 1;
+    }
+    return rows;
+}
+
+void testAdjacencyMatrixCellsMatchEdges() {
+    const LogisticsGraph g = makeSampleGraph();   // N01 -> N02 -> N03
+
+    const std::vector<std::vector<std::string>> grid =
+        splitGrid(g.toAdjacencyMatrixString(logistics::WeightType::Distance));
+
+    check(grid.size() == 4, "矩阵应有 1 行表头 + 3 行数据，实际 "
+              + std::to_string(grid.size()));
+    for (std::size_t r = 0; r < grid.size(); ++r) {
+        check(grid[r].size() == 4, "第 " + std::to_string(r) + " 行应有 1 角标 + 3 列，实际 "
+                  + std::to_string(grid[r].size()));
+    }
+    if (grid.size() != 4) {
+        return;
+    }
+
+    // 表头为节点 ID，顺序与 nodes() 一致；行标同理
+    check(grid[0][1] == "N01" && grid[0][2] == "N02" && grid[0][3] == "N03",
+          "表头为节点 ID 顺序");
+    check(grid[1][0] == "N01" && grid[2][0] == "N02" && grid[3][0] == "N03",
+          "行标为节点 ID 顺序");
+
+    // 单元格语义：grid[r][c] 对应 nodes[r-1] -> nodes[c-1]
+    check(grid[1][2] == "5.2", "N01->N02 距离 5.2，实际 " + grid[1][2]);
+    check(grid[2][3] == "3", "N02->N03 距离 3，实际 " + grid[2][3]);
+    // 对角线（无自环）与反向边（有向图）都应为缺边占位
+    check(grid[1][1] == "-", "对角 N01->N01 无自环");
+    check(grid[2][2] == "-", "对角 N02->N02 无自环");
+    check(grid[3][3] == "-", "对角 N03->N03 无自环");
+    check(grid[2][1] == "-", "N02->N01 不存在（有向）");
+    check(grid[3][1] == "-", "N03->N01 不存在");
+    check(grid[1][3] == "-", "N01->N03 不存在");
+}
+
+void testAdjacencyMatrixReflectsChosenWeight() {
+    const LogisticsGraph g = makeSampleGraph();
+    const std::vector<std::vector<std::string>> byDistance =
+        splitGrid(g.toAdjacencyMatrixString(logistics::WeightType::Distance));
+    const std::vector<std::vector<std::string>> byTime =
+        splitGrid(g.toAdjacencyMatrixString(logistics::WeightType::Time));
+    const std::vector<std::vector<std::string>> byCost =
+        splitGrid(g.toAdjacencyMatrixString(logistics::WeightType::Cost));
+
+    check(byDistance.size() == 4 && byTime.size() == 4 && byCost.size() == 4,
+          "三种权重维度都产出 4 行");
+    if (byDistance.size() != 4) {
+        return;
+    }
+    check(byDistance[1][2] == "5.2", "距离矩阵 N01->N02 为 5.2");
+    check(byTime[1][2] == "12", "耗时矩阵 N01->N02 为 12，实际 " + byTime[1][2]);
+    check(byCost[1][2] == "8", "成本矩阵 N01->N02 为 8，实际 " + byCost[1][2]);
+}
+
+void testEmptyGraphAdjacencyMatrix() {
+    const LogisticsGraph g;
+    const std::vector<std::vector<std::string>> grid =
+        splitGrid(g.toAdjacencyMatrixString(logistics::WeightType::Distance));
+    // 空图：只有 1 行表头（含角标），且不崩溃
+    check(grid.size() <= 1, "空图矩阵不超过 1 行，实际 " + std::to_string(grid.size()));
 }
 
 } // namespace
@@ -138,6 +236,9 @@ int main() {
     testOutEdgesAndRemoval();
     testAdjacencyListString();
     testEmptyGraphBoundary();
+    testAdjacencyMatrixCellsMatchEdges();
+    testAdjacencyMatrixReflectsChosenWeight();
+    testEmptyGraphAdjacencyMatrix();
 
     return testutil::summarize("core_tests");
 }

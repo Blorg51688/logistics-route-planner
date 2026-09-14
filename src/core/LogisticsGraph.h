@@ -6,6 +6,7 @@
 
 #include "core/Edge.h"
 #include "core/Node.h"
+#include "core/WeightType.h"
 
 namespace logistics {
 
@@ -43,6 +44,12 @@ public:
 
     // 邻接表文本表示，用于调试与课程要求的图表示输出
     std::string toAdjacencyListString() const;
+
+    // 邻接矩阵文本表示（按指定权重维度）。
+    // 首行为列标（角标 ID + 各节点 ID），其后每行为行标 + 各列单元格；
+    // 单元格为边在该维度上的权重，缺边显示为 "-"。
+    // 输出**不含标题行**，以便直接按空白切分解析。
+    std::string toAdjacencyMatrixString(WeightType weight = WeightType::Distance) const;
 
     // 邻接表本体：下标与 nodes() 对齐，供图算法按索引高效遍历
     const std::vector<std::vector<Edge>>& adjacency() const { return out_; }

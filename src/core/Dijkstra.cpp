@@ -11,16 +11,6 @@ namespace {
 // 不可达标记。真实权重远小于该值。
 const double kInfinity = 1e100;
 
-// 取边在指定维度上的权重。手写分支，不引入 <algorithm> 或任何库算法。
-double weightOf(const Edge& edge, WeightType type) {
-    switch (type) {
-        case WeightType::Distance: return edge.distanceKm;
-        case WeightType::Time:     return edge.timeMin;
-        case WeightType::Cost:     return edge.costYuan;
-    }
-    return 0.0;
-}
-
 } // namespace
 
 PathResult shortestPath(const LogisticsGraph& graph,
@@ -65,7 +55,8 @@ PathResult shortestPath(const LogisticsGraph& graph,
             if (next < 0) {
                 continue;
             }
-            const double candidate = currentDist + weightOf(edge, weight);
+            const double candidate =
+                currentDist + pickWeight(edge.distanceKm, edge.timeMin, edge.costYuan, weight);
             if (candidate < dist[static_cast<std::size_t>(next)]) {
                 dist[static_cast<std::size_t>(next)] = candidate;
                 previous[static_cast<std::size_t>(next)] = current;

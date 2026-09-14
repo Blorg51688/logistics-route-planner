@@ -186,6 +186,56 @@ void checkDataQualityInvariants(const Config& cfg, const RoutePlan& byDistance,
           "黄金值·成本策略总成本 288.2，实际 " + std::to_string(byCost.totalCostYuan));
 }
 
+// B3：两种图表示在真实规模（30 节点）上的形状检查
+void checkGraphRepresentationsOnRealData(const Config& cfg) {
+    const std::string list = cfg.graph.toAdjacencyListString();
+    check(list.find("W01") != std::string::npos, "邻接表包含顶点 W01");
+    check(list.find("->") != std::string::npos, "邻接表包含出边");
+
+    const std::string matrix = cfg.graph.toAdjacencyMatrixString(WeightType::Distance);
+    std::size_t lines = 0;
+    std::size_t tokensPerLine = 0;
+    std::size_t mismatched = 0;
+    std::size_t i = 0;
+    while (i < matrix.size()) {
+        const std::size_t nl = matrix.find('\n', i);
+        const std::string line =
+            (nl == std::string::npos) ? matrix.substr(i) : matrix.substr(i, nl - i);
+        std::size_t tokens = 0;
+        bool inToken = false;
+        for (char c : line) {
+            const bool space = (c == ' ' || c == '\t' || c == '\r');
+            if (!space && !inToken) {
+                ++tokens;
+                inToken = true;
+            } else if (space) {
+                inToken = false;
+            }
+        }
+        ++lines;
+        if (lines == 1) {
+            tokensPerLine = tokens;
+        } else if (tokens != tokensPerLine) {
+            ++mismatched;
+        }
+        if (nl == std::string::npos) {
+            break;
+        }
+        i = nl + 1;
+    }
+
+    const std::size_t expected = cfg.graph.nodeCount() + 1;   // 角标 + 各列
+    check(lines == expected, "邻接矩阵行数 = 节点数 + 1（" + std::to_string(expected)
+              + "），实际 " + std::to_string(lines));
+    check(mismatched == 0, "邻接矩阵各行 token 数一致");
+    check(tokensPerLine == expected, "邻接矩阵每行 token 数 = 节点数 + 1（"
+              + std::to_string(expected) + "），实际 " + std::to_string(tokensPerLine));
+    check(matrix.find("-") != std::string::npos, "邻接矩阵含缺边占位符");
+
+    std::printf("      B3: 邻接表 %zu 行；邻接矩阵 %zux%zu\n",
+                cfg.graph.nodeCount() + 1, lines, tokensPerLine);
+}
+
 // E1 + E3 在真实数据上的端到端验证：
 // 服务前 k 站后触发路况变化 -> 重规划 -> 再插入紧急订单 -> 再次重算。
 void checkTrafficAndUrgentOrderOnRealData(const Config& cfg) {
@@ -298,6 +348,7 @@ int main() {
 
     checkDataQualityInvariants(cfg, byDistance, byCost);
 
+    checkGraphRepresentationsOnRealData(cfg);
     checkTrafficAndUrgentOrderOnRealData(cfg);
 
     return testutil::summarize("integration_tests");

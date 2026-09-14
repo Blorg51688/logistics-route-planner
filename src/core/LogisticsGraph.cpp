@@ -1,5 +1,6 @@
 #include "core/LogisticsGraph.h"
 
+#include <iomanip>
 #include <sstream>
 
 namespace logistics {
@@ -145,6 +146,32 @@ std::size_t LogisticsGraph::edgeCount() const {
         total += list.size();
     }
     return total;
+}
+
+std::string LogisticsGraph::toAdjacencyMatrixString(WeightType weight) const {
+    const int kWidth = 10;
+    std::ostringstream os;
+
+    os << std::setw(kWidth) << "ID";
+    for (const Node& col : nodes_) {
+        os << std::setw(kWidth) << col.id;
+    }
+    os << '\n';
+
+    for (const Node& row : nodes_) {
+        os << std::setw(kWidth) << row.id;
+        for (const Node& col : nodes_) {
+            const Edge* edge = findEdge(row.id, col.id);
+            if (edge == nullptr) {
+                os << std::setw(kWidth) << "-";   // 缺边占位；有向图的对角线同样是 "-"
+            } else {
+                os << std::setw(kWidth)
+                   << pickWeight(edge->distanceKm, edge->timeMin, edge->costYuan, weight);
+            }
+        }
+        os << '\n';
+    }
+    return os.str();
 }
 
 std::string LogisticsGraph::toAdjacencyListString() const {
