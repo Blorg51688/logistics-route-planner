@@ -12,6 +12,8 @@ add_library(core STATIC
     src/core/MinHeap.cpp
     src/core/Dijkstra.cpp
     src/core/RoutePlanner.cpp
+    src/core/Random.cpp
+    src/core/GraphEdit.cpp
     src/core/Traffic.cpp
 )
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -50,6 +52,9 @@ target_compile_definitions(integration_tests PRIVATE
 add_executable(traffic_tests tests/traffic_tests.cpp)
 target_link_libraries(traffic_tests PRIVATE core)
 
+add_executable(graphedit_tests tests/graphedit_tests.cpp)
+target_link_libraries(graphedit_tests PRIVATE core)
+
 enable_testing()
 add_test(NAME core_tests COMMAND core_tests)
 add_test(NAME config_tests COMMAND config_tests)
@@ -58,6 +63,7 @@ add_test(NAME dijkstra_tests COMMAND dijkstra_tests)
 add_test(NAME routeplanner_tests COMMAND routeplanner_tests)
 add_test(NAME integration_tests COMMAND integration_tests)
 add_test(NAME traffic_tests COMMAND traffic_tests)
+add_test(NAME graphedit_tests COMMAND graphedit_tests)
 
 # ---- 期望值预言机自检（开发工具，不参与交付程序；缺 python3 时自动跳过）----
 find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -81,6 +87,7 @@ if(Qt6_FOUND)
         src/gui/NodeItem.cpp
         src/gui/EdgeItem.cpp
         src/gui/GraphScene.cpp
+        src/gui/MainWindow.cpp
     )
     target_link_libraries(app PRIVATE io Qt6::Widgets)
     target_compile_definitions(app PRIVATE

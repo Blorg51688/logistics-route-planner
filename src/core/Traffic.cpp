@@ -1,48 +1,11 @@
 #include "core/Traffic.h"
 
+#include "core/Random.h"
 #include "core/RoutePlanner.h"
 
 #include <cstddef>
 
 namespace logistics {
-
-namespace {
-
-// 手写 xorshift32 伪随机数发生器。
-// 核心层不引入 <random>（§10.1），且确定性种子让测试可复现。
-class Rng {
-public:
-    explicit Rng(unsigned int seed)
-        : state_(seed == 0u ? 0x9E3779B9u : seed) {}
-
-    unsigned int nextU32() {
-        unsigned int x = state_;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        state_ = x;
-        return x;
-    }
-
-    // 返回 [0, 1) 内的数；取高 24 位以保证精度足够且不引入低位偏差
-    double nextUnit() {
-        return static_cast<double>(nextU32() >> 8) / 16777216.0;
-    }
-
-    // 返回 [low, high] 闭区间内的整数
-    int nextInt(int low, int high) {
-        if (high <= low) {
-            return low;
-        }
-        const unsigned int span = static_cast<unsigned int>(high - low + 1);
-        return low + static_cast<int>(nextU32() % span);
-    }
-
-private:
-    unsigned int state_;
-};
-
-} // namespace
 
 TrafficReport simulateTrafficChange(LogisticsGraph& graph,
                                     double ratio,

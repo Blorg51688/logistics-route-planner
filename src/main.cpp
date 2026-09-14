@@ -15,6 +15,7 @@
 #include "core/Config.h"
 #include "core/RoutePlanner.h"
 #include "gui/GraphScene.h"
+#include "gui/MainWindow.h"
 #include "io/ConfigLoader.h"
 
 #ifndef DEFAULT_CONFIG_PATH
@@ -26,6 +27,8 @@ namespace {
 struct Options {
     std::string            configPath = DEFAULT_CONFIG_PATH;
     std::string            renderPath;
+    std::string            windowRenderPath;
+    int                    demoRounds = 0;
     std::string            planStrategy;   // 空表示不高亮任何路线
     bool                   allLabels = false;
     logistics::WeightType  weight = logistics::WeightType::Distance;
@@ -65,7 +68,9 @@ void usage() {
         "  --weight distance|time|cost  权重标签显示的维度（默认 distance）\n"
         "  --plan distance|cost       规划并高亮该策略的路线\n"
         "  --labels all|route         权重标签显示全部边还是仅高亮路线（默认 route）\n"
-        "  --render PATH.png          离屏渲染成 PNG 后退出\n"
+        "  --render PATH.png          离屏渲染图形场景成 PNG 后退出\n"
+        "  --render-window PATH.png   离屏渲染完整窗口（工具栏+侧栏）成 PNG 后退出\n"
+        "  --demo N                   渲染窗口前先自动触发 N 轮交互（验证交互后状态）\n"
         "  --width N --height N       窗口/图像尺寸\n");
 }
 
@@ -87,6 +92,12 @@ int main(int argc, char** argv) {
             takeNext(opt.configPath);
         } else if (flag == "--render") {
             takeNext(opt.renderPath);
+        } else if (flag == "--render-window") {
+            takeNext(opt.windowRenderPath);
+        } else if (flag == "--demo") {
+            std::string value;
+            takeNext(value);
+            opt.demoRounds = std::atoi(value.c_str());
         } else if (flag == "--labels") {
             std::string value;
             takeNext(value);
@@ -130,6 +141,16 @@ int main(int argc, char** argv) {
     }
     std::printf("已加载 %s：节点 %zu，边 %zu，订单 %zu\n", opt.configPath.c_str(),
                 config.graph.nodeCount(), config.graph.edgeCount(), config.orders.size());
+
+    if (!opt.windowRenderPath.empty()) {
+        MainWindow window(config);
+        if (opt.demoRounds > 0) {
+            window.runDemoActions(opt.demoRounds);
+        }
+        window.renderToFile(QString::fromStdString(opt.windowRenderPath), opt.width, opt.height);
+        std::printf("已渲染窗口 -> %s\n", opt.windowRenderPath.c_str());
+        return 0;
+    }
 
     GraphScene scene;
     scene.build(config.graph, opt.weight);

@@ -1,0 +1,85 @@
+#pragma once
+
+#include <QMainWindow>
+
+#include <string>
+#include <vector>
+
+#include "core/Config.h"
+#include "core/Random.h"
+#include "core/RoutePlanner.h"
+#include "core/WeightType.h"
+
+class GraphScene;
+class QComboBox;
+class QGraphicsView;
+class QLabel;
+class QPlainTextEdit;
+class QTableWidget;
+class QTextBrowser;
+class QTimer;
+
+// 主窗口：工具栏 + 画布 + 侧栏。
+// 这里只做**编排**：规划、路况、插单、增删图这些逻辑都在 core 里且已有测试，
+// 本类负责把它们串起来并更新界面。
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+
+public:
+    explicit MainWindow(logistics::Config config, QWidget* parent = nullptr);
+
+    // 供无头渲染验证使用
+    void renderToFile(const QString& path, int width, int height);
+    // 供无头验证交互后的状态：按顺序触发推进 / 路况 / 插单
+    void runDemoActions(int rounds);
+
+private slots:
+    void onStrategyChanged();
+    void onWeightChanged();
+    void onSimulateTraffic();
+    void onInsertUrgentOrder();
+    void onAddRandomCustomer();
+    void onCloseRandomRoad();
+    void onAdvanceStop();
+    void onReplan();
+    void onDebugToggled(bool on);
+    void onDebugTick();
+    void onManualEdit();
+
+private:
+    void buildActions();
+    void buildDocks();
+
+    void replan();
+    void syncScene();
+    void updatePanels();
+    void appendLog(const QString& text);
+
+    std::string        currentPositionId() const;
+    int                currentTimeMin() const;
+    std::vector<logistics::Order> remainingOrders() const;
+
+    logistics::Config     config_;
+    GraphScene*           scene_ = nullptr;
+    QGraphicsView*        view_ = nullptr;
+    logistics::RoutePlan  plan_;
+    // 车辆当前位置与当前时刻必须**显式保存**：重规划会用一个全新的
+    // plan_ 覆盖旧计划，此时按 servedCount_ 回查 plan_.stops 会索引错位
+    // （新计划里的停靠点全都没送过），进而取到错误的时刻、penalty 暴涨。
+    std::string           currentNodeId_;
+    int                   currentTimeMin_ = 0;
+    std::size_t           servedCount_ = 0;   // 当前计划内已送达的站数，仅用于显示
+    logistics::Rng        rng_{20260914u};
+    logistics::WeightType planWeight_ = logistics::WeightType::Distance;
+
+    QComboBox*     strategyBox_ = nullptr;
+    QComboBox*     weightBox_ = nullptr;
+    QTextBrowser*  routeInfo_ = nullptr;
+    QLabel*        vehicleInfo_ = nullptr;
+    QTableWidget*  orderTable_ = nullptr;
+    QTableWidget*  lateTable_ = nullptr;
+    QPlainTextEdit* logView_ = nullptr;
+
+    QTimer* debugTimer_ = nullptr;
+    bool    debugOn_ = false;
+};
