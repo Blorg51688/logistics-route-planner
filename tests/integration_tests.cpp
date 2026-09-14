@@ -9,6 +9,7 @@
 #include "core/Config.h"
 #include "core/RoutePlanner.h"
 #include "core/Traffic.h"
+#include "graph_fixtures.h"
 #include "io/ConfigLoader.h"
 #include "test_util.h"
 
@@ -52,7 +53,25 @@ std::size_t distinctOrderNodes(const Config& cfg) {
     return seen.size();
 }
 
-void checkPlanCoversAllOrders(const Config& cfg, WeightType weight, const char* label) {
+// 合并后停靠点的窗口跨度（分钟）：同节点多订单取并集 [min 起, max 止]
+int windowSpanMinutes(const Config& cfg, const std::string& nodeId) {
+    int lo = 1 << 30;
+    int hi = -(1 << 30);
+    for (const logistics::Order& o : cfg.orders) {
+        if (o.nodeId != nodeId) {
+            continue;
+        }
+        if (o.windowStartMin < lo) {
+            lo = o.windowStartMin;
+        }
+        if (o.windowEndMin > hi) {
+            hi = o.windowEndMin;
+        }
+    }
+    return hi > lo ? hi - lo : 0;
+}
+
+RoutePlan checkPlanCoversAllOrders(const Config& cfg, WeightType weight, const char* label) {
     const Vehicle& v = cfg.vehicles[0];
     const RoutePlan plan = planRoute(cfg.graph, v, cfg.orders, cfg.general.serviceTimeMin, weight);
 
@@ -82,7 +101,7 @@ void checkPlanCoversAllOrders(const Config& cfg, WeightType weight, const char* 
     check(plan.nodes.back() == v.startNodeId,
           std::string(label) + "：路线返回起始仓库");
 
-    std::printf("      %s: 距离 %.1fkm  耗时 %.1fmin  成本 %.1f元  penalty %dmin  停靠 %zu 站\n",
+    std::printf("      %s: 距离 %.3fkm  耗时 %.3fmin  成本 %.3f元  penalty %dmin  停靠 %zu 站\n",
                 label, plan.totalDistanceKm, plan.totalTimeMin, plan.totalCostYuan,
                 plan.totalPenaltyMin, plan.stops.size());
 
@@ -96,6 +115,75 @@ void checkPlanCoversAllOrders(const Config& cfg, WeightType weight, const char* 
         }
     }
     std::printf("%s\n", anyLate ? "" : " 无");
+    return plan;
+}
+
+// 数据质量不变量。
+//
+// 起因（必须记住的教训）：RoutePlanner 完成后单元测试全绿，但默认数据里藏着两个
+// 真实缺陷 —— ① 巡游 1048km / 28 小时，全部订单必然超时；② 成本与距离完全线性相关，
+// 最低成本策略恒等价于最短距离策略、B7"两种策略"名存实亡。
+// 当时集成测试只有"非零 / 非负 / 结构正确"这类弱断言，两个缺陷是靠人眼看 printf
+// 发现的 —— 也就是说同样的缺陷今天重来一遍，测试依然会全绿通过。
+// 以下断言把"数据有效性"从"人眼观察"变成"机器守的契约"。
+void checkDataQualityInvariants(const Config& cfg, const RoutePlan& byDistance,
+                                const RoutePlan& byCost) {
+    // ① 双策略必须真的分化
+    check(byDistance.nodes != byCost.nodes
+              || !fixtures::nearlyEqual(byDistance.totalDistanceKm, byCost.totalDistanceKm),
+          "两种策略必须给出不同结果（相同则最低成本策略形同虚设）");
+
+    // ② 各自在自身目标上不得劣于对方 —— "最优"的直接体现
+    check(byDistance.totalDistanceKm <= byCost.totalDistanceKm + 1e-6,
+          "距离策略的总距离不应劣于成本策略");
+    check(byCost.totalCostYuan <= byDistance.totalCostYuan + 1e-6,
+          "成本策略的总成本不应劣于距离策略");
+
+    // ③ 单车辆必须能在工作日内跑完，否则默认数据下全部订单必然超时
+    const double kWorkdayMinutes = 12.0 * 60.0;
+    check(byDistance.totalTimeMin <= kWorkdayMinutes,
+          "距离策略总耗时须在 12 小时工作日内，实际 "
+              + std::to_string(byDistance.totalTimeMin));
+    check(byCost.totalTimeMin <= kWorkdayMinutes,
+          "成本策略总耗时须在 12 小时工作日内，实际 " + std::to_string(byCost.totalTimeMin));
+
+    // ④ 超时必须是少数，且只能出现在"刻意收紧"的窗口上：
+    //    窗口跨度充裕（> 4 小时）的停靠点绝不允许超时。
+    //    这条用"窗口跨度"判定而非硬编码节点 ID，数据调整后依然成立。
+    const std::size_t kMaxLateStops = 3;
+    const int kTightWindowMinutes = 4 * 60;
+    const RoutePlan* plans[] = {&byDistance, &byCost};
+    const char* labels[] = {"距离策略", "成本策略"};
+    for (int i = 0; i < 2; ++i) {
+        std::size_t lateStops = 0;
+        for (const logistics::Stop& s : plans[i]->stops) {
+            if (!s.late) {
+                continue;
+            }
+            ++lateStops;
+            const int span = windowSpanMinutes(cfg, s.nodeId);
+            check(span <= kTightWindowMinutes,
+                  std::string(labels[i]) + "：窗口跨度充裕的停靠点不应超时，"
+                      + s.nodeId + " 跨度 " + std::to_string(span) + " 分钟");
+        }
+        check(lateStops <= kMaxLateStops,
+              std::string(labels[i]) + "：超时停靠点应属少数，实际 "
+                  + std::to_string(lateStops) + " / " + std::to_string(plans[i]->stops.size()));
+    }
+
+    // 5) 黄金基准（characterization test）。
+    //    明确性质：这四个值是从**当前行为捕获**的，不是独立推导的真值
+    //    （贪心顺序来自被测实现，oracle 无法独立复现）。因此它们不用于证明正确性，
+    //    只用于**检测非预期漂移**：数据或算法被无意改动时立刻报警。
+    //    有意调整数据/算法时，应连同这些值一起显式更新。
+    check(fixtures::nearlyEqual(byDistance.totalDistanceKm, 262.2, 0.01),
+          "黄金值·距离策略总距离 262.2，实际 " + std::to_string(byDistance.totalDistanceKm));
+    check(fixtures::nearlyEqual(byDistance.totalCostYuan, 290.8, 0.01),
+          "黄金值·距离策略总成本 290.8，实际 " + std::to_string(byDistance.totalCostYuan));
+    check(fixtures::nearlyEqual(byCost.totalDistanceKm, 288.2, 0.01),
+          "黄金值·成本策略总距离 288.2，实际 " + std::to_string(byCost.totalDistanceKm));
+    check(fixtures::nearlyEqual(byCost.totalCostYuan, 288.2, 0.01),
+          "黄金值·成本策略总成本 288.2，实际 " + std::to_string(byCost.totalCostYuan));
 }
 
 // E1 + E3 在真实数据上的端到端验证：
@@ -204,8 +292,11 @@ int main() {
                 cfg.graph.nodeCount(), cfg.graph.edgeCount(), cfg.orders.size(),
                 cfg.vehicles[0].capacityKg);
 
-    checkPlanCoversAllOrders(cfg, WeightType::Distance, "最短距离策略");
-    checkPlanCoversAllOrders(cfg, WeightType::Cost, "最低成本策略");
+    const RoutePlan byDistance =
+        checkPlanCoversAllOrders(cfg, WeightType::Distance, "最短距离策略");
+    const RoutePlan byCost = checkPlanCoversAllOrders(cfg, WeightType::Cost, "最低成本策略");
+
+    checkDataQualityInvariants(cfg, byDistance, byCost);
 
     checkTrafficAndUrgentOrderOnRealData(cfg);
 

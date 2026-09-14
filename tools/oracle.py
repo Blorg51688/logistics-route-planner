@@ -233,6 +233,40 @@ def self_check():
         print(f"[FAIL] 自检总耗时: {r['total_time']}")
         ok = False
 
+    # 贪心夹具：W->D2 的最短路是绕经 D1 的 3.0，而非直达 5.0
+    path, w = shortest(fixture_greedy(), "W", "D2", "distance")
+    if path != ["W", "D1", "D2"] or abs(w - 3.0) > EPS:
+        print(f"[FAIL] 自检 W->D2 距离: {path} {w}")
+        ok = False
+
+    # 并列夹具：W->DA 与 W->DZ 等距
+    _, wa = shortest(fixture_tie(), "W", "DA", "distance")
+    _, wz = shortest(fixture_tie(), "W", "DZ", "distance")
+    if abs(wa - wz) > EPS:
+        print(f"[FAIL] 自检并列夹具等距: {wa} vs {wz}")
+        ok = False
+
+    # 路况改动条数口径
+    for e_count, ratio, expect in ((6, 0.5, 3), (6, 0.1, 1), (6, 1.0, 6), (72, 0.1, 7)):
+        got = traffic_count(e_count, ratio)
+        if got != expect:
+            print(f"[FAIL] 自检 traffic_count({e_count},{ratio}) = {got}，应为 {expect}")
+            ok = False
+
+    # 全部边 +50% 后的重规划：总耗时 75 -> 80
+    r = route_metrics(fixture_w_d1_congested(0.5), "W", "W", 480, ["D1"],
+                      {"D1": (540, 1080)}, 5.0, "distance")
+    if abs(r["total_time"] - 80.0) > EPS or r["stops"][0]["raw"] != 495:
+        print(f"[FAIL] 自检拥堵后重规划: {r}")
+        ok = False
+
+    # 紧急单场景：先 D2 后 D1，总耗时 22.0
+    r = route_metrics(fixture_greedy(), "W", "W", 480, ["D2", "D1"],
+                      {"D1": (0, 1440), "D2": (0, 1440)}, 5.0, "distance")
+    if abs(r["total_time"] - 22.0) > EPS or r["stops"][0]["node"] != "D2":
+        print(f"[FAIL] 自检紧急优先: {r}")
+        ok = False
+
     if ok:
         print("[oracle] 自检通过")
     return 0 if ok else 1

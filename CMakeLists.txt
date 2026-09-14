@@ -65,6 +65,10 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME oracle_selfcheck
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tools/oracle.py --check)
+    # 校验 default.ini 确实出自生成器，且通过数据有效性自检
+    add_test(NAME dataset_selfcheck
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_dataset.py)
 else()
     message(STATUS "未找到 python3，跳过 oracle_selfcheck 测试")
 endif()

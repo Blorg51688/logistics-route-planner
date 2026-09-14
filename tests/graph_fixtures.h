@@ -10,8 +10,8 @@
 // 多个测试共用的图构造夹具，避免 Node / Edge 的构造样板在各测试文件里重复。
 namespace fixtures {
 
-inline bool nearlyEqual(double a, double b) {
-    return std::fabs(a - b) < 1e-9;
+inline bool nearlyEqual(double a, double b, double tolerance = 1e-9) {
+    return std::fabs(a - b) < tolerance;
 }
 
 inline logistics::Node makeNode(const std::string& id, logistics::NodeType type,

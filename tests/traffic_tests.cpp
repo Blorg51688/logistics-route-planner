@@ -1,5 +1,6 @@
 // E1 路况模拟/重规划 与 E3 动态订单插入 的行为测试。
 // 期望值均先由 tools/oracle.py 独立算出，再抄为字面量。
+#include <algorithm>
 #include <initializer_list>
 #include <map>
 #include <string>
@@ -323,6 +324,68 @@ void testInsertUrgentOrderWarnsButStillPlansWhenWindowCannotBeMet() {
     check(ok.plan.totalPenaltyMin == 0, "窗口充裕时 penalty 为 0");
 }
 
+// 跨种子不变量：路况模拟是随机的，单一种子只覆盖一条随机路径。
+// 这里遍历多个种子，验证「改动条数」「增幅范围」「baseTimeMin 不变」
+// 这些不变量对**任意种子**都成立；并确认不同种子确实给出不同结果（随机性真实存在）。
+// 种子集合固定，因此本测试自身是确定性的、不会 flaky。
+void testTrafficInvariantsHoldAcrossSeeds() {
+    const unsigned int kSeeds = 20;
+    std::vector<std::string> signatures;
+    bool countOk = true;
+    bool rangeOk = true;
+    bool baseOk = true;
+
+    for (unsigned int seed = 1; seed <= kSeeds; ++seed) {
+        LogisticsGraph g = makeGreedyGraph();
+        const EdgeSnapshot before = snapshot(g);
+        const TrafficReport r = simulateTrafficChange(g, 0.5, 0.2, 0.5, seed);
+
+        if (r.changes.size() != 3) {
+            countOk = false;
+        }
+        for (const logistics::TrafficChange& c : r.changes) {
+            if (c.increaseRatio < 0.2 - 1e-9 || c.increaseRatio > 0.5 + 1e-9) {
+                rangeOk = false;
+            }
+        }
+        // baseTimeMin 在任何种子下都不得被改动
+        std::size_t i = 0;
+        for (const logistics::Edge& e : g.edges()) {
+            if (!fixtures::nearlyEqual(e.baseTimeMin, before.base.at(key(e.fromId, e.toId)))) {
+                baseOk = false;
+            }
+            ++i;
+        }
+
+        // 用改动集合的排序签名判断不同种子是否给出不同结果
+        std::vector<std::string> picked;
+        for (const logistics::TrafficChange& c : r.changes) {
+            picked.push_back(key(c.fromId, c.toId));
+        }
+        std::sort(picked.begin(), picked.end());
+        std::string sig;
+        for (const std::string& p : picked) {
+            sig += p + ";";
+        }
+        bool seen = false;
+        for (const std::string& s : signatures) {
+            if (s == sig) {
+                seen = true;
+            }
+        }
+        if (!seen) {
+            signatures.push_back(sig);
+        }
+    }
+
+    check(countOk, "任意种子下改动条数恒为 round(0.5*6) = 3");
+    check(rangeOk, "任意种子下增幅恒落在 [0.2, 0.5]");
+    check(baseOk, "任意种子下 baseTimeMin 恒不被改动");
+    check(signatures.size() >= 2,
+          "不同种子应给出不同改动集合（证明随机性真实存在），实际 "
+              + std::to_string(signatures.size()) + " 种");
+}
+
 } // namespace
 
 int main() {
@@ -333,5 +396,6 @@ int main() {
     testCongestionTriggersReplanAndChangesTimes();
     testInsertUrgentOrderIsServedFirstAndServedNodesExcluded();
     testInsertUrgentOrderWarnsButStillPlansWhenWindowCannotBeMet();
+    testTrafficInvariantsHoldAcrossSeeds();
     return testutil::summarize("traffic_tests");
 }
