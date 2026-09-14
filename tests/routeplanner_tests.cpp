@@ -382,6 +382,25 @@ void testPlanRouteEqualsReplanFromDepot() {
           "planRoute 与 replan(仓库, 发车时刻) 结果必须完全一致");
 }
 
+// 切片 8：路径成员判定（GUI 路径高亮与路况触发判定共用这一条逻辑）
+void testIsEdgeOnRoute() {
+    const std::vector<std::string> route = {"W", "D1", "D2", "W"};
+
+    check(logistics::isEdgeOnRoute(route, "W", "D1"), "首段在路径上");
+    check(logistics::isEdgeOnRoute(route, "D1", "D2"), "中段在路径上");
+    check(logistics::isEdgeOnRoute(route, "D2", "W"), "末段在路径上");
+
+    check(!logistics::isEdgeOnRoute(route, "D1", "W"), "反向边不算（路径有向）");
+    check(!logistics::isEdgeOnRoute(route, "W", "D2"), "非相邻的一对不算");
+    check(!logistics::isEdgeOnRoute(route, "D2", "D1"), "反向的另一半也不算");
+    check(!logistics::isEdgeOnRoute({}, "W", "D1"), "空路径不含任何边");
+    check(!logistics::isEdgeOnRoute({"W"}, "W", "W"), "单节点无相邻对");
+
+    // 重复经过同一段也算在路径上
+    const std::vector<std::string> loop = {"W", "D1", "W", "D1", "W"};
+    check(logistics::isEdgeOnRoute(loop, "D1", "W"), "重复经过的段落也在路径上");
+}
+
 } // namespace
 
 int main() {
@@ -397,5 +416,6 @@ int main() {
     testReplanFromCurrentPosition();
     testReplanWhenAlreadyAtTheDeliveryNode();
     testPlanRouteEqualsReplanFromDepot();
+    testIsEdgeOnRoute();
     return testutil::summarize("routeplanner_tests");
 }

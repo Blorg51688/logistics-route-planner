@@ -205,6 +205,17 @@ RoutePlan replan(const LogisticsGraph& graph,
     return plan;
 }
 
+bool isEdgeOnRoute(const std::vector<std::string>& routeNodes,
+                   const std::string& fromId,
+                   const std::string& toId) {
+    for (std::size_t i = 1; i < routeNodes.size(); ++i) {
+        if (routeNodes[i - 1] == fromId && routeNodes[i] == toId) {
+            return true;
+        }
+    }
+    return false;
+}
+
 RoutePlan planRoute(const LogisticsGraph& graph,
                     const Vehicle& vehicle,
                     const std::vector<Order>& orders,

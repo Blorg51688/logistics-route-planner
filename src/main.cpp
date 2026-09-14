@@ -1,0 +1,184 @@
+// 程序入口：加载配置 -> 构建图形场景。
+//
+// 不带 --render 时打开交互窗口；带 --render 时**离屏渲染成 PNG 后退出**，
+// 便于无头环境下验证渲染结果，也用于产出报告配图。
+#include <QApplication>
+#include <QGraphicsView>
+#include <QImage>
+#include <QPainter>
+#include <QStringList>
+
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
+#include "core/Config.h"
+#include "core/RoutePlanner.h"
+#include "gui/GraphScene.h"
+#include "io/ConfigLoader.h"
+
+#ifndef DEFAULT_CONFIG_PATH
+#define DEFAULT_CONFIG_PATH "config/default.ini"
+#endif
+
+namespace {
+
+struct Options {
+    std::string            configPath = DEFAULT_CONFIG_PATH;
+    std::string            renderPath;
+    std::string            planStrategy;   // 空表示不高亮任何路线
+    bool                   allLabels = false;
+    logistics::WeightType  weight = logistics::WeightType::Distance;
+    int                    width = 1400;
+    int                    height = 1000;
+};
+
+bool parseWeight(const std::string& text, logistics::WeightType& out) {
+    if (text == "distance") {
+        out = logistics::WeightType::Distance;
+        return true;
+    }
+    if (text == "time") {
+        out = logistics::WeightType::Time;
+        return true;
+    }
+    if (text == "cost") {
+        out = logistics::WeightType::Cost;
+        return true;
+    }
+    return false;
+}
+
+const char* weightLabel(logistics::WeightType weight) {
+    switch (weight) {
+        case logistics::WeightType::Distance: return "最短距离";
+        case logistics::WeightType::Time:     return "最短耗时";
+        case logistics::WeightType::Cost:     return "最低成本";
+    }
+    return "?";
+}
+
+void usage() {
+    std::printf(
+        "用法: app [选项]\n"
+        "  --config PATH              配置文件（默认内置 config/default.ini）\n"
+        "  --weight distance|time|cost  权重标签显示的维度（默认 distance）\n"
+        "  --plan distance|cost       规划并高亮该策略的路线\n"
+        "  --labels all|route         权重标签显示全部边还是仅高亮路线（默认 route）\n"
+        "  --render PATH.png          离屏渲染成 PNG 后退出\n"
+        "  --width N --height N       窗口/图像尺寸\n");
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    QApplication app(argc, argv);
+
+    Options opt;
+    const QStringList args = app.arguments();
+    for (int i = 1; i < args.size(); ++i) {
+        const QString flag = args[i];
+        auto takeNext = [&](std::string& dst) {
+            if (i + 1 < args.size()) {
+                dst = args[++i].toStdString();
+            }
+        };
+        if (flag == "--config") {
+            takeNext(opt.configPath);
+        } else if (flag == "--render") {
+            takeNext(opt.renderPath);
+        } else if (flag == "--labels") {
+            std::string value;
+            takeNext(value);
+            if (value != "all" && value != "route") {
+                std::fprintf(stderr, "--labels 只接受 all 或 route\n");
+                return 2;
+            }
+            opt.allLabels = (value == "all");
+        } else if (flag == "--plan") {
+            takeNext(opt.planStrategy);
+        } else if (flag == "--weight") {
+            std::string value;
+            takeNext(value);
+            if (!parseWeight(value, opt.weight)) {
+                std::fprintf(stderr, "未知权重维度: %s\n", value.c_str());
+                return 2;
+            }
+        } else if (flag == "--width") {
+            std::string value;
+            takeNext(value);
+            opt.width = std::atoi(value.c_str());
+        } else if (flag == "--height") {
+            std::string value;
+            takeNext(value);
+            opt.height = std::atoi(value.c_str());
+        } else if (flag == "--help" || flag == "-h") {
+            usage();
+            return 0;
+        } else {
+            std::fprintf(stderr, "未知参数: %s\n", flag.toUtf8().constData());
+            usage();
+            return 2;
+        }
+    }
+
+    logistics::Config config;
+    std::string error;
+    if (!logistics::ConfigLoader::load(opt.configPath, config, error)) {
+        std::fprintf(stderr, "配置加载失败: %s\n", error.c_str());
+        return 1;
+    }
+    std::printf("已加载 %s：节点 %zu，边 %zu，订单 %zu\n", opt.configPath.c_str(),
+                config.graph.nodeCount(), config.graph.edgeCount(), config.orders.size());
+
+    GraphScene scene;
+    scene.build(config.graph, opt.weight);
+    scene.setAllLabelsVisible(opt.allLabels);
+
+    if (!opt.planStrategy.empty()) {
+        logistics::WeightType planWeight = logistics::WeightType::Distance;
+        if (!parseWeight(opt.planStrategy, planWeight)) {
+            std::fprintf(stderr, "未知规划策略: %s\n", opt.planStrategy.c_str());
+            return 2;
+        }
+        if (config.vehicles.empty()) {
+            std::fprintf(stderr, "配置中没有车辆，无法规划\n");
+            return 1;
+        }
+        const logistics::RoutePlan plan =
+            logistics::planRoute(config.graph, config.vehicles.front(), config.orders,
+                                 config.general.serviceTimeMin, planWeight);
+        if (plan.status == logistics::PlanStatus::Ok) {
+            scene.highlightRoute(plan.nodes);
+            std::printf("规划（%s）：距离 %.1fkm  耗时 %.1fmin  成本 %.1f元  "
+                        "penalty %dmin  停靠 %zu 站\n",
+                        weightLabel(planWeight), plan.totalDistanceKm, plan.totalTimeMin,
+                        plan.totalCostYuan, plan.totalPenaltyMin, plan.stops.size());
+        } else {
+            std::fprintf(stderr, "规划不可行: %s\n", plan.reason.c_str());
+        }
+    }
+
+    if (!opt.renderPath.empty()) {
+        const QRectF area = scene.itemsBoundingRect().adjusted(-30, -30, 30, 30);
+        QImage image(opt.width, opt.height, QImage::Format_ARGB32);
+        image.fill(Qt::white);
+        QPainter painter(&image);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        scene.render(&painter, QRectF(0, 0, opt.width, opt.height), area);
+        painter.end();
+        if (!image.save(QString::fromStdString(opt.renderPath))) {
+            std::fprintf(stderr, "渲染保存失败: %s\n", opt.renderPath.c_str());
+            return 1;
+        }
+        std::printf("已渲染 %dx%d -> %s\n", opt.width, opt.height, opt.renderPath.c_str());
+        return 0;
+    }
+
+    QGraphicsView view(&scene);
+    view.setRenderHint(QPainter::Antialiasing, true);
+    view.setWindowTitle(QStringLiteral("电商物流配送路径规划系统"));
+    view.resize(opt.width, opt.height);
+    view.show();
+    return app.exec();
+}

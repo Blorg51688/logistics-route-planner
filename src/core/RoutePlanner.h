@@ -82,4 +82,10 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
                                double serviceTimeMin,
                                WeightType weight);
 
+// 判断某条有向边是否落在给定路线序列的**相邻两站**之间。
+// GUI 的路径高亮与路况重规划的触发判定共用这一条逻辑。
+bool isEdgeOnRoute(const std::vector<std::string>& routeNodes,
+                   const std::string& fromId,
+                   const std::string& toId);
+
 } // namespace logistics

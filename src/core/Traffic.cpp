@@ -1,5 +1,7 @@
 #include "core/Traffic.h"
 
+#include "core/RoutePlanner.h"
+
 #include <cstddef>
 
 namespace logistics {
@@ -104,12 +106,10 @@ TrafficReport simulateTrafficChange(LogisticsGraph& graph,
 bool needsReplan(const std::vector<std::string>& routeNodes,
                  const TrafficReport& report,
                  double thresholdRatio) {
-    for (std::size_t i = 1; i < routeNodes.size(); ++i) {
-        for (const TrafficChange& c : report.changes) {
-            if (c.fromId == routeNodes[i - 1] && c.toId == routeNodes[i]
-                && c.increaseRatio >= thresholdRatio) {
-                return true;
-            }
+    for (const TrafficChange& c : report.changes) {
+        if (c.increaseRatio >= thresholdRatio
+            && isEdgeOnRoute(routeNodes, c.fromId, c.toId)) {
+            return true;
         }
     }
     return false;

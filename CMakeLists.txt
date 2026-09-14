@@ -73,7 +73,19 @@ else()
     message(STATUS "未找到 python3，跳过 oracle_selfcheck 测试")
 endif()
 
-# ---- GUI：Qt6 已安装，待 gui 层源码就位后启用 ----
-# find_package(Qt6 REQUIRED COMPONENTS Widgets)
-# add_executable(app src/main.cpp src/gui/MainWindow.cpp)
-# target_link_libraries(app PRIVATE io Qt6::Widgets)
+# ---- GUI：Qt6 Widgets。未安装 Qt 时自动跳过，核心层与测试不受影响 ----
+find_package(Qt6 QUIET COMPONENTS Widgets)
+if(Qt6_FOUND)
+    add_executable(app
+        src/main.cpp
+        src/gui/NodeItem.cpp
+        src/gui/EdgeItem.cpp
+        src/gui/GraphScene.cpp
+    )
+    target_link_libraries(app PRIVATE io Qt6::Widgets)
+    target_compile_definitions(app PRIVATE
+        DEFAULT_CONFIG_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/default.ini")
+    set_target_properties(app PROPERTIES AUTOMOC ON)
+else()
+    message(STATUS "未找到 Qt6 Widgets，跳过 GUI 目标（app）")
+endif()
