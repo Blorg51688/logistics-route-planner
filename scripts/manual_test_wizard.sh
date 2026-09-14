@@ -72,6 +72,10 @@ record() {
         失败) FAIL=$((FAIL + 1)) ;;
         跳过) SKIP=$((SKIP + 1)) ;;
     esac
+
+    # 每答完一关立即落盘。向导此前只在最后才写盘，一旦中途中断
+    # （例如终端被全屏分页器打乱后不得不终止），整轮结果就全部丢失。
+    write_record
 }
 
 stage() {
@@ -145,7 +149,13 @@ stop_app() {
     APP_PID=""
 }
 
-cleanup() { stop_app; }
+cleanup() {
+    stop_app
+    # 即使被中断（Ctrl-C / 终端异常），也把已经记录到的关卡保存下来
+    if [[ ${#RESULTS_NAME[@]} -gt 0 ]]; then
+        write_record
+    fi
+}
 trap cleanup EXIT INT TERM
 
 write_record() {
@@ -175,9 +185,6 @@ write_record() {
         done
         printf '\n---\n\n*本文件由 `scripts/manual_test_wizard.sh` 生成，是人工测试证据，非课程报告内容。*\n'
     } > "$RECORD"
-
-    say ""
-    head1 "结果已写入 $RECORD"
 }
 
 summary() {
@@ -197,6 +204,7 @@ summary() {
            "$GREEN" "$PASS" "$RED" "$FAIL" "$YELLOW" "$SKIP" "$RESET"
     say ""
     write_record
+    head1 "结果已写入 $RECORD"
     if [[ "$FAIL" -gt 0 ]]; then
         printf '\n%s存在失败关卡。请把失败现象的备注反馈出来，修复后重跑本向导。%s\n' "$RED" "$RESET"
     fi
@@ -566,27 +574,34 @@ main() {
 
     # ---------------------------------------------------------------- 第 17 关
     stage "图表示输出：邻接表 / 邻接矩阵（B3）"
-    say "本关在命令行完成，向导直接运行给你看。"
+    say "本关在命令行完成，向导直接运行并把结果落成两个文件。"
     say ""
-    if "$APP" --dump-graph both >/tmp/wizard_dump.txt 2>/dev/null; then
-        local dump_lines
-        dump_lines="$(wc -l < /tmp/wizard_dump.txt)"
+
+    local list_file="$ROOT/build/graph_adjacency_list.txt"
+    local matrix_file="$ROOT/build/graph_adjacency_matrix.txt"
+    mkdir -p "$ROOT/build"
+
+    if "$APP" --dump-graph list >"$list_file" 2>/dev/null \
+       && "$APP" --dump-graph matrix >"$matrix_file" 2>/dev/null; then
+        head1 "① 邻接表（节选前 4 行，行已截断）"
+        sed -n '1,4p' "$list_file" | cut -c1-150
+        say ""
+        head1 "② 邻接矩阵（列标 + 前 2 行，列已截断）"
+        sed -n '1,3p' "$matrix_file" | cut -c1-150
+        say ""
         head1 "预期："
-        want "邻接表：30 行，每行形如 W01(warehouse,中央仓库A): -> T01(7.6km,7.6min,12.2元) …"
+        want "邻接表：1 行标题 + 30 行节点，每行形如"
+        want "  W01(warehouse,中央仓库A): -> T01(7.6km,7.6min,12.2元) -> …"
         want "邻接矩阵：1 行列标 + 30 行数据，共 31×31 个单元格"
-        want "矩阵中缺边位置显示 -，对角线也全是 -（无自环）"
+        want "缺边位置显示为 -，对角线也全是 -（无自环）"
         want "数值与画布上看到的边一致"
         say ""
-        dim "完整输出共 $dump_lines 行，下一步会**整屏显示全文**给你核对"
-        dim "（在分页器里可用方向键/空格上下翻页，按 q 退出返回向导）。"
-        pause
-        if command -v less >/dev/null 2>&1; then
-            less -R /tmp/wizard_dump.txt
-        else
-            cat /tmp/wizard_dump.txt
-        fi
+        head1 "查看完整输出（可复制到另一个终端执行）："
+        printf '    less %s\n' "$list_file"
+        printf '    less %s\n' "$matrix_file"
+        printf '    xdg-open %s\n' "$matrix_file"
         say ""
-        dim "以上是完整输出，无需再手动打开任何文件。"
+        dim "两个文件分别保存邻接表与邻接矩阵的完整内容，演示时可直接粘贴上面命令打开。"
         pause
         ask_result "图表示输出（B3）"
     else
