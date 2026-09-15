@@ -868,6 +868,68 @@ static void testTransitStockNeverMakesPlanWorse() {
     }
 }
 
+// 顺路寄存（前置储存点机制）：车本次要回仓库、而车上还载着**来不及送**的货，
+// 且该货所属簇的中转站就在回程路径上 -> 顺手卸下，变成站里的存货。
+// 关键点：① 只卸在回程路径上的站（零绕路）② 必须是该站所服务簇的货
+//        ③ 本次会先送掉的不卸下来
+static void testOnboardSurplusIsBankedEnRoute() {
+    logistics::LogisticsGraph g;
+    auto mk = [](const char* id, logistics::NodeType t, double x, double y, int sub) {
+        logistics::Node n; n.id = id; n.type = t; n.x = x; n.y = y; n.subNetworkId = sub;
+        return n; };
+    g.addNode(mk("W", logistics::NodeType::Warehouse, 0, 0, 0));
+    g.addNode(mk("T", logistics::NodeType::Transit, 10, 0, 1));
+    g.addNode(mk("D1", logistics::NodeType::Delivery, 11, 0, 1));
+    g.addNode(mk("D2", logistics::NodeType::Delivery, 11, 1, 1));
+    g.addNode(mk("D3", logistics::NodeType::Delivery, 12, 0, 1));
+    g.addNode(mk("D4", logistics::NodeType::Delivery, 13, 0, 1));
+    auto link = [&g](const char* a, const char* b, double d) {
+        logistics::Edge e; e.fromId = a; e.toId = b;
+        e.distanceKm = d; e.timeMin = d; e.costYuan = d; e.baseTimeMin = d;
+        g.addEdge(e); e.fromId = b; e.toId = a; g.addEdge(e); };
+    link("W", "T", 10); link("T", "D1", 1); link("D1", "D2", 1);
+    link("D1", "D3", 1); link("D3", "D4", 1);
+
+    logistics::Vehicle v;
+    v.id = "V01"; v.startNodeId = "W"; v.capacityKg = 50.0; v.departTimeMin = 480;
+
+    auto ord = [](const char* id, const char* n) {
+        logistics::Order o; o.id = id; o.nodeId = n; o.demandKg = 20.0;
+        o.windowStartMin = 0; o.windowEndMin = 1440; return o; };
+    // D2 排在最后，使本趟装不下它 -> 它落在后面的批次
+    const std::vector<logistics::Order> rest = {ord("O1", "D1"), ord("O3", "D3"),
+                                                ord("O4", "D4"), ord("O2", "D2")};
+
+    // 车已到 D1，车上仍载着 D2 的 20kg
+    const std::vector<logistics::OnboardItem> onboard = {{"D2", 20.0}};
+    const std::map<std::string, double> noStock;
+    const logistics::RoutePlan p =
+        logistics::replan(g, v, rest, "D1", 500, 5.0, logistics::WeightType::Distance,
+                          noStock, onboard);
+
+    check(p.status == logistics::PlanStatus::Ok, "寄存场景下仍规划成功");
+    double tStock = 0.0;
+    for (const logistics::TransitStock& st : p.transitStock) {
+        if (st.nodeId == "T") {
+            tStock = st.finalKg;
+        }
+    }
+    check(tStock > 1e-9,
+          "在途的 D2 货来不及送、且 T 在回程路径上 -> 被顺路寄存，期末存货 "
+              + std::to_string(tStock) + "kg");
+
+    // 寄存必须**零绕路**：路线不得因为寄存而变长
+    const logistics::RoutePlan noOnboard =
+        logistics::replan(g, v, rest, "D1", 500, 5.0, logistics::WeightType::Distance,
+                          noStock, std::vector<logistics::OnboardItem>());
+    check(p.totalDistanceKm <= noOnboard.totalDistanceKm + 1e-6,
+          "寄存不得增加里程：" + std::to_string(p.totalDistanceKm) + " vs "
+              + std::to_string(noOnboard.totalDistanceKm));
+
+    // 守恒：期末存货不得超过当初寄存进去的那部分
+    check(tStock <= 20.0 + 1e-6, "期末存货不得超过寄存量（不得凭空产生）");
+}
+
 int main() {
     testSingleOrderRouteIsFullyCorrect();
     testEmptyOrdersDegeneratesToNoMovement();
@@ -889,6 +951,7 @@ int main() {
     testIsEdgeOnRoute();
     testStationUsedOnlyWhenStockExists();
     testTransitStockNeverMakesPlanWorse();
+    testOnboardSurplusIsBankedEnRoute();
 
     return testutil::summarize("routeplanner_tests");
 }

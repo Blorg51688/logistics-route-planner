@@ -326,6 +326,61 @@ double MainWindow::currentLoadKg() const {
     return load;
 }
 
+std::vector<logistics::OnboardItem> MainWindow::onboardGoods() const {
+    std::vector<logistics::OnboardItem> items;
+    if (plan_.nodes.empty() || plan_.trips.empty()
+        || nodeIndex_ >= plan_.nodeTripIndex.size()) {
+        return items;
+    }
+    const std::size_t t = plan_.nodeTripIndex[nodeIndex_];
+    if (t >= plan_.trips.size()) {
+        return items;
+    }
+    const logistics::Trip& trip = plan_.trips[t];
+
+    // 该趟在扁平序列中的起点
+    std::size_t start = 0;
+    for (std::size_t k = 0; k < t; ++k) {
+        start += plan_.trips[k].nodes.size() - (k == 0 ? 0 : 1);
+    }
+    const std::size_t offset = (nodeIndex_ >= start) ? nodeIndex_ - start : 0;
+
+    // 本趟里"还没经过"的停靠点，就是车上还载着的货
+    std::size_t stopIdx = 0;
+    for (std::size_t i = 0; i < trip.nodes.size(); ++i) {
+        if (i >= trip.nodeIsStop.size() || !trip.nodeIsStop[i]
+            || stopIdx >= trip.stops.size()) {
+            continue;
+        }
+        if (i > offset) {
+            const std::string nodeId = trip.stops[stopIdx].nodeId;
+            double kg = 0.0;
+            for (const Order& o : remainingOrders()) {
+                if (o.nodeId == nodeId) {
+                    kg += o.demandKg;
+                }
+            }
+            if (kg > 1e-9) {
+                logistics::OnboardItem item;
+                item.nodeId = nodeId;
+                item.kg = kg;
+                items.push_back(item);
+            }
+        }
+        ++stopIdx;
+    }
+    return items;
+}
+
+void MainWindow::syncStationStock() {
+    stationStock_.clear();
+    for (const logistics::TransitStock& st : plan_.transitStock) {
+        if (st.finalKg > 1e-9) {
+            stationStock_[st.nodeId] = st.finalKg;
+        }
+    }
+}
+
 QString MainWindow::orderIdsAt(const std::string& nodeId) const {
     QString ids;
     for (const Order& order : config_.orders) {
@@ -398,7 +453,9 @@ void MainWindow::replan() {
     const std::vector<Order> remaining = remainingOrders();
 
     plan_ = logistics::replan(config_.graph, config_.vehicles.front(), remaining, here, now,
-                              config_.general.serviceTimeMin, planWeight_);
+                              config_.general.serviceTimeMin, planWeight_,
+                              stationStock_, onboardGoods());
+    syncStationStock();
     // 新路线的推进状态归零；当前位置/时刻由显式字段保存，不受本次重算影响
     nodeIndex_ = 0;
     stopCursor_ = 0;
@@ -486,6 +543,7 @@ void MainWindow::onSimulateTraffic() {
                                          remainingOrders(), remainder, currentTimeMin(),
                                          config_.general.serviceTimeMin, planWeight_,
                                          report, config_.general.trafficTimeIncreaseMin);
+    syncStationStock();
     // 新路线的起点就是车辆当前位置，推进游标归零
     nodeIndex_ = 0;
     stopCursor_ = 0;
@@ -539,7 +597,8 @@ std::string MainWindow::insertUrgentOrderAction() {
 
     const logistics::InsertResult inserted = logistics::insertUrgentOrder(
         config_.graph, config_.vehicles.front(), pending, urgent, currentPositionId(),
-        currentTimeMin(), config_.general.serviceTimeMin, planWeight_);
+        currentTimeMin(), config_.general.serviceTimeMin, planWeight_,
+        stationStock_, onboardGoods());
 
     // 关键：必须并入 config_.orders。
     // 否则订单表看不到这一单，且下一次 replan 用 remainingOrders() 重建候选集时
@@ -556,6 +615,7 @@ std::string MainWindow::insertUrgentOrderAction() {
         appendLog(QStringLiteral("  ⚠ %1").arg(QString::fromStdString(inserted.warning)));
     }
     plan_ = inserted.plan;
+    syncStationStock();
     syncScene();
     updatePanels();
     return urgent.id;

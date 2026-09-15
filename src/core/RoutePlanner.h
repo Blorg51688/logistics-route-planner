@@ -106,6 +106,13 @@ RoutePlan planRoute(const LogisticsGraph& graph,
 
 // 从指定位置与指定时刻出发，对剩余未服务订单重新规划，最后返回车辆起始仓库。
 // 供"配送过程中插入紧急订单"与"路况变化触发重规划"复用同一套贪心逻辑。
+// OnboardItem：车辆**此刻已经载在车上**的货（节点 + 货量）。
+// 供"途中重规划"时告诉规划器车不是空的——否则规划会假设车在起点重新装货。
+struct OnboardItem {
+    std::string nodeId;
+    double      kg = 0.0;
+};
+
 // initialStock：各中转站的**期初存货**（前置储存点机制）。
 // 默认空 = 全部为 0，此时中转站完全不参与路由（直达更快就直达）。
 // 只有在站内确实有货、且用它不必绕路时，规划才会把该站当作"前置仓库"使用。
@@ -117,7 +124,9 @@ RoutePlan replan(const LogisticsGraph& graph,
                  double serviceTimeMin,
                  WeightType weight,
                  const std::map<std::string, double>& initialStock
-                     = std::map<std::string, double>());
+                     = std::map<std::string, double>(),
+                 const std::vector<OnboardItem>& onboard
+                     = std::vector<OnboardItem>());
 
 struct InsertResult {
     RoutePlan   plan;
@@ -137,7 +146,11 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
                                const std::string& currentPositionId,
                                int currentTimeMin,
                                double serviceTimeMin,
-                               WeightType weight);
+                               WeightType weight,
+                               const std::map<std::string, double>& initialStock
+                                   = std::map<std::string, double>(),
+                               const std::vector<OnboardItem>& onboard
+                                   = std::vector<OnboardItem>());
 
 // 增量式重规划（设计 §5.7 / D22）。
 // 把当前路线按**停靠点**切成若干 leg，只对"走过被路况命中的边"的那些 leg

@@ -89,6 +89,12 @@ private:
                                   double& peak) const;
     // 车辆**当前**载着的货量（随送达递减），不是本趟出发时的装载量
     double             currentLoadKg() const;
+    // 车辆此刻**已经载在车上**的货（当前趟里还没经过的停靠点）。
+    // 重规划时交给规划器，才能让它知道"车不是空的"。
+    std::vector<logistics::OnboardItem> onboardGoods() const;
+    // 把最近一次规划的结果里各站的期末存货回写为"当前存货"，
+    // 供下一次重规划作为期初存货传入 —— 这就是"积少成多"的回路。
+    void               syncStationStock();
     void               onShowGraphTables();
     QString            windowTextAt(const std::string& nodeId) const;
     int                currentTimeMin() const;
@@ -114,6 +120,8 @@ private:
     QComboBox*     weightBox_ = nullptr;
     QComboBox*     debugSpeedBox_ = nullptr;
     int            debugIntervalMs_ = 2000;
+    // 各中转站的当前存货（跨重规划延续）
+    std::map<std::string, double> stationStock_;
     QTextBrowser*  routeInfo_ = nullptr;
     QLabel*        vehicleInfo_ = nullptr;
     QTableWidget*  orderTable_ = nullptr;

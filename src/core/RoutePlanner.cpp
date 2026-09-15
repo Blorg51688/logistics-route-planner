@@ -4,6 +4,7 @@
 #include <sstream>
 #include <cstddef>
 #include <map>
+#include <set>
 
 namespace logistics {
 
@@ -599,9 +600,16 @@ static bool betterPlan(const RoutePlan& a, const RoutePlan& b, WeightType weight
     return a.trips.size() < b.trips.size();
 }
 
-// 多趟规划入口：先算"完全不经过中转站"的直达版；站内若有存货，
-// 再算一版"把中转站当前置仓库用"的方案，**取更优者**。
-// 没有存货时只算一版（此时两版等价），因此默认路径不受任何影响。
+// 多趟规划入口。
+//
+// 三件事，按顺序：
+//   ① **顺路寄存**：在途货里那些"车本次要回仓库、于是会白带一趟"的部分，
+//      若它所属簇的中转站就在回程路径上，就顺手卸在站里——**零成本**，
+//      只是把那部分货从"跟着车白跑"变成"站里的期初存货"。
+//      安全约束（用户第 10 轮确认）：只卸在**回程路径上的站**，且**必须属于
+//      该站所服务的簇**；不满足就原样带回去，绝不为了寄存而绕路。
+//   ② 算两版：一版完全不许用中转站（直达），一版允许把中转站当前置仓库用。
+//   ③ 取更优者（用站版 penalty 更差则一票否决），使"绝不更差"成为构造保证。
 RoutePlan multiTripPlan(const LogisticsGraph& graph,
                         const Vehicle& vehicle,
                         const std::vector<Candidate>& candidates,
@@ -609,33 +617,95 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
                         int startTimeMin,
                         double serviceTimeMin,
                         WeightType weight,
-                        const std::map<std::string, double>& initialStock) {
-    const std::map<std::string, double> none;
-    RoutePlan direct = multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
-                                         serviceTimeMin, weight, none, false);
+                        const std::map<std::string, double>& initialStock,
+                        const std::vector<OnboardItem>& onboard) {
+    // ---- ① 顺路寄存 ----
+    std::map<int, std::string> transitBySub;
+    for (const Node& n : graph.nodes()) {
+        if (n.type == NodeType::Transit && n.subNetworkId != 0) {
+            transitBySub[n.subNetworkId] = n.id;
+        }
+    }
+
+    // 先空跑一版，看看哪些在途货**来不及在本次回仓库前送掉**——
+    // 只有那部分才会被白带回仓库，也才是可寄存的。
+    // （把全部在途货都寄存是错的：车马上要送掉的那些不该卸下来。）
+    std::set<std::string> servedBeforeDepot;
+    {
+        const std::map<std::string, double> none;
+        const RoutePlan draft = multiTripPlanImpl(graph, vehicle, candidates, startPos,
+                                                  startTimeMin, serviceTimeMin, weight,
+                                                  none, false);
+        bool reachedDepot = false;
+        for (const Trip& t : draft.trips) {
+            for (std::size_t i = 0; i < t.nodes.size() && !reachedDepot; ++i) {
+                if (i < t.nodeIsStop.size() && t.nodeIsStop[i]) {
+                    servedBeforeDepot.insert(t.nodes[i]);
+                }
+                if (t.nodes[i] == vehicle.startNodeId) {
+                    reachedDepot = true;
+                }
+            }
+            if (reachedDepot) {
+                break;
+            }
+        }
+    }
+
+    std::map<std::string, double> stock = initialStock;
+    const PathResult toDepot = shortestPath(graph, startPos, vehicle.startNodeId, weight);
+    for (const OnboardItem& item : onboard) {
+        if (item.kg <= 1e-9 || servedBeforeDepot.count(item.nodeId) > 0) {
+            continue;   // 本次会先送掉，不必寄存
+        }
+        const Node* node = graph.findNode(item.nodeId);
+        if (node == nullptr) {
+            continue;
+        }
+        const std::map<int, std::string>::const_iterator hub = transitBySub.find(node->subNetworkId);
+        if (hub == transitBySub.end()) {
+            continue;   // 不属于任何中转站所服务的簇：没有合法寄存点
+        }
+        if (!toDepot.found) {
+            continue;
+        }
+        // 站必须在回程**路径上**（出发地->站->仓库 不比 出发地->仓库 更远），
+        // 否则寄存要绕路，就不寄存。
+        const PathResult a = shortestPath(graph, startPos, hub->second, weight);
+        const PathResult b = shortestPath(graph, hub->second, vehicle.startNodeId, weight);
+        if (!a.found || !b.found
+            || a.totalWeight + b.totalWeight > toDepot.totalWeight + 1e-6) {
+            continue;
+        }
+        stock[hub->second] += item.kg;
+    }
 
     bool hasStock = false;
-    for (const auto& kv : initialStock) {
+    for (const auto& kv : stock) {
         if (kv.second > 1e-9) {
             hasStock = true;
             break;
         }
     }
     if (!hasStock) {
-        return direct;   // 站内无货：只有直达一版，行为与历史完全一致
+        const std::map<std::string, double> none;
+        return multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
+                                 serviceTimeMin, weight, none, false);
     }
 
+    // ---- ② 两版 ----
+    RoutePlan direct = multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
+                                         serviceTimeMin, weight, stock, false);
     RoutePlan viaStation = multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
-                                             serviceTimeMin, weight, initialStock, true);
+                                             serviceTimeMin, weight, stock, true);
+
+    // ---- ③ 取更优 ----
     if (direct.status != PlanStatus::Ok) {
         return viaStation;
     }
     if (viaStation.status != PlanStatus::Ok) {
         return direct;
     }
-    // 只比"当前策略的目标"是不够的：实测"每站存满一个载重"在成本策略下
-    // 总成本略低（234.8 < 235.9），却把 penalty 从 307 推到 362、趟数 6->10。
-    // 那是"用整体变差换目标略好"，不是我们想要的，因此 penalty 更差一律退回直达版。
     if (viaStation.totalPenaltyMin > direct.totalPenaltyMin) {
         return direct;
     }
@@ -651,7 +721,8 @@ RoutePlan replan(const LogisticsGraph& graph,
                  int currentTimeMin,
                  double serviceTimeMin,
                  WeightType weight,
-                 const std::map<std::string, double>& initialStock) {
+                 const std::map<std::string, double>& initialStock,
+                 const std::vector<OnboardItem>& onboard) {
     RoutePlan plan;
 
     if (graph.findNode(currentPositionId) == nullptr) {
@@ -666,7 +737,7 @@ RoutePlan replan(const LogisticsGraph& graph,
     if (total > vehicle.capacityKg + 1e-9) {
         // 总需求超过载重：改走多趟 + 中转集散（D21），不再判为不可行
         return multiTripPlan(graph, vehicle, remaining, currentPositionId, currentTimeMin,
-                             serviceTimeMin, weight, initialStock);
+                             serviceTimeMin, weight, initialStock, onboard);
     }
 
     // 单趟：车辆在起点已装载全部货物，直接贪心串联后回仓库（与历史行为一致）
@@ -867,7 +938,9 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
                                const std::string& currentPositionId,
                                int currentTimeMin,
                                double serviceTimeMin,
-                               WeightType weight) {
+                               WeightType weight,
+                               const std::map<std::string, double>& initialStock,
+                               const std::vector<OnboardItem>& onboard) {
     InsertResult result;
 
     // 插入的订单一律按紧急处理，调用方传入的 urgent 不作数
