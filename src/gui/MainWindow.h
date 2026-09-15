@@ -74,6 +74,8 @@ private:
     void appendLog(const QString& text);
 
     std::string        currentPositionId() const;
+    QString            orderIdsAt(const std::string& nodeId) const;
+    QString            windowTextAt(const std::string& nodeId) const;
     int                currentTimeMin() const;
     std::vector<logistics::Order> remainingOrders() const;
 
@@ -82,12 +84,14 @@ private:
     QGraphicsView*        view_ = nullptr;
     logistics::RoutePlan  plan_;
     // 车辆当前位置与当前时刻必须**显式保存**：重规划会用一个全新的
-    // plan_ 覆盖旧计划，此时按 servedCount_ 回查 plan_.stops 会索引错位
+    // plan_ 覆盖旧计划，此时按下标回查 plan_.stops 会索引错位
     // （新计划里的停靠点全都没送过），进而取到错误的时刻、penalty 暴涨。
     std::string           currentNodeId_;
     int                   currentTimeMin_ = 0;
-    std::size_t           servedCount_ = 0;   // 当前计划内已送达的站数，仅用于显示
-    bool                  returnedToDepot_ = false;   // 是否已完成"返回仓库"这一步
+    // 车辆沿 plan_.nodes 逐个节点前进（含仓库与中转站），而不再只跳配送点。
+    // nodeIndex_ 指向车辆当前所在的节点，stopCursor_ 指向下一个待服务的停靠记录。
+    std::size_t           nodeIndex_ = 0;
+    std::size_t           stopCursor_ = 0;
     logistics::Rng        rng_{20260914u};
     logistics::WeightType planWeight_ = logistics::WeightType::Distance;
 

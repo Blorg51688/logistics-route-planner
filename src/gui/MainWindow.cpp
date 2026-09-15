@@ -157,10 +157,10 @@ void MainWindow::buildDocks() {
 
     auto* lateDock = new QDockWidget(QStringLiteral("超时订单"), this);
     lateDock->setMinimumWidth(360);
-    lateTable_ = new QTableWidget(0, 4, lateDock);
+    lateTable_ = new QTableWidget(0, 5, lateDock);
     lateTable_->setHorizontalHeaderLabels(
-        {QStringLiteral("配送点"), QStringLiteral("到达"), QStringLiteral("penalty"),
-         QStringLiteral("剩余载重")});
+        {QStringLiteral("订单"), QStringLiteral("配送点"), QStringLiteral("到达"),
+         QStringLiteral("窗口"), QStringLiteral("penalty")});
     lateTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     lateTable_->horizontalHeader()->setStretchLastSection(true);
     lateTable_->verticalHeader()->setVisible(false);
@@ -193,6 +193,42 @@ std::string MainWindow::currentPositionId() const {
 
 int MainWindow::currentTimeMin() const {
     return currentTimeMin_;
+}
+
+// 某配送点上的全部订单号，用 / 连接（同一节点可能有多单合并成一次停靠）
+QString MainWindow::orderIdsAt(const std::string& nodeId) const {
+    QString ids;
+    for (const Order& order : config_.orders) {
+        if (order.nodeId != nodeId) {
+            continue;
+        }
+        if (!ids.isEmpty()) {
+            ids += QLatin1Char('/');
+        }
+        ids += QString::fromStdString(order.id);
+    }
+    return ids;
+}
+
+// 某配送点的合并窗口 [min 起, max 止]，与规划器使用的口径一致
+QString MainWindow::windowTextAt(const std::string& nodeId) const {
+    int lo = -1;
+    int hi = -1;
+    for (const Order& order : config_.orders) {
+        if (order.nodeId != nodeId) {
+            continue;
+        }
+        if (lo < 0 || order.windowStartMin < lo) {
+            lo = order.windowStartMin;
+        }
+        if (hi < 0 || order.windowEndMin > hi) {
+            hi = order.windowEndMin;
+        }
+    }
+    if (lo < 0) {
+        return QStringLiteral("-");
+    }
+    return minutesToClock(lo) + QStringLiteral("-") + minutesToClock(hi);
 }
 
 std::vector<Order> MainWindow::remainingOrders() const {
@@ -228,10 +264,9 @@ void MainWindow::replan() {
 
     plan_ = logistics::replan(config_.graph, config_.vehicles.front(), remaining, here, now,
                               config_.general.serviceTimeMin, planWeight_);
-    // 新计划里的停靠点全部尚未送达，计数必须归零；
-    // 当前位置/时刻由显式字段保存，不受本次重算影响
-    servedCount_ = 0;
-    returnedToDepot_ = false;   // 新路线尚未走完，返回仓库这一步要重新计
+    // 新路线的推进状态归零；当前位置/时刻由显式字段保存，不受本次重算影响
+    nodeIndex_ = 0;
+    stopCursor_ = 0;
 
     if (plan_.status == logistics::PlanStatus::Ok) {
         appendLog(QStringLiteral("规划成功：%1 站，总距离 %2km，总耗时 %3min，penalty %4min")
@@ -250,7 +285,8 @@ void MainWindow::onStrategyChanged() {
     planWeight_ = (strategyBox_->currentData().toString() == QStringLiteral("cost"))
                       ? WeightType::Cost
                       : WeightType::Distance;
-    servedCount_ = 0;
+    nodeIndex_ = 0;
+    stopCursor_ = 0;
     appendLog(QStringLiteral("切换规划策略 -> %1").arg(strategyBox_->currentText()));
     replan();
 }
@@ -406,14 +442,26 @@ void MainWindow::onCloseRandomRoad() {
 }
 
 void MainWindow::onAdvanceStop() {
-    if (plan_.status != logistics::PlanStatus::Ok || plan_.stops.empty()) {
+    if (plan_.status != logistics::PlanStatus::Ok || plan_.nodes.empty()) {
         return;
     }
+    if (nodeIndex_ + 1 >= plan_.nodes.size()) {
+        appendLog(QStringLiteral("本次配送已完成：车辆已在仓库 %1")
+                      .arg(QString::fromStdString(currentNodeId_)));
+        return;   // 已结束，不再刷新
+    }
 
-    if (servedCount_ < plan_.stops.size()) {
-        const Stop& stop = plan_.stops[servedCount_];
-        currentNodeId_ = stop.nodeId;
-        currentTimeMin_ = stop.departureMin;
+    // 逐个节点前进：仓库、中转站、配送点、返程都算一次位置变化
+    ++nodeIndex_;
+    currentNodeId_ = plan_.nodes[nodeIndex_];
+    if (nodeIndex_ < plan_.nodeArrivalMin.size()) {
+        currentTimeMin_ = plan_.nodeArrivalMin[nodeIndex_];
+    }
+
+    if (nodeIndex_ < plan_.nodeIsStop.size() && plan_.nodeIsStop[nodeIndex_]
+        && stopCursor_ < plan_.stops.size()) {
+        const Stop& stop = plan_.stops[stopCursor_];
+        ++stopCursor_;
         appendLog(QStringLiteral("送达 %1（到达 %2%3）")
                       .arg(QString::fromStdString(stop.nodeId))
                       .arg(minutesToClock(stop.arrivalMin))
@@ -424,26 +472,17 @@ void MainWindow::onAdvanceStop() {
                 order.served = true;
             }
         }
-        ++servedCount_;
-    } else if (!returnedToDepot_) {
-        // 送完全部停靠点之后，还差最后一步：回到起始仓库。
-        // 早先推进到最后一个客户就停了，车辆永远不回仓库，与 B6
-        //「遍历所有待配送点后返回仓库」不符。
-        currentNodeId_ = config_.vehicles.empty() ? std::string()
-                                                  : config_.vehicles.front().startNodeId;
-        currentTimeMin_ = plan_.returnArrivalMin;
-        returnedToDepot_ = true;
+    } else if (nodeIndex_ + 1 == plan_.nodes.size()) {
         appendLog(QStringLiteral("返回仓库 %1（到达 %2），本次配送结束")
                       .arg(QString::fromStdString(currentNodeId_))
                       .arg(minutesToClock(currentTimeMin_)));
     } else {
-        appendLog(QStringLiteral("本次配送已完成：车辆已在仓库 %1")
-                      .arg(QString::fromStdString(currentNodeId_)));
-        return;   // 已结束，不再刷新
+        appendLog(QStringLiteral("经过 %1（到达 %2）")
+                      .arg(QString::fromStdString(currentNodeId_))
+                      .arg(minutesToClock(currentTimeMin_)));
     }
 
     // 推进后必须刷新画布：车辆位置标记要跟着移动
-    // （早先这里只更新侧栏数据，画布上的车标记不会动，用户只能靠手动"重新规划"来触发重绘）
     syncScene();
     updatePanels();
 }
@@ -611,7 +650,7 @@ void MainWindow::updatePanels() {
         route += QStringLiteral("总 penalty：%1 min\n").arg(plan_.totalPenaltyMin);
         route += QStringLiteral("停靠 %1 站，已送达 %2 站\n\n")
                      .arg(plan_.stops.size())
-                     .arg(servedCount_);
+                     .arg(stopCursor_);
         route += QStringLiteral("完整序列：\n");
         for (std::size_t i = 0; i < plan_.nodes.size(); ++i) {
             route += QString::fromStdString(plan_.nodes[i]);
@@ -671,7 +710,8 @@ void MainWindow::updatePanels() {
                                                                        : QStringLiteral("待配送"))));
     }
 
-    // 超时订单
+    // 超时订单：列出**订单号**而不只是配送点——紧急订单也可能超时，
+    // 只记录地点用处不大；并用"窗口"替代"剩余载重"（后者在这里没有观测价值）。
     int lateRows = 0;
     if (plan_.status == logistics::PlanStatus::Ok) {
         for (const Stop& s : plan_.stops) {
@@ -679,11 +719,14 @@ void MainWindow::updatePanels() {
                 continue;
             }
             lateTable_->setRowCount(lateRows + 1);
-            lateTable_->setItem(lateRows, 0, new QTableWidgetItem(QString::fromStdString(s.nodeId)));
-            lateTable_->setItem(lateRows, 1, new QTableWidgetItem(minutesToClock(s.arrivalMin)));
-            lateTable_->setItem(lateRows, 2, new QTableWidgetItem(QString::number(s.penaltyMin)));
-            lateTable_->setItem(lateRows, 3,
-                                new QTableWidgetItem(QString::number(s.remainingLoadKg, 'f', 0)));
+            lateTable_->setItem(lateRows, 0,
+                                new QTableWidgetItem(orderIdsAt(s.nodeId)));
+            lateTable_->setItem(lateRows, 1,
+                                new QTableWidgetItem(QString::fromStdString(s.nodeId)));
+            lateTable_->setItem(lateRows, 2,
+                                new QTableWidgetItem(minutesToClock(s.arrivalMin)));
+            lateTable_->setItem(lateRows, 3, new QTableWidgetItem(windowTextAt(s.nodeId)));
+            lateTable_->setItem(lateRows, 4, new QTableWidgetItem(QString::number(s.penaltyMin)));
             ++lateRows;
         }
     }
@@ -818,14 +861,21 @@ int MainWindow::runActionSelfCheck() {
     // 早先推进到最后一个客户就停住，车辆永远不回仓库。
     const std::string depot = config_.vehicles.empty() ? std::string()
                                                        : config_.vehicles.front().startNodeId;
-    const std::size_t stops = plan_.stops.size();
-    for (std::size_t i = 0; i <= stops + 1; ++i) {
+    // 现在每一步前进一个**节点**（含仓库与中转站），故步数取节点总数
+    const std::size_t nodeSteps = plan_.nodes.size();
+    for (std::size_t i = 0; i < nodeSteps; ++i) {
         onAdvanceStop();
     }
     expect(currentNodeId_ == depot,
            QStringLiteral("推进到底后车辆回到仓库 %1，实际停在 %2")
                .arg(QString::fromStdString(depot))
                .arg(QString::fromStdString(currentNodeId_)));
+    expect(plan_.nodes.empty() || plan_.nodes.back() == depot,
+           QStringLiteral("路线序列的最后一个节点就是起始仓库"));
+    expect(stopCursor_ == plan_.stops.size(),
+           QStringLiteral("推进到底后全部 %1 个停靠点都已送达，实际 %2")
+               .arg(plan_.stops.size())
+               .arg(stopCursor_));
 
     // ⑤ 车辆位置标记必须与当前位置一致（画布刷新的依据）
     expect(scene_ != nullptr, QStringLiteral("场景已建立"));

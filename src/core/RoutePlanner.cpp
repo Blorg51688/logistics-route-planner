@@ -56,10 +56,12 @@ std::vector<Candidate> buildCandidates(const std::vector<Order>& orders) {
 // 沿一条最短路推进时间并累加三个维度的权重，
 // 把途经节点追加到 plan.nodes（不含路径起点，起点已在前一步入列）。
 // 时间推进始终使用耗时维度，与本次规划所选策略无关。
+// endpointIsStop=true 表示这条最短路的目的地是一次配送停靠（而非单纯途经或返程）
 void walkPath(const LogisticsGraph& graph,
               const std::vector<std::string>& path,
               RoutePlan& plan,
-              double& elapsedMin) {
+              double& elapsedMin,
+              bool endpointIsStop) {
     for (std::size_t i = 1; i < path.size(); ++i) {
         const Edge* edge = graph.findEdge(path[i - 1], path[i]);
         if (edge == nullptr) {
@@ -69,6 +71,8 @@ void walkPath(const LogisticsGraph& graph,
         plan.totalDistanceKm += edge->distanceKm;
         plan.totalCostYuan += edge->costYuan;
         plan.nodes.push_back(path[i]);
+        plan.nodeArrivalMin.push_back(static_cast<int>(std::lround(elapsedMin)));
+        plan.nodeIsStop.push_back(endpointIsStop && (i + 1 == path.size()));
     }
 }
 
@@ -112,6 +116,8 @@ RoutePlan replan(const LogisticsGraph& graph,
     std::string current = currentPositionId;
     double elapsedMin = static_cast<double>(currentTimeMin);
     plan.nodes.push_back(current);
+    plan.nodeArrivalMin.push_back(currentTimeMin);
+    plan.nodeIsStop.push_back(false);
 
     while (!remaining.empty()) {
         // 紧急订单优先：只要还有未服务的紧急订单，候选集就收缩到紧急订单之内。
@@ -164,7 +170,7 @@ RoutePlan replan(const LogisticsGraph& graph,
             return plan;
         }
 
-        walkPath(graph, bestPath.nodes, plan, elapsedMin);
+        walkPath(graph, bestPath.nodes, plan, elapsedMin, true);
 
         const Candidate& chosen = remaining[static_cast<std::size_t>(bestIndex)];
 
@@ -186,6 +192,11 @@ RoutePlan replan(const LogisticsGraph& graph,
                               : 0;
         plan.totalPenaltyMin += stop.penaltyMin;
 
+        // 停靠节点在序列中记录的应是**实际送达时刻**（等窗口开启之后的 arrival），
+        // 而不是 walkPath 记下的未经等待的原始到达时刻——否则界面推进到这一站时
+        // 显示的会比侧面板上 stolps 里的到达时间早一截。
+        plan.nodeArrivalMin[plan.nodeArrivalMin.size() - 1] = stop.arrivalMin;
+
         elapsedMin = arrival + serviceTimeMin;
         stop.departureMin = static_cast<int>(std::lround(elapsedMin));
 
@@ -204,7 +215,7 @@ RoutePlan replan(const LogisticsGraph& graph,
         plan.reason = "无法从 " + current + " 返回仓库 " + vehicle.startNodeId;
         return plan;
     }
-    walkPath(graph, back.nodes, plan, elapsedMin);
+    walkPath(graph, back.nodes, plan, elapsedMin, false);
 
     plan.returnArrivalMin = static_cast<int>(std::lround(elapsedMin));
     plan.totalTimeMin = elapsedMin - static_cast<double>(currentTimeMin);

@@ -74,6 +74,15 @@ void testSingleOrderRouteIsFullyCorrect() {
     // 抵达仓库的时刻（oracle 值 555）
     check(plan.returnArrivalMin == 555,
           "返回仓库时刻 555，实际 " + std::to_string(plan.returnArrivalMin));
+
+    // 逐节点到达时刻与"是否停靠"标记，供界面逐个节点推进
+    check(plan.nodeArrivalMin.size() == plan.nodes.size(), "到达时刻序列与节点序列等长");
+    check(plan.nodeIsStop.size() == plan.nodes.size(), "停靠标记序列与节点序列等长");
+    // W(出发 480) -> D1(送达 540) -> W(回到 555)
+    check(plan.nodeArrivalMin == std::vector<int>({480, 540, 555}),
+          "逐节点到达时刻应为 480 / 540 / 555");
+    check(plan.nodeIsStop == std::vector<bool>({false, true, false}),
+          "只有中间那个配送点才是停靠");
     check(fixtures::nearlyEqual(plan.totalCostYuan, 8.0),
           "总成本 8.0，实际 " + std::to_string(plan.totalCostYuan));
     check(plan.totalPenaltyMin == 0, "totalPenalty 为 0");

@@ -34,6 +34,12 @@ struct RoutePlan {
     PlanStatus               status = PlanStatus::Ok;
     std::string              reason;      // 不可行原因
     std::vector<std::string> nodes;       // 完整序列：起点、途经节点、终点仓库
+    // 与 nodes 一一对应的抵达时刻。界面的"推进"据此逐个节点前进，
+    // 而不是只跳过配送点——仓库与中转站的到达也算一次位置变化。
+    std::vector<int>         nodeArrivalMin;
+    // 与 nodes 一一对应的标记：该节点是否为一次配送停靠
+    // （同一节点可能在序列中出现多次，只有作为停靠点的那一次为 true）
+    std::vector<bool>        nodeIsStop;
     std::vector<Stop>        stops;       // 仅配送停靠点，按服务顺序
     double totalDistanceKm = 0.0;
     double totalTimeMin    = 0.0;         // 返回仓库时刻 − 起始时刻（含等待与服务）
