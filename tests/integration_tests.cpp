@@ -176,14 +176,14 @@ void checkDataQualityInvariants(const Config& cfg, const RoutePlan& byDistance,
     //    （贪心顺序来自被测实现，oracle 无法独立复现）。因此它们不用于证明正确性，
     //    只用于**检测非预期漂移**：数据或算法被无意改动时立刻报警。
     //    有意调整数据/算法时，应连同这些值一起显式更新。
-    check(fixtures::nearlyEqual(byDistance.totalDistanceKm, 210.8, 0.01),
-          "黄金值·距离策略总距离 210.8，实际 " + std::to_string(byDistance.totalDistanceKm));
-    check(fixtures::nearlyEqual(byDistance.totalCostYuan, 273.4, 0.01),
-          "黄金值·距离策略总成本 273.4，实际 " + std::to_string(byDistance.totalCostYuan));
-    check(fixtures::nearlyEqual(byCost.totalDistanceKm, 247.0, 0.01),
-          "黄金值·成本策略总距离 247.0，实际 " + std::to_string(byCost.totalDistanceKm));
-    check(fixtures::nearlyEqual(byCost.totalCostYuan, 247.0, 0.01),
-          "黄金值·成本策略总成本 247.0，实际 " + std::to_string(byCost.totalCostYuan));
+    check(fixtures::nearlyEqual(byDistance.totalDistanceKm, 198.2, 0.01),
+          "黄金值·距离策略总距离 198.2，实际 " + std::to_string(byDistance.totalDistanceKm));
+    check(fixtures::nearlyEqual(byDistance.totalCostYuan, 277.2, 0.01),
+          "黄金值·距离策略总成本 277.2，实际 " + std::to_string(byDistance.totalCostYuan));
+    check(fixtures::nearlyEqual(byCost.totalDistanceKm, 209.1, 0.01),
+          "黄金值·成本策略总距离 209.1，实际 " + std::to_string(byCost.totalDistanceKm));
+    check(fixtures::nearlyEqual(byCost.totalCostYuan, 267.0, 0.01),
+          "黄金值·成本策略总成本 267.0，实际 " + std::to_string(byCost.totalCostYuan));
 }
 
 // B3：两种图表示在真实规模（30 节点）上的形状检查

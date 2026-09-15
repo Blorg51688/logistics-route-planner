@@ -34,15 +34,15 @@ DEFAULT_INI = os.path.join(ROOT, "config", "default.ini")
 # ---------------------------------------------------------------- 可调参数
 # 坐标单位为 1/SCALE 公里。放大 SCALE 会缩短里程与耗时；
 # 若过小会导致单车辆一天跑不完、全部订单超时（这正是当初的缺陷之一）。
-SCALE = 60.0
+SCALE = 64.0
 
 # 道路等级：主干道快但贵（含通行费），支线慢但便宜。
 # 若两类系数让 cost 与 dist 的比值**处处相同**，最低成本策略就必然等价于
 # 最短距离策略，双策略功能形同虚设（这正是当初的另一个缺陷）。
 TRUNK_TIME_FACTOR = 1.0    # 主干道 min/km
 TRUNK_COST_FACTOR = 1.6    # 主干道 元/km
-BRANCH_TIME_FACTOR = 1.8   # 支线 min/km
-BRANCH_COST_FACTOR = 1.0   # 支线 元/km
+BRANCH_TIME_FACTOR = 2.4
+BRANCH_COST_FACTOR = 1.2
 
 SERVICE_TIME_MIN = 5
 TRAFFIC_CHANGE_INTERVAL_SEC = 30
