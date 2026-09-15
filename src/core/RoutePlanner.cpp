@@ -54,6 +54,13 @@ std::vector<Candidate> buildCandidates(const std::vector<Order>& orders) {
     return candidates;
 }
 
+// 开局一趟：把起点写入序列（appendLeg 只追加路径上的后续节点，不含起点）
+void beginTrip(Trip& trip, const std::string& nodeId, double elapsedMin) {
+    trip.nodes.push_back(nodeId);
+    trip.nodeArrivalMin.push_back(static_cast<int>(std::lround(elapsedMin)));
+    trip.nodeIsStop.push_back(false);
+}
+
 // 沿 from→to 的最短路走一段，追加到某一趟。
 // 时间推进始终使用耗时维度，与本次规划所选策略无关。
 // endpointIsStop=true 表示这段的终点是一次配送停靠（而非途经或返程）。
@@ -107,9 +114,7 @@ bool weave(const LogisticsGraph& graph,
            Trip& trip,
            std::string& failReason) {
     std::string current = startPos;
-    trip.nodes.push_back(current);
-    trip.nodeArrivalMin.push_back(static_cast<int>(std::lround(elapsedMin)));
-    trip.nodeIsStop.push_back(false);
+    beginTrip(trip, current, elapsedMin);
 
     if (!pickupNode.empty() && current != pickupNode) {
         if (!appendLeg(graph, trip, elapsedMin, current, pickupNode, weight, false, failReason)) {
@@ -445,6 +450,7 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
                     }
                 }
                 Trip trip;
+                beginTrip(trip, current, elapsed);
                 if (!appendLeg(graph, trip, elapsed, current, vehicle.startNodeId, weight,
                                false, fail)) {
                     plan.status = PlanStatus::Unreachable;
@@ -476,6 +482,7 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
     if (current != vehicle.startNodeId) {
         Trip trip;
         std::string fail;
+        beginTrip(trip, current, elapsed);
         if (!appendLeg(graph, trip, elapsed, current, vehicle.startNodeId, weight, false, fail)) {
             plan.status = PlanStatus::Unreachable;
             plan.reason = fail;
@@ -534,6 +541,160 @@ RoutePlan replan(const LogisticsGraph& graph,
     }
     plan.trips.push_back(trip);
 
+    collectTransits(graph, plan.transitStock);
+    flatten(plan, currentTimeMin, elapsed);
+    return plan;
+}
+
+namespace {
+
+const Candidate* findCandidate(const std::vector<Candidate>& pool, const std::string& nodeId) {
+    for (const Candidate& c : pool) {
+        if (c.nodeId == nodeId) {
+            return &c;
+        }
+    }
+    return nullptr;
+}
+
+// 从停靠记录生成一个 Stop（时间推进口径与 weave 完全一致）
+Stop makeStop(const Candidate& chosen, double& elapsedMin, double serviceTimeMin,
+              double& loadKg) {
+    Stop stop;
+    stop.nodeId = chosen.nodeId;
+    const double rawArrival = elapsedMin;
+    const double wait = (static_cast<double>(chosen.windowStartMin) > rawArrival)
+                            ? (static_cast<double>(chosen.windowStartMin) - rawArrival)
+                            : 0.0;
+    const double arrival = rawArrival + wait;
+    stop.rawArrivalMin = static_cast<int>(std::lround(rawArrival));
+    stop.waitMin = static_cast<int>(std::lround(wait));
+    stop.arrivalMin = static_cast<int>(std::lround(arrival));
+    stop.late = arrival > static_cast<double>(chosen.windowEndMin);
+    stop.penaltyMin = stop.late
+        ? static_cast<int>(std::lround(arrival - static_cast<double>(chosen.windowEndMin))) : 0;
+    elapsedMin = arrival + serviceTimeMin;
+    stop.departureMin = static_cast<int>(std::lround(elapsedMin));
+    loadKg -= chosen.demandKg;
+    stop.remainingLoadKg = loadKg;
+    return stop;
+}
+
+} // namespace
+
+RoutePlan replanIncremental(const LogisticsGraph& graph,
+                            const Vehicle& vehicle,
+                            const std::vector<Order>& remainingOrders,
+                            const RoutePlan& previous,
+                            int currentTimeMin,
+                            double serviceTimeMin,
+                            WeightType weight,
+                            const TrafficReport& report,
+                            double thresholdRatio) {
+    const std::string startPos =
+        previous.nodes.empty() ? vehicle.startNodeId : previous.nodes.front();
+
+    // 适用范围：单趟且序列完整。否则退回全量重算。
+    if (previous.status != PlanStatus::Ok || previous.trips.size() != 1
+        || previous.nodes.size() < 2
+        || previous.nodes.back() != vehicle.startNodeId) {
+        return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
+                      serviceTimeMin, weight);
+    }
+
+    const std::vector<Candidate> pool = buildCandidates(remainingOrders);
+
+    // 停靠点在扁平序列中的下标 -> 切段边界 [起点, 站1, 站2, …, 末站, 终点]
+    std::vector<std::size_t> bounds;
+    bounds.push_back(0);
+    for (std::size_t i = 0; i < previous.nodeIsStop.size(); ++i) {
+        if (previous.nodeIsStop[i]) {
+            bounds.push_back(i);
+        }
+    }
+    bounds.push_back(previous.nodes.size() - 1);
+    const std::size_t stopCount = bounds.size() - 2;
+
+    // 逐段处理：只有"走过的边被路况命中"的段才重新求最短路
+    std::vector<std::vector<std::string> > legPaths;
+    for (std::size_t k = 0; k + 1 < bounds.size(); ++k) {
+        const std::size_t b = bounds[k];
+        const std::size_t e = bounds[k + 1];
+
+        bool affected = false;
+        for (std::size_t i = b + 1; i <= e && !affected; ++i) {
+            for (const TrafficChange& c : report.changes) {
+                if (c.increaseRatio >= thresholdRatio
+                    && c.fromId == previous.nodes[i - 1] && c.toId == previous.nodes[i]) {
+                    affected = true;
+                    break;
+                }
+            }
+        }
+
+        std::vector<std::string> path;
+        if (affected && previous.nodes[b] != previous.nodes[e]) {
+            const PathResult r = shortestPath(graph, previous.nodes[b], previous.nodes[e], weight);
+            if (!r.found) {
+                // 该段已不可达：退回全量重算，由它给出统一的原因
+                return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
+                              serviceTimeMin, weight);
+            }
+            path = r.nodes;
+        } else {
+            path.assign(previous.nodes.begin() + static_cast<std::ptrdiff_t>(b),
+                        previous.nodes.begin() + static_cast<std::ptrdiff_t>(e) + 1);
+        }
+        legPaths.push_back(path);
+    }
+
+    // 沿各段重建路线（停靠顺序保持不变）
+    RoutePlan plan;
+    Trip trip;
+    double elapsed = static_cast<double>(currentTimeMin);
+    double load = 0.0;
+    for (const Candidate& c : pool) {
+        load += c.demandKg;
+    }
+
+    trip.nodes.push_back(startPos);
+    trip.nodeArrivalMin.push_back(currentTimeMin);
+    trip.nodeIsStop.push_back(false);
+
+    for (std::size_t k = 0; k < legPaths.size(); ++k) {
+        const std::vector<std::string>& path = legPaths[k];
+        const bool endpointIsStop = (k < stopCount);
+
+        for (std::size_t i = 1; i < path.size(); ++i) {
+            const Edge* edge = graph.findEdge(path[i - 1], path[i]);
+            if (edge == nullptr) {
+                return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
+                              serviceTimeMin, weight);
+            }
+            elapsed += edge->timeMin;
+            trip.totalDistanceKm += edge->distanceKm;
+            trip.totalCostYuan += edge->costYuan;
+            trip.nodes.push_back(path[i]);
+            trip.nodeArrivalMin.push_back(static_cast<int>(std::lround(elapsed)));
+            trip.nodeIsStop.push_back(endpointIsStop && (i + 1 == path.size()));
+        }
+
+        if (!endpointIsStop) {
+            continue;
+        }
+        const Candidate* chosen = findCandidate(pool, path.back());
+        if (chosen == nullptr) {
+            return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
+                          serviceTimeMin, weight);
+        }
+        const Stop stop = makeStop(*chosen, elapsed, serviceTimeMin, load);
+        // 停靠节点记录实际送达时刻（等窗口开启之后）
+        trip.nodeArrivalMin[trip.nodeArrivalMin.size() - 1] = stop.arrivalMin;
+        trip.stops.push_back(stop);
+    }
+
+    trip.endNodeId = vehicle.startNodeId;
+    plan.trips.push_back(trip);
     collectTransits(graph, plan.transitStock);
     flatten(plan, currentTimeMin, elapsed);
     return plan;

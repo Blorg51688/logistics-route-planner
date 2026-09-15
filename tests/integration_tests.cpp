@@ -259,8 +259,40 @@ void checkMultiTripAndTransitOnRealData(const Config& cfg) {
     check(plan.nodes.size() == plan.nodeArrivalMin.size()
               && plan.nodes.size() == plan.nodeIsStop.size(),
           "扁平序列的节点/到达时刻/停靠标记三个数组等长");
-    check(!plan.nodes.empty() && plan.nodes.back() == cfg.vehicles[0].startNodeId,
-          "最后一趟终点回到起始仓库");
+    check(!plan.nodes.empty() && plan.nodes.front() == cfg.vehicles[0].startNodeId
+              && plan.nodes.back() == cfg.vehicles[0].startNodeId,
+          "多趟路线从仓库出发并回到仓库");
+
+    // 序列必须是图上真实可走的：相邻节点之间必须有有向边。
+    // 这条断言本该一开始就有——多趟的 Trip 一度漏写起点，
+    // 只查"末尾是不是仓库"恰好被蒙对，直到看图才发现。
+    bool walkable = true;
+    for (std::size_t i = 1; i < plan.nodes.size(); ++i) {
+        if (cfg.graph.findEdge(plan.nodes[i - 1], plan.nodes[i]) == nullptr) {
+            walkable = false;
+        }
+    }
+    check(walkable, "多趟路线的相邻节点之间都存在有向边");
+
+    bool tripsWalkable = true;
+    for (std::size_t k = 0; k < plan.trips.size(); ++k) {
+        const logistics::Trip& trip = plan.trips[k];
+        if (trip.nodes.empty()) {
+            tripsWalkable = false;
+            continue;
+        }
+        if (k > 0 && trip.nodes.front() != plan.trips[k - 1].endNodeId) {
+            tripsWalkable = false;
+        }
+        for (std::size_t i = 1; i < trip.nodes.size(); ++i) {
+            if (cfg.graph.findEdge(trip.nodes[i - 1], trip.nodes[i]) == nullptr) {
+                tripsWalkable = false;
+            }
+        }
+    }
+    check(tripsWalkable, "各趟首尾相接且每趟自身可走");
+    check(!plan.trips.empty() && plan.trips.back().endNodeId == cfg.vehicles[0].startNodeId,
+          "最后一趟终点是仓库");
 
     std::printf("    多趟场景（载重 100kg）：%zu 趟，总距离 %.1fkm，"
                 "使用 %zu 个中转站，峰值合计 %.0fkg\n",

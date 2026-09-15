@@ -6,6 +6,7 @@
 #include "core/Dijkstra.h"
 #include "core/LogisticsGraph.h"
 #include "core/Order.h"
+#include "core/Traffic.h"
 #include "core/Vehicle.h"
 
 namespace logistics {
@@ -126,6 +127,21 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
                                int currentTimeMin,
                                double serviceTimeMin,
                                WeightType weight);
+
+// 增量式重规划（设计 §5.7 / D22）。
+// 把当前路线按**停靠点**切成若干 leg，只对"走过被路况命中的边"的那些 leg
+// 重新求最短路，其余 leg 原样复用，**停靠顺序不变**。
+// 适用范围：上一版必须是单趟路线；否则（多趟、或某个 leg 重算后不可达）
+// 自动退回全量重算 replan()，调用方无需区分。
+RoutePlan replanIncremental(const LogisticsGraph& graph,
+                            const Vehicle& vehicle,
+                            const std::vector<Order>& remainingOrders,
+                            const RoutePlan& previous,
+                            int currentTimeMin,
+                            double serviceTimeMin,
+                            WeightType weight,
+                            const TrafficReport& report,
+                            double thresholdRatio);
 
 // 判断某条有向边是否落在给定路线序列的**相邻两站**之间。
 // GUI 的路径高亮与路况重规划的触发判定共用这一条逻辑。

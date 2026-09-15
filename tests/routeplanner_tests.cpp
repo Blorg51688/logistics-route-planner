@@ -10,6 +10,9 @@
 using logistics::LogisticsGraph;
 using logistics::NodeType;
 using logistics::Node;
+using logistics::replanIncremental;
+using logistics::TrafficChange;
+using logistics::TrafficReport;
 using logistics::Order;
 using logistics::PlanStatus;
 using logistics::RoutePlan;
@@ -289,6 +292,64 @@ void testSingleOrderExceedingCapacityIsInfeasible() {
           "原因应含超限货量，实际: " + plan.reason);
 }
 
+// 路线必须是图上**真实可走**的序列。这条断言本该一开始就有：
+// 多趟的 Trip 一度漏写起点，就是因为只查了"末尾是不是仓库"而没查相邻可达。
+void checkRouteIsWalkable(const LogisticsGraph& g, const RoutePlan& plan,
+                          const std::string& depot) {
+    check(!plan.nodes.empty(), "路线序列非空");
+    if (plan.nodes.empty()) {
+        return;
+    }
+    check(plan.nodes.front() == depot, "路线从仓库出发");
+    check(plan.nodes.back() == depot, "路线回到仓库");
+
+    bool walkable = true;
+    int lastArrival = -1;
+    bool timeMonotonic = true;
+    for (std::size_t i = 1; i < plan.nodes.size(); ++i) {
+        if (g.findEdge(plan.nodes[i - 1], plan.nodes[i]) == nullptr) {
+            walkable = false;
+        }
+    }
+    check(walkable, "路线相邻节点之间都存在有向边（序列真实可走）");
+
+    for (std::size_t i = 0; i < plan.nodeArrivalMin.size(); ++i) {
+        if (plan.nodeArrivalMin[i] < lastArrival) {
+            timeMonotonic = false;
+        }
+        lastArrival = plan.nodeArrivalMin[i];
+    }
+    check(timeMonotonic, "到达时刻沿序列单调不减");
+
+    check(plan.nodes.size() == plan.nodeArrivalMin.size()
+              && plan.nodes.size() == plan.nodeIsStop.size(),
+          "节点/到达时刻/停靠标记三个数组等长");
+
+    // 各趟首尾相接，且每趟自身也可走
+    bool tripsChain = true;
+    for (std::size_t k = 0; k < plan.trips.size(); ++k) {
+        const logistics::Trip& trip = plan.trips[k];
+        if (trip.nodes.empty()) {
+            tripsChain = false;
+            continue;
+        }
+        if (!trip.nodeArrivalMin.empty() && trip.nodes.size() != trip.nodeArrivalMin.size()) {
+            tripsChain = false;
+        }
+        if (k > 0 && trip.nodes.front() != plan.trips[k - 1].endNodeId) {
+            tripsChain = false;
+        }
+        for (std::size_t i = 1; i < trip.nodes.size(); ++i) {
+            if (g.findEdge(trip.nodes[i - 1], trip.nodes[i]) == nullptr) {
+                tripsChain = false;
+            }
+        }
+    }
+    check(tripsChain, "各趟首尾相接且每趟自身可走");
+    check(!plan.trips.empty() && plan.trips.back().endNodeId == depot,
+          "最后一趟终点是仓库");
+}
+
 // 构造一个含中转站的图：W -- T -- {D1, D2}，D1/D2 归属于 T 的子网络
 LogisticsGraph makeTransitClusterGraph() {
     LogisticsGraph g;
@@ -360,6 +421,9 @@ void testTotalDemandOverCapacityBecomesMultiTripViaTransit() {
     // 不变量 5：需求超载 -> 必须多于一趟
     check(plan.trips.size() > 1, "多趟配送，实际 " + std::to_string(plan.trips.size()) + " 趟");
 
+    // 路线必须是图上真实可走的序列（这条断言能抓住"Trip 漏写起点"这类错误）
+    checkRouteIsWalkable(g, plan, "W");
+
     // 不变量 6：汇总等于各趟累加
     double distSum = 0.0;
     std::size_t stopSum = 0;
@@ -388,6 +452,7 @@ void testWithinCapacityStaysSingleTrip() {
     check(plan.status == PlanStatus::Ok, "可行");
     check(plan.trips.size() == 1, "不超载时只有一趟，实际 "
               + std::to_string(plan.trips.size()));
+    checkRouteIsWalkable(g, plan, "W");
     bool allZero = true;
     for (const logistics::TransitStock& st : plan.transitStock) {
         if (st.peakKg > 1e-9 || st.finalKg > 1e-9) {
@@ -411,6 +476,143 @@ void testUnreachableDeliveryIsInfeasibleAndNamesTheNode() {
     check(plan.stops.empty(), "不可行时无停靠点");
     check(plan.reason.find("D9") != std::string::npos,
           "原因中应含不可达节点 ID，实际: " + plan.reason);
+}
+
+
+// ---- P2：增量式重规划（设计 §5.7 / D22）----
+//
+// 拓扑：W --10-- D1 --10-- D2 --20-- W，另有绕行 D1 --6-- D3 --6-- D2（D3 是中转站）。
+// 按耗时规划时 D1->D2 走直连（10 < 12）。把直连封堵成 +50%（=15）后，
+// 绕行 12 反而更快，于是只有"含该边的那一段"需要重算。
+LogisticsGraph makeIncrementalGraph() {
+    LogisticsGraph g;
+    Node w = makeNode("W", NodeType::Warehouse, "仓库");   w.x = 0;   w.y = 0;
+    Node d1 = makeNode("D1", NodeType::Delivery, "客户1"); d1.x = 100; d1.y = 0;
+    Node d2 = makeNode("D2", NodeType::Delivery, "客户2"); d2.x = 200; d2.y = 0;
+    Node d3 = makeNode("D3", NodeType::Transit, "中转站"); d3.x = 150; d3.y = 100;
+    g.addNode(w); g.addNode(d1); g.addNode(d2); g.addNode(d3);
+    addTwoWay(g, "W", "D1", 10.0, 10.0, 10.0);
+    addTwoWay(g, "D1", "D2", 10.0, 10.0, 10.0);
+    addTwoWay(g, "D2", "W", 20.0, 20.0, 20.0);
+    addTwoWay(g, "D1", "D3", 6.0, 6.0, 6.0);
+    addTwoWay(g, "D3", "D2", 6.0, 6.0, 6.0);
+    return g;
+}
+
+// 断言 1/2/3/5：只重算受影响的段、停靠顺序不变、其余段逐位不变、总耗时更优
+void testIncrementalReplanRecomputesOnlyAffectedLeg() {
+    LogisticsGraph g = makeIncrementalGraph();
+    const Vehicle v = makeVehicle("W", 1000.0, 480);
+    const std::vector<Order> orders = {makeOrder("O1", "D1", 10.0, 0, 1440, false),
+                                       makeOrder("O2", "D2", 10.0, 0, 1440, false)};
+
+    const RoutePlan before = planRoute(g, v, orders, 5.0, WeightType::Time);
+    check(before.status == PlanStatus::Ok, "初始规划可行");
+    check(before.nodes == std::vector<std::string>({"W", "D1", "D2", "W"}),
+          "初始序列 W->D1->D2->W");
+
+    // 构造确定的拥堵：D1->D2 耗时 +50%（不用随机模拟器，保证可复现）
+    const logistics::Edge* e = g.findEdge("D1", "D2");
+    check(e != nullptr, "D1->D2 存在");
+    if (e == nullptr) {
+        return;
+    }
+    g.updateEdgeTime("D1", "D2", e->baseTimeMin * 1.5);
+    const logistics::Edge* e2 = g.findEdge("D2", "D1");
+    if (e2 != nullptr) {
+        g.updateEdgeTime("D2", "D1", e2->baseTimeMin * 1.5);
+    }
+
+    TrafficReport report;
+    TrafficChange c;
+    c.fromId = "D1";
+    c.toId = "D2";
+    c.increaseRatio = 0.5;
+    c.congested = true;
+    report.changes.push_back(c);
+
+    // 重规划前那条路线在**拥堵后**的耗时，作为比较基准
+    const RoutePlan congestedSameRoute = replan(g, v, orders, "W", 480, 5.0, WeightType::Time);
+
+    const RoutePlan after =
+        replanIncremental(g, v, orders, before, 480, 5.0, WeightType::Time, report, 0.2);
+
+    check(after.status == PlanStatus::Ok, "增量重规划可行");
+
+    // 断言 1：停靠顺序逐位相同
+    check(after.stops.size() == 2, "仍服务 2 个停靠点");
+    if (after.stops.size() == 2) {
+        check(after.stops[0].nodeId == "D1" && after.stops[1].nodeId == "D2",
+              "停靠顺序不变（增量不重排服务顺序）");
+    }
+
+    // 断言 2：未受影响的段逐位不变 —— 首段 W->D1 必须原样
+    check(after.nodes.size() >= 2 && after.nodes[0] == "W" && after.nodes[1] == "D1",
+          "未受影响的首段 W->D1 保持原样");
+
+    // 受影响的段被重算：改走绕行 D3
+    bool viaD3 = false;
+    for (const std::string& id : after.nodes) {
+        if (id == "D3") {
+            viaD3 = true;
+        }
+    }
+    check(viaD3, "受影响的 D1->D2 段被重算，改经 D3 绕行");
+
+    // 断言 5：仍回到仓库，且序列真实可走
+    checkRouteIsWalkable(g, after, "W");
+
+    // 断言 3：总耗时优于"沿旧路线的拥堵版本"
+    check(after.totalTimeMin <= congestedSameRoute.totalTimeMin + 1e-6,
+          "增量结果总耗时 <= 拥堵后沿旧路线："
+              + std::to_string(after.totalTimeMin) + " vs "
+              + std::to_string(congestedSameRoute.totalTimeMin));
+}
+
+// 断言 4：没有任何 leg 受影响时，结果与原路线逐位相同（幂等）
+void testIncrementalReplanIsIdempotentWhenNothingAffected() {
+    const LogisticsGraph g = makeIncrementalGraph();
+    const Vehicle v = makeVehicle("W", 1000.0, 480);
+    const std::vector<Order> orders = {makeOrder("O1", "D1", 10.0, 0, 1440, false),
+                                       makeOrder("O2", "D2", 10.0, 0, 1440, false)};
+
+    const RoutePlan before = planRoute(g, v, orders, 5.0, WeightType::Time);
+
+    // 报告里只有一条**不在路线上的**边（D1->D3 是绕行边，当前路线没走）
+    TrafficReport report;
+    TrafficChange c;
+    c.fromId = "D1";
+    c.toId = "D3";
+    c.increaseRatio = 0.8;
+    c.congested = true;
+    report.changes.push_back(c);
+
+    const RoutePlan after =
+        replanIncremental(g, v, orders, before, 480, 5.0, WeightType::Time, report, 0.2);
+
+    check(after.nodes == before.nodes, "无 leg 受影响时，节点序列逐位不变");
+    check(after.stops.size() == before.stops.size(), "停靠点数不变");
+    check(fixtures::nearlyEqual(after.totalTimeMin, before.totalTimeMin),
+          "总耗时不变");
+}
+
+// 范围限制：上一版是多趟时，增量退回全量重算，结果仍须合法
+void testIncrementalReplanFallsBackForMultiTrip() {
+    const LogisticsGraph g = makeTransitClusterGraph();
+    const Vehicle v = makeVehicle("W", 20.0, 480);
+    const std::vector<Order> orders = {makeOrder("O1", "D1", 15.0, 0, 1440, false),
+                                       makeOrder("O2", "D2", 15.0, 0, 1440, false)};
+
+    const RoutePlan multi = planRoute(g, v, orders, 5.0, WeightType::Distance);
+    check(multi.trips.size() > 1, "前提：上一版确为多趟");
+
+    TrafficReport report;   // 空报告
+    const RoutePlan after =
+        replanIncremental(g, v, orders, multi, 480, 5.0, WeightType::Distance, report, 0.2);
+
+    check(after.status == PlanStatus::Ok, "退回全量重算后仍可行");
+    check(after.stops.size() == 2, "仍然服务全部配送点");
+    checkRouteIsWalkable(g, after, "W");
 }
 
 bool samePlan(const RoutePlan& a, const RoutePlan& b) {
@@ -537,6 +739,9 @@ int main() {
     testSingleOrderExceedingCapacityIsInfeasible();
     testTotalDemandOverCapacityBecomesMultiTripViaTransit();
     testWithinCapacityStaysSingleTrip();
+    testIncrementalReplanRecomputesOnlyAffectedLeg();
+    testIncrementalReplanIsIdempotentWhenNothingAffected();
+    testIncrementalReplanFallsBackForMultiTrip();
     testUnreachableDeliveryIsInfeasibleAndNamesTheNode();
     testReplanFromCurrentPosition();
     testReplanWhenAlreadyAtTheDeliveryNode();
