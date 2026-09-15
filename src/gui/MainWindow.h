@@ -38,6 +38,8 @@ public:
     // 供 UI 完整性探针使用（--ui-probe）
     int toolbarActionCount() const;
     int dockCount() const;
+    // 中转站面板的文本快照，供 --ui-probe 在无头环境下确定性核对
+    QString transitPanelSummary() const;
 
     // 供 --self-check-actions 使用：自动验证两个由人工测试发现的缺陷不再复现
     //   ① 连续插入多个紧急订单不得丢单，且它们必须整体优先于普通订单
@@ -100,6 +102,7 @@ private:
     QTextBrowser*  routeInfo_ = nullptr;
     QLabel*        vehicleInfo_ = nullptr;
     QTableWidget*  orderTable_ = nullptr;
+    QTableWidget*  transitTable_ = nullptr;
     QTableWidget*  lateTable_ = nullptr;
     QPlainTextEdit* logView_ = nullptr;
 

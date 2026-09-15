@@ -14,6 +14,7 @@
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
+#include <QStringList>
 #include <QLineEdit>
 #include <QPlainTextEdit>
 #include <QPushButton>
@@ -155,6 +156,21 @@ void MainWindow::buildDocks() {
     orderDock->setWidget(orderTable_);
     addDockWidget(Qt::RightDockWidgetArea, orderDock);
 
+    // 中转站 / 集散面板：既承担 P3 的"子网络分组标识"，
+    // 也承担 P4 的"中转站暂存货量显示"
+    auto* transitDock = new QDockWidget(QStringLiteral("中转站 / 集散"), this);
+    transitDock->setMinimumWidth(360);
+    transitTable_ = new QTableWidget(0, 5, transitDock);
+    transitTable_->setHorizontalHeaderLabels(
+        {QStringLiteral("中转站"), QStringLiteral("子网络"), QStringLiteral("下属配送点"),
+         QStringLiteral("峰值暂存"), QStringLiteral("当前暂存")});
+    transitTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    transitTable_->horizontalHeader()->setStretchLastSection(true);
+    transitTable_->verticalHeader()->setVisible(false);
+    transitTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    transitDock->setWidget(transitTable_);
+    addDockWidget(Qt::RightDockWidgetArea, transitDock);
+
     auto* lateDock = new QDockWidget(QStringLiteral("超时订单"), this);
     lateDock->setMinimumWidth(360);
     lateTable_ = new QTableWidget(0, 5, lateDock);
@@ -177,6 +193,7 @@ void MainWindow::buildDocks() {
     // 订单列表与超时订单叠成标签页：笔记本屏幕高度有限，
     // 四个面板纵向平铺会把每个都压到不可用
     tabifyDockWidget(orderDock, lateDock);
+    tabifyDockWidget(lateDock, transitDock);
     orderDock->raise();
 
     resizeDocks({routeDock, vehicleDock}, {240, 110}, Qt::Vertical);
@@ -477,9 +494,26 @@ void MainWindow::onAdvanceStop() {
                       .arg(QString::fromStdString(currentNodeId_))
                       .arg(minutesToClock(currentTimeMin_)));
     } else {
-        appendLog(QStringLiteral("经过 %1（到达 %2）")
+        // 若当前节点在本趟里有装卸记录，把它翻译成人话（界面不必自己反推趟边界）
+        QString handled;
+        if (nodeIndex_ < plan_.nodeTripIndex.size()) {
+            const std::size_t t = plan_.nodeTripIndex[nodeIndex_];
+            if (t < plan_.trips.size()) {
+                for (const logistics::TransitOp& op : plan_.trips[t].transitOps) {
+                    if (op.nodeId != currentNodeId_) {
+                        continue;
+                    }
+                    handled = (op.amountKg >= 0.0)
+                                  ? QStringLiteral("，入库暂存 %1kg").arg(op.amountKg, 0, 'f', 0)
+                                  : QStringLiteral("，取货 %1kg 二次配发")
+                                        .arg(std::fabs(op.amountKg), 0, 'f', 0);
+                }
+            }
+        }
+        appendLog(QStringLiteral("经过 %1（到达 %2）%3")
                       .arg(QString::fromStdString(currentNodeId_))
-                      .arg(minutesToClock(currentTimeMin_)));
+                      .arg(minutesToClock(currentTimeMin_))
+                      .arg(handled));
     }
 
     // 推进后必须刷新画布：车辆位置标记要跟着移动
@@ -648,10 +682,32 @@ void MainWindow::updatePanels() {
                      .arg(minutesToClock(static_cast<int>(std::llround(plan_.totalTimeMin))));
         route += QStringLiteral("总成本：%1 元\n").arg(plan_.totalCostYuan, 0, 'f', 1);
         route += QStringLiteral("总 penalty：%1 min\n").arg(plan_.totalPenaltyMin);
-        route += QStringLiteral("停靠 %1 站，已送达 %2 站\n\n")
+        route += QStringLiteral("停靠 %1 站，已送达 %2 站，共 %3 趟\n")
                      .arg(plan_.stops.size())
-                     .arg(stopCursor_);
-        route += QStringLiteral("完整序列：\n");
+                     .arg(stopCursor_)
+                     .arg(plan_.trips.size());
+        if (plan_.trips.size() > 1) {
+            route += QStringLiteral("\n各趟：\n");
+            for (std::size_t i = 0; i < plan_.trips.size(); ++i) {
+                const logistics::Trip& trip = plan_.trips[i];
+                route += QStringLiteral("  第 %1 趟：%2 → %3（%4 节点，%5km）\n")
+                             .arg(i + 1)
+                             .arg(QString::fromStdString(trip.nodes.empty()
+                                                             ? std::string()
+                                                             : trip.nodes.front()))
+                             .arg(QString::fromStdString(trip.endNodeId))
+                             .arg(trip.nodes.size())
+                             .arg(trip.totalDistanceKm, 0, 'f', 1);
+                for (const logistics::TransitOp& op : trip.transitOps) {
+                    route += QStringLiteral("    %1 %2 %3kg\n")
+                                 .arg(op.amountKg >= 0.0 ? QStringLiteral("入库暂存")
+                                                         : QStringLiteral("取货配发"))
+                                 .arg(QString::fromStdString(op.nodeId))
+                                 .arg(std::fabs(op.amountKg), 0, 'f', 0);
+                }
+            }
+        }
+        route += QStringLiteral("\n完整序列：\n");
         for (std::size_t i = 0; i < plan_.nodes.size(); ++i) {
             route += QString::fromStdString(plan_.nodes[i]);
             route += (i + 1 == plan_.nodes.size()) ? QString() : QStringLiteral(" -> ");
@@ -710,6 +766,52 @@ void MainWindow::updatePanels() {
                                                                        : QStringLiteral("待配送"))));
     }
 
+    // 中转站 / 集散：子网络标识 + 下属配送点数 + 暂存货量
+    {
+        struct TransitRow {
+            QString name;
+            int     sub = 0;
+            int     serves = 0;
+            double  peak = 0.0;
+            double  now = 0.0;
+        };
+        std::vector<TransitRow> rows;
+        for (const logistics::Node& n : config_.graph.nodes()) {
+            if (n.type != logistics::NodeType::Transit) {
+                continue;
+            }
+            TransitRow row;
+            row.name = QString::fromStdString(n.id) + QStringLiteral("（")
+                       + QString::fromStdString(n.name) + QStringLiteral("）");
+            row.sub = n.subNetworkId;
+            for (const logistics::Node& other : config_.graph.nodes()) {
+                if (other.type == logistics::NodeType::Delivery
+                    && other.subNetworkId == n.subNetworkId) {
+                    ++row.serves;
+                }
+            }
+            for (const logistics::TransitStock& st : plan_.transitStock) {
+                if (st.nodeId == n.id) {
+                    row.peak = st.peakKg;
+                    row.now = st.finalKg;
+                }
+            }
+            rows.push_back(row);
+        }
+        transitTable_->setRowCount(static_cast<int>(rows.size()));
+        for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+            transitTable_->setItem(i, 0, new QTableWidgetItem(rows[i].name));
+            transitTable_->setItem(i, 1,
+                                   new QTableWidgetItem(QString::number(rows[i].sub)));
+            transitTable_->setItem(i, 2,
+                                   new QTableWidgetItem(QString::number(rows[i].serves)));
+            transitTable_->setItem(i, 3,
+                                   new QTableWidgetItem(QString::number(rows[i].peak, 'f', 0)));
+            transitTable_->setItem(i, 4,
+                                   new QTableWidgetItem(QString::number(rows[i].now, 'f', 0)));
+        }
+    }
+
     // 超时订单：列出**订单号**而不只是配送点——紧急订单也可能超时，
     // 只记录地点用处不大；并用"窗口"替代"剩余载重"（后者在这里没有观测价值）。
     int lateRows = 0;
@@ -757,6 +859,19 @@ int MainWindow::toolbarActionCount() const {
         total += bar->actions().size();
     }
     return total;
+}
+
+QString MainWindow::transitPanelSummary() const {
+    QString out;
+    for (int row = 0; row < transitTable_->rowCount(); ++row) {
+        QStringList cells;
+        for (int col = 0; col < transitTable_->columnCount(); ++col) {
+            const QTableWidgetItem* item = transitTable_->item(row, col);
+            cells << (item != nullptr ? item->text() : QString());
+        }
+        out += cells.join(QStringLiteral(" | ")) + QLatin1Char('\n');
+    }
+    return out;
 }
 
 int MainWindow::dockCount() const {

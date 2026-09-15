@@ -322,8 +322,25 @@ void checkRouteIsWalkable(const LogisticsGraph& g, const RoutePlan& plan,
     check(timeMonotonic, "到达时刻沿序列单调不减");
 
     check(plan.nodes.size() == plan.nodeArrivalMin.size()
-              && plan.nodes.size() == plan.nodeIsStop.size(),
-          "节点/到达时刻/停靠标记三个数组等长");
+              && plan.nodes.size() == plan.nodeIsStop.size()
+              && plan.nodes.size() == plan.nodeTripIndex.size(),
+          "节点/到达时刻/停靠标记/趟归属四个数组等长");
+
+    // 趟归属必须与 trips 的拼接一一对应（单调不减，且在有效范围内）
+    bool tripIndexOk = true;
+    std::size_t lastTrip = 0;
+    for (std::size_t i = 0; i < plan.nodeTripIndex.size(); ++i) {
+        if (plan.nodeTripIndex[i] >= plan.trips.size()) {
+            tripIndexOk = false;
+        }
+        if (i > 0 && plan.nodeTripIndex[i] < plan.nodeTripIndex[i - 1]) {
+            tripIndexOk = false;
+        }
+        lastTrip = plan.nodeTripIndex[i];
+    }
+    check(tripIndexOk, "趟归属单调不减且都在有效范围内");
+    check(plan.trips.empty() || lastTrip + 1 == plan.trips.size(),
+          "趟归属覆盖到最后一趟");
 
     // 各趟首尾相接，且每趟自身也可走
     bool tripsChain = true;

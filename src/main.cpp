@@ -280,6 +280,37 @@ int main(int argc, char** argv) {
                          "[ui-probe] UI 不完整：预期至少 9 个工具栏动作、5 个停靠面板\n");
             return 1;
         }
+        // 中转站面板必须为图中每个中转站列一行，且子网络编号非 0
+        // （D17：sub_network_id 必须真正接上行为，不能是死字段）
+        std::size_t transitNodes = 0;
+        for (const logistics::Node& n : config.graph.nodes()) {
+            if (n.type == logistics::NodeType::Transit) {
+                ++transitNodes;
+            }
+        }
+        const QString panel = window.transitPanelSummary();
+        const std::size_t listed = static_cast<std::size_t>(panel.count(QLatin1Char('\n')));
+        if (listed != transitNodes) {
+            std::fprintf(stderr, "[ui-probe] 中转站面板行数 %zu != 图中中转站数 %zu\n",
+                         listed, transitNodes);
+            return 1;
+        }
+        // 逐行只看**子网络**那一列（第 2 列）。先前用 contains(" | 0 | ") 太松，
+        // 会把"峰值暂存/当前暂存为 0"的行也误判。
+        const QStringList panelRows = panel.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+        for (const QString& row : panelRows) {
+            const QStringList cells = row.split(QStringLiteral(" | "));
+            if (cells.size() >= 2 && cells[1].trimmed() == QStringLiteral("0")) {
+                const QByteArray bad = row.toUtf8();
+                std::fprintf(stderr, "[ui-probe] 中转站子网络编号为 0：%s\n", bad.constData());
+                return 1;
+            }
+        }
+
+        // 中转站面板的内容快照：无头环境下据此确定性核对（不必靠肉眼裁图）
+        const QByteArray transit = panel.toUtf8();
+        std::printf("[ui-probe] 中转站面板（%s）:\n%s", "中转站|子网络|下属配送点|峰值暂存|当前暂存",
+                    transit.constData());
         std::printf("[ui-probe] 通过\n");
         return 0;
     }

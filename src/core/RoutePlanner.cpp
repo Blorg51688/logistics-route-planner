@@ -237,13 +237,15 @@ void flatten(RoutePlan& plan, int startTimeMin, double elapsedMin) {
     plan.nodes.clear();
     plan.nodeArrivalMin.clear();
     plan.nodeIsStop.clear();
+    plan.nodeTripIndex.clear();
     plan.stops.clear();
     plan.totalDistanceKm = 0.0;
     plan.totalCostYuan = 0.0;
     plan.totalPenaltyMin = 0;
 
     bool firstTrip = true;
-    for (Trip& trip : plan.trips) {
+    for (std::size_t tripIndex = 0; tripIndex < plan.trips.size(); ++tripIndex) {
+        Trip& trip = plan.trips[tripIndex];
         // 后续趟的起点与上一趟终点是同一个节点，展平时跳过，避免出现"原地一步"
         const std::size_t begin = firstTrip ? 0 : 1;
         for (std::size_t i = begin; i < trip.nodes.size(); ++i) {
@@ -251,6 +253,7 @@ void flatten(RoutePlan& plan, int startTimeMin, double elapsedMin) {
             plan.nodeArrivalMin.push_back(
                 i < trip.nodeArrivalMin.size() ? trip.nodeArrivalMin[i] : 0);
             plan.nodeIsStop.push_back(i < trip.nodeIsStop.size() ? trip.nodeIsStop[i] : false);
+            plan.nodeTripIndex.push_back(tripIndex);
         }
         for (const Stop& s : trip.stops) {
             plan.stops.push_back(s);
