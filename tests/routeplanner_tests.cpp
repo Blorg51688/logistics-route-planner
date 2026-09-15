@@ -926,8 +926,22 @@ static void testOnboardSurplusIsBankedEnRoute() {
           "寄存不得增加里程：" + std::to_string(p.totalDistanceKm) + " vs "
               + std::to_string(noOnboard.totalDistanceKm));
 
-    // 守恒：期末存货不得超过当初寄存进去的那部分
-    check(tStock <= 20.0 + 1e-6, "期末存货不得超过寄存量（不得凭空产生）");
+    // 语义断言（审计提出的歧义点，在此显式固化）：
+    //   寄存后站里那 20kg 是**不记名库存**，不再绑定 D2；
+    //   D2 仍按正常流程被服务（从仓库装货）。所以「D2 被送达」与「站里留 20kg」
+    //   同时成立是**设计意图**（库存由仓库额外供给），不是重复计数。
+    //   反过来若要求"那批货专供 D2"，它一送掉库存就归零，也就攒不起来——
+    //   与"积少成多"的目标不符。
+    bool d2Served = false;
+    for (const logistics::Stop& st : p.stops) {
+        if (st.nodeId == "D2") {
+            d2Served = true;
+        }
+    }
+    check(d2Served, "原订单仍被正常服务（寄存不改变订单的服务状态）");
+    check(tStock > 1e-9 && tStock <= 20.0 + 1e-6,
+          "寄存量成为站里的不记名库存（0 < 存货 <= 寄存量），实际 "
+              + std::to_string(tStock) + "kg");
 }
 
 // 增量重规划在全量回退时，必须把"站内存货"与"在途货"一并带走。
@@ -1034,6 +1048,56 @@ static void testNoBankingWhenStillAtDepot() {
     check(p.status == logistics::PlanStatus::Ok, "该情形下仍应规划成功");
 }
 
+// 审计发现：insertUrgentOrder 虽然加了 initialStock/onboard 形参，但底层调 replan 时
+// 没转发，导致这条路径上存货与在途货全丢、GUI 回写时把存货清空。
+static void testUrgentInsertForwardsStock() {
+    const logistics::LogisticsGraph g = makeTransitClusterGraph();
+    logistics::Vehicle v;
+    v.id = "V01"; v.startNodeId = "W"; v.capacityKg = 40.0; v.departTimeMin = 480;
+
+    logistics::Order o1 = makeOrder("O1", "D1", 30.0, 0, 1440, false);
+    logistics::Order o2 = makeOrder("O2", "D2", 30.0, 0, 1440, false);
+    const std::vector<logistics::Order> rest = {o1, o2};
+
+    const std::map<std::string, double> stock{{"T", 25.0}};
+    logistics::Order urgent = makeOrder("U1", "D1", 5.0, 0, 1440, true);
+    const logistics::InsertResult r =
+        logistics::insertUrgentOrder(g, v, rest, urgent, "W", 480, 5.0,
+                                     logistics::WeightType::Distance, stock);
+
+    double finalKg = 0.0;
+    for (const logistics::TransitStock& st : r.plan.transitStock) {
+        finalKg += st.finalKg;
+    }
+    check(finalKg > 1e-9,
+          "紧急插单必须把站内存货带下去（实际期末合计 "
+              + std::to_string(finalKg) + "kg）——丢了的话 GUI 回写会把存货清空");
+}
+
+// 审计发现：单趟分支（总需求 ≤ 载重）不读 initialStock，
+// collectTransits 把 finalKg 置 0 —— 攒起来的存货会在一次单趟规划后被抹掉。
+static void testSingleTripPlanPreservesStationStock() {
+    const logistics::LogisticsGraph g = makeTransitClusterGraph();
+    logistics::Vehicle v;
+    v.id = "V01"; v.startNodeId = "W"; v.capacityKg = 100.0; v.departTimeMin = 480;
+
+    // 单个订单 30kg ≤ 载重 100 -> 走单趟分支
+    const std::vector<logistics::Order> orders = {makeOrder("O1", "D1", 30.0, 0, 1440, false)};
+    const std::map<std::string, double> stock{{"T", 20.0}};
+    const logistics::RoutePlan p = logistics::replan(
+        g, v, orders, "W", 480, 5.0, logistics::WeightType::Distance, stock);
+
+    check(p.status == logistics::PlanStatus::Ok, "单趟分支应规划成功");
+    check(p.trips.size() == 1, "该情形确实是单趟");
+    double finalKg = 0.0;
+    for (const logistics::TransitStock& st : p.transitStock) {
+        finalKg += st.finalKg;
+    }
+    check(finalKg > 19.9 && finalKg < 20.1,
+          "单趟分支必须原样带回站内存货（实际 " + std::to_string(finalKg)
+              + "kg）——否则 GUI 回写会把它抹掉");
+}
+
 int main() {
     testSingleOrderRouteIsFullyCorrect();
     testEmptyOrdersDegeneratesToNoMovement();
@@ -1058,6 +1122,8 @@ int main() {
     testOnboardSurplusIsBankedEnRoute();
     testIncrementalReplanForwardsStockAndOnboard();
     testNoBankingWhenStillAtDepot();
+    testUrgentInsertForwardsStock();
+    testSingleTripPlanPreservesStationStock();
 
     return testutil::summarize("routeplanner_tests");
 }

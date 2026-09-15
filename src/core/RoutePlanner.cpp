@@ -758,6 +758,13 @@ RoutePlan replan(const LogisticsGraph& graph,
     plan.trips.push_back(trip);
 
     collectTransits(graph, plan.transitStock);
+    // 单趟分支不经中转站，但**存货必须原样带回**：GUI 用 finalKg 回写 stationStock_，
+    // 若这里置 0，积累起来的存货会在一次单趟规划后被静默抹掉（审计发现的守恒缺口）。
+    for (TransitStock& st : plan.transitStock) {
+        const std::map<std::string, double>::const_iterator it = initialStock.find(st.nodeId);
+        st.finalKg = (it != initialStock.end()) ? it->second : 0.0;
+        st.peakKg = st.finalKg;
+    }
     flatten(plan, currentTimeMin, elapsed);
     return plan;
 }
@@ -973,7 +980,7 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
     }
 
     result.plan = replan(graph, vehicle, all, currentPositionId, currentTimeMin,
-                         serviceTimeMin, weight);
+                         serviceTimeMin, weight, initialStock, onboard);
     return result;
 }
 
