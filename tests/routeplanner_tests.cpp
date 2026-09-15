@@ -437,7 +437,10 @@ void testTotalDemandOverCapacityBecomesMultiTripViaTransit() {
     }
     check(stockNonNegative, "中转站暂存量始终非负");
     check(stockEndsZero, "规划结束时每个中转站暂存必须为 0");
-    check(stationUsed, "本情形下中转站确实被使用（峰值 > 0）");
+    // 设计变更（用户第 9 轮原则"不为满足策略前提去执行更差的方案"）：
+    // 中转站**初始无存货**，因此这里**不得**参与路由——直达更快就直达。
+    // 这条断言正是用来守住该原则：一旦有人把"每簇必经站"加回来，它立刻失败。
+    check(!stationUsed, "期初无存货时中转站不得参与路由（不为用站而绕路）");
 
     // 不变量 5：需求超载 -> 必须多于一趟
     check(plan.trips.size() > 1, "多趟配送，实际 " + std::to_string(plan.trips.size()) + " 趟");
@@ -749,6 +752,59 @@ void testIsEdgeOnRoute() {
 
 } // namespace
 
+// 前置储存点机制：**只有站内确实有存货时**，规划才会把该站当前置仓库使用。
+// 这是"中转站不强行参与路由"的另一面——有货则用、无货则完全绕开。
+static void testStationUsedOnlyWhenStockExists() {
+    const logistics::LogisticsGraph g = makeTransitClusterGraph();
+    logistics::Vehicle v;
+    v.id = "V01";
+    v.startNodeId = "W";
+    v.capacityKg = 40.0;
+    v.departTimeMin = 480;
+
+    // 该测试图里只有 D1 / D2 两个配送点，合计 60kg > 载重 40kg，必然多趟
+    std::vector<logistics::Order> orders;
+    for (const char* id : {"D1", "D2"}) {
+        logistics::Order o;
+        o.id = std::string("O") + id[1];
+        o.nodeId = id;
+        o.demandKg = 30.0;
+        o.windowStartMin = 540;
+        o.windowEndMin = 1080;
+        orders.push_back(o);
+    }
+
+    const auto stationOps = [](const logistics::RoutePlan& p) {
+        double sum = 0.0;
+        for (const logistics::Trip& t : p.trips) {
+            for (const logistics::TransitOp& op : t.transitOps) {
+                sum += std::fabs(op.amountKg);
+            }
+        }
+        return sum;
+    };
+
+    const std::map<std::string, double> noStock;
+    const std::map<std::string, double> withStock{{"T", 30.0}};
+
+    const logistics::RoutePlan a =
+        logistics::replan(g, v, orders, "W", 480, 5.0, logistics::WeightType::Distance, noStock);
+    const logistics::RoutePlan b =
+        logistics::replan(g, v, orders, "W", 480, 5.0, logistics::WeightType::Distance, withStock);
+
+    check(a.status == logistics::PlanStatus::Ok && b.status == logistics::PlanStatus::Ok,
+          "有无期初存货都应规划成功");
+    check(std::fabs(stationOps(a)) < 1e-9, "期初无存货：中转站装卸为 0，完全绕开");
+    check(stationOps(b) > 1e-9, "期初有 30kg：中转站被当前置仓库使用，装卸 "
+                                + std::to_string(stationOps(b)) + "kg");
+
+    // 存货守恒：用掉的不超过期初 + 卸入，期末余量非负
+    for (const logistics::TransitStock& st : b.transitStock) {
+        check(st.finalKg >= -1e-9, "期末暂存非负: " + st.nodeId);
+        check(st.peakKg >= st.finalKg - 1e-9, "峰值不小于期末值: " + st.nodeId);
+    }
+}
+
 int main() {
     testSingleOrderRouteIsFullyCorrect();
     testEmptyOrdersDegeneratesToNoMovement();
@@ -768,5 +824,7 @@ int main() {
     testReplanWhenAlreadyAtTheDeliveryNode();
     testPlanRouteEqualsReplanFromDepot();
     testIsEdgeOnRoute();
+    testStationUsedOnlyWhenStockExists();
+
     return testutil::summarize("routeplanner_tests");
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -105,13 +106,18 @@ RoutePlan planRoute(const LogisticsGraph& graph,
 
 // 从指定位置与指定时刻出发，对剩余未服务订单重新规划，最后返回车辆起始仓库。
 // 供"配送过程中插入紧急订单"与"路况变化触发重规划"复用同一套贪心逻辑。
+// initialStock：各中转站的**期初存货**（前置储存点机制）。
+// 默认空 = 全部为 0，此时中转站完全不参与路由（直达更快就直达）。
+// 只有在站内确实有货、且用它不必绕路时，规划才会把该站当作"前置仓库"使用。
 RoutePlan replan(const LogisticsGraph& graph,
                  const Vehicle& vehicle,
                  const std::vector<Order>& remainingOrders,
                  const std::string& currentPositionId,
                  int currentTimeMin,
                  double serviceTimeMin,
-                 WeightType weight);
+                 WeightType weight,
+                 const std::map<std::string, double>& initialStock
+                     = std::map<std::string, double>());
 
 struct InsertResult {
     RoutePlan   plan;

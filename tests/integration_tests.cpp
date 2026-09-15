@@ -176,14 +176,14 @@ void checkDataQualityInvariants(const Config& cfg, const RoutePlan& byDistance,
     //    （贪心顺序来自被测实现，oracle 无法独立复现）。因此它们不用于证明正确性，
     //    只用于**检测非预期漂移**：数据或算法被无意改动时立刻报警。
     //    有意调整数据/算法时，应连同这些值一起显式更新。
-    check(fixtures::nearlyEqual(byDistance.totalDistanceKm, 198.2, 0.01),
-          "黄金值·距离策略总距离 198.2，实际 " + std::to_string(byDistance.totalDistanceKm));
-    check(fixtures::nearlyEqual(byDistance.totalCostYuan, 277.2, 0.01),
-          "黄金值·距离策略总成本 277.2，实际 " + std::to_string(byDistance.totalCostYuan));
-    check(fixtures::nearlyEqual(byCost.totalDistanceKm, 209.1, 0.01),
-          "黄金值·成本策略总距离 209.1，实际 " + std::to_string(byCost.totalDistanceKm));
-    check(fixtures::nearlyEqual(byCost.totalCostYuan, 267.0, 0.01),
-          "黄金值·成本策略总成本 267.0，实际 " + std::to_string(byCost.totalCostYuan));
+    check(fixtures::nearlyEqual(byDistance.totalDistanceKm, 178.2, 0.01),
+          "黄金值·距离策略总距离 178.2，实际 " + std::to_string(byDistance.totalDistanceKm));
+    check(fixtures::nearlyEqual(byDistance.totalCostYuan, 244.2, 0.01),
+          "黄金值·距离策略总成本 244.2，实际 " + std::to_string(byDistance.totalCostYuan));
+    check(fixtures::nearlyEqual(byCost.totalDistanceKm, 186.3, 0.01),
+          "黄金值·成本策略总距离 186.3，实际 " + std::to_string(byCost.totalDistanceKm));
+    check(fixtures::nearlyEqual(byCost.totalCostYuan, 235.9, 0.01),
+          "黄金值·成本策略总成本 235.9，实际 " + std::to_string(byCost.totalCostYuan));
 }
 
 // B3：两种图表示在真实规模（30 节点）上的形状检查
@@ -222,7 +222,11 @@ void checkMultiTripAndTransitOnRealData(const Config& cfg) {
         }
     }
     check(loadOk, "任一趟的在车货量都不超过载重上限");
-    check(maxOp > 0.0, "中转站确有装卸记录，单次最大装卸 " + std::to_string(maxOp) + "kg");
+    // 设计变更（用户第 9 轮原则："一切决策都不应该为了满足某种策略的前提条件
+    // 而去实际执行更差的策略"）：中转站**初始无存货**，此时直接分批更快，
+    // 因此不得为了"用上中转站"而绕路。实验证据（设计 §16 P12）：
+    // 强制每簇经站 = 198.2km / 13 趟，直达分批 = 178.2km / 6 趟，后者全面更优。
+    check(maxOp < 1e-9, "期初无存货时中转站不得参与路由，实际装卸 " + std::to_string(maxOp) + "kg");
 
     // 本趟装载量本身也不得超过载重上限（用户手工测试发现的显示 bug 的本质：
     // 界面曾把"剩余待送总量 740kg"当成"当前载重"显示，而载重上限只有 200kg）
@@ -251,8 +255,10 @@ void checkMultiTripAndTransitOnRealData(const Config& cfg) {
         }
     }
     check(finalAbs < 1e-6, "规划结束时全部中转站暂存为 0（不留残余库存）");
-    check(peakSum > 0.0, "中转站峰值暂存合计 > 0，实际 " + std::to_string(peakSum));
-    check(usedStations > 0, "至少一个中转站被真正使用");
+    // 同理：无存货时中转站既不出现峰值，也不该被"使用"
+    check(peakSum < 1e-9, "期初无存货时中转站峰值合计应为 0，实际 " + std::to_string(peakSum));
+    check(usedStations == 0, "期初无存货时不得有中转站被使用，实际 " + std::to_string(usedStations));
+    (void)usedStations;
 
     // 不变量：扁平视图必须等于各趟的拼接
     std::size_t stopSum = 0;

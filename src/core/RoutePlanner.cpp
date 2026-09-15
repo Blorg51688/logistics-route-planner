@@ -294,7 +294,9 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
                         const std::string& startPos,
                         int startTimeMin,
                         double serviceTimeMin,
-                        WeightType weight) {
+                        WeightType weight,
+                        const std::map<std::string, double>& initialStock
+                            = std::map<std::string, double>()) {
     RoutePlan plan;
 
     // 子网络编号 → 该子网络的中转站。配送点按 sub_network_id 归属，
@@ -396,8 +398,9 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
         }
     }
 
-    std::map<std::string, double> stock;
-    std::map<std::string, double> peak;
+    // 期初存货：站里本来就有货时，才可能把它当前置仓库用
+    std::map<std::string, double> stock = initialStock;
+    std::map<std::string, double> peak = initialStock;
 
     for (std::size_t h = 0; h < hubOrder.size(); ++h) {
         const std::string hub = hubOrder[h];
@@ -405,8 +408,17 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
         const double clusterTotal = totalDemand(pool);
         std::string fail;
 
-        // 单趟装得下就直接送达，不必动用中转站（保持默认数据的简单路径）
-        const bool useStation = !hub.empty() && clusterTotal > vehicle.capacityKg + 1e-9;
+        // 是否动用中转站：**只有站内确实有存货时才考虑**。
+        //
+        // 这是用户第 9 轮定的原则："一切决策都不应该为了满足某种策略的前提条件
+        // 而去实际执行更差的策略。" 实验（设计 §16 P12）证明：让每个簇都强行经站，
+        // 在单车辆模型下比直达分批全面更差（198.2 vs 178.2km、13 趟 vs 6 趟）。
+        // 中转站初始无存货，因此默认数据一律走下面的直达分批。
+        //
+        // 站内存货来自"即将带回仓库的余货顺路寄存"（前置储存点机制，见 §16 P13）。
+        // 在那一机制落地之前，stock 恒为 0，此分支不会进入。
+        const bool useStation = !hub.empty() && clusterTotal > vehicle.capacityKg + 1e-9
+                                && stock[hub] > 1e-9;
 
         if (!useStation) {
             // 不经中转站：按载重上限分批，每批一趟直接从仓库出发送达后返回。
@@ -569,7 +581,8 @@ RoutePlan replan(const LogisticsGraph& graph,
                  const std::string& currentPositionId,
                  int currentTimeMin,
                  double serviceTimeMin,
-                 WeightType weight) {
+                 WeightType weight,
+                 const std::map<std::string, double>& initialStock) {
     RoutePlan plan;
 
     if (graph.findNode(currentPositionId) == nullptr) {
@@ -584,7 +597,7 @@ RoutePlan replan(const LogisticsGraph& graph,
     if (total > vehicle.capacityKg + 1e-9) {
         // 总需求超过载重：改走多趟 + 中转集散（D21），不再判为不可行
         return multiTripPlan(graph, vehicle, remaining, currentPositionId, currentTimeMin,
-                             serviceTimeMin, weight);
+                             serviceTimeMin, weight, initialStock);
     }
 
     // 单趟：车辆在起点已装载全部货物，直接贪心串联后回仓库（与历史行为一致）
