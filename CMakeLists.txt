@@ -115,6 +115,9 @@ if(Qt6_FOUND)
         # 会让用户卡住，而 bash -n 与引号检查都发现不了
         add_test(NAME wizard_ui_names_lint
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_wizard_ui_names.py)
+        # 向导的"关卡选择"逻辑（输入 0 跑全部 / 关号 / 关名 / 片段）
+        add_test(NAME wizard_stage_pick
+                 COMMAND bash ${CMAKE_SOURCE_DIR}/tools/check_wizard_stage_pick.sh)
     endif()
 
     # UI 完整性：工具栏与侧栏必须真的被构造出来。

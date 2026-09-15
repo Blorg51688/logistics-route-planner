@@ -227,27 +227,60 @@ summary() {
 
 # ============================ 本流程的关卡 ============================
 #
-# 8 关（第 2 次瘦身，用户要求"把只是看看的关卡合并"）：
-#   原来"认清布局""看网络图""看规划结果""看超时表""看三策略"是五关纯粹的"看"，
-#   熟练测试者每关都要清屏、按回车、再切回程序，成本全在切换而不在验证。
-#   合并后：看界面/看网络/看图表示 -> 一关；看路线/看车辆/看中转站/看明细/
-#   切三策略/看超时 -> 一关。每个"要不要动手"的环节仍然是独立一关，不打乱节奏。
+# 每关一个函数，外加一张注册表。这样既能按顺序全跑，
+# 也能**只跑指定的一关**（人工测试脚本开头会让你选），便于快速回归某一项。
 
-main() {
-    clear 2>/dev/null || true
-    head1 "人工测试向导 —— 电商物流配送路径规划系统"
-    say ""
-    say "共 $TOTAL_STAGES 关；熟练后全程约 5–6 分钟。"
-    say "第 1 关自动跑；第 2–3 关主要是「看」，第 4–8 关需要你动手。"
-    say ""
-    if [[ ! -t 0 ]]; then
-        printf '%s当前 stdin 不是终端，无法交互。请在终端里直接运行：%s\n' "$RED" "$RESET"
-        say "  bash scripts/manual_test_wizard.sh"
-        exit 2
+STAGE_NAMES=()
+ONLY_STAGE=""
+
+    STAGE_NAMES+=("构建与自动检查")
+    STAGE_NAMES+=("启动、界面布局、网络图与图表示")
+    STAGE_NAMES+=("规划结果：路线 / 车辆 / 中转站 / 停靠明细 / 三策略 / 超时")
+    STAGE_NAMES+=("画布交互与手工增删健壮性")
+    STAGE_NAMES+=("动态事件：路况 / 增量重规划 / 紧急订单 / 新客户 / 封路")
+    STAGE_NAMES+=("推进一站：车辆位置、当前载重与暂存随动")
+    STAGE_NAMES+=("Debug 模式（A1）")
+    STAGE_NAMES+=("边界：制造不可行场景")
+
+# 当前这一关是否被选中（未指定 ONLY_STAGE 时全选）
+stage_wanted() {
+    [[ -z "$ONLY_STAGE" || "$ONLY_STAGE" == "$1" ]]
+}
+
+# 列出所有关卡名，供 --list 与输入错误时提示
+list_stages() {
+    local i=1
+    for n in "${STAGE_NAMES[@]}"; do
+        printf '  %d) %s\n' "$i" "$n"
+        i=$((i + 1))
+    done
+}
+
+# 把用户输入解析成关卡名：0/空 = 全部；数字 = 第 N 关；否则按名字（支持子串唯一匹配）
+resolve_stage_input() {
+    local in="$1"
+    [[ -z "$in" || "$in" == "0" ]] && { echo ""; return 0; }
+    if [[ "$in" =~ ^[0-9]+$ ]]; then
+        local n=$((in - 1))
+        if (( n >= 0 && n < ${#STAGE_NAMES[@]} )); then
+            echo "${STAGE_NAMES[$n]}"; return 0
+        fi
+        return 1
     fi
-    confirm "准备好了吗？" || { say "已取消。"; exit 0; }
+    # 精确匹配
+    for n in "${STAGE_NAMES[@]}"; do
+        [[ "$n" == "$in" ]] && { echo "$n"; return 0; }
+    done
+    # 子串唯一匹配
+    local hits=()
+    for n in "${STAGE_NAMES[@]}"; do
+        [[ "$n" == *"$in"* ]] && hits+=("$n")
+    done
+    (( ${#hits[@]} == 1 )) && { echo "${hits[0]}"; return 0; }
+    return 1
+}
 
-    # ---------------------------------------------------------------- 1
+do_stage_1() {
     stage "构建与自动检查"
     local build_ok=1
     if cmake -S . -B build >/tmp/wizard_cmake.log 2>&1 \
@@ -297,6 +330,9 @@ main() {
     pause
 
     # ---------------------------------------------------------------- 2
+}
+
+do_stage_2() {
     stage "启动、界面布局、网络图与图表示"
     say "这一关把「认界面」和「看网络图」合在一起——都是看，不必分两次启动。"
     say ""
@@ -334,6 +370,9 @@ main() {
     ask_result "启动、界面布局、网络图与图表示"
 
     # ---------------------------------------------------------------- 3
+}
+
+do_stage_3() {
     stage "规划结果：路线 / 车辆 / 中转站 / 停靠明细 / 三策略 / 超时"
     say "这一关全是「看」，一口气看完六样。中途不用切回终端。"
     say ""
@@ -384,6 +423,9 @@ main() {
     ask_result "规划结果：路线/车辆/中转站/明细/三策略/超时"
 
     # ---------------------------------------------------------------- 4
+}
+
+do_stage_4() {
     stage "画布交互与手工增删健壮性"
     todo "按住任意一个绿色客户点拖动一段距离再松手"
     want "相连的边实时跟随、箭头贴在节点边界上、权重标签跟着走"
@@ -399,6 +441,9 @@ main() {
     ask_result "画布交互与手工增删健壮性"
 
     # ---------------------------------------------------------------- 5
+}
+
+do_stage_5() {
     stage "动态事件：路况 / 增量重规划 / 紧急订单 / 新客户 / 封路"
     say "五个按钮，都在工具栏上，按顺序点。"
     say ""
@@ -436,6 +481,9 @@ main() {
     ask_result "动态事件：路况/增量重规划/紧急订单/新客户/封路"
 
     # ---------------------------------------------------------------- 6
+}
+
+do_stage_6() {
     stage "推进一站：车辆位置、当前载重与暂存随动"
     todo "点几次「推进一站」，盯住画布与右侧三处"
     say ""
@@ -456,6 +504,9 @@ main() {
     ask_result "推进一站：车辆位置、当前载重与暂存随动"
 
     # ---------------------------------------------------------------- 7
+}
+
+do_stage_7() {
     stage "Debug 模式（A1）"
     todo "勾选工具栏的「Debug 模式」"
     want "日志**每 1 秒**增长一次：自动模拟路况、偶尔插单、自动推进、偶发道路封闭"
@@ -466,6 +517,9 @@ main() {
     ask_result "Debug 模式（A1）"
 
     # ---------------------------------------------------------------- 8
+}
+
+do_stage_8() {
     stage "边界：制造不可行场景"
     todo "点「手工增删…」，在「节点 ID」填一个配送点（如 D01），点「删除节点」，关闭对话框"
     head1 "预期："
@@ -476,5 +530,103 @@ main() {
     stop_app
 }
 
-main "$@"
-summary
+
+main() {
+    clear 2>/dev/null || true
+    head1 "人工测试向导 —— 电商物流配送路径规划系统"
+    say ""
+    say "共 $TOTAL_STAGES 关。全程约 5–6 分钟。"
+    say ""
+    head1 "请选择要跑什么："
+    say "  输入 ${BOLD}0${RESET}（或直接回车）-> 按顺序跑完整流程"
+    say "  输入 ${BOLD}关卡号${RESET}（如 3）或 ${BOLD}关卡名${RESET}（如 停靠明细，支持片段匹配）"
+    say "       -> 只跑那一关，跑完直接结束"
+    say ""
+    dim "全部关卡："
+    list_stages
+    say ""
+    # --only 的参数校验放在"是否终端"检查之前：
+    # 关卡名写错跟有没有 TTY 无关，应当直接报错而不是被终端检查挡住。
+    if [[ -n "${WIZARD_ONLY:-}" ]]; then
+        if ! resolved="$(resolve_stage_input "$WIZARD_ONLY")" || [[ -z "$resolved" ]]; then
+            printf '%s--only 指定的关卡无法识别：%s%s\n' "$RED" "$WIZARD_ONLY" "$RESET"
+            list_stages
+            exit 2
+        fi
+    fi
+
+    if [[ ! -t 0 ]]; then
+        printf '%s当前 stdin 不是终端，无法交互。请在终端里直接运行：%s\n' "$RED" "$RESET"
+        say "  bash scripts/manual_test_wizard.sh"
+        exit 2
+    fi
+
+    local picked="${WIZARD_ONLY:-}"
+    while :; do
+        if [[ -n "$picked" ]]; then
+            ONLY_STAGE="$(resolve_stage_input "$picked")"
+            break
+        fi
+        printf '%s> %s' "$BOLD" "$RESET"
+        read -r picked
+        if resolved="$(resolve_stage_input "$picked")"; then
+            ONLY_STAGE="$resolved"
+            break
+        fi
+        printf '%s没听明白：%s%s\n' "$RED" "$picked" "$RESET"
+        say "  0 = 全部；也可以输入上面的关卡号或关卡名片段。"
+    done
+
+    if [[ -n "$ONLY_STAGE" ]]; then
+        say ""
+        say "只跑这一关：${BOLD}${ONLY_STAGE}${RESET}"
+        # 单关模式也要保证程序是构建好的；第 2 关之后还需要程序**已在运行**，
+        # 因此在这里先启动，跑完再关掉。
+        if [[ "$ONLY_STAGE" != "构建与自动检查" ]]; then
+            say "先确认构建产物并启动程序…"
+            if ! cmake -S . -B build >/tmp/wizard_cmake.log 2>&1 \
+               || ! cmake --build build >/tmp/wizard_build.log 2>&1; then
+                printf '%s构建失败，日志：/tmp/wizard_build.log%s\n' "$RED" "$RESET"
+                exit 1
+            fi
+            if [[ "$ONLY_STAGE" != "启动、界面布局、网络图与图表示" ]]; then
+                if ! launch_app; then
+                    printf '%s程序未能启动%s\n' "$RED" "$RESET"
+                    exit 1
+                fi
+                sleep 1
+            fi
+        fi
+        confirm "开始？" || { say "已取消。"; exit 0; }
+        ONLY_HANDLED=1
+    else
+        confirm "准备好了吗？" || { say "已取消。"; exit 0; }
+    fi
+
+    do_stage_1
+    do_stage_2
+    do_stage_3
+    do_stage_4
+    do_stage_5
+    do_stage_6
+    do_stage_7
+    do_stage_8
+
+    if [[ -n "$ONLY_STAGE" ]]; then
+        stop_app
+    fi
+}
+
+# 只在"被直接执行"时进入交互；被 source 时只加载函数，便于单独测试关卡选择逻辑
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    WIZARD_ONLY=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --list) list_stages; exit 0;;
+            --only) WIZARD_ONLY="$2"; shift 2;;
+            *) shift;;
+        esac
+    done
+    main "$@"
+    summary
+fi
