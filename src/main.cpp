@@ -76,6 +76,7 @@ void usage() {
         "  --labels all|route         权重标签显示全部边还是仅高亮路线（默认 route）\n"
         "  --render PATH.png          离屏渲染图形场景成 PNG 后退出\n"
         "  --render-window PATH.png   离屏渲染完整窗口（工具栏+侧栏）成 PNG 后退出\n"
+        "                              （注意 --width/--height 对交互窗口无效——它总是最大化）\n"
         "  --demo N                   渲染窗口前先自动触发 N 轮交互（验证交互后状态）\n"
         "  --dump-graph [list|matrix|both]  输出邻接表 / 邻接矩阵后退出（B3）\n"
         "  --ui-probe                 检查工具栏与侧栏是否完整构造后退出\n"
@@ -226,6 +227,16 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // --plan / --labels 只在 --render 分支生效。用在交互窗口或 --render-window
+    // 上会被静默忽略（用户以为设了、其实没效果），这里直接报错说明。
+    // 注意 --weight 不在此列：--dump-graph matrix 也会读它。
+    if (opt.renderPath.empty() && (!opt.planStrategy.empty() || opt.allLabels)) {
+        std::fprintf(stderr,
+                     "--plan / --labels 只在 --render 时生效；"
+                     "交互窗口请用界面上的\"规划策略\"与\"权重标签\"控件\n");
+        return 2;
+    }
+
     // ---- 仅图形场景的渲染（报告配图用），不构造窗口 ----
     if (!opt.renderPath.empty()) {
         GraphScene scene;
@@ -329,6 +340,17 @@ int main(int argc, char** argv) {
         const QByteArray transit = panel.toUtf8();
         std::printf("[ui-probe] 中转站面板（%s）:\n%s", "中转站|子网络|下属配送点|峰值暂存|当前暂存",
                     transit.constData());
+        // 停靠明细必须每个停靠点一行（这些字段此前只有测试在读，界面上看不到）
+        const QString stopPanel = window.stopPanelSummary();
+        const std::size_t stopRows =
+            static_cast<std::size_t>(stopPanel.count(QLatin1Char('\n')));
+        if (stopRows == 0) {
+            std::fprintf(stderr, "[ui-probe] 停靠明细面板为空\n");
+            return 1;
+        }
+        std::printf("[ui-probe] 停靠明细 %zu 行（配送点|原始到达|等待|送达|离开|剩余载重）\n",
+                    stopRows);
+
         std::printf("[ui-probe] 通过\n");
         return 0;
     }
@@ -343,6 +365,6 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    window.showInteractive(opt.width, opt.height);
+    window.showInteractive();
     return app.exec();
 }

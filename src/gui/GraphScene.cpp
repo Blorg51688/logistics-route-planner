@@ -71,6 +71,7 @@ void GraphScene::clearHighlight() {
 }
 
 void GraphScene::setVehiclePosition(const std::string& nodeId) {
+    vehicleNodeId_ = nodeId;
     for (NodeItem* node : nodes_) {
         node->setVehicleHere(node->nodeId() == nodeId);
     }

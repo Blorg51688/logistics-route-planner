@@ -29,20 +29,20 @@ public:
 
     // 标记车辆当前所在节点（空串表示不标记任何节点）
     void setVehiclePosition(const std::string& nodeId);
+    // 当前被标记为"车辆所在"的节点 ID —— 供自检核对画布与状态一致
+    const std::string& vehiclePosition() const { return vehicleNodeId_; }
 
     // 是否让全部边都显示权重标签（默认只在被高亮的边上显示，避免密集网络互相遮挡）
     void setAllLabelsVisible(bool on);
-    bool allLabelsVisible() const { return allLabelsVisible_; }
 
     logistics::WeightType weightType() const { return weight_; }
-    std::size_t edgeItemCount() const { return edges_.size(); }
-    std::size_t nodeItemCount() const { return nodes_.size(); }
 
 private:
     std::vector<NodeItem*> nodes_;
     std::vector<EdgeItem*> edges_;
     logistics::WeightType weight_ = logistics::WeightType::Distance;
     bool allLabelsVisible_ = false;
+    std::string vehicleNodeId_;
 
     void refreshLabelVisibility();
 };

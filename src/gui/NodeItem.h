@@ -18,7 +18,6 @@ public:
 
     int type() const override { return Type; }
 
-    const logistics::Node& node() const { return node_; }
     const std::string& nodeId() const { return node_.id; }
 
     void addEdge(EdgeItem* edge);

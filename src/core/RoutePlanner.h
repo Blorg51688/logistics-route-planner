@@ -46,9 +46,6 @@ struct Trip {
     std::vector<std::string> nodes;         // 含本趟起点
     std::vector<int>         nodeArrivalMin;
     std::vector<bool>        nodeIsStop;
-    // 与 nodes 一一对应：该节点属于第几趟。界面据此把"到达某节点"翻译成
-    // "在某个中转站卸货/取货"，而不必自己反推趟边界。
-    std::vector<std::size_t> nodeTripIndex;
     std::vector<Stop>        stops;
     std::vector<TransitOp>   transitOps;
     double totalDistanceKm = 0.0;
@@ -80,8 +77,7 @@ struct RoutePlan {
     std::vector<Stop>        stops;       // 仅配送停靠点，按服务顺序
     double totalDistanceKm = 0.0;
     double totalTimeMin    = 0.0;         // 返回仓库时刻 − 起始时刻（含等待与服务）
-    // 抵达起始仓库的时刻。用于让界面的"推进"在送完最后一站后还能再走一步回到仓库，
-    // 而不是把车停在最后一个客户处。
+    // 抵达起始仓库的时刻（路线汇总字段之一，供界面与测试核对配送结束时间）。
     int    returnArrivalMin = 0;
     double totalCostYuan   = 0.0;
     int    totalPenaltyMin = 0;

@@ -30,7 +30,7 @@ public:
 
     // 交互式显示：把窗口尺寸限制在可用屏幕之内，避免默认尺寸大于屏幕
     // 导致侧栏或工具栏被推到屏幕之外而"看不见"
-    void showInteractive(int preferredWidth, int preferredHeight);
+    void showInteractive();
 
     // 供无头渲染验证使用
     void renderToFile(const QString& path, int width, int height);
@@ -40,6 +40,8 @@ public:
     int dockCount() const;
     // 中转站面板的文本快照，供 --ui-probe 在无头环境下确定性核对
     QString transitPanelSummary() const;
+    // 停靠明细面板的文本快照（供 --ui-probe）
+    QString stopPanelSummary() const;
 
     // 供 --self-check-actions 使用：自动验证两个由人工测试发现的缺陷不再复现
     //   ① 连续插入多个紧急订单不得丢单，且它们必须整体优先于普通订单
@@ -107,6 +109,7 @@ private:
     QLabel*        vehicleInfo_ = nullptr;
     QTableWidget*  orderTable_ = nullptr;
     QTableWidget*  transitTable_ = nullptr;
+    QTableWidget*  stopTable_ = nullptr;
     int            debugClosureCounter_ = 0;
     QTableWidget*  lateTable_ = nullptr;
     QPlainTextEdit* logView_ = nullptr;

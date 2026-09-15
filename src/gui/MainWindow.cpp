@@ -174,6 +174,22 @@ void MainWindow::buildDocks() {
     transitDock->setWidget(transitTable_);
     addDockWidget(Qt::RightDockWidgetArea, transitDock);
 
+    // 停靠明细：把每个停靠点的原始到达/等待/送达/离开/剩余载重摊开。
+    // 这些字段是设计 §4.6 明确要求记录的，此前只有测试在读、界面上看不到；
+    // 报告要求【需求分析】⑵ 也要求呈现"到达时间"，而"等待"能解释早到的影响。
+    auto* stopDock = new QDockWidget(QStringLiteral("停靠明细"), this);
+    stopDock->setMinimumWidth(360);
+    stopTable_ = new QTableWidget(0, 6, stopDock);
+    stopTable_->setHorizontalHeaderLabels(
+        {QStringLiteral("配送点"), QStringLiteral("原始到达"), QStringLiteral("等待"),
+         QStringLiteral("送达"), QStringLiteral("离开"), QStringLiteral("剩余载重")});
+    stopTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    stopTable_->horizontalHeader()->setStretchLastSection(true);
+    stopTable_->verticalHeader()->setVisible(false);
+    stopTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    stopDock->setWidget(stopTable_);
+    addDockWidget(Qt::RightDockWidgetArea, stopDock);
+
     auto* lateDock = new QDockWidget(QStringLiteral("超时订单"), this);
     lateDock->setMinimumWidth(360);
     lateTable_ = new QTableWidget(0, 5, lateDock);
@@ -197,6 +213,7 @@ void MainWindow::buildDocks() {
     // 四个面板纵向平铺会把每个都压到不可用
     tabifyDockWidget(orderDock, lateDock);
     tabifyDockWidget(lateDock, transitDock);
+    tabifyDockWidget(transitDock, stopDock);
     orderDock->raise();
 
     resizeDocks({routeDock, vehicleDock}, {240, 110}, Qt::Vertical);
@@ -617,8 +634,6 @@ void MainWindow::onDebugToggled(bool on) {
         debugTimer_->start(intervalMs);
 
         const double tickSec = intervalMs / 1000.0;
-        const int ticksPerUrgent = std::max(
-            1, static_cast<int>(config_.general.urgentOrderIntervalSec / tickSec));
         appendLog(QStringLiteral("Debug 模式开启：每 %1 秒自动模拟一次"
                                  "（配置值 %2 秒，按 10 倍速加速）")
                       .arg(tickSec, 0, 'f', 1)
@@ -921,6 +936,18 @@ void MainWindow::updatePanels() {
                                                                        : QStringLiteral("待配送"))));
     }
 
+    // 停靠明细（顺序与 plan_.stops 一致，即服务顺序）
+    stopTable_->setRowCount(static_cast<int>(plan_.stops.size()));
+    for (int i = 0; i < static_cast<int>(plan_.stops.size()); ++i) {
+        const Stop& s = plan_.stops[static_cast<std::size_t>(i)];
+        stopTable_->setItem(i, 0, new QTableWidgetItem(QString::fromStdString(s.nodeId)));
+        stopTable_->setItem(i, 1, new QTableWidgetItem(minutesToClock(s.rawArrivalMin)));
+        stopTable_->setItem(i, 2, new QTableWidgetItem(QString::number(s.waitMin) + QStringLiteral(" 分")));
+        stopTable_->setItem(i, 3, new QTableWidgetItem(minutesToClock(s.arrivalMin)));
+        stopTable_->setItem(i, 4, new QTableWidgetItem(minutesToClock(s.departureMin)));
+        stopTable_->setItem(i, 5, new QTableWidgetItem(QString::number(s.remainingLoadKg, 'f', 0) + QStringLiteral(" kg")));
+    }
+
     // 中转站 / 集散：子网络标识 + 下属配送点数 + 暂存货量
     {
         struct TransitRow {
@@ -1029,26 +1056,31 @@ QString MainWindow::transitPanelSummary() const {
     return out;
 }
 
+QString MainWindow::stopPanelSummary() const {
+    QString out;
+    for (int row = 0; row < stopTable_->rowCount(); ++row) {
+        QStringList cells;
+        for (int col = 0; col < stopTable_->columnCount(); ++col) {
+            const QTableWidgetItem* item = stopTable_->item(row, col);
+            cells << (item != nullptr ? item->text() : QString());
+        }
+        out += cells.join(QStringLiteral(" | ")) + QLatin1Char('\n');
+    }
+    return out;
+}
+
 int MainWindow::dockCount() const {
     return findChildren<QDockWidget*>().size();
 }
 
-void MainWindow::showInteractive(int preferredWidth, int preferredHeight) {
-    int width = preferredWidth;
-    int height = preferredHeight;
-
+void MainWindow::showInteractive() {
     // 关键：窗口尺寸一旦超过屏幕，侧栏就会被推到可见区域之外，
-    // 用户会以为"这些面板根本不存在"。直接最大化是唯一稳妥的做法——
-    // 不必猜测用户的屏幕有多大，工具栏与五个面板必然全部可见。
-    setMinimumSize(900, 600);
-
-    const QScreen* screen = QGuiApplication::primaryScreen();
-    const QRect available = (screen != nullptr) ? screen->availableGeometry() : QRect();
-    if (available.isValid() && available.width() < preferredWidth + 60) {
-        // 屏幕比期望尺寸还小：退回最大化 + 更宽松的最小尺寸
-        setMinimumSize(640, 480);
-    }
-
+    // 用户会以为"这些面板根本不存在"。直接最大化是唯一不必猜测用户
+    // 屏幕尺寸的做法——工具栏与全部面板必然可见。
+    // （原先此函数接收 --width/--height 并计算 width/height 局部变量，
+    //   但从未使用它们；已删除这两个无效参数与死变量，--width/--height
+    //   现在只对 --render / --render-window 生效。）
+    setMinimumSize(640, 480);
     showMaximized();
     raise();
     activateWindow();
@@ -1148,7 +1180,11 @@ int MainWindow::runActionSelfCheck() {
                .arg(stopCursor_));
 
     // ⑤ 车辆位置标记必须与当前位置一致（画布刷新的依据）
-    expect(scene_ != nullptr, QStringLiteral("场景已建立"));
+    expect(scene_ != nullptr && scene_->vehiclePosition() == currentNodeId_,
+           QStringLiteral("画布上的车辆标记与当前位置一致：标记在 %1，当前位置 %2")
+               .arg(QString::fromStdString(scene_ != nullptr ? scene_->vehiclePosition()
+                                                             : std::string()))
+               .arg(QString::fromStdString(currentNodeId_)));
 
     std::printf("[self-check] %s（失败 %d 项）\n",
                 failures == 0 ? "全部通过" : "存在失败", failures);

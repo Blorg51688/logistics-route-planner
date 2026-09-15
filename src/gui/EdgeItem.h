@@ -35,11 +35,9 @@ public:
 
     // 权重标签默认只在被高亮的边上显示，避免密集网络里 72 个标签互相遮挡
     void setLabelVisible(bool on);
-    bool labelVisible() const { return labelVisible_; }
 
     const std::string& fromId() const { return edge_.fromId; }
     const std::string& toId() const { return edge_.toId; }
-    const logistics::Edge& edge() const { return edge_; }
 
     QRectF boundingRect() const override;
     QPainterPath shape() const override;

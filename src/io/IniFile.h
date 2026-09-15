@@ -34,7 +34,6 @@ public:
     static bool loadFromFile(const std::string& path, IniFile& out, std::string& error);
 
     const IniSection* findSection(const std::string& name) const;
-    const std::vector<IniSection>& sections() const { return sections_; }
 
 private:
     std::vector<IniSection> sections_;
