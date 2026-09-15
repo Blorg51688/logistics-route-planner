@@ -96,9 +96,10 @@ void MainWindow::buildActions() {
     bar->setMovable(false);
 
     strategyBox_ = new QComboBox(this);
+    // 顺序与「权重标签」下拉保持一致：距离 -> 耗时 -> 成本
     strategyBox_->addItem(QStringLiteral("最短距离策略"), QVariant(QStringLiteral("distance")));
-    strategyBox_->addItem(QStringLiteral("最低成本策略"), QVariant(QStringLiteral("cost")));
     strategyBox_->addItem(QStringLiteral("最低耗时策略"), QVariant(QStringLiteral("time")));
+    strategyBox_->addItem(QStringLiteral("最低成本策略"), QVariant(QStringLiteral("cost")));
     bar->addWidget(new QLabel(QStringLiteral(" 规划策略: "), this));
     bar->addWidget(strategyBox_);
     connect(strategyBox_, &QComboBox::currentIndexChanged, this, &MainWindow::onStrategyChanged);
@@ -121,6 +122,20 @@ void MainWindow::buildActions() {
     bar->addAction(QStringLiteral("重新规划"), this, &MainWindow::onReplan);
     bar->addAction(QStringLiteral("手工增删…"), this, &MainWindow::onManualEdit);
     bar->addAction(QStringLiteral("图表示…"), this, &MainWindow::onShowGraphTables);
+
+    debugSpeedBox_ = new QComboBox(this);
+    debugSpeedBox_->addItem(QStringLiteral("展示模式（2 秒/步）"), 2000);
+    debugSpeedBox_->addItem(QStringLiteral("快速预览（1 秒/步）"), 1000);
+    bar->addWidget(new QLabel(QStringLiteral("  Debug 速度: "), this));
+    bar->addWidget(debugSpeedBox_);
+    connect(debugSpeedBox_, &QComboBox::currentIndexChanged, this, [this] {
+        debugIntervalMs_ = debugSpeedBox_->currentData().toInt();
+        if (debugOn_) {
+            debugTimer_->start(debugIntervalMs_);
+            appendLog(QStringLiteral("Debug 速度切换为每 %1 秒一步")
+                          .arg(debugIntervalMs_ / 1000.0, 0, 'f', 0));
+        }
+    });
 
     QAction* debugAction = bar->addAction(QStringLiteral("Debug 模式"));
     debugAction->setCheckable(true);
@@ -233,10 +248,12 @@ int MainWindow::currentTimeMin() const {
 }
 
 // 某配送点上的全部订单号，用 / 连接（同一节点可能有多单合并成一次停靠）
-double MainWindow::stockAt(const std::string& stationId) const {
-    double stock = 0.0;
+void MainWindow::stockTrace(const std::string& stationId, double& current,
+                            double& peak) const {
+    current = 0.0;
+    peak = 0.0;
     if (plan_.nodes.empty()) {
-        return stock;
+        return;
     }
     const std::size_t upto = (nodeIndex_ + 1 < plan_.nodes.size()) ? nodeIndex_ + 1
                                                                   : plan_.nodes.size();
@@ -261,11 +278,52 @@ double MainWindow::stockAt(const std::string& stationId) const {
         }
         for (const logistics::TransitOp& op : plan_.trips[t].transitOps) {
             if (op.nodeId == stationId && plan_.nodes[i] == stationId) {
-                stock += op.amountKg;
+                current += op.amountKg;
+            }
+        }
+        // 峰值"实时"更新：只有真的存进去了、当前量超过历史峰值才刷新
+        if (current > peak) {
+            peak = current;
+        }
+    }
+}
+
+double MainWindow::currentLoadKg() const {
+    if (plan_.nodes.empty() || plan_.trips.empty()) {
+        return 0.0;
+    }
+    const std::size_t flat = (nodeIndex_ < plan_.nodeTripIndex.size())
+                                 ? nodeIndex_
+                                 : plan_.nodes.size() - 1;
+    const std::size_t t = (nodeIndex_ < plan_.nodeTripIndex.size())
+                              ? plan_.nodeTripIndex[nodeIndex_]
+                              : 0;
+    if (t >= plan_.trips.size()) {
+        return 0.0;
+    }
+    const logistics::Trip& trip = plan_.trips[t];
+    double load = trip.loadKg;
+
+    // 该趟在扁平序列中的起点（flatten 对非首趟跳过重复的首节点）
+    std::size_t start = 0;
+    for (std::size_t k = 0; k < t; ++k) {
+        start += plan_.trips[k].nodes.size() - (k == 0 ? 0 : 1);
+    }
+    const std::size_t offset = (flat >= start) ? flat - start : 0;
+
+    std::size_t stopIdx = 0;
+    for (std::size_t i = 0; i <= offset && i < trip.nodes.size(); ++i) {
+        if (i < trip.nodeIsStop.size() && trip.nodeIsStop[i] && stopIdx < trip.stops.size()) {
+            load = trip.stops[stopIdx].remainingLoadKg;   // 送达后递减
+            ++stopIdx;
+        }
+        for (const logistics::TransitOp& op : trip.transitOps) {
+            if (op.nodeId == trip.nodes[i] && op.amountKg > 0.0) {
+                load = 0.0;   // 在中转站卸货，车空了
             }
         }
     }
-    return stock;
+    return load;
 }
 
 QString MainWindow::orderIdsAt(const std::string& nodeId) const {
@@ -624,20 +682,15 @@ void MainWindow::onDebugToggled(bool on) {
     appendLog(on ? QStringLiteral("Debug 模式开启：自动模拟路况 / 插单 / 推进")
                  : QStringLiteral("Debug 模式关闭"));
     if (on) {
-        // 配置里的 traffic_change_interval_sec 默认 30 秒，那是对路况模型本身的描述；
-        // Debug 模式是**演示加速**，30 秒一次会让人以为"根本没反应"。
-        // 这里按 10 倍速取，下限 1.5 秒。
-        const int rawMs = static_cast<int>(config_.general.trafficChangeIntervalSec * 1000.0);
-        const int intervalMs = std::max(1500, rawMs / 10);
+        // 速度由工具栏的「Debug 速度」档位决定（展示 2 秒 / 快速 1 秒）。
+        // 原先由配置的 traffic_change_interval_sec(30s) 按 10 倍速推导，
+        // 用户反馈仍太慢——Debug 模式本质是演示加速，直接给两档更直观。
+        const int intervalMs = debugIntervalMs_ > 0 ? debugIntervalMs_ : 2000;
         debugTickMs_ = intervalMs;
         debugTicks_ = 0;
         debugTimer_->start(intervalMs);
 
         const double tickSec = intervalMs / 1000.0;
-        appendLog(QStringLiteral("Debug 模式开启：每 %1 秒自动模拟一次"
-                                 "（配置值 %2 秒，按 10 倍速加速）")
-                      .arg(tickSec, 0, 'f', 1)
-                      .arg(config_.general.trafficChangeIntervalSec, 0, 'f', 0));
         appendLog(QStringLiteral("  紧急订单每 %1 秒最多插入一单，且同时最多 2 单待处理")
                       .arg(config_.general.urgentOrderIntervalSec, 0, 'f', 0));
     } else {
@@ -915,7 +968,8 @@ void MainWindow::updatePanels() {
 
         vehicleInfo_->setText(
             QStringLiteral("ID：%1\n起始仓库：%2\n载重上限：%3 kg\n发车：%4\n"
-                           "本趟装载：%5 kg（第 %6 / %7 趟）\n剩余待送：%8 kg")
+                           "本趟装载：%5 kg（第 %6 / %7 趟）\n当前载重：%8 kg\n"
+                           "剩余待送：%9 kg")
                 .arg(QString::fromStdString(v.id))
                 .arg(QString::fromStdString(v.startNodeId))
                 .arg(v.capacityKg, 0, 'f', 0)
@@ -923,6 +977,7 @@ void MainWindow::updatePanels() {
                 .arg(tripLoad, 0, 'f', 0)
                 .arg(tripNo)
                 .arg(plan_.trips.size())
+                .arg(currentLoadKg(), 0, 'f', 0)
                 .arg(remainingDemand, 0, 'f', 0));
     }
 
@@ -995,12 +1050,9 @@ void MainWindow::updatePanels() {
                     ++row.serves;
                 }
             }
-            for (const logistics::TransitStock& st : plan_.transitStock) {
-                if (st.nodeId == n.id) {
-                    row.peak = st.peakKg;
-                }
-            }
-            row.now = stockAt(n.id);   // 截至当前推进位置，而不是规划终值
+            // 峰值与当前值都随推进实时变化：峰值是"存进去时才比较是否刷新"，
+            // 而不是规划时算好的定值；当前值是此刻站内实际存货。
+            stockTrace(n.id, row.now, row.peak);
             rows.push_back(row);
         }
         transitTable_->setRowCount(static_cast<int>(rows.size()));

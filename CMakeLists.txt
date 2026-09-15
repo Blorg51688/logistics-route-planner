@@ -107,6 +107,10 @@ if(Qt6_FOUND)
     if(Python3_Interpreter_FOUND)
         add_test(NAME wizard_text_lint
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_wizard_text.py)
+        # 向导里写死的规模/结构数字必须与 config/default.ini 一致——
+        # "预期文案过期"已在第 3、6、7 轮反复发生，改由脚本每次守住
+        add_test(NAME wizard_claims_lint
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_wizard_claims.py)
     endif()
 
     # UI 完整性：工具栏与侧栏必须真的被构造出来。

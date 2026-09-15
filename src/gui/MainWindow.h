@@ -83,7 +83,12 @@ private:
     QString            orderIdsAt(const std::string& nodeId) const;
     // 某中转站**截至当前推进位置**的暂存货量（不是规划终值——终值必为 0，
     // 那样界面上这一列永远是 0，没有观测价值）
-    double             stockAt(const std::string& stationId) const;
+    // 中转站暂存：截至当前推进位置的**当前值**与**历史峰值**。
+    // 二者都随推进实时变化——峰值不是在规划时定死的，而是"存进去时才比较是否刷新"。
+    void               stockTrace(const std::string& stationId, double& current,
+                                  double& peak) const;
+    // 车辆**当前**载着的货量（随送达递减），不是本趟出发时的装载量
+    double             currentLoadKg() const;
     void               onShowGraphTables();
     QString            windowTextAt(const std::string& nodeId) const;
     int                currentTimeMin() const;
@@ -107,6 +112,8 @@ private:
 
     QComboBox*     strategyBox_ = nullptr;
     QComboBox*     weightBox_ = nullptr;
+    QComboBox*     debugSpeedBox_ = nullptr;
+    int            debugIntervalMs_ = 2000;
     QTextBrowser*  routeInfo_ = nullptr;
     QLabel*        vehicleInfo_ = nullptr;
     QTableWidget*  orderTable_ = nullptr;
