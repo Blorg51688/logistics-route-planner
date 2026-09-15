@@ -9,6 +9,7 @@
 
 using logistics::LogisticsGraph;
 using logistics::NodeType;
+using logistics::Node;
 using logistics::Order;
 using logistics::PlanStatus;
 using logistics::RoutePlan;
@@ -272,18 +273,128 @@ void testMultipleOrdersOnSameNodeMergeIntoOneStop() {
     check(fixtures::nearlyEqual(plan.totalDistanceKm, 10.0), "总距离 10.0");
 }
 
-// 切片 5：总需求超过载重上限 -> 明确不可行，且不生成任何路线
-void testOverCapacityIsInfeasible() {
+// 切片 5：**单个订单**的货量就超过载重上限 -> 这才是真正的载重不可行
+// （分多少趟都装不下一个订单）
+void testSingleOrderExceedingCapacityIsInfeasible() {
     const LogisticsGraph g = makeWtoD1Graph();
     const Vehicle v = makeVehicle("W", 10.0, 480);   // 载重仅 10
     const std::vector<Order> orders = {makeOrder("O1", "D1", 20.0, 0, 1440, false)};
 
     const RoutePlan plan = planRoute(g, v, orders, 5.0, WeightType::Distance);
 
-    check(plan.status == PlanStatus::OverCapacity, "状态为 OverCapacity");
+    check(plan.status == PlanStatus::OrderExceedsCapacity, "状态为 OrderExceedsCapacity");
     check(plan.nodes.empty(), "不可行时不生成路线（nodes 为空）");
     check(plan.stops.empty(), "不可行时无停靠点");
-    check(!plan.reason.empty(), "必须给出不可行原因");
+    check(plan.reason.find("20") != std::string::npos,
+          "原因应含超限货量，实际: " + plan.reason);
+}
+
+// 构造一个含中转站的图：W -- T -- {D1, D2}，D1/D2 归属于 T 的子网络
+LogisticsGraph makeTransitClusterGraph() {
+    LogisticsGraph g;
+    Node w = makeNode("W", NodeType::Warehouse, "仓库");
+    w.x = 0;    w.y = 0;
+    Node t = makeNode("T", NodeType::Transit, "集散站");
+    t.x = 100;  t.y = 0;   t.subNetworkId = 1;
+    Node d1 = makeNode("D1", NodeType::Delivery, "客户1");
+    d1.x = 150; d1.y = 0;  d1.subNetworkId = 1;
+    Node d2 = makeNode("D2", NodeType::Delivery, "客户2");
+    d2.x = 150; d2.y = 20; d2.subNetworkId = 1;
+    g.addNode(w); g.addNode(t); g.addNode(d1); g.addNode(d2);
+    addTwoWay(g, "W", "T", 10.0, 10.0, 16.0);
+    addTwoWay(g, "T", "D1", 5.0, 5.0, 5.0);
+    addTwoWay(g, "T", "D2", 6.0, 6.0, 6.0);
+    return g;
+}
+
+// 切片 6（D21 核心）：总需求超过载重上限**不再不可行**，
+// 而是多趟 + 中转站暂存 + 二次配发。
+void testTotalDemandOverCapacityBecomesMultiTripViaTransit() {
+    const LogisticsGraph g = makeTransitClusterGraph();
+    const Vehicle v = makeVehicle("W", 20.0, 480);   // 载重 20，总需求 30
+    const std::vector<Order> orders = {makeOrder("O1", "D1", 15.0, 0, 1440, false),
+                                       makeOrder("O2", "D2", 15.0, 0, 1440, false)};
+
+    const RoutePlan plan = planRoute(g, v, orders, 5.0, WeightType::Distance);
+
+    // 不变量 1：全部订单被服务（否则才叫不可行）
+    check(plan.status == PlanStatus::Ok, "总需求超载不再是不可行");
+    check(plan.stops.size() == 2, "两个订单都被送达，实际 "
+              + std::to_string(plan.stops.size()));
+
+    // 不变量 2：任一趟的在车货量不超过载重
+    bool loadOk = true;
+    for (const logistics::Trip& trip : plan.trips) {
+        for (const logistics::Stop& s : trip.stops) {
+            if (s.remainingLoadKg < -1e-9) {
+                loadOk = false;
+            }
+        }
+        for (const logistics::TransitOp& op : trip.transitOps) {
+            if (std::fabs(op.amountKg) > v.capacityKg + 1e-9) {
+                loadOk = false;
+            }
+        }
+    }
+    check(loadOk, "任一趟的在车货量都不超过载重上限");
+
+    // 不变量 3/4：暂存始终非负，且规划结束时为 0
+    bool stockNonNegative = true;
+    bool stockEndsZero = true;
+    bool stationUsed = false;
+    for (const logistics::TransitStock& st : plan.transitStock) {
+        if (st.peakKg < -1e-9 || st.finalKg < -1e-9) {
+            stockNonNegative = false;
+        }
+        if (st.finalKg > 1e-9) {
+            stockEndsZero = false;
+        }
+        if (st.peakKg > 1e-9) {
+            stationUsed = true;
+        }
+    }
+    check(stockNonNegative, "中转站暂存量始终非负");
+    check(stockEndsZero, "规划结束时每个中转站暂存必须为 0");
+    check(stationUsed, "本情形下中转站确实被使用（峰值 > 0）");
+
+    // 不变量 5：需求超载 -> 必须多于一趟
+    check(plan.trips.size() > 1, "多趟配送，实际 " + std::to_string(plan.trips.size()) + " 趟");
+
+    // 不变量 6：汇总等于各趟累加
+    double distSum = 0.0;
+    std::size_t stopSum = 0;
+    bool flattenOk = true;
+    for (const logistics::Trip& trip : plan.trips) {
+        distSum += trip.totalDistanceKm;
+        stopSum += trip.stops.size();
+        flattenOk = flattenOk && trip.nodes.size() == trip.nodeArrivalMin.size()
+                    && trip.nodes.size() == trip.nodeIsStop.size();
+    }
+    check(std::fabs(distSum - plan.totalDistanceKm) < 1e-6,
+          "总距离 = 各趟累加");
+    check(stopSum == plan.stops.size(), "扁平停靠点 = 各趟停靠点之和");
+    check(flattenOk, "每趟的节点序列与到达时刻/停靠标记等长");
+}
+
+// 切片 6：总需求不超过载重时保持单趟，不引入多余的中转环节
+void testWithinCapacityStaysSingleTrip() {
+    const LogisticsGraph g = makeTransitClusterGraph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+    const std::vector<Order> orders = {makeOrder("O1", "D1", 15.0, 0, 1440, false),
+                                       makeOrder("O2", "D2", 15.0, 0, 1440, false)};
+
+    const RoutePlan plan = planRoute(g, v, orders, 5.0, WeightType::Distance);
+
+    check(plan.status == PlanStatus::Ok, "可行");
+    check(plan.trips.size() == 1, "不超载时只有一趟，实际 "
+              + std::to_string(plan.trips.size()));
+    bool allZero = true;
+    for (const logistics::TransitStock& st : plan.transitStock) {
+        if (st.peakKg > 1e-9 || st.finalKg > 1e-9) {
+            allZero = false;
+        }
+    }
+    check(allZero, "不超载时不经过中转站，暂存全程为 0");
 }
 
 // 切片 5：存在无法到达的配送点 -> Unreachable，且原因要能定位到具体节点
@@ -423,7 +534,9 @@ int main() {
     testUrgentOrderIsServedFirstDespiteBeingFarther();
     testLateArrivalIsMarkedWithPenalty();
     testMultipleOrdersOnSameNodeMergeIntoOneStop();
-    testOverCapacityIsInfeasible();
+    testSingleOrderExceedingCapacityIsInfeasible();
+    testTotalDemandOverCapacityBecomesMultiTripViaTransit();
+    testWithinCapacityStaysSingleTrip();
     testUnreachableDeliveryIsInfeasibleAndNamesTheNode();
     testReplanFromCurrentPosition();
     testReplanWhenAlreadyAtTheDeliveryNode();

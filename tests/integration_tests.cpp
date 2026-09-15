@@ -187,6 +187,86 @@ void checkDataQualityInvariants(const Config& cfg, const RoutePlan& byDistance,
 }
 
 // B3：两种图表示在真实规模（30 节点）上的形状检查
+// D21：总需求超过载重上限**不再判不可行**，改为多趟 + 中转集散。
+// 用真实网络 + 把载重改小来构造（默认 740 <= 800 只会走单趟）。
+// 合成图只能覆盖简单拓扑，这里验证真实网络上的不变量。
+void checkMultiTripAndTransitOnRealData(const Config& cfg) {
+    Vehicle small = cfg.vehicles[0];
+    small.capacityKg = 100.0;   // 远小于总需求 740kg
+
+    const RoutePlan plan = planRoute(cfg.graph, small, cfg.orders,
+                                     cfg.general.serviceTimeMin, WeightType::Distance);
+
+    check(plan.status == PlanStatus::Ok, "载重远小于总需求时不再是不可行");
+    check(plan.stops.size() == distinctOrderNodes(cfg),
+          "全部配送点仍被服务，实际 " + std::to_string(plan.stops.size()));
+    check(plan.trips.size() > 1,
+          "确实分成多趟，实际 " + std::to_string(plan.trips.size()) + " 趟");
+
+    // 不变量：任一趟的在车货量不超过载重上限
+    bool loadOk = true;
+    double maxOp = 0.0;
+    for (const logistics::Trip& trip : plan.trips) {
+        for (const logistics::Stop& s : trip.stops) {
+            if (s.remainingLoadKg < -1e-9) {
+                loadOk = false;
+            }
+        }
+        for (const logistics::TransitOp& op : trip.transitOps) {
+            if (std::fabs(op.amountKg) > small.capacityKg + 1e-9) {
+                loadOk = false;
+            }
+            if (std::fabs(op.amountKg) > maxOp) {
+                maxOp = std::fabs(op.amountKg);
+            }
+        }
+    }
+    check(loadOk, "任一趟的在车货量都不超过载重上限");
+    check(maxOp > 0.0, "中转站确有装卸记录，单次最大装卸 " + std::to_string(maxOp) + "kg");
+
+    // 不变量：暂存终值必须为 0；峰值 > 0 说明中转站确实参与了集散
+    double finalAbs = 0.0;
+    double peakSum = 0.0;
+    std::size_t usedStations = 0;
+    for (const logistics::TransitStock& st : plan.transitStock) {
+        finalAbs += std::fabs(st.finalKg);
+        peakSum += st.peakKg;
+        if (st.peakKg > 1e-9) {
+            ++usedStations;
+        }
+    }
+    check(finalAbs < 1e-6, "规划结束时全部中转站暂存为 0（不留残余库存）");
+    check(peakSum > 0.0, "中转站峰值暂存合计 > 0，实际 " + std::to_string(peakSum));
+    check(usedStations > 0, "至少一个中转站被真正使用");
+
+    // 不变量：扁平视图必须等于各趟的拼接
+    std::size_t stopSum = 0;
+    double distSum = 0.0;
+    double costSum = 0.0;
+    int penaltySum = 0;
+    for (const logistics::Trip& trip : plan.trips) {
+        stopSum += trip.stops.size();
+        distSum += trip.totalDistanceKm;
+        costSum += trip.totalCostYuan;
+        for (const logistics::Stop& s : trip.stops) {
+            penaltySum += s.penaltyMin;
+        }
+    }
+    check(stopSum == plan.stops.size(), "停靠点数 = 各趟之和");
+    check(std::fabs(distSum - plan.totalDistanceKm) < 1e-6, "总距离 = 各趟之和");
+    check(std::fabs(costSum - plan.totalCostYuan) < 1e-6, "总成本 = 各趟之和");
+    check(penaltySum == plan.totalPenaltyMin, "总 penalty = 各停靠点之和");
+    check(plan.nodes.size() == plan.nodeArrivalMin.size()
+              && plan.nodes.size() == plan.nodeIsStop.size(),
+          "扁平序列的节点/到达时刻/停靠标记三个数组等长");
+    check(!plan.nodes.empty() && plan.nodes.back() == cfg.vehicles[0].startNodeId,
+          "最后一趟终点回到起始仓库");
+
+    std::printf("    多趟场景（载重 100kg）：%zu 趟，总距离 %.1fkm，"
+                "使用 %zu 个中转站，峰值合计 %.0fkg\n",
+                plan.trips.size(), plan.totalDistanceKm, usedStations, peakSum);
+}
+
 void checkGraphRepresentationsOnRealData(const Config& cfg) {
     const std::string list = cfg.graph.toAdjacencyListString();
     check(list.find("W01") != std::string::npos, "邻接表包含顶点 W01");
@@ -348,6 +428,7 @@ int main() {
 
     checkDataQualityInvariants(cfg, byDistance, byCost);
 
+    checkMultiTripAndTransitOnRealData(cfg);
     checkGraphRepresentationsOnRealData(cfg);
     checkTrafficAndUrgentOrderOnRealData(cfg);
 

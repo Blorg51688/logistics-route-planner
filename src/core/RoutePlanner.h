@@ -13,7 +13,10 @@ namespace logistics {
 // 规划结果状态。不可行时会给出 reason 且不产生路线。
 enum class PlanStatus {
     Ok,
-    OverCapacity,   // 总需求超过车辆载重上限
+    // 单个订单的货量就超过载重上限——多趟也无法解决，这才是真正的载重不可行。
+    // 注意：**总需求超过载重不再属于不可行**（D21）：车辆可反复返回仓库取货，
+    // 把货暂存在中转站再二次配发，因此改为多趟配送。
+    OrderExceedsCapacity,
     Unreachable     // 存在无法到达的配送点，或无法返回仓库
 };
 
@@ -28,6 +31,33 @@ struct Stop {
     bool   late            = false;
     int    penaltyMin      = 0;    // = max(0, arrival - 窗口止)
     double remainingLoadKg = 0.0;  // 离开该站时的剩余载重
+};
+
+// 一趟行程内对某个中转站的暂存操作
+struct TransitOp {
+    std::string nodeId;      // 中转站
+    double      amountKg = 0.0;   // >0 入库（卸货暂存）；<0 出库（取货二次配发）
+};
+
+// 一趟行程：车辆的一段连续行程。
+// 起点 = 上一趟的终点（首趟为规划起点），终点 = 起始仓库或某个中转站。
+struct Trip {
+    std::vector<std::string> nodes;         // 含本趟起点
+    std::vector<int>         nodeArrivalMin;
+    std::vector<bool>        nodeIsStop;
+    std::vector<Stop>        stops;
+    std::vector<TransitOp>   transitOps;
+    double totalDistanceKm = 0.0;
+    double totalCostYuan   = 0.0;
+    double totalTimeMin    = 0.0;
+    std::string endNodeId;                  // 本趟终点
+};
+
+// 某个中转站在整个规划过程中的暂存状态
+struct TransitStock {
+    std::string nodeId;
+    double      finalKg = 0.0;   // 终值。不变量：规划结束时必须为 0（不留残余库存）
+    double      peakKg  = 0.0;   // 峰值，供界面展示
 };
 
 struct RoutePlan {
@@ -48,6 +78,12 @@ struct RoutePlan {
     int    returnArrivalMin = 0;
     double totalCostYuan   = 0.0;
     int    totalPenaltyMin = 0;
+
+    // ---- 多趟结构（D20/D21）----
+    // trips 是**真源**；上面的 nodes/nodeArrivalMin/nodeIsStop/stops
+    // 是由它展平（flatten）出来的兼容视图，只在一处生成，不会各自维护。
+    std::vector<Trip>         trips;
+    std::vector<TransitStock> transitStock;
 };
 
 // 从车辆起始仓库出发、按其发车时刻规划，服务完全部订单后返回该仓库。
