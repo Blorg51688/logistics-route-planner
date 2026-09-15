@@ -163,10 +163,17 @@ void testLoadDefaultConfig() {
         check(o.demandKg > 0.0, "订单货物量为正: " + o.id);
     }
 
-    // D14：总需求必须 ≤ 载重，否则默认配置下 B6 直接不可行
-    const double demand = totalDemand(cfg);
-    check(!cfg.vehicles.empty() && demand <= cfg.vehicles[0].capacityKg,
-          "总需求 " + std::to_string(demand) + " ≤ 载重");
+    // D21（修订 D14）：总需求**可以**超过载重——车辆会多趟往返取货、
+    // 把货暂存在中转站再二次配发。真正不可行的是"**单个订单**的货量就超过载重"，
+    // 那样分多少趟都装不下。
+    double maxOrderDemand = 0.0;
+    for (const logistics::Order& o : cfg.orders) {
+        if (o.demandKg > maxOrderDemand) {
+            maxOrderDemand = o.demandKg;
+        }
+    }
+    check(!cfg.vehicles.empty() && maxOrderDemand <= cfg.vehicles[0].capacityKg,
+          "单个订单最大货量 " + std::to_string(maxOrderDemand) + " ≤ 载重");
 
     // [general] 参数
     check(cfg.general.serviceTimeMin == 5.0, "service_time_min == 5");

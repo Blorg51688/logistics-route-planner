@@ -102,6 +102,13 @@ if(Qt6_FOUND)
     add_test(NAME cli_action_self_check
              COMMAND ${CMAKE_COMMAND} -E env QT_QPA_PLATFORM=offscreen
                      $<TARGET_FILE:app> --self-check-actions)
+    # 向导文案的引号截断检查：这类错误 bash -n 查不出来（语法合法、语义错），
+    # 本项目已经踩过两次（把中文引号写成英文 "，导致标题/正文被静默截断）。
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME wizard_text_lint
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_wizard_text.py)
+    endif()
+
     # UI 完整性：工具栏与侧栏必须真的被构造出来。
     # 曾经交互路径只构造裸 QGraphicsView，工具栏/侧栏在正常启动时完全不存在。
     add_test(NAME cli_ui_probe

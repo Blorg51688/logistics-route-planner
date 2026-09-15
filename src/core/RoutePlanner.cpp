@@ -305,9 +305,63 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
         }
     }
 
+    // ---- 紧急订单优先：单独成趟，最先执行（E3）----
+    //
+    // 多趟模式下不能只靠"簇内紧急优先"：若紧急订单分属两个簇，它们仍会被
+    // 各自簇的行程隔开，不满足「优先满足紧急订单」。同样地，现实中紧急单
+    // 也应当立即派车，因此这里把它摘出来作为独立批次直接从仓库送达。
+    std::vector<Candidate> urgentPool;
+    std::vector<Candidate> normalPool;
+    for (const Candidate& c : candidates) {
+        if (c.urgent) {
+            urgentPool.push_back(c);
+        } else {
+            normalPool.push_back(c);
+        }
+    }
+
+    double elapsed = static_cast<double>(startTimeMin);
+    std::string current = startPos;
+
+    while (!urgentPool.empty()) {
+        double batchLoad = 0.0;
+        std::vector<Candidate> batch;
+        for (const Candidate& c : urgentPool) {
+            if (c.demandKg > vehicle.capacityKg + 1e-9) {
+                plan.status = PlanStatus::OrderExceedsCapacity;
+                std::ostringstream os;
+                os << "订单货量 " << static_cast<long long>(std::lround(c.demandKg))
+                   << "kg 超过载重上限 "
+                   << static_cast<long long>(std::lround(vehicle.capacityKg)) << "kg";
+                plan.reason = os.str();
+                return plan;
+            }
+            if (batchLoad + c.demandKg <= vehicle.capacityKg + 1e-9) {
+                batch.push_back(c);
+                batchLoad += c.demandKg;
+            }
+        }
+        if (batch.empty()) {
+            break;   // 兜底
+        }
+        Trip trip;
+        std::string fail;
+        if (!weave(graph, batch, current, elapsed, serviceTimeMin, weight,
+                   vehicle.startNodeId, vehicle.startNodeId, batchLoad, trip, fail)) {
+            plan.status = PlanStatus::Unreachable;
+            plan.reason = fail;
+            return plan;
+        }
+        plan.trips.push_back(trip);
+        current = vehicle.startNodeId;
+        for (const Candidate& b : batch) {
+            eraseCandidateByNode(urgentPool, b.nodeId);
+        }
+    }
+
     // 分簇：键为中转站 ID；空字符串表示"仓库簇"（不属于任何子网络的配送点）
     std::map<std::string, std::vector<Candidate>> clusters;
-    for (const Candidate& c : candidates) {
+    for (const Candidate& c : normalPool) {
         const Node* node = graph.findNode(c.nodeId);
         const int sub = (node != nullptr) ? node->subNetworkId : 0;
         std::string hub;
@@ -318,7 +372,8 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
         clusters[hub].push_back(c);
     }
 
-    // 簇按总货量降序处理（平局按 hub 名升序），保证输出确定
+    // 簇按总货量降序处理（平局按 hub 名升序），保证输出确定。
+    // 紧急订单已在上面的独立批次里先行处理，不参与这里的簇排序。
     std::vector<std::string> hubOrder;
     for (std::map<std::string, std::vector<Candidate>>::const_iterator it = clusters.begin();
          it != clusters.end(); ++it) {
@@ -340,8 +395,6 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
         }
     }
 
-    double elapsed = static_cast<double>(startTimeMin);
-    std::string current = startPos;
     std::map<std::string, double> stock;
     std::map<std::string, double> peak;
 

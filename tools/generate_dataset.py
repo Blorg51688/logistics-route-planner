@@ -34,7 +34,7 @@ DEFAULT_INI = os.path.join(ROOT, "config", "default.ini")
 # ---------------------------------------------------------------- 可调参数
 # 坐标单位为 1/SCALE 公里。放大 SCALE 会缩短里程与耗时；
 # 若过小会导致单车辆一天跑不完、全部订单超时（这正是当初的缺陷之一）。
-SCALE = 40.0
+SCALE = 60.0
 
 # 道路等级：主干道快但贵（含通行费），支线慢但便宜。
 # 若两类系数让 cost 与 dist 的比值**处处相同**，最低成本策略就必然等价于
@@ -51,7 +51,7 @@ TRAFFIC_TIME_INCREASE_MIN = 0.2
 TRAFFIC_TIME_INCREASE_MAX = 0.5
 URGENT_ORDER_INTERVAL_SEC = 60
 
-CAPACITY_KG = 800
+CAPACITY_KG = 200
 DEPART_TIME = "08:00"
 DEFAULT_WINDOW = ("09:00", "18:00")
 # 刻意收紧的窗口：用于演示 E2（超时标记 + penalty），且保证超时是"少数"
