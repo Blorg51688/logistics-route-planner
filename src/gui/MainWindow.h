@@ -87,6 +87,7 @@ private:
     std::string           currentNodeId_;
     int                   currentTimeMin_ = 0;
     std::size_t           servedCount_ = 0;   // 当前计划内已送达的站数，仅用于显示
+    bool                  returnedToDepot_ = false;   // 是否已完成"返回仓库"这一步
     logistics::Rng        rng_{20260914u};
     logistics::WeightType planWeight_ = logistics::WeightType::Distance;
 

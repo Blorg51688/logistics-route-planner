@@ -71,6 +71,9 @@ void testSingleOrderRouteIsFullyCorrect() {
           "总距离 10.0，实际 " + std::to_string(plan.totalDistanceKm));
     check(fixtures::nearlyEqual(plan.totalTimeMin, 75.0),
           "总耗时 75（含等待与服务），实际 " + std::to_string(plan.totalTimeMin));
+    // 抵达仓库的时刻（oracle 值 555）
+    check(plan.returnArrivalMin == 555,
+          "返回仓库时刻 555，实际 " + std::to_string(plan.returnArrivalMin));
     check(fixtures::nearlyEqual(plan.totalCostYuan, 8.0),
           "总成本 8.0，实际 " + std::to_string(plan.totalCostYuan));
     check(plan.totalPenaltyMin == 0, "totalPenalty 为 0");

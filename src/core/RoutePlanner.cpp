@@ -1,6 +1,7 @@
 #include "core/RoutePlanner.h"
 
 #include <cmath>
+#include <sstream>
 #include <cstddef>
 
 namespace logistics {
@@ -99,8 +100,12 @@ RoutePlan replan(const LogisticsGraph& graph,
     // 「总需求 <= 载重上限」，在规划前一次性判定；超限时不生成任何路线。
     if (loadKg > vehicle.capacityKg) {
         plan.status = PlanStatus::OverCapacity;
-        plan.reason = "总需求 " + std::to_string(loadKg) + "kg 超过载重上限 "
-                      + std::to_string(vehicle.capacityKg) + "kg";
+        // 用整数公斤输出，避免显示成 740.000000kg
+        std::ostringstream os;
+        os << "总需求 " << static_cast<long long>(std::lround(loadKg))
+           << "kg 超过载重上限 " << static_cast<long long>(std::lround(vehicle.capacityKg))
+           << "kg";
+        plan.reason = os.str();
         return plan;
     }
 
@@ -201,6 +206,7 @@ RoutePlan replan(const LogisticsGraph& graph,
     }
     walkPath(graph, back.nodes, plan, elapsedMin);
 
+    plan.returnArrivalMin = static_cast<int>(std::lround(elapsedMin));
     plan.totalTimeMin = elapsedMin - static_cast<double>(currentTimeMin);
     return plan;
 }

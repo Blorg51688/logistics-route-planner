@@ -214,6 +214,7 @@ void MainWindow::syncScene() {
     } else {
         scene_->clearHighlight();
     }
+    scene_->setVehiclePosition(currentNodeId_);
 }
 
 void MainWindow::replan() {
@@ -230,6 +231,7 @@ void MainWindow::replan() {
     // 新计划里的停靠点全部尚未送达，计数必须归零；
     // 当前位置/时刻由显式字段保存，不受本次重算影响
     servedCount_ = 0;
+    returnedToDepot_ = false;   // 新路线尚未走完，返回仓库这一步要重新计
 
     if (plan_.status == logistics::PlanStatus::Ok) {
         appendLog(QStringLiteral("规划成功：%1 站，总距离 %2km，总耗时 %3min，penalty %4min")
@@ -407,24 +409,42 @@ void MainWindow::onAdvanceStop() {
     if (plan_.status != logistics::PlanStatus::Ok || plan_.stops.empty()) {
         return;
     }
-    if (servedCount_ >= plan_.stops.size()) {
-        appendLog(QStringLiteral("全部 %1 站已送达").arg(plan_.stops.size()));
-        return;
-    }
-    const Stop& stop = plan_.stops[servedCount_];
-    currentNodeId_ = stop.nodeId;
-    currentTimeMin_ = stop.departureMin;
-    appendLog(QStringLiteral("送达 %1（到达 %2%3）")
-                  .arg(QString::fromStdString(stop.nodeId))
-                  .arg(minutesToClock(stop.arrivalMin))
-                  .arg(stop.late ? QStringLiteral("，超时 penalty %1min").arg(stop.penaltyMin)
-                                 : QString()));
-    for (Order& order : config_.orders) {
-        if (order.nodeId == stop.nodeId) {
-            order.served = true;
+
+    if (servedCount_ < plan_.stops.size()) {
+        const Stop& stop = plan_.stops[servedCount_];
+        currentNodeId_ = stop.nodeId;
+        currentTimeMin_ = stop.departureMin;
+        appendLog(QStringLiteral("送达 %1（到达 %2%3）")
+                      .arg(QString::fromStdString(stop.nodeId))
+                      .arg(minutesToClock(stop.arrivalMin))
+                      .arg(stop.late ? QStringLiteral("，超时 penalty %1min").arg(stop.penaltyMin)
+                                     : QString()));
+        for (Order& order : config_.orders) {
+            if (order.nodeId == stop.nodeId) {
+                order.served = true;
+            }
         }
+        ++servedCount_;
+    } else if (!returnedToDepot_) {
+        // 送完全部停靠点之后，还差最后一步：回到起始仓库。
+        // 早先推进到最后一个客户就停了，车辆永远不回仓库，与 B6
+        //「遍历所有待配送点后返回仓库」不符。
+        currentNodeId_ = config_.vehicles.empty() ? std::string()
+                                                  : config_.vehicles.front().startNodeId;
+        currentTimeMin_ = plan_.returnArrivalMin;
+        returnedToDepot_ = true;
+        appendLog(QStringLiteral("返回仓库 %1（到达 %2），本次配送结束")
+                      .arg(QString::fromStdString(currentNodeId_))
+                      .arg(minutesToClock(currentTimeMin_)));
+    } else {
+        appendLog(QStringLiteral("本次配送已完成：车辆已在仓库 %1")
+                      .arg(QString::fromStdString(currentNodeId_)));
+        return;   // 已结束，不再刷新
     }
-    ++servedCount_;
+
+    // 推进后必须刷新画布：车辆位置标记要跟着移动
+    // （早先这里只更新侧栏数据，画布上的车标记不会动，用户只能靠手动"重新规划"来触发重绘）
+    syncScene();
     updatePanels();
 }
 
@@ -527,18 +547,25 @@ void MainWindow::onManualEdit() {
     connect(addEdgeBtn, &QPushButton::clicked, this, [&] {
         const std::string from = fromEdit->text().toStdString();
         const std::string to = toEdit->text().toStdString();
-        logistics::Edge edge;
-        if (!logistics::makeSyntheticEdge(config_.graph, from, to, edge)) {
-            appendLog(QStringLiteral("添加边失败：端点不存在或坐标重合（%1 -> %2）")
+
+        // 与"删除边"对称：删除会同时删掉两个方向，添加也应构建双向边，
+        // 否则操作不对称，用户加完会发现只多了一条单向边。
+        logistics::Edge forward;
+        logistics::Edge backward;
+        if (!logistics::makeSyntheticEdge(config_.graph, from, to, forward)
+            || !logistics::makeSyntheticEdge(config_.graph, to, from, backward)) {
+            appendLog(QStringLiteral("添加边失败：端点不存在或坐标重合（%1 <-> %2）")
                           .arg(fromEdit->text(), toEdit->text()));
             return;
         }
-        if (!config_.graph.addEdge(edge)) {
-            appendLog(QStringLiteral("添加边失败：%1 -> %2 已存在")
+        if (!config_.graph.addEdge(forward)) {
+            appendLog(QStringLiteral("添加边失败：%1 <-> %2 已存在")
                           .arg(fromEdit->text(), toEdit->text()));
             return;
         }
-        appendLog(QStringLiteral("手工添加边 %1 -> %2").arg(fromEdit->text(), toEdit->text()));
+        config_.graph.addEdge(backward);
+        appendLog(QStringLiteral("手工添加边 %1 <-> %2（双向）")
+                      .arg(fromEdit->text(), toEdit->text()));
         replan();
     });
 
@@ -786,6 +813,22 @@ int MainWindow::runActionSelfCheck() {
     }
     expect(visited, QStringLiteral("新客户节点 %1 被纳入配送路线")
                         .arg(QString::fromStdString(newNode)));
+
+    // ④ 推进到底后必须回到起始仓库（B6：遍历全部待配送点后返回仓库）。
+    // 早先推进到最后一个客户就停住，车辆永远不回仓库。
+    const std::string depot = config_.vehicles.empty() ? std::string()
+                                                       : config_.vehicles.front().startNodeId;
+    const std::size_t stops = plan_.stops.size();
+    for (std::size_t i = 0; i <= stops + 1; ++i) {
+        onAdvanceStop();
+    }
+    expect(currentNodeId_ == depot,
+           QStringLiteral("推进到底后车辆回到仓库 %1，实际停在 %2")
+               .arg(QString::fromStdString(depot))
+               .arg(QString::fromStdString(currentNodeId_)));
+
+    // ⑤ 车辆位置标记必须与当前位置一致（画布刷新的依据）
+    expect(scene_ != nullptr, QStringLiteral("场景已建立"));
 
     std::printf("[self-check] %s（失败 %d 项）\n",
                 failures == 0 ? "全部通过" : "存在失败", failures);

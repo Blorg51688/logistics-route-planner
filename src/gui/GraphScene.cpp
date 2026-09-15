@@ -70,6 +70,12 @@ void GraphScene::clearHighlight() {
     highlightRoute({});
 }
 
+void GraphScene::setVehiclePosition(const std::string& nodeId) {
+    for (NodeItem* node : nodes_) {
+        node->setVehicleHere(node->nodeId() == nodeId);
+    }
+}
+
 void GraphScene::setAllLabelsVisible(bool on) {
     allLabelsVisible_ = on;
     refreshLabelVisibility();

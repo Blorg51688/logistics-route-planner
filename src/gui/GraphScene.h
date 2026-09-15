@@ -27,6 +27,9 @@ public:
     void highlightRoute(const std::vector<std::string>& routeNodes);
     void clearHighlight();
 
+    // 标记车辆当前所在节点（空串表示不标记任何节点）
+    void setVehiclePosition(const std::string& nodeId);
+
     // 是否让全部边都显示权重标签（默认只在被高亮的边上显示，避免密集网络互相遮挡）
     void setAllLabelsVisible(bool on);
     bool allLabelsVisible() const { return allLabelsVisible_; }

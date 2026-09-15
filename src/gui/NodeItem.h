@@ -23,6 +23,9 @@ public:
 
     void addEdge(EdgeItem* edge);
 
+    // 标记"车辆当前所在节点"，用区别于节点类型色与路径高亮色的环表示
+    void setVehicleHere(bool on);
+
     QRectF boundingRect() const override;
     QPainterPath shape() const override;
     void paint(QPainter* painter, const QStyleOptionGraphicsItem* option,
@@ -36,4 +39,5 @@ public:
 private:
     logistics::Node node_;
     std::vector<EdgeItem*> edges_;
+    bool vehicleHere_ = false;
 };

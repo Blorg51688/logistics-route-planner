@@ -33,6 +33,7 @@ struct Options {
     std::string            dumpGraph;      // "" / "list" / "matrix" / "both"
     bool                   uiProbe = false;
     bool                   selfCheckActions = false;
+    std::string            planSummary;      // "" / "distance" / "cost"
     int                    demoRounds = 0;
     std::string            planStrategy;   // 空表示不高亮任何路线
     bool                   allLabels = false;
@@ -79,6 +80,7 @@ void usage() {
         "  --dump-graph [list|matrix|both]  输出邻接表 / 邻接矩阵后退出（B3）\n"
         "  --ui-probe                 检查工具栏与侧栏是否完整构造后退出\n"
         "  --self-check-actions       自动验证插单不丢单 / 新客户会被配送后退出\n"
+        "  --plan-summary distance|cost  打印该策略的规划汇总后退出（供人工测试核对）\n"
         "  --width N --height N       窗口/图像尺寸\n");
 }
 
@@ -106,6 +108,8 @@ int main(int argc, char** argv) {
             opt.uiProbe = true;
         } else if (flag == "--self-check-actions") {
             opt.selfCheckActions = true;
+        } else if (flag == "--plan-summary") {
+            takeNext(opt.planSummary);
         } else if (flag == "--dump-graph") {
             // 值可省略；省略时取 both
             if (i + 1 < args.size() && !args[i + 1].startsWith(QStringLiteral("--"))) {
@@ -168,6 +172,32 @@ int main(int argc, char** argv) {
 
     // B3：把图的两种文本表示打印出来。此前这两个函数只有测试在调用，
     // 程序没有任何入口能让人看到，验收时无法展示。
+    // 供人工测试向导取用：把规划的汇总值打出来，向导据此显示"应看到什么"，
+    // 这样数据集调整后向导的期望值不会过期
+    if (!opt.planSummary.empty()) {
+        logistics::WeightType planWeight = logistics::WeightType::Distance;
+        if (!parseWeight(opt.planSummary, planWeight)) {
+            std::fprintf(stderr, "未知策略: %s\n", opt.planSummary.c_str());
+            return 2;
+        }
+        if (config.vehicles.empty()) {
+            std::fprintf(stderr, "配置中没有车辆\n");
+            return 1;
+        }
+        const logistics::RoutePlan plan =
+            logistics::planRoute(config.graph, config.vehicles.front(), config.orders,
+                                 config.general.serviceTimeMin, planWeight);
+        if (plan.status != logistics::PlanStatus::Ok) {
+            std::printf("不可行：%s\n", plan.reason.c_str());
+            return 0;
+        }
+        std::printf("总距离 %.3f km | 总耗时 %.3f min | 总成本 %.3f 元 | "
+                    "总 penalty %d min | 停靠 %zu 站\n",
+                    plan.totalDistanceKm, plan.totalTimeMin, plan.totalCostYuan,
+                    plan.totalPenaltyMin, plan.stops.size());
+        return 0;
+    }
+
     if (!opt.dumpGraph.empty()) {
         if (opt.dumpGraph == "list" || opt.dumpGraph == "both") {
             std::printf("%s\n", config.graph.toAdjacencyListString().c_str());
