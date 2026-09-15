@@ -45,6 +45,8 @@ public:
     // 工具栏动作名与面板标题（供 --ui-probe，供向导检查器比对）
     QString toolbarActionTexts() const;
     QString dockTitles() const;
+    // 当前规划的趟数（供 --ui-probe 核对停靠明细的趟号）
+    int     tripCount() const;
     // 车辆信息面板的文本快照（供 --ui-probe）
     QString vehiclePanelSummary() const;
 
@@ -121,8 +123,8 @@ private:
 
     QComboBox*     strategyBox_ = nullptr;
     QComboBox*     weightBox_ = nullptr;
-    QComboBox*     debugSpeedBox_ = nullptr;
-    int            debugIntervalMs_ = 2000;
+    // Debug 模拟间隔固定 1 秒（用户要求删掉速度选择卡片以节约工具栏空间）
+    int            debugIntervalMs_ = 1000;
     // 各中转站的当前存货（跨重规划延续）
     std::map<std::string, double> stationStock_;
     QTextBrowser*  routeInfo_ = nullptr;

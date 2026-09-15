@@ -123,20 +123,6 @@ void MainWindow::buildActions() {
     bar->addAction(QStringLiteral("手工增删…"), this, &MainWindow::onManualEdit);
     bar->addAction(QStringLiteral("图表示…"), this, &MainWindow::onShowGraphTables);
 
-    debugSpeedBox_ = new QComboBox(this);
-    debugSpeedBox_->addItem(QStringLiteral("展示模式（2 秒/步）"), 2000);
-    debugSpeedBox_->addItem(QStringLiteral("快速预览（1 秒/步）"), 1000);
-    bar->addWidget(new QLabel(QStringLiteral("  Debug 速度: "), this));
-    bar->addWidget(debugSpeedBox_);
-    connect(debugSpeedBox_, &QComboBox::currentIndexChanged, this, [this] {
-        debugIntervalMs_ = debugSpeedBox_->currentData().toInt();
-        if (debugOn_) {
-            debugTimer_->start(debugIntervalMs_);
-            appendLog(QStringLiteral("Debug 速度切换为每 %1 秒一步")
-                          .arg(debugIntervalMs_ / 1000.0, 0, 'f', 0));
-        }
-    });
-
     QAction* debugAction = bar->addAction(QStringLiteral("Debug 模式"));
     debugAction->setCheckable(true);
     connect(debugAction, &QAction::toggled, this, &MainWindow::onDebugToggled);
@@ -534,17 +520,10 @@ void MainWindow::onSimulateTraffic() {
     // 增量式重规划（D22）：只把**尚未走完的那一段**交给它，
     // 它会按停靠点切段、仅重算走过被命中边的段，停靠顺序不变。
     // 多趟方案或某段重算后不可达时，它内部自动退回全量重算。
-    logistics::RoutePlan remainder;
-    logistics::Trip restTrip;
-    for (std::size_t i = nodeIndex_; i < plan_.nodes.size(); ++i) {
-        restTrip.nodes.push_back(plan_.nodes[i]);
-        restTrip.nodeArrivalMin.push_back(plan_.nodeArrivalMin[i]);
-        restTrip.nodeIsStop.push_back(plan_.nodeIsStop[i]);
-    }
-    restTrip.endNodeId = plan_.nodes.empty() ? std::string() : plan_.nodes.back();
-    remainder.nodes = restTrip.nodes;
-    remainder.nodeIsStop = restTrip.nodeIsStop;
-    remainder.trips.push_back(restTrip);
+    // 按**趟**切分剩余路线，保留真实的趟结构（逻辑在 core，可单测）。
+    // 曾经这里把整条剩余路线塞成"一趟"，结果增量重规划之后 plan_.trips 只剩 1 趟，
+    // 界面上的「第 N 趟」全变成「第 1 趟」、「共 N 趟」变成「共 1 趟」。
+    const logistics::RoutePlan remainder = logistics::sliceRemainder(plan_, nodeIndex_);
 
     const bool wasSingleTrip = (plan_.trips.size() == 1);
     plan_ = logistics::replanIncremental(config_.graph, config_.vehicles.front(),
@@ -751,10 +730,9 @@ void MainWindow::onDebugToggled(bool on) {
     appendLog(on ? QStringLiteral("Debug 模式开启：自动模拟路况 / 插单 / 推进")
                  : QStringLiteral("Debug 模式关闭"));
     if (on) {
-        // 速度由工具栏的「Debug 速度」档位决定（展示 2 秒 / 快速 1 秒）。
-        // 原先由配置的 traffic_change_interval_sec(30s) 按 10 倍速推导，
-        // 用户反馈仍太慢——Debug 模式本质是演示加速，直接给两档更直观。
-        const int intervalMs = debugIntervalMs_ > 0 ? debugIntervalMs_ : 2000;
+        // 固定 1 秒一步。原先给过「展示 2 秒 / 快速 1 秒」两档，用户要求
+        // 只留快的那一档并删掉选择卡片，以节约工具栏空间。
+        const int intervalMs = 1000;
         debugTickMs_ = intervalMs;
         debugTicks_ = 0;
         debugTimer_->start(intervalMs);
@@ -1239,6 +1217,10 @@ QString MainWindow::toolbarActionTexts() const {
     names.removeDuplicates();
     names.sort();
     return names.join(QStringLiteral(" | "));
+}
+
+int MainWindow::tripCount() const {
+    return static_cast<int>(plan_.trips.size());
 }
 
 QString MainWindow::dockTitles() const {

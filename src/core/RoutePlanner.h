@@ -152,6 +152,11 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
                                const std::vector<OnboardItem>& onboard
                                    = std::vector<OnboardItem>());
 
+// 从已规划好的 plan 中切出"尚未走完的部分"，**保留趟结构**。
+// 供增量式重规划使用：若把整条剩余路线压成一趟，增量重规划之后
+// plan.trips 会只剩 1 趟，界面上的「第 N 趟」就全变成「第 1 趟」。
+RoutePlan sliceRemainder(const RoutePlan& plan, std::size_t fromNodeIndex);
+
 // 增量式重规划（设计 §5.7 / D22）。
 // 把当前路线按**停靠点**切成若干 leg，只对"走过被路况命中的边"的那些 leg
 // 重新求最短路，其余 leg 原样复用，**停靠顺序不变**。

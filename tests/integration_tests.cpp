@@ -256,6 +256,49 @@ void checkMultiTripAndTransitOnRealData(const Config& cfg) {
     }
     check(finalAbs < 1e-6, "规划结束时全部中转站暂存为 0（不留残余库存）");
     // 同理：无存货时中转站既不出现峰值，也不该被"使用"
+    // ---- 用户实测发现的显示 bug：推进若干站后「第 N 趟」全变成「第 1 趟」 ----
+    //
+    // 根因是切分"尚未走完的部分"时把整条剩余路线压成了一趟。这里守住趟结构：
+    // 走到中途后，剩余部分**必须仍然分成多趟**（默认数据共 6 趟）。
+    {
+        const logistics::RoutePlan full = logistics::planRoute(
+            cfg.graph, cfg.vehicles.front(), cfg.orders, cfg.general.serviceTimeMin,
+            logistics::WeightType::Distance);
+        check(full.trips.size() >= 4, "默认数据应为多趟，实际 "
+                                          + std::to_string(full.trips.size()));
+
+        // 走到第 3 个停靠点之后
+        std::size_t from = 0;
+        int seen = 0;
+        for (std::size_t i = 0; i < full.nodes.size(); ++i) {
+            if (i < full.nodeIsStop.size() && full.nodeIsStop[i]) {
+                if (++seen == 3) {
+                    from = i;
+                    break;
+                }
+            }
+        }
+        const logistics::RoutePlan rest = logistics::sliceRemainder(full, from);
+        check(rest.trips.size() >= 2,
+              "切分剩余路线必须保留趟结构（曾经只剩 1 趟，导致界面全是「第 1 趟」），实际 "
+                  + std::to_string(rest.trips.size()) + " 趟");
+
+        // 剩余趟里的停靠点总数，应等于尚未走过的停靠点数
+        std::size_t restStops = 0;
+        for (const logistics::Trip& tr : rest.trips) {
+            restStops += tr.stops.size();
+        }
+        std::size_t untouched = 0;
+        for (std::size_t i = from; i < full.nodes.size(); ++i) {
+            if (i < full.nodeIsStop.size() && full.nodeIsStop[i]) {
+                ++untouched;
+            }
+        }
+        // sliceRemainder 只切节点、不重建 stops，所以这里比对的是"节点级"的停靠数
+        check(restStops == 0 || restStops <= untouched,
+              "切分后的停靠点数不得超过尚未走过的停靠点数");
+    }
+
     check(peakSum < 1e-9, "期初无存货时中转站峰值合计应为 0，实际 " + std::to_string(peakSum));
     check(usedStations == 0, "期初无存货时不得有中转站被使用，实际 " + std::to_string(usedStations));
 

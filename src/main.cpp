@@ -390,15 +390,28 @@ int main(int argc, char** argv) {
             }
             // 每一行的第一列都必须是「第 N」：趟号映射一旦坏掉，
             // 停靠明细里"余载从 0 跳回几十"就会重新变成看不懂的数字。
-            const QRegularExpression tripCell(QStringLiteral("^第 [0-9]+ \\|"));
+            const QRegularExpression tripCell(QStringLiteral("^第 ([0-9]+) \\|"));
+            QSet<int> tripNumbers;
             for (const QString& line : lines) {
-                if (!tripCell.match(line).hasMatch()) {
+                const QRegularExpressionMatch tm = tripCell.match(line);
+                if (!tm.hasMatch()) {
                     std::fprintf(stderr,
                                  "[ui-probe] 停靠明细行缺少趟号: %s\n",
                                  line.toUtf8().constData());
                     return 1;
                 }
+                tripNumbers.insert(tm.captured(1).toInt());
             }
+            // 多趟方案下，趟号列必须真的出现多个不同的趟号。
+            // 用户实测过：切分剩余路线时把整条压成一趟，会让这里全部塌成「第 1」。
+            if (window.tripCount() > 1 && tripNumbers.size() < 2) {
+                std::fprintf(stderr,
+                             "[ui-probe] 共 %d 趟，但停靠明细的趟号只有 %d 种（全塌成同一趟？）\n",
+                             window.tripCount(), int(tripNumbers.size()));
+                return 1;
+            }
+            std::printf("[ui-probe] 停靠明细趟号种类 %d 种（共 %d 趟）\n",
+                        int(tripNumbers.size()), window.tripCount());
         }
 
         std::printf("[ui-probe] 通过\n");

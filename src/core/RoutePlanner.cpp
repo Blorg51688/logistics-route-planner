@@ -805,6 +805,51 @@ Stop makeStop(const Candidate& chosen, double& elapsedMin, double serviceTimeMin
 
 } // namespace
 
+RoutePlan sliceRemainder(const RoutePlan& plan, std::size_t fromNodeIndex) {
+    RoutePlan remainder;
+    remainder.status = PlanStatus::Ok;
+    if (plan.nodes.empty() || plan.trips.empty()) {
+        return remainder;
+    }
+    const std::size_t from = (fromNodeIndex < plan.nodes.size()) ? fromNodeIndex : 0;
+
+    // 每一趟在扁平序列中的区间 [begin, end)
+    std::vector<std::size_t> tripBegin(plan.trips.size(), 0);
+    std::vector<std::size_t> tripEnd(plan.trips.size(), 0);
+    for (std::size_t i = 0; i < plan.nodeTripIndex.size(); ++i) {
+        const std::size_t t = plan.nodeTripIndex[i];
+        if (t < plan.trips.size()) {
+            if (tripEnd[t] == 0) {
+                tripBegin[t] = i;
+            }
+            tripEnd[t] = i + 1;
+        }
+    }
+    const std::size_t cur =
+        (from < plan.nodeTripIndex.size()) ? plan.nodeTripIndex[from] : 0;
+
+    for (std::size_t t = cur; t < plan.trips.size(); ++t) {
+        const std::size_t b = (t == cur && from > tripBegin[t]) ? from : tripBegin[t];
+        Trip trip;
+        for (std::size_t i = b; i < tripEnd[t] && i < plan.nodes.size(); ++i) {
+            trip.nodes.push_back(plan.nodes[i]);
+            trip.nodeArrivalMin.push_back(plan.nodeArrivalMin[i]);
+            trip.nodeIsStop.push_back(plan.nodeIsStop[i]);
+        }
+        if (trip.nodes.empty()) {
+            continue;
+        }
+        trip.endNodeId = trip.nodes.back();
+        trip.loadKg = plan.trips[t].loadKg;
+        remainder.trips.push_back(trip);
+        for (std::size_t i = 0; i < trip.nodes.size(); ++i) {
+            remainder.nodes.push_back(trip.nodes[i]);
+            remainder.nodeIsStop.push_back(trip.nodeIsStop[i]);
+        }
+    }
+    return remainder;
+}
+
 RoutePlan replanIncremental(const LogisticsGraph& graph,
                             const Vehicle& vehicle,
                             const std::vector<Order>& remainingOrders,
