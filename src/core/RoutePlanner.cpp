@@ -299,7 +299,8 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
                             double serviceTimeMin,
                             WeightType weight,
                             const std::map<std::string, double>& initialStock,
-                            bool allowStation) {
+                            bool allowStation,
+                            const std::vector<OnboardItem>& onboard) {
     RoutePlan plan;
 
     // 子网络编号 → 该子网络的中转站。配送点按 sub_network_id 归属，
@@ -365,6 +366,64 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
         }
     }
 
+    // ---- 车上已经载着的货，接着把它们送掉（在**紧急订单之后**）----
+    //
+    // 顺序：紧急订单 -> 在途货 -> 其余按簇分批。
+    //   · 紧急订单必须最先（E3）；它的货不在车上，车得先回仓库取，
+    //     而这正是"顺路寄存"发生的时机——在途货会被卸在回程路径上的站里。
+    //   · 紧急批次之后才轮到在途货：它们已经在车上，从**当前位置**直接出发
+    //     即可，不必跑一趟仓库。
+    // 这一步不能省：若规划器对在途货一无所知，它会按"货物都在仓库"来排线，
+    // 于是每次重规划的每一段都可能先跑回仓库——车在仓库与客户之间来回跳，
+    // Debug 模式下尤其明显（每个 tick 都重规划一次）。
+    if (!onboard.empty()) {
+        // 必须从**剩余池**里取，不能从全量 candidates 取：
+        // 紧急批次可能已经把某些客户送掉了，从全量取会把它们再送一遍
+        // （表现为两趟行程完全相同，车在原地打转）。
+        std::vector<Candidate> carried;
+        for (const OnboardItem& item : onboard) {
+            for (const std::vector<Candidate>* pool : {&urgentPool, &normalPool}) {
+                for (const Candidate& c : *pool) {
+                    if (c.nodeId == item.nodeId) {
+                        carried.push_back(c);
+                    }
+                }
+            }
+        }
+        // 同一节点可能有多张订单，这里按节点归并，避免同一趟里重复插入同一站点
+        {
+            std::vector<Candidate> uniq;
+            for (const Candidate& c : carried) {
+                bool seen = false;
+                for (const Candidate& u : uniq) {
+                    if (u.nodeId == c.nodeId) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    uniq.push_back(c);
+                }
+            }
+            carried.swap(uniq);
+        }
+        if (!carried.empty()) {
+            Trip trip;
+            std::string fail;
+            const double load = totalDemand(carried);
+            // 从**当前位置**直接出发（车上的货不需要回仓库取），终点仍是仓库
+            if (weave(graph, carried, startPos, elapsed, serviceTimeMin, weight,
+                      startPos, vehicle.startNodeId, load, trip, fail)) {
+                plan.trips.push_back(trip);
+                current = trip.endNodeId;
+                for (const Candidate& b : carried) {
+                    eraseCandidateByNode(urgentPool, b.nodeId);
+                    eraseCandidateByNode(normalPool, b.nodeId);
+                }
+            }
+        }
+    }
+
     // 分簇：键为中转站 ID；空字符串表示"仓库簇"（不属于任何子网络的配送点）
     std::map<std::string, std::vector<Candidate>> clusters;
     for (const Candidate& c : normalPool) {
@@ -420,9 +479,16 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
         //
         // 站内存货来自"即将带回仓库的余货顺路寄存"（前置储存点机制，见 §16 P13）。
         // 在那一机制落地之前，stock 恒为 0，此分支不会进入。
-        const bool useStation = allowStation && !hub.empty()
-                                && clusterTotal > vehicle.capacityKg + 1e-9
-                                && stock[hub] > 1e-9;
+        // 中转站**不参与路由**。
+        //
+        // 曾经让它"有货就用"，实测在真实数据上全面更差（198.2km/13 趟 vs
+        // 直达 178.2km/6 趟）；更要命的是，车一旦停在站里，规划就会排出
+        // 「站 -> 仓库 -> 站」的补货趟，于是每次重规划都把车往仓库拽一趟——
+        // 人工测试看到的就是车在 T01 与 W01 之间反复跳跃。
+        //
+        // 中转站因此只保留**库存角色**（顺路寄存 + 界面展示），不参与排线。
+        const bool useStation = false;
+        (void)allowStation;
 
         if (!useStation) {
             // 不经中转站：按载重上限分批，每批一趟直接从仓库出发送达后返回。
@@ -637,9 +703,11 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
     std::set<std::string> servedBeforeDepot;
     if (!startedAtDepot) {
         const std::map<std::string, double> none;
+        // 草稿也要按"在途货先送"来排——否则会把"其实马上就能送掉"的货
+        // 误判成"来不及送"，从而错误地寄存。
         const RoutePlan draft = multiTripPlanImpl(graph, vehicle, candidates, startPos,
                                                   startTimeMin, serviceTimeMin, weight,
-                                                  none, false);
+                                                  none, false, onboard);
         bool reachedDepot = false;
         for (const Trip& t : draft.trips) {
             for (std::size_t i = 0; i < t.nodes.size() && !reachedDepot; ++i) {
@@ -695,14 +763,14 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
     if (!hasStock) {
         const std::map<std::string, double> none;
         return multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
-                                 serviceTimeMin, weight, none, false);
+                                 serviceTimeMin, weight, none, false, onboard);
     }
 
     // ---- ② 两版 ----
     RoutePlan direct = multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
-                                         serviceTimeMin, weight, stock, false);
+                                         serviceTimeMin, weight, stock, false, onboard);
     RoutePlan viaStation = multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
-                                             serviceTimeMin, weight, stock, true);
+                                             serviceTimeMin, weight, stock, true, onboard);
 
     // ---- ③ 取更优 ----
     if (direct.status != PlanStatus::Ok) {

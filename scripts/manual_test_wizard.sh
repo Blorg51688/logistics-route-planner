@@ -281,6 +281,7 @@ resolve_stage_input() {
 }
 
 do_stage_1() {
+    stage_wanted "构建与自动检查" || return 0
     stage "构建与自动检查"
     local build_ok=1
     if cmake -S . -B build >/tmp/wizard_cmake.log 2>&1 \
@@ -333,6 +334,7 @@ do_stage_1() {
 }
 
 do_stage_2() {
+    stage_wanted "启动、界面布局、网络图与图表示" || return 0
     stage "启动、界面布局、网络图与图表示"
     say "这一关把「认界面」和「看网络图」合在一起——都是看，不必分两次启动。"
     say ""
@@ -373,6 +375,7 @@ do_stage_2() {
 }
 
 do_stage_3() {
+    stage_wanted "规划结果：路线 / 车辆 / 中转站 / 停靠明细 / 三策略 / 超时" || return 0
     stage "规划结果：路线 / 车辆 / 中转站 / 停靠明细 / 三策略 / 超时"
     say "这一关全是「看」，一口气看完六样。中途不用切回终端。"
     say ""
@@ -426,6 +429,7 @@ do_stage_3() {
 }
 
 do_stage_4() {
+    stage_wanted "画布交互与手工增删健壮性" || return 0
     stage "画布交互与手工增删健壮性"
     todo "按住任意一个绿色客户点拖动一段距离再松手"
     want "相连的边实时跟随、箭头贴在节点边界上、权重标签跟着走"
@@ -444,6 +448,7 @@ do_stage_4() {
 }
 
 do_stage_5() {
+    stage_wanted "动态事件：路况 / 增量重规划 / 紧急订单 / 新客户 / 封路" || return 0
     stage "动态事件：路况 / 增量重规划 / 紧急订单 / 新客户 / 封路"
     say "五个按钮，都在工具栏上，按顺序点。"
     say ""
@@ -484,6 +489,7 @@ do_stage_5() {
 }
 
 do_stage_6() {
+    stage_wanted "推进一站：车辆位置、当前载重与暂存随动" || return 0
     stage "推进一站：车辆位置、当前载重与暂存随动"
     todo "点几次「推进一站」，盯住画布与右侧三处"
     say ""
@@ -507,6 +513,7 @@ do_stage_6() {
 }
 
 do_stage_7() {
+    stage_wanted "Debug 模式（A1）" || return 0
     stage "Debug 模式（A1）"
     todo "勾选工具栏的「Debug 模式」"
     want "日志**每 1 秒**增长一次：自动模拟路况、偶尔插单、自动推进、偶发道路封闭"
@@ -520,6 +527,7 @@ do_stage_7() {
 }
 
 do_stage_8() {
+    stage_wanted "边界：制造不可行场景" || return 0
     stage "边界：制造不可行场景"
     todo "点「手工增删…」，在「节点 ID」填一个配送点（如 D01），点「删除节点」，关闭对话框"
     head1 "预期："

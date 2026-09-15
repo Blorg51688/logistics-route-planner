@@ -58,6 +58,22 @@ if ! grep -q "无法识别" <<<"$out"; then
     fail=1
 fi
 
+# 静态检查：每个 do_stage_N() 内部必须真的有 stage_wanted 守卫。
+# 之前"只跑一关"整个失效，就是因为 stage_wanted 函数写好了却没有任何一关调用它——
+# 光测 resolve_stage_input 是发现不了的。
+wiz="$ROOT/scripts/manual_test_wizard.sh"
+n_funcs="$(grep -cE '^do_stage_[0-9]+\(\) \{$' "$wiz")"
+n_guards="$(grep -cE '^    stage_wanted "' "$wiz")"
+if [[ "$n_funcs" != "$n_guards" ]]; then
+    echo "FAIL  关卡函数 $n_funcs 个，但带 stage_wanted 守卫的只有 $n_guards 个"
+    echo "      （守卫缺失时'只跑一关'会退化成跑完全程）"
+    fail=1
+fi
+if (( n_funcs != ${#STAGE_NAMES[@]} )); then
+    echo "FAIL  注册表 ${#STAGE_NAMES[@]} 关，但只有 $n_funcs 个关卡函数"
+    fail=1
+fi
+
 if [[ "$fail" -eq 0 ]]; then
     echo "check_wizard_stage_pick: 关卡选择逻辑正常（共 ${#STAGE_NAMES[@]} 关）"
 fi

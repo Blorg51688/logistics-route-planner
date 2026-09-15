@@ -330,14 +330,26 @@ void checkMultiTripAndTransitOnRealData(const Config& cfg) {
             }
         }
         check(stPl.status == logistics::PlanStatus::Ok, "注入存货后仍可行");
-        check(stOps > 1e-9, "每站存半个载重时，中转站被真正启用（装卸 "
-                                + std::to_string(stOps) + "kg）");
+        // 设计变更（第 13 轮）：中转站**不再参与路由**，只保留库存角色。
+        // 原因是实测它全面更差（198.2km/13 趟 vs 直达 178.2km/6 趟），
+        // 而且车一停在站里就会排出「站->仓库->站」的补货趟，
+        // 导致人工测试看到"车在仓库与站点之间反复跳跃"。
+        check(stOps < 1e-9, "中转站不参与路由（装卸应为 0），实际 "
+                                + std::to_string(stOps) + "kg");
         check(stPl.totalDistanceKm <= basePl.totalDistanceKm + 1e-6,
-              "启用中转站后总距离不得更差：" + std::to_string(stPl.totalDistanceKm)
+              "有存货时总距离也不得比无存货更差：" + std::to_string(stPl.totalDistanceKm)
                   + " vs " + std::to_string(basePl.totalDistanceKm));
         check(stPl.totalPenaltyMin <= basePl.totalPenaltyMin,
-              "启用中转站后 penalty 不得更差：" + std::to_string(stPl.totalPenaltyMin)
+              "有存货时 penalty 也不得比无存货更差："
+                  + std::to_string(stPl.totalPenaltyMin)
                   + " vs " + std::to_string(basePl.totalPenaltyMin));
+        // 存货必须原样保留在账上（作为库存），不得被抹掉
+        double keptStock = 0.0;
+        for (const logistics::TransitStock& st : stPl.transitStock) {
+            keptStock += st.finalKg;
+        }
+        check(keptStock > 1e-9, "注入的存货应保留在账上，实际 "
+                                    + std::to_string(keptStock) + "kg");
         (void)cap;
     }
 

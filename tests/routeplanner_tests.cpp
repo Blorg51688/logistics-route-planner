@@ -896,9 +896,12 @@ static void testOnboardSurplusIsBankedEnRoute() {
     auto ord = [](const char* id, const char* n) {
         logistics::Order o; o.id = id; o.nodeId = n; o.demandKg = 20.0;
         o.windowStartMin = 0; o.windowEndMin = 1440; return o; };
-    // D2 排在最后，使本趟装不下它 -> 它落在后面的批次
+    // 关键：必须有一张**货物不在车上**的紧急订单，把车先逼回仓库。
+    // 否则规划器会把在途货就地送掉（那才是对的），也就轮不到寄存。
+    logistics::Order urgent = ord("OU", "D4");
+    urgent.urgent = true;
     const std::vector<logistics::Order> rest = {ord("O1", "D1"), ord("O3", "D3"),
-                                                ord("O4", "D4"), ord("O2", "D2")};
+                                                ord("O4", "D4"), ord("O2", "D2"), urgent};
 
     // 车已到 D1，车上仍载着 D2 的 20kg
     const std::vector<logistics::OnboardItem> onboard = {{"D2", 20.0}};
