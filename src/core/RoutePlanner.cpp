@@ -801,7 +801,9 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
                             double serviceTimeMin,
                             WeightType weight,
                             const TrafficReport& report,
-                            double thresholdRatio) {
+                            double thresholdRatio,
+                            const std::map<std::string, double>& initialStock,
+                            const std::vector<OnboardItem>& onboard) {
     const std::string startPos =
         previous.nodes.empty() ? vehicle.startNodeId : previous.nodes.front();
 
@@ -810,7 +812,7 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
         || previous.nodes.size() < 2
         || previous.nodes.back() != vehicle.startNodeId) {
         return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
-                      serviceTimeMin, weight);
+                      serviceTimeMin, weight, initialStock, onboard);
     }
 
     const std::vector<Candidate> pool = buildCandidates(remainingOrders);
@@ -849,7 +851,7 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
             if (!r.found) {
                 // 该段已不可达：退回全量重算，由它给出统一的原因
                 return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
-                              serviceTimeMin, weight);
+                              serviceTimeMin, weight, initialStock, onboard);
             }
             path = r.nodes;
         } else {
@@ -880,7 +882,7 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
             const Edge* edge = graph.findEdge(path[i - 1], path[i]);
             if (edge == nullptr) {
                 return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
-                              serviceTimeMin, weight);
+                              serviceTimeMin, weight, initialStock, onboard);
             }
             elapsed += edge->timeMin;
             trip.totalDistanceKm += edge->distanceKm;
@@ -896,7 +898,7 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
         const Candidate* chosen = findCandidate(pool, path.back());
         if (chosen == nullptr) {
             return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
-                          serviceTimeMin, weight);
+                          serviceTimeMin, weight, initialStock, onboard);
         }
         const Stop stop = makeStop(*chosen, elapsed, serviceTimeMin, load);
         // 停靠节点记录实际送达时刻（等窗口开启之后）

@@ -930,6 +930,50 @@ static void testOnboardSurplusIsBankedEnRoute() {
     check(tStock <= 20.0 + 1e-6, "期末存货不得超过寄存量（不得凭空产生）");
 }
 
+// 增量重规划在全量回退时，必须把"站内存货"与"在途货"一并带走。
+// 否则这条路径上寄存与"积少成多"会静默断掉（审计时发现的缺口）。
+static void testIncrementalReplanForwardsStockAndOnboard() {
+    const logistics::LogisticsGraph g = makeTransitClusterGraph();
+    logistics::Vehicle v;
+    v.id = "V01"; v.startNodeId = "W"; v.capacityKg = 40.0; v.departTimeMin = 480;
+
+    std::vector<logistics::Order> orders;
+    for (const char* id : {"D1", "D2"}) {
+        logistics::Order o;
+        o.id = std::string("O") + id[1];
+        o.nodeId = id;
+        o.demandKg = 30.0;
+        o.windowStartMin = 0;
+        o.windowEndMin = 1440;
+        orders.push_back(o);
+    }
+
+    // 让增量重规划走上"回退到全量重算"的分支：给一条把当前路线打成不可达的报告
+    logistics::TrafficReport report;
+    logistics::TrafficChange ch;
+    ch.fromId = "T"; ch.toId = "D1";
+    ch.congested = true; ch.increaseRatio = 50.0;   // 极大增幅，逼它回退全量重算
+    report.changes.push_back(ch);
+
+    const std::map<std::string, double> stock{{"T", 30.0}};
+    const std::vector<logistics::OnboardItem> onboard{{"D2", 30.0}};
+
+    const logistics::RoutePlan base = logistics::replan(
+        g, v, orders, "W", 480, 5.0, logistics::WeightType::Distance);
+    const logistics::RoutePlan inc = logistics::replanIncremental(
+        g, v, orders, base, 480, 5.0, logistics::WeightType::Distance, report, 0.2,
+        stock, onboard);
+
+    // 只要带上了存货，期末存货就不该是 0（哪怕全量回退也不许把它丢掉）
+    double finalKg = 0.0;
+    for (const logistics::TransitStock& st : inc.transitStock) {
+        finalKg += st.finalKg;
+    }
+    check(finalKg > 1e-9,
+          "增量重规划（含全量回退）必须保留站内存货，实际期末合计 "
+              + std::to_string(finalKg) + "kg");
+}
+
 int main() {
     testSingleOrderRouteIsFullyCorrect();
     testEmptyOrdersDegeneratesToNoMovement();
@@ -952,6 +996,7 @@ int main() {
     testStationUsedOnlyWhenStockExists();
     testTransitStockNeverMakesPlanWorse();
     testOnboardSurplusIsBankedEnRoute();
+    testIncrementalReplanForwardsStockAndOnboard();
 
     return testutil::summarize("routeplanner_tests");
 }

@@ -542,7 +542,8 @@ void MainWindow::onSimulateTraffic() {
     plan_ = logistics::replanIncremental(config_.graph, config_.vehicles.front(),
                                          remainingOrders(), remainder, currentTimeMin(),
                                          config_.general.serviceTimeMin, planWeight_,
-                                         report, config_.general.trafficTimeIncreaseMin);
+                                         report, config_.general.trafficTimeIncreaseMin,
+                                         stationStock_, onboardGoods());
     syncStationStock();
     // 新路线的起点就是车辆当前位置，推进游标归零
     nodeIndex_ = 0;

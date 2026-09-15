@@ -165,7 +165,14 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
                             double serviceTimeMin,
                             WeightType weight,
                             const TrafficReport& report,
-                            double thresholdRatio);
+                            double thresholdRatio,
+                            // 与 replan 保持一致：回退到全量重算时，
+                            // 站内存货与在途货必须一并带上，否则"顺路寄存"与
+                            // "积少成多"的回路会在这条路径上断掉。
+                            const std::map<std::string, double>& initialStock
+                                = std::map<std::string, double>(),
+                            const std::vector<OnboardItem>& onboard
+                                = std::vector<OnboardItem>());
 
 // 判断某条有向边是否落在给定路线序列的**相邻两站**之间。
 // GUI 的路径高亮与路况重规划的触发判定共用这一条逻辑。
