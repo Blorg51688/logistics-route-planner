@@ -974,6 +974,66 @@ static void testIncrementalReplanForwardsStockAndOnboard() {
               + std::to_string(finalKg) + "kg");
 }
 
+// 车**还在仓库没出发**时车上没有任何货。此时若调用方错误地传了"在途货"
+// （例如把第一趟待装的货当成在途货），规划器必须忽略，不得给从未装过车的货
+// 记上站内存货——那会让同一批货既被送达、又被记成站里有货。
+//
+// 注意断言的是"有没有动用中转站"，而不是期末存货：虚增的存货若被"用站版"
+// 消耗掉，期末同样是 0，从 finalKg 看不出来（这一点是构造测试时才发现的）。
+static void testNoBankingWhenStillAtDepot() {
+    logistics::LogisticsGraph g;
+    auto mk = [](const char* id, logistics::NodeType t, double x, double y, int sub) {
+        logistics::Node n; n.id = id; n.type = t; n.x = x; n.y = y; n.subNetworkId = sub;
+        return n; };
+    g.addNode(mk("W", logistics::NodeType::Warehouse, 0, 0, 0));
+    g.addNode(mk("T", logistics::NodeType::Transit, 10, 0, 1));
+    g.addNode(mk("D1", logistics::NodeType::Delivery, 11, 0, 1));
+    g.addNode(mk("D2", logistics::NodeType::Delivery, 12, 0, 1));
+    auto link = [&g](const char* a, const char* b, double d) {
+        logistics::Edge e; e.fromId = a; e.toId = b;
+        e.distanceKm = d; e.timeMin = d; e.costYuan = d; e.baseTimeMin = d;
+        g.addEdge(e); e.fromId = b; e.toId = a; g.addEdge(e); };
+    link("W", "T", 10); link("T", "D1", 1); link("D1", "D2", 1);
+
+    logistics::Vehicle v;
+    v.id = "V01"; v.startNodeId = "W"; v.capacityKg = 50.0; v.departTimeMin = 480;
+
+    std::vector<logistics::Order> orders;
+    for (const char* id : {"D1", "D2"}) {
+        logistics::Order o;
+        o.id = std::string("O") + id[1];
+        o.nodeId = id;
+        o.demandKg = 30.0;
+        o.windowStartMin = 0;
+        o.windowEndMin = 1440;
+        orders.push_back(o);
+    }
+
+    const std::map<std::string, double> noStock;
+    const std::vector<logistics::OnboardItem> bogus{{"D1", 30.0}};   // 尚未装车
+    const logistics::RoutePlan p =
+        logistics::replan(g, v, orders, "W", 480, 5.0, logistics::WeightType::Distance,
+                          noStock, bogus);
+
+    double stationOps = 0.0;
+    for (const logistics::Trip& t : p.trips) {
+        for (const logistics::TransitOp& op : t.transitOps) {
+            stationOps += std::fabs(op.amountKg);
+        }
+    }
+    check(stationOps < 1e-9,
+          "车未出发时不得动用中转站（否则等于给从未装过的货记了存货），实际装卸 "
+              + std::to_string(stationOps) + "kg");
+    // 期末存货同样必须是 0：虚增的存货即使没被本趟用掉，也会留在账上
+    double phantom = 0.0;
+    for (const logistics::TransitStock& st : p.transitStock) {
+        phantom += st.finalKg;
+    }
+    check(phantom < 1e-9,
+          "车未出发时不得在站里留下存货，实际 " + std::to_string(phantom) + "kg");
+    check(p.status == logistics::PlanStatus::Ok, "该情形下仍应规划成功");
+}
+
 int main() {
     testSingleOrderRouteIsFullyCorrect();
     testEmptyOrdersDegeneratesToNoMovement();
@@ -997,6 +1057,7 @@ int main() {
     testTransitStockNeverMakesPlanWorse();
     testOnboardSurplusIsBankedEnRoute();
     testIncrementalReplanForwardsStockAndOnboard();
+    testNoBankingWhenStillAtDepot();
 
     return testutil::summarize("routeplanner_tests");
 }

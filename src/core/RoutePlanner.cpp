@@ -630,8 +630,12 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
     // 先空跑一版，看看哪些在途货**来不及在本次回仓库前送掉**——
     // 只有那部分才会被白带回仓库，也才是可寄存的。
     // （把全部在途货都寄存是错的：车马上要送掉的那些不该卸下来。）
+    // 车如果还在仓库没出发，车上就没有任何货 —— 此时传进来的"在途货"
+    // 只能是"待装载的第一批"，直接忽略，否则会给从未装过的货记上存货。
+    const bool startedAtDepot = (startPos == vehicle.startNodeId);
+
     std::set<std::string> servedBeforeDepot;
-    {
+    if (!startedAtDepot) {
         const std::map<std::string, double> none;
         const RoutePlan draft = multiTripPlanImpl(graph, vehicle, candidates, startPos,
                                                   startTimeMin, serviceTimeMin, weight,
@@ -655,8 +659,9 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
     std::map<std::string, double> stock = initialStock;
     const PathResult toDepot = shortestPath(graph, startPos, vehicle.startNodeId, weight);
     for (const OnboardItem& item : onboard) {
-        if (item.kg <= 1e-9 || servedBeforeDepot.count(item.nodeId) > 0) {
-            continue;   // 本次会先送掉，不必寄存
+        if (startedAtDepot || item.kg <= 1e-9
+            || servedBeforeDepot.count(item.nodeId) > 0) {
+            continue;   // 未出发则无在途货；本次会先送掉的也不必寄存
         }
         const Node* node = graph.findNode(item.nodeId);
         if (node == nullptr) {

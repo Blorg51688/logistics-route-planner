@@ -328,6 +328,11 @@ double MainWindow::currentLoadKg() const {
 
 std::vector<logistics::OnboardItem> MainWindow::onboardGoods() const {
     std::vector<logistics::OnboardItem> items;
+    // 车还在仓库（尚未出发）时车上没有货——此时若把"第一趟待装的货"当成在途货，
+    // 会给从未装过车的货记上站内存货。
+    if (!config_.vehicles.empty() && currentNodeId_ == config_.vehicles.front().startNodeId) {
+        return items;
+    }
     if (plan_.nodes.empty() || plan_.trips.empty()
         || nodeIndex_ >= plan_.nodeTripIndex.size()) {
         return items;
