@@ -380,8 +380,26 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "[ui-probe] 停靠明细面板为空\n");
             return 1;
         }
-        std::printf("[ui-probe] 停靠明细 %zu 行（配送点|原始到达|等待|送达|离开|剩余载重）\n",
-                    stopRows);
+        std::printf("[ui-probe] 停靠明细 %zu 行"
+                    "（趟|配送点|原始到达|等待(分)|送达|离开|送后余载(kg)）\n", stopRows);
+        // 打前几行实际数值：这是"数值对不对"的核对依据，光有行数不够
+        {
+            const QStringList lines = stopPanel.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+            for (int i = 0; i < lines.size() && i < 3; ++i) {
+                std::printf("[ui-probe]   %s\n", lines[i].toUtf8().constData());
+            }
+            // 每一行的第一列都必须是「第 N」：趟号映射一旦坏掉，
+            // 停靠明细里"余载从 0 跳回几十"就会重新变成看不懂的数字。
+            const QRegularExpression tripCell(QStringLiteral("^第 [0-9]+ \\|"));
+            for (const QString& line : lines) {
+                if (!tripCell.match(line).hasMatch()) {
+                    std::fprintf(stderr,
+                                 "[ui-probe] 停靠明细行缺少趟号: %s\n",
+                                 line.toUtf8().constData());
+                    return 1;
+                }
+            }
+        }
 
         std::printf("[ui-probe] 通过\n");
         return 0;

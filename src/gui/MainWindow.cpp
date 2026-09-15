@@ -194,10 +194,13 @@ void MainWindow::buildDocks() {
     // 报告要求【需求分析】⑵ 也要求呈现"到达时间"，而"等待"能解释早到的影响。
     auto* stopDock = new QDockWidget(QStringLiteral("停靠明细"), this);
     stopDock->setMinimumWidth(360);
-    stopTable_ = new QTableWidget(0, 6, stopDock);
+    // 列里必须有「趟」：停靠明细是**跨趟拉平**的，不加这一列的话
+    // "剩余载重"会从 0 跳回几十公斤，看起来像数据错了，其实是新的一趟开始装货。
+    stopTable_ = new QTableWidget(0, 7, stopDock);
     stopTable_->setHorizontalHeaderLabels(
-        {QStringLiteral("配送点"), QStringLiteral("原始到达"), QStringLiteral("等待"),
-         QStringLiteral("送达"), QStringLiteral("离开"), QStringLiteral("剩余载重")});
+        {QStringLiteral("趟"), QStringLiteral("配送点"), QStringLiteral("原始到达"),
+         QStringLiteral("等待(分)"), QStringLiteral("送达"), QStringLiteral("离开"),
+         QStringLiteral("送后余载(kg)")});
     stopTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     stopTable_->horizontalHeader()->setStretchLastSection(true);
     stopTable_->verticalHeader()->setVisible(false);
@@ -979,14 +982,26 @@ void MainWindow::updatePanels() {
             route += QStringLiteral("\n各趟：\n");
             for (std::size_t i = 0; i < plan_.trips.size(); ++i) {
                 const logistics::Trip& trip = plan_.trips[i];
-                route += QStringLiteral("  第 %1 趟：%2 → %3（%4 节点，%5km）\n")
+                // 直达分批下每趟都从仓库出发、回仓库，"起点 → 终点"两个端点
+                // 全是 W01，毫无信息量。改为显示**本趟服务了哪些配送点**。
+                QString range;
+                if (!trip.stops.empty()) {
+                    range = QStringLiteral("%1 个配送点  %2 → %3")
+                                .arg(trip.stops.size())
+                                .arg(QString::fromStdString(trip.stops.front().nodeId))
+                                .arg(QString::fromStdString(trip.stops.back().nodeId));
+                } else {
+                    range = QStringLiteral("无配送点（%1 → %2）")
+                                .arg(QString::fromStdString(trip.nodes.empty()
+                                                                ? std::string()
+                                                                : trip.nodes.front()))
+                                .arg(QString::fromStdString(trip.endNodeId));
+                }
+                route += QStringLiteral("  第 %1 趟：%2  %3km  装载 %4kg\n")
                              .arg(i + 1)
-                             .arg(QString::fromStdString(trip.nodes.empty()
-                                                             ? std::string()
-                                                             : trip.nodes.front()))
-                             .arg(QString::fromStdString(trip.endNodeId))
-                             .arg(trip.nodes.size())
-                             .arg(trip.totalDistanceKm, 0, 'f', 1);
+                             .arg(range)
+                             .arg(trip.totalDistanceKm, 0, 'f', 1)
+                             .arg(trip.loadKg, 0, 'f', 0);
                 for (const logistics::TransitOp& op : trip.transitOps) {
                     route += QStringLiteral("    %1 %2 %3kg\n")
                                  .arg(op.amountKg >= 0.0 ? QStringLiteral("入库暂存")
@@ -1081,15 +1096,28 @@ void MainWindow::updatePanels() {
     }
 
     // 停靠明细（顺序与 plan_.stops 一致，即服务顺序）
+    // 先算出每个停靠点属于第几趟：trips 里的 stops 顺序拼接即为 plan_.stops
+    std::vector<int> stopTrip(plan_.stops.size(), 0);
+    {
+        std::size_t si = 0;
+        for (std::size_t t = 0; t < plan_.trips.size(); ++t) {
+            for (std::size_t k = 0;
+                 k < plan_.trips[t].stops.size() && si < stopTrip.size(); ++k) {
+                stopTrip[si++] = static_cast<int>(t + 1);
+            }
+        }
+    }
     stopTable_->setRowCount(static_cast<int>(plan_.stops.size()));
     for (int i = 0; i < static_cast<int>(plan_.stops.size()); ++i) {
         const Stop& s = plan_.stops[static_cast<std::size_t>(i)];
-        stopTable_->setItem(i, 0, new QTableWidgetItem(QString::fromStdString(s.nodeId)));
-        stopTable_->setItem(i, 1, new QTableWidgetItem(minutesToClock(s.rawArrivalMin)));
-        stopTable_->setItem(i, 2, new QTableWidgetItem(QString::number(s.waitMin) + QStringLiteral(" 分")));
-        stopTable_->setItem(i, 3, new QTableWidgetItem(minutesToClock(s.arrivalMin)));
-        stopTable_->setItem(i, 4, new QTableWidgetItem(minutesToClock(s.departureMin)));
-        stopTable_->setItem(i, 5, new QTableWidgetItem(QString::number(s.remainingLoadKg, 'f', 0) + QStringLiteral(" kg")));
+        stopTable_->setItem(i, 0, new QTableWidgetItem(
+            QStringLiteral("第 %1").arg(stopTrip[static_cast<std::size_t>(i)])));
+        stopTable_->setItem(i, 1, new QTableWidgetItem(QString::fromStdString(s.nodeId)));
+        stopTable_->setItem(i, 2, new QTableWidgetItem(minutesToClock(s.rawArrivalMin)));
+        stopTable_->setItem(i, 3, new QTableWidgetItem(QString::number(s.waitMin)));
+        stopTable_->setItem(i, 4, new QTableWidgetItem(minutesToClock(s.arrivalMin)));
+        stopTable_->setItem(i, 5, new QTableWidgetItem(minutesToClock(s.departureMin)));
+        stopTable_->setItem(i, 6, new QTableWidgetItem(QString::number(s.remainingLoadKg, 'f', 0)));
     }
 
     // 中转站 / 集散：子网络标识 + 下属配送点数 + 暂存货量
