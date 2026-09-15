@@ -795,13 +795,76 @@ static void testStationUsedOnlyWhenStockExists() {
     check(a.status == logistics::PlanStatus::Ok && b.status == logistics::PlanStatus::Ok,
           "有无期初存货都应规划成功");
     check(std::fabs(stationOps(a)) < 1e-9, "期初无存货：中转站装卸为 0，完全绕开");
-    check(stationOps(b) > 1e-9, "期初有 30kg：中转站被当前置仓库使用，装卸 "
-                                + std::to_string(stationOps(b)) + "kg");
+    // 期初**有**存货时不强制要求被使用：规划会把"用站版"与"直达版"都算出来取更优者，
+    // 若这一情形下用站并不更优，就会退回直达版（这正是"绝不更差"的构造保证）。
+    // 因此这里断言的是"结果不更差"，而不是"一定被使用"；
+    // "确实会被使用"的正面用例由集成测试在真实数据上覆盖。
+    check(b.status == logistics::PlanStatus::Ok, "期初有存货时仍可行");
+    check(b.totalDistanceKm <= a.totalDistanceKm + 1e-6
+              && b.totalPenaltyMin <= a.totalPenaltyMin,
+          "期初有存货时结果不得更差（装卸 " + std::to_string(stationOps(b)) + "kg）");
 
     // 存货守恒：用掉的不超过期初 + 卸入，期末余量非负
     for (const logistics::TransitStock& st : b.transitStock) {
         check(st.finalKg >= -1e-9, "期末暂存非负: " + st.nodeId);
         check(st.peakKg >= st.finalKg - 1e-9, "峰值不小于期末值: " + st.nodeId);
+    }
+}
+
+// 守住用户第 9 轮定的性质：**中转站绝不会让结果更差**。
+// 该性质不是靠推理保证，而是靠"把直达版与用站版都算出来、取更优者"构造保证的；
+// 这条测试就是它的守卫——注入任意存货量，结果都不许比无存货时差。
+static void testTransitStockNeverMakesPlanWorse() {
+    const logistics::LogisticsGraph g = makeTransitClusterGraph();
+    logistics::Vehicle v;
+    v.id = "V01";
+    v.startNodeId = "W";
+    v.capacityKg = 40.0;
+    v.departTimeMin = 480;
+
+    std::vector<logistics::Order> orders;
+    for (const char* id : {"D1", "D2"}) {
+        logistics::Order o;
+        o.id = std::string("O") + id[1];
+        o.nodeId = id;
+        o.demandKg = 30.0;
+        o.windowStartMin = 540;
+        o.windowEndMin = 1080;
+        orders.push_back(o);
+    }
+
+    const logistics::WeightType weights[] = {logistics::WeightType::Distance,
+                                              logistics::WeightType::Time,
+                                              logistics::WeightType::Cost};
+    const auto objective = [](const logistics::RoutePlan& p, logistics::WeightType w) {
+        switch (w) {
+            case logistics::WeightType::Time: return p.totalTimeMin;
+            case logistics::WeightType::Cost: return p.totalCostYuan;
+            default:                          return p.totalDistanceKm;
+        }
+    };
+
+    for (logistics::WeightType w : weights) {
+        const logistics::RoutePlan base = logistics::replan(
+            g, v, orders, "W", 480, 5.0, w, std::map<std::string, double>());
+
+        // 注入从 0 到"整个载重"的各种存货量，逐个核对不许变差
+        for (double stock = 5.0; stock <= v.capacityKg; stock += 5.0) {
+            const std::map<std::string, double> st{{"T", stock}};
+            const logistics::RoutePlan p =
+                logistics::replan(g, v, orders, "W", 480, 5.0, w, st);
+            const std::string tag = "（存货 " + std::to_string(static_cast<int>(stock))
+                                    + "kg）";
+            check(p.status == logistics::PlanStatus::Ok, "注入存货后仍可行 " + tag);
+            check(objective(p, w) <= objective(base, w) + 1e-6,
+                  "注入存货后目标不得更差 " + tag + "："
+                      + std::to_string(objective(p, w)) + " vs "
+                      + std::to_string(objective(base, w)));
+            check(p.totalPenaltyMin <= base.totalPenaltyMin,
+                  "注入存货后 penalty 不得更差 " + tag + "："
+                      + std::to_string(p.totalPenaltyMin) + " vs "
+                      + std::to_string(base.totalPenaltyMin));
+        }
     }
 }
 
@@ -825,6 +888,7 @@ int main() {
     testPlanRouteEqualsReplanFromDepot();
     testIsEdgeOnRoute();
     testStationUsedOnlyWhenStockExists();
+    testTransitStockNeverMakesPlanWorse();
 
     return testutil::summarize("routeplanner_tests");
 }

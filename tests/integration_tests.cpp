@@ -258,7 +258,45 @@ void checkMultiTripAndTransitOnRealData(const Config& cfg) {
     // 同理：无存货时中转站既不出现峰值，也不该被"使用"
     check(peakSum < 1e-9, "期初无存货时中转站峰值合计应为 0，实际 " + std::to_string(peakSum));
     check(usedStations == 0, "期初无存货时不得有中转站被使用，实际 " + std::to_string(usedStations));
-    (void)usedStations;
+
+    // ---- 前置储存点机制：注入存货后应当**被启用**，且结果**更优** ----
+    //
+    // 这是"中转站有正面价值"的正面用例。规划会把"直达版"与"用站版"都算出来取更优者，
+    // 所以只有在用站确实更优时它才会被启用——下面用真实数据验证这一点成立。
+    {
+        std::map<std::string, double> stock;
+        for (const logistics::Node& n : cfg.graph.nodes()) {
+            if (n.type == logistics::NodeType::Transit) {
+                stock[n.id] = cfg.vehicles.front().capacityKg * 0.5;   // 每站存半个载重
+            }
+        }
+        const double cap = cfg.vehicles.front().capacityKg;
+        const std::map<std::string, double> noStock;
+        const logistics::RoutePlan basePl = logistics::replan(
+            cfg.graph, cfg.vehicles.front(), cfg.orders, cfg.vehicles.front().startNodeId,
+            static_cast<int>(cfg.vehicles.front().departTimeMin),
+            cfg.general.serviceTimeMin, logistics::WeightType::Distance, noStock);
+        const logistics::RoutePlan stPl = logistics::replan(
+            cfg.graph, cfg.vehicles.front(), cfg.orders, cfg.vehicles.front().startNodeId,
+            static_cast<int>(cfg.vehicles.front().departTimeMin),
+            cfg.general.serviceTimeMin, logistics::WeightType::Distance, stock);
+        double stOps = 0.0;
+        for (const logistics::Trip& tr : stPl.trips) {
+            for (const logistics::TransitOp& op : tr.transitOps) {
+                stOps += std::fabs(op.amountKg);
+            }
+        }
+        check(stPl.status == logistics::PlanStatus::Ok, "注入存货后仍可行");
+        check(stOps > 1e-9, "每站存半个载重时，中转站被真正启用（装卸 "
+                                + std::to_string(stOps) + "kg）");
+        check(stPl.totalDistanceKm <= basePl.totalDistanceKm + 1e-6,
+              "启用中转站后总距离不得更差：" + std::to_string(stPl.totalDistanceKm)
+                  + " vs " + std::to_string(basePl.totalDistanceKm));
+        check(stPl.totalPenaltyMin <= basePl.totalPenaltyMin,
+              "启用中转站后 penalty 不得更差：" + std::to_string(stPl.totalPenaltyMin)
+                  + " vs " + std::to_string(basePl.totalPenaltyMin));
+        (void)cap;
+    }
 
     // 不变量：扁平视图必须等于各趟的拼接
     std::size_t stopSum = 0;

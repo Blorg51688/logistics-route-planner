@@ -288,15 +288,17 @@ void collectTransits(const LogisticsGraph& graph, std::vector<TransitStock>& out
 }
 
 // 多趟 + 中转集散（设计 §5.6）。仅在总需求超过载重上限时进入。
-RoutePlan multiTripPlan(const LogisticsGraph& graph,
-                        const Vehicle& vehicle,
-                        const std::vector<Candidate>& candidates,
-                        const std::string& startPos,
-                        int startTimeMin,
-                        double serviceTimeMin,
-                        WeightType weight,
-                        const std::map<std::string, double>& initialStock
-                            = std::map<std::string, double>()) {
+// 多趟规划的实际实现。allowStation=false 表示**完全不允许**动用中转站
+// （用于生成"直达"对照版本）。
+RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
+                            const Vehicle& vehicle,
+                            const std::vector<Candidate>& candidates,
+                            const std::string& startPos,
+                            int startTimeMin,
+                            double serviceTimeMin,
+                            WeightType weight,
+                            const std::map<std::string, double>& initialStock,
+                            bool allowStation) {
     RoutePlan plan;
 
     // 子网络编号 → 该子网络的中转站。配送点按 sub_network_id 归属，
@@ -417,7 +419,8 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
         //
         // 站内存货来自"即将带回仓库的余货顺路寄存"（前置储存点机制，见 §16 P13）。
         // 在那一机制落地之前，stock 恒为 0，此分支不会进入。
-        const bool useStation = !hub.empty() && clusterTotal > vehicle.capacityKg + 1e-9
+        const bool useStation = allowStation && !hub.empty()
+                                && clusterTotal > vehicle.capacityKg + 1e-9
                                 && stock[hub] > 1e-9;
 
         if (!useStation) {
@@ -571,6 +574,72 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
     }
     flatten(plan, startTimeMin, elapsed);
     return plan;
+}
+
+// 按当前策略的目标比较两版方案；目标相同则比 penalty，再比趟数。
+// 用"取更优者"而不是"有货就用"，把"中转站绝不使结果更差"变成**构造性保证**：
+// 实测证明仅凭"有货就用"是会算差的（每站存满一个载重时距离 179.6 > 直达 178.2）。
+static double objectiveOf(const RoutePlan& p, WeightType weight) {
+    switch (weight) {
+        case WeightType::Time: return p.totalTimeMin;
+        case WeightType::Cost: return p.totalCostYuan;
+        default:               return p.totalDistanceKm;
+    }
+}
+
+static bool betterPlan(const RoutePlan& a, const RoutePlan& b, WeightType weight) {
+    const double oa = objectiveOf(a, weight);
+    const double ob = objectiveOf(b, weight);
+    if (std::fabs(oa - ob) > 1e-6) {
+        return oa < ob;
+    }
+    if (a.totalPenaltyMin != b.totalPenaltyMin) {
+        return a.totalPenaltyMin < b.totalPenaltyMin;
+    }
+    return a.trips.size() < b.trips.size();
+}
+
+// 多趟规划入口：先算"完全不经过中转站"的直达版；站内若有存货，
+// 再算一版"把中转站当前置仓库用"的方案，**取更优者**。
+// 没有存货时只算一版（此时两版等价），因此默认路径不受任何影响。
+RoutePlan multiTripPlan(const LogisticsGraph& graph,
+                        const Vehicle& vehicle,
+                        const std::vector<Candidate>& candidates,
+                        const std::string& startPos,
+                        int startTimeMin,
+                        double serviceTimeMin,
+                        WeightType weight,
+                        const std::map<std::string, double>& initialStock) {
+    const std::map<std::string, double> none;
+    RoutePlan direct = multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
+                                         serviceTimeMin, weight, none, false);
+
+    bool hasStock = false;
+    for (const auto& kv : initialStock) {
+        if (kv.second > 1e-9) {
+            hasStock = true;
+            break;
+        }
+    }
+    if (!hasStock) {
+        return direct;   // 站内无货：只有直达一版，行为与历史完全一致
+    }
+
+    RoutePlan viaStation = multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
+                                             serviceTimeMin, weight, initialStock, true);
+    if (direct.status != PlanStatus::Ok) {
+        return viaStation;
+    }
+    if (viaStation.status != PlanStatus::Ok) {
+        return direct;
+    }
+    // 只比"当前策略的目标"是不够的：实测"每站存满一个载重"在成本策略下
+    // 总成本略低（234.8 < 235.9），却把 penalty 从 307 推到 362、趟数 6->10。
+    // 那是"用整体变差换目标略好"，不是我们想要的，因此 penalty 更差一律退回直达版。
+    if (viaStation.totalPenaltyMin > direct.totalPenaltyMin) {
+        return direct;
+    }
+    return betterPlan(direct, viaStation, weight) ? direct : viaStation;
 }
 
 } // namespace
