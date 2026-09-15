@@ -305,6 +305,10 @@ int main(int argc, char** argv) {
         const int actions = window.toolbarActionCount();
         const int docks = window.dockCount();
         std::printf("[ui-probe] 工具栏动作 %d 个，停靠面板 %d 个\n", actions, docks);
+        // 打印实际的动作名与面板名：向导里让用户点的按钮必须真实存在，
+        // 由 check_wizard_ui_names.py 逐条比对，避免向导指示一个不存在的按钮。
+        std::printf("[ui-probe] 动作: %s\n", window.toolbarActionTexts().toUtf8().constData());
+        std::printf("[ui-probe] 面板: %s\n", window.dockTitles().toUtf8().constData());
         if (actions < 9 || docks < 5) {
             std::fprintf(stderr,
                          "[ui-probe] UI 不完整：预期至少 9 个工具栏动作、5 个停靠面板\n");

@@ -42,6 +42,9 @@ public:
     QString transitPanelSummary() const;
     // 停靠明细面板的文本快照（供 --ui-probe）
     QString stopPanelSummary() const;
+    // 工具栏动作名与面板标题（供 --ui-probe，供向导检查器比对）
+    QString toolbarActionTexts() const;
+    QString dockTitles() const;
     // 车辆信息面板的文本快照（供 --ui-probe）
     QString vehiclePanelSummary() const;
 

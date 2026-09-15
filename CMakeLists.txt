@@ -111,6 +111,10 @@ if(Qt6_FOUND)
         # "预期文案过期"已在第 3、6、7 轮反复发生，改由脚本每次守住
         add_test(NAME wizard_claims_lint
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_wizard_claims.py)
+        # 向导让用户点的界面元素必须真实存在——改名/删除/从未实现的按钮
+        # 会让用户卡住，而 bash -n 与引号检查都发现不了
+        add_test(NAME wizard_ui_names_lint
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_wizard_ui_names.py)
     endif()
 
     # UI 完整性：工具栏与侧栏必须真的被构造出来。

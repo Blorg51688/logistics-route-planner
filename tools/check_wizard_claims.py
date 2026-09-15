@@ -66,6 +66,7 @@ def facts():
         "total_demand": sum(demands.values()),
         "max_order": max(demands.values()) if demands else 0.0,
         "min_cluster": min(cluster.values()) if cluster else 0.0,
+        "max_cluster": max(cluster.values()) if cluster else 0.0,
         "subs": subs,
     }
 
@@ -74,6 +75,23 @@ def main():
     text = open(WIZARD, encoding="utf-8").read()
     f = facts()
     checks = []
+
+    def claim_all(pattern, expected, desc):
+        """检查该模式在向导里**每一处**出现都等于 expected。
+        只查第一处是不够的——同一个数字常在多处重复（如配送点数出现在
+        "绿色=配送点(25)" 与 "串起全部 25 个配送点" 两处）。"""
+        found = re.findall(pattern, text)
+        if not found:
+            checks.append((False, "%s：向导里没找到这处声明（模式 %s）" % (desc, pattern)))
+            return
+        for got in found:
+            try:
+                ok = abs(float(got) - float(expected)) < 1e-9
+                shown = "%.0f" % float(expected)
+            except (TypeError, ValueError):
+                ok = str(got) == str(expected)
+                shown = str(expected)
+            checks.append((ok, "%s：向导写的是 %s，数据实际是 %s" % (desc, got, shown)))
 
     def claim(pattern, expected, desc):
         m = re.search(pattern, text)
@@ -89,12 +107,25 @@ def main():
             shown = str(expected)
         checks.append((ok, "%s：向导写的是 %s，数据实际是 %s" % (desc, got, shown)))
 
-    claim(r"(\d+) 个节点：蓝色", f["nodes"], "节点总数")
+    claim_all(r"(\d+) 个节点", f["nodes"], "节点总数")
     claim(r"蓝色=仓库\((\d+)\)", f["warehouse"], "仓库数")
-    claim(r"绿色=配送点\((\d+)\)", f["delivery"], "配送点数")
+    claim_all(r"绿色=配送点\((\d+)\)", f["delivery"], "配送点数（图例）")
+    claim_all(r"串起全部 (\d+) 个配送点", f["delivery"], "配送点数（描述）")
+    claim_all(r"「停靠 (\d+) 站", f["delivery"], "停靠站点数")
     claim(r"橙色=中转站\((\d+)\)", f["transit"], "中转站数")
     claim(r"至少 (\d+) 条边只有一端有箭头", f["oneway"], "单向边数")
-    claim(r"载重上限 (\d+)kg", f["capacity"], "载重上限")
+    claim_all(r"载重上限 (\d+)kg", f["capacity"], "载重上限")
+    claim_all(r"剩余待送（全部未送达货量之和，(\d+)kg 量级）", int(f["total_demand"]),
+              "总需求量级")
+    # 簇货量区间是两端的整数近似，单独比
+    m = re.search(r"货量\((\d+)~(\d+)kg\)", text)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        checks.append((lo <= f["min_cluster"] and hi >= f["max_cluster"],
+                       "簇货量区间：向导写 %d~%d，实际 %.0f~%.0f"
+                       % (lo, hi, f["min_cluster"], f["max_cluster"])))
+    # "配送点(...)" 里那条多捕获组的模式要按"至少一个捕获组命中"来判
+    checks = [c for c in checks if "None" not in c[1]]
     first_sub = list(f["subs"].values())[0] if f["subs"] else {"delivery": []}
     claim(r"下属配送点 (\d+)/", len(first_sub["delivery"]), "第一个子网络的配送点数")
     # 这条没有捕获组，单独判断：向导写死了「子网络 1/2/3」

@@ -1201,6 +1201,30 @@ QString MainWindow::vehiclePanelSummary() const {
     return vehicleInfo_ != nullptr ? vehicleInfo_->text() : QString();
 }
 
+QString MainWindow::toolbarActionTexts() const {
+    QStringList names;
+    for (QAction* a : findChildren<QAction*>()) {
+        if (a != nullptr && !a->text().isEmpty() && a->isEnabled()) {
+            names << a->text();
+        }
+    }
+    names.removeDuplicates();
+    names.sort();
+    return names.join(QStringLiteral(" | "));
+}
+
+QString MainWindow::dockTitles() const {
+    QStringList names;
+    for (QDockWidget* d : findChildren<QDockWidget*>()) {
+        if (d != nullptr) {
+            names << d->windowTitle();
+        }
+    }
+    names.removeDuplicates();
+    names.sort();
+    return names.join(QStringLiteral(" | "));
+}
+
 QString MainWindow::stopPanelSummary() const {
     QString out;
     for (int row = 0; row < stopTable_->rowCount(); ++row) {
