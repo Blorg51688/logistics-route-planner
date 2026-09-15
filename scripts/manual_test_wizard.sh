@@ -354,8 +354,12 @@ main() {
     want "每条边的两端各带一个箭头（有向图；双向边两端都有箭头）"
     want "没有箭头被画进节点圆圈内部而看不见"
     say ""
-    dim "参考图：docs/screenshots/gui-network.png"
-    open_path "docs/screenshots/gui-network.png"
+    # 参考图**现场重渲染**：仓库里的静态截图会随数据变化而过期
+    # （第 6 轮第 3 关就是因为截图没更新而误报失败）
+    QT_QPA_PLATFORM=offscreen "$APP" --render build/wizard_network.png \
+        --width 1200 --height 800 >/dev/null 2>&1
+    dim "参考图：build/wizard_network.png（本次现场渲染，不会过期）"
+    open_path "build/wizard_network.png"
     pause
     ask_result "初始网络图（B1/B2/B4）"
 
@@ -377,19 +381,25 @@ main() {
     ask_result "初始规划与路径高亮（B6/B7）"
 
     # ---------------------------------------------------------------- 第 5 关
-    stage "双策略分化（B7）"
-    todo "点工具栏**最左边**那个下拉框「规划策略」，选「最低成本策略」。"
+    stage "多策略分化（B7）"
+    todo "点工具栏**最左边**那个下拉框「规划策略」，依次选三种策略观察："
+    todo "  最短距离策略 / 最低成本策略 / 最低耗时策略"
     say ""
     head1 "预期："
-    want "路由高亮发生变化（不再与最短距离策略相同）"
-    want "两者互换优劣：距离策略更短、成本策略更便宜"
+    want "切换策略后，路由高亮会变化（至少有一次明显不同）"
+    want "三种策略各自在自己的目标上占优："
+    want "  距离策略的总距离最小、成本策略的总成本最小、耗时策略的总耗时最小"
     say ""
-    head1 "两种策略的参考值："
-    printf '    最短距离策略  %s\n' "$(QT_QPA_PLATFORM=offscreen "$APP" --plan-summary distance 2>/dev/null)"
-    printf '    最低成本策略  %s\n' "$(QT_QPA_PLATFORM=offscreen "$APP" --plan-summary cost 2>/dev/null)"
+    head1 "三种策略的参考值（由程序现场算出）："
+    printf '    最短距离策略  %s\n' "$(QT_QPA_PLATFORM=offscreen "$APP" --plan-summary distance 2>/dev/null | head -1)"
+    printf '    最低成本策略  %s\n' "$(QT_QPA_PLATFORM=offscreen "$APP" --plan-summary cost 2>/dev/null | head -1)"
+    printf '    最低耗时策略  %s\n' "$(QT_QPA_PLATFORM=offscreen "$APP" --plan-summary time 2>/dev/null | head -1)"
     say ""
-    dim "对照要点：成本策略的总成本应**更小**，但总距离**更大**。"
-    dim "若两种策略给出完全一样的结果，说明数据或算法退化，属失败。"
+    dim "对照要点：成本策略的总成本应**最小**、耗时策略的总耗时应**最小**。"
+    dim "若三种策略给出完全一样的结果，说明数据或算法退化，属失败。"
+    say ""
+    dim "注意：若某两种策略的结果恰好相同，不一定是错——主干道同时是最短与最快时"
+    dim "就会重合。关键看"各自的优势指标"。"
     dim "看完请把它切回「最短距离策略」，后面几关基于它。"
     pause
     ask_result "双策略分化（B7）"
@@ -426,12 +436,14 @@ main() {
     say ""
     head1 "预期："
     want "列头为：订单 / 配送点 / 到达 / 窗口 / penalty"
-    want "只列出 2 个超时站点：D12 与 D05"
-    want "「订单」列给出该配送点上的订单号（如 O12、O05）"
-    want "「窗口」列给出该点的送达窗口（如 09:00-11:00），便于判断为什么超时"
-    want "其余 23 个站点准时 —— 超时应是**少数**、且只出现在窗口很紧的那两站"
+    want "「订单」列给出该配送点上的订单号（如 O05）"
+    want "「窗口」列给出该点的送达窗口（如 09:00-10:00），便于判断为什么超时"
+    want "超时站点应当**很少**，且只出现在窗口很紧的那些点上"
     say ""
-    dim "若大量站点都超时，说明默认数据或时间模型有问题，属失败。"
+    head1 "本次数据下的参考值（由程序自身算出，不写死）："
+    QT_QPA_PLATFORM=offscreen "$APP" --plan-summary distance 2>/dev/null | sed 's/^/    /' 
+    say ""
+    dim "若「超时订单」表里的站点与上面的参考值不一致，或大量站点都超时，属失败。"
     dim "看完可点「订单列表」标签切回去。"
     pause
     ask_result "时间窗与超时 penalty（E2）"
@@ -628,6 +640,15 @@ main() {
     stage "单向路与有向性（D18）"
     say "本关验证"有向图"确实在行为上有向。"
     say ""
+    say "先说明为什么需要重新启动：上一关用的是小载重配置，已经关掉了。"
+    if ! launch_app; then
+        record "单向路与有向性（D18）" "失败" "程序未能启动"
+        summary
+        exit 1
+    fi
+    sleep 2
+    say "${GREEN}程序已用默认配置启动。${RESET}"
+    say ""
     todo "回到画布，找一条**只有一个箭头**的边（全图共 6 条这样的单行道）"
     say ""
     head1 "预期："
@@ -655,6 +676,8 @@ main() {
     want "重规划后未受影响的那部分路线保持不变（前几个停靠点应还是原来那些）"
     pause
     ask_result "增量式重规划（D22）"
+    stop_app
+    pause
 
     # ---------------------------------------------------------------- 第 19 关
     stage "图表示输出：邻接表 / 邻接矩阵（B3）"

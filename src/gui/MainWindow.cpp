@@ -19,6 +19,7 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QTableWidget>
+#include <QTabWidget>
 #include <QTextBrowser>
 #include <QTimer>
 #include <QToolBar>
@@ -97,6 +98,7 @@ void MainWindow::buildActions() {
     strategyBox_ = new QComboBox(this);
     strategyBox_->addItem(QStringLiteral("最短距离策略"), QVariant(QStringLiteral("distance")));
     strategyBox_->addItem(QStringLiteral("最低成本策略"), QVariant(QStringLiteral("cost")));
+    strategyBox_->addItem(QStringLiteral("最低耗时策略"), QVariant(QStringLiteral("time")));
     bar->addWidget(new QLabel(QStringLiteral(" 规划策略: "), this));
     bar->addWidget(strategyBox_);
     connect(strategyBox_, &QComboBox::currentIndexChanged, this, &MainWindow::onStrategyChanged);
@@ -118,6 +120,7 @@ void MainWindow::buildActions() {
     bar->addAction(QStringLiteral("推进一站"), this, &MainWindow::onAdvanceStop);
     bar->addAction(QStringLiteral("重新规划"), this, &MainWindow::onReplan);
     bar->addAction(QStringLiteral("手工增删…"), this, &MainWindow::onManualEdit);
+    bar->addAction(QStringLiteral("图表示…"), this, &MainWindow::onShowGraphTables);
 
     QAction* debugAction = bar->addAction(QStringLiteral("Debug 模式"));
     debugAction->setCheckable(true);
@@ -213,6 +216,41 @@ int MainWindow::currentTimeMin() const {
 }
 
 // 某配送点上的全部订单号，用 / 连接（同一节点可能有多单合并成一次停靠）
+double MainWindow::stockAt(const std::string& stationId) const {
+    double stock = 0.0;
+    if (plan_.nodes.empty()) {
+        return stock;
+    }
+    const std::size_t upto = (nodeIndex_ + 1 < plan_.nodes.size()) ? nodeIndex_ + 1
+                                                                  : plan_.nodes.size();
+    for (std::size_t i = 0; i < upto; ++i) {
+        if (i >= plan_.nodeTripIndex.size()) {
+            break;
+        }
+        const std::size_t t = plan_.nodeTripIndex[i];
+        if (t >= plan_.trips.size()) {
+            continue;
+        }
+        // 同一趟里同一节点可能出现多次（如 T→D→T），装卸只按**首次到达**计一次
+        bool firstInTrip = true;
+        for (std::size_t j = 0; j < i; ++j) {
+            if (plan_.nodeTripIndex[j] == t && plan_.nodes[j] == plan_.nodes[i]) {
+                firstInTrip = false;
+                break;
+            }
+        }
+        if (!firstInTrip) {
+            continue;
+        }
+        for (const logistics::TransitOp& op : plan_.trips[t].transitOps) {
+            if (op.nodeId == stationId && plan_.nodes[i] == stationId) {
+                stock += op.amountKg;
+            }
+        }
+    }
+    return stock;
+}
+
 QString MainWindow::orderIdsAt(const std::string& nodeId) const {
     QString ids;
     for (const Order& order : config_.orders) {
@@ -263,7 +301,12 @@ void MainWindow::syncScene() {
     scene_->build(config_.graph, scene_->weightType());
     scene_->setAllLabelsVisible(false);
     if (plan_.status == logistics::PlanStatus::Ok) {
-        scene_->highlightRoute(plan_.nodes);
+        // 只高亮**尚未走完**的那一段：已走过的路段继续标红会让人误以为还没送到
+        const std::size_t from = (nodeIndex_ < plan_.nodes.size()) ? nodeIndex_ : 0;
+        const std::vector<std::string> remaining(plan_.nodes.begin()
+                                                     + static_cast<std::ptrdiff_t>(from),
+                                                 plan_.nodes.end());
+        scene_->highlightRoute(remaining);
     } else {
         scene_->clearHighlight();
     }
@@ -299,9 +342,11 @@ void MainWindow::replan() {
 }
 
 void MainWindow::onStrategyChanged() {
-    planWeight_ = (strategyBox_->currentData().toString() == QStringLiteral("cost"))
+    const QString strategy = strategyBox_->currentData().toString();
+    planWeight_ = (strategy == QStringLiteral("cost"))
                       ? WeightType::Cost
-                      : WeightType::Distance;
+                      : (strategy == QStringLiteral("time") ? WeightType::Time
+                                                            : WeightType::Distance);
     nodeIndex_ = 0;
     stopCursor_ = 0;
     appendLog(QStringLiteral("切换规划策略 -> %1").arg(strategyBox_->currentText()));
@@ -613,7 +658,88 @@ void MainWindow::onDebugTick() {
     if (debugTicks_ % ticksPerUrgent == 0 && pendingUrgent < kMaxPendingUrgent) {
         insertUrgentOrderAction();
     }
+
+    // 道路封闭也纳入自动模拟，但**概率压得很低**：它每次都会改动图结构，
+    // 连续发生会大幅破坏网络、让演示失去可读性。每 20 个 tick 最多一次。
+    if (++debugClosureCounter_ >= 20) {
+        debugClosureCounter_ = 0;
+        onCloseRandomRoad();
+    }
     onAdvanceStop();
+}
+
+// 邻接表 / 邻接矩阵的**表格**展示（B3 修订）。
+// 原先只有命令行打印的文本文件，用户反馈"不够直观"——这里用真正的表格呈现。
+void MainWindow::onShowGraphTables() {
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("图的表示（邻接表 / 邻接矩阵）"));
+    dialog.resize(1100, 720);
+
+    const std::vector<logistics::Node>& nodes = config_.graph.nodes();
+    const int n = static_cast<int>(nodes.size());
+    auto* tabs = new QTabWidget(&dialog);
+
+    // ---- 邻接表：每个节点一行，列出其全部出边
+    auto* listTable = new QTableWidget(n, 3, tabs);
+    listTable->setHorizontalHeaderLabels({QStringLiteral("节点"), QStringLiteral("类型"),
+                                          QStringLiteral("出边  目标(距离km/耗时min/成本元)")});
+    for (int i = 0; i < n; ++i) {
+        const logistics::Node& node = nodes[static_cast<std::size_t>(i)];
+        listTable->setItem(i, 0, new QTableWidgetItem(QString::fromStdString(node.id)));
+        listTable->setItem(i, 1, new QTableWidgetItem(typeText(node.type)));
+        QString out;
+        for (const logistics::Edge& e : config_.graph.outEdges(node.id)) {
+            if (!out.isEmpty()) {
+                out += QStringLiteral("   ");
+            }
+            out += QString::fromStdString(e.toId) + QStringLiteral("(")
+                   + QString::number(e.distanceKm, 'f', 1) + QStringLiteral("/")
+                   + QString::number(e.timeMin, 'f', 1) + QStringLiteral("/")
+                   + QString::number(e.costYuan, 'f', 1) + QStringLiteral(")")
+                   + (e.congested ? QStringLiteral("[堵]") : QString());
+        }
+        listTable->setItem(i, 2, new QTableWidgetItem(out));
+    }
+    listTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    listTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    listTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
+    listTable->verticalHeader()->setVisible(false);
+    listTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    tabs->addTab(listTable, QStringLiteral("邻接表"));
+
+    // ---- 邻接矩阵：真正的 N x N 表格
+    auto* matrixTable = new QTableWidget(n, n + 1, tabs);
+    QStringList headers;
+    headers << QStringLiteral("ID");
+    for (const logistics::Node& node : nodes) {
+        headers << QString::fromStdString(node.id);
+    }
+    matrixTable->setHorizontalHeaderLabels(headers);
+    for (int r = 0; r < n; ++r) {
+        const logistics::Node& row = nodes[static_cast<std::size_t>(r)];
+        matrixTable->setItem(r, 0, new QTableWidgetItem(QString::fromStdString(row.id)));
+        for (int c = 0; c < n; ++c) {
+            const logistics::Node& col = nodes[static_cast<std::size_t>(c)];
+            const logistics::Edge* e = config_.graph.findEdge(row.id, col.id);
+            const QString text =
+                (e == nullptr)
+                    ? QStringLiteral("-")
+                    : QString::number(logistics::pickWeight(e->distanceKm, e->timeMin,
+                                                            e->costYuan, scene_->weightType()),
+                                      'f', 1);
+            matrixTable->setItem(r, c + 1, new QTableWidgetItem(text));
+        }
+    }
+    matrixTable->verticalHeader()->setVisible(false);
+    matrixTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    tabs->addTab(matrixTable, QStringLiteral("邻接矩阵"));
+
+    auto* layout = new QVBoxLayout(&dialog);
+    layout->addWidget(tabs);
+    auto* box = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+    connect(box, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(box);
+    dialog.exec();
 }
 
 void MainWindow::onManualEdit() {
@@ -822,9 +948,9 @@ void MainWindow::updatePanels() {
             for (const logistics::TransitStock& st : plan_.transitStock) {
                 if (st.nodeId == n.id) {
                     row.peak = st.peakKg;
-                    row.now = st.finalKg;
                 }
             }
+            row.now = stockAt(n.id);   // 截至当前推进位置，而不是规划终值
             rows.push_back(row);
         }
         transitTable_->setRowCount(static_cast<int>(rows.size()));

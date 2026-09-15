@@ -77,6 +77,10 @@ private:
 
     std::string        currentPositionId() const;
     QString            orderIdsAt(const std::string& nodeId) const;
+    // 某中转站**截至当前推进位置**的暂存货量（不是规划终值——终值必为 0，
+    // 那样界面上这一列永远是 0，没有观测价值）
+    double             stockAt(const std::string& stationId) const;
+    void               onShowGraphTables();
     QString            windowTextAt(const std::string& nodeId) const;
     int                currentTimeMin() const;
     std::vector<logistics::Order> remainingOrders() const;
@@ -103,6 +107,7 @@ private:
     QLabel*        vehicleInfo_ = nullptr;
     QTableWidget*  orderTable_ = nullptr;
     QTableWidget*  transitTable_ = nullptr;
+    int            debugClosureCounter_ = 0;
     QTableWidget*  lateTable_ = nullptr;
     QPlainTextEdit* logView_ = nullptr;
 

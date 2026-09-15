@@ -192,9 +192,27 @@ int main(int argc, char** argv) {
             return 0;
         }
         std::printf("总距离 %.3f km | 总耗时 %.3f min | 总成本 %.3f 元 | "
-                    "总 penalty %d min | 停靠 %zu 站\n",
+                    "总 penalty %d min | 停靠 %zu 站",
                     plan.totalDistanceKm, plan.totalTimeMin, plan.totalCostYuan,
                     plan.totalPenaltyMin, plan.stops.size());
+        if (plan.trips.size() > 1) {
+            std::printf(" | 共 %zu 趟", plan.trips.size());
+        }
+        std::printf("\n");
+
+        // 超时停靠点：向导据此显示"应看到什么"，避免把具体站点写死在脚本里
+        // （数据一改就过期，第 6 轮的第 8 关就是这么误报的）
+        std::string late;
+        for (const logistics::Stop& s : plan.stops) {
+            if (!s.late) {
+                continue;
+            }
+            if (!late.empty()) {
+                late += "、";
+            }
+            late += s.nodeId + "(+" + std::to_string(s.penaltyMin) + "min)";
+        }
+        std::printf("超时停靠点：%s\n", late.empty() ? "（无）" : late.c_str());
         return 0;
     }
 

@@ -359,6 +359,7 @@ def self_check(text):
         vehicles.append((f[0], f[1], cap, f[3]))
 
     total_demand = 0.0
+    max_single_demand = 0.0
     for row in sec["orders"]:
         f = [x.strip() for x in row.split(",")]
         if len(f) != 6:
@@ -377,11 +378,16 @@ def self_check(text):
         if ws >= we:
             problems.append("窗口起必须早于止: %s" % row)
         total_demand += demand
+        if demand > max_single_demand:
+            max_single_demand = demand
 
     if vehicles:
         cap = vehicles[0][2]
-        if total_demand > cap:
-            problems.append("总需求 %.0f > 载重 %.0f" % (total_demand, cap))
+        # D21 修订：总需求**可以**超过载重——车辆会多趟往返、经中转站暂存后二次配发。
+        # 真正不可行的是"单个订单的货量就超过载重"，那样分多少趟都装不下。
+        if max_single_demand > cap:
+            problems.append("单个订单最大货量 %.0f > 载重 %.0f（多趟也装不下）"
+                            % (max_single_demand, cap))
         # 往返可达性：有向图里"能去"不等于"能回"，B6 要求遍历后返回
         start = vehicles[0][1]
         for row in sec["orders"]:

@@ -18,3 +18,6 @@ cmake-build-*/
 
 # 系统文件
 .DS_Store
+
+# LibreOffice 打开文档时生成的锁文件
+.~lock.*#
