@@ -42,6 +42,8 @@ public:
     QString transitPanelSummary() const;
     // 停靠明细面板的文本快照（供 --ui-probe）
     QString stopPanelSummary() const;
+    // 车辆信息面板的文本快照（供 --ui-probe）
+    QString vehiclePanelSummary() const;
 
     // 供 --self-check-actions 使用：自动验证两个由人工测试发现的缺陷不再复现
     //   ① 连续插入多个紧急订单不得丢单，且它们必须整体优先于普通订单

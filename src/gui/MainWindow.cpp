@@ -888,19 +888,42 @@ void MainWindow::updatePanels() {
     routeInfo_->setPlainText(route);
 
     // 车辆信息
+    //
+    // 这里必须区分两个量（此前混为一谈，导致"载重上限 200kg / 当前载重 740kg"）：
+    //   · 本趟装载：当前这趟车上实际装的货量，不变量是 **不得超过载重上限**
+    //   · 剩余待送：全部未送达订单的货量之和，可以远超载重上限
+    //     —— 多趟模式下车辆正是一趟趟把这些货送完的
     if (!config_.vehicles.empty()) {
         const logistics::Vehicle& v = config_.vehicles.front();
-        double load = 0.0;
-        for (const Order& o : remainingOrders()) {
-            load += o.demandKg;
+
+        double tripLoad = 0.0;
+        std::size_t tripNo = 0;
+        if (!plan_.nodes.empty() && !plan_.trips.empty()) {
+            const std::size_t t = (nodeIndex_ < plan_.nodeTripIndex.size())
+                                      ? plan_.nodeTripIndex[nodeIndex_]
+                                      : 0;
+            if (t < plan_.trips.size()) {
+                tripLoad = plan_.trips[t].loadKg;
+                tripNo = t + 1;
+            }
         }
-        vehicleInfo_->setText(QStringLiteral("ID：%1\n起始仓库：%2\n载重上限：%3 kg\n"
-                                             "发车：%4\n当前载重：%5 kg")
-                                  .arg(QString::fromStdString(v.id))
-                                  .arg(QString::fromStdString(v.startNodeId))
-                                  .arg(v.capacityKg, 0, 'f', 0)
-                                  .arg(minutesToClock(v.departTimeMin))
-                                  .arg(load, 0, 'f', 0));
+
+        double remainingDemand = 0.0;
+        for (const Order& o : remainingOrders()) {
+            remainingDemand += o.demandKg;
+        }
+
+        vehicleInfo_->setText(
+            QStringLiteral("ID：%1\n起始仓库：%2\n载重上限：%3 kg\n发车：%4\n"
+                           "本趟装载：%5 kg（第 %6 / %7 趟）\n剩余待送：%8 kg")
+                .arg(QString::fromStdString(v.id))
+                .arg(QString::fromStdString(v.startNodeId))
+                .arg(v.capacityKg, 0, 'f', 0)
+                .arg(minutesToClock(v.departTimeMin))
+                .arg(tripLoad, 0, 'f', 0)
+                .arg(tripNo)
+                .arg(plan_.trips.size())
+                .arg(remainingDemand, 0, 'f', 0));
     }
 
     // 订单列表：按"未送达的紧急 → 未送达普通 → 已送达"排序。
@@ -1054,6 +1077,10 @@ QString MainWindow::transitPanelSummary() const {
         out += cells.join(QStringLiteral(" | ")) + QLatin1Char('\n');
     }
     return out;
+}
+
+QString MainWindow::vehiclePanelSummary() const {
+    return vehicleInfo_ != nullptr ? vehicleInfo_->text() : QString();
 }
 
 QString MainWindow::stopPanelSummary() const {

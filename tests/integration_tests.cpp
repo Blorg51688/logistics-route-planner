@@ -224,6 +224,21 @@ void checkMultiTripAndTransitOnRealData(const Config& cfg) {
     check(loadOk, "任一趟的在车货量都不超过载重上限");
     check(maxOp > 0.0, "中转站确有装卸记录，单次最大装卸 " + std::to_string(maxOp) + "kg");
 
+    // 本趟装载量本身也不得超过载重上限（用户手工测试发现的显示 bug 的本质：
+    // 界面曾把"剩余待送总量 740kg"当成"当前载重"显示，而载重上限只有 200kg）
+    bool tripLoadOk = true;
+    double maxTripLoad = 0.0;
+    for (const logistics::Trip& trip : plan.trips) {
+        if (trip.loadKg > small.capacityKg + 1e-9) {
+            tripLoadOk = false;
+        }
+        if (trip.loadKg > maxTripLoad) {
+            maxTripLoad = trip.loadKg;
+        }
+    }
+    check(tripLoadOk, "任一趟的装载量都不超过载重上限，最大 "
+              + std::to_string(maxTripLoad) + "kg");
+
     // 不变量：暂存终值必须为 0；峰值 > 0 说明中转站确实参与了集散
     double finalAbs = 0.0;
     double peakSum = 0.0;

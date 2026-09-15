@@ -113,6 +113,7 @@ bool weave(const LogisticsGraph& graph,
            double loadKg,
            Trip& trip,
            std::string& failReason) {
+    trip.loadKg = loadKg;
     std::string current = startPos;
     beginTrip(trip, current, elapsedMin);
 
@@ -524,6 +525,7 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
                 op.nodeId = hub;
                 op.amountKg = load;       // 入库
                 trip.transitOps.push_back(op);
+                trip.loadKg = load;       // 本趟车上装载的就是这一批
                 trip.endNodeId = hub;
                 stock[hub] += load;
                 if (stock[hub] > peak[hub]) {

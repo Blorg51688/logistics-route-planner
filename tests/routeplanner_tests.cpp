@@ -413,6 +413,10 @@ void testTotalDemandOverCapacityBecomesMultiTripViaTransit() {
                 loadOk = false;
             }
         }
+        // 本趟装载量本身也必须 <= 载重上限
+        if (trip.loadKg > v.capacityKg + 1e-9) {
+            loadOk = false;
+        }
     }
     check(loadOk, "任一趟的在车货量都不超过载重上限");
 

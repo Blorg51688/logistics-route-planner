@@ -8,6 +8,7 @@
 #include <QGraphicsView>
 #include <QImage>
 #include <QPainter>
+#include <QRegularExpression>
 #include <QStringList>
 
 #include <cstdio>
@@ -340,6 +341,29 @@ int main(int argc, char** argv) {
         const QByteArray transit = panel.toUtf8();
         std::printf("[ui-probe] 中转站面板（%s）:\n%s", "中转站|子网络|下属配送点|峰值暂存|当前暂存",
                     transit.constData());
+        // 车辆面板：断言**界面上显示的"本趟装载"**不超过载重上限。
+        // 用户手工测试发现过：面板把"剩余待送总量 740kg"当成"当前载重"显示，
+        // 而载重上限只有 200kg —— 数据层没错，是显示口径错了，所以必须查显示值本身。
+        const QString vehiclePanel = window.vehiclePanelSummary();
+        {
+            const QRegularExpression re(QStringLiteral("本趟装载：([0-9.]+) kg"));
+            const QRegularExpressionMatch match = re.match(vehiclePanel);
+            if (!match.hasMatch()) {
+                std::fprintf(stderr, "[ui-probe] 车辆面板没有\"本趟装载\"一行\n");
+                return 1;
+            }
+            const double shownLoad = match.captured(1).toDouble();
+            const double cap = config.vehicles.empty() ? 0.0 : config.vehicles.front().capacityKg;
+            if (shownLoad > cap + 1e-6) {
+                std::fprintf(stderr,
+                             "[ui-probe] 面板显示的装载量 %.1fkg 超过载重上限 %.1fkg\n",
+                             shownLoad, cap);
+                return 1;
+            }
+            std::printf("[ui-probe] 车辆面板本趟装载 %.1fkg <= 载重上限 %.1fkg\n",
+                        shownLoad, cap);
+        }
+
         // 停靠明细必须每个停靠点一行（这些字段此前只有测试在读，界面上看不到）
         const QString stopPanel = window.stopPanelSummary();
         const std::size_t stopRows =

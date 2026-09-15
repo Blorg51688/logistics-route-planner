@@ -48,6 +48,9 @@ struct Trip {
     std::vector<bool>        nodeIsStop;
     std::vector<Stop>        stops;
     std::vector<TransitOp>   transitOps;
+    // 本趟车上装载的货量（不变量：任一趟都不得超过载重上限）。
+    // 与"剩余待送总量"是两回事——多趟模式下车辆不会一次装完全部货物。
+    double loadKg = 0.0;
     double totalDistanceKm = 0.0;
     double totalCostYuan   = 0.0;
     double totalTimeMin    = 0.0;
