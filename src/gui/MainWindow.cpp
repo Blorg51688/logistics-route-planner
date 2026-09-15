@@ -338,13 +338,42 @@ void MainWindow::onSimulateTraffic() {
 
     const bool trigger = logistics::needsReplan(plan_.nodes, report,
                                                 config_.general.trafficTimeIncreaseMin);
-    if (trigger) {
-        appendLog(QStringLiteral("受影响边位于当前路径且增幅达标 -> 自动触发重规划"));
-        replan();
-    } else {
+    if (!trigger) {
         appendLog(QStringLiteral("受影响边不在当前路径或增幅不足 -> 不触发重规划"));
         syncScene();   // 拥堵标记需要重绘
+        return;
     }
+
+    appendLog(QStringLiteral("受影响边位于当前路径且增幅达标 -> 自动触发重规划"));
+
+    // 增量式重规划（D22）：只把**尚未走完的那一段**交给它，
+    // 它会按停靠点切段、仅重算走过被命中边的段，停靠顺序不变。
+    // 多趟方案或某段重算后不可达时，它内部自动退回全量重算。
+    logistics::RoutePlan remainder;
+    logistics::Trip restTrip;
+    for (std::size_t i = nodeIndex_; i < plan_.nodes.size(); ++i) {
+        restTrip.nodes.push_back(plan_.nodes[i]);
+        restTrip.nodeArrivalMin.push_back(plan_.nodeArrivalMin[i]);
+        restTrip.nodeIsStop.push_back(plan_.nodeIsStop[i]);
+    }
+    restTrip.endNodeId = plan_.nodes.empty() ? std::string() : plan_.nodes.back();
+    remainder.nodes = restTrip.nodes;
+    remainder.nodeIsStop = restTrip.nodeIsStop;
+    remainder.trips.push_back(restTrip);
+
+    const bool wasSingleTrip = (plan_.trips.size() == 1);
+    plan_ = logistics::replanIncremental(config_.graph, config_.vehicles.front(),
+                                         remainingOrders(), remainder, currentTimeMin(),
+                                         config_.general.serviceTimeMin, planWeight_,
+                                         report, config_.general.trafficTimeIncreaseMin);
+    // 新路线的起点就是车辆当前位置，推进游标归零
+    nodeIndex_ = 0;
+    stopCursor_ = 0;
+    appendLog(wasSingleTrip
+                  ? QStringLiteral("  → 增量式重规划：仅重算受影响的路段，其余原样保留")
+                  : QStringLiteral("  → 上一版为多趟方案，退回全量重算"));
+    syncScene();
+    updatePanels();
 }
 
 std::string MainWindow::nextFreeId(const char* prefix) const {
