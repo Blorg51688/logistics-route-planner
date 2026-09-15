@@ -176,14 +176,14 @@ void checkDataQualityInvariants(const Config& cfg, const RoutePlan& byDistance,
     //    （贪心顺序来自被测实现，oracle 无法独立复现）。因此它们不用于证明正确性，
     //    只用于**检测非预期漂移**：数据或算法被无意改动时立刻报警。
     //    有意调整数据/算法时，应连同这些值一起显式更新。
-    check(fixtures::nearlyEqual(byDistance.totalDistanceKm, 237.8, 0.01),
-          "黄金值·距离策略总距离 237.8，实际 " + std::to_string(byDistance.totalDistanceKm));
-    check(fixtures::nearlyEqual(byDistance.totalCostYuan, 251.5, 0.01),
-          "黄金值·距离策略总成本 251.5，实际 " + std::to_string(byDistance.totalCostYuan));
-    check(fixtures::nearlyEqual(byCost.totalDistanceKm, 240.6, 0.01),
-          "黄金值·成本策略总距离 240.6，实际 " + std::to_string(byCost.totalDistanceKm));
-    check(fixtures::nearlyEqual(byCost.totalCostYuan, 240.6, 0.01),
-          "黄金值·成本策略总成本 240.6，实际 " + std::to_string(byCost.totalCostYuan));
+    check(fixtures::nearlyEqual(byDistance.totalDistanceKm, 157.1, 0.01),
+          "黄金值·距离策略总距离 157.1，实际 " + std::to_string(byDistance.totalDistanceKm));
+    check(fixtures::nearlyEqual(byDistance.totalCostYuan, 170.8, 0.01),
+          "黄金值·距离策略总成本 170.8，实际 " + std::to_string(byDistance.totalCostYuan));
+    check(fixtures::nearlyEqual(byCost.totalDistanceKm, 159.9, 0.01),
+          "黄金值·成本策略总距离 159.9，实际 " + std::to_string(byCost.totalDistanceKm));
+    check(fixtures::nearlyEqual(byCost.totalCostYuan, 159.9, 0.01),
+          "黄金值·成本策略总成本 159.9，实际 " + std::to_string(byCost.totalCostYuan));
 }
 
 // B3：两种图表示在真实规模（30 节点）上的形状检查
@@ -258,9 +258,9 @@ void checkTrafficAndUrgentOrderOnRealData(const Config& cfg) {
     const TrafficReport report = simulateTrafficChange(
         g, cfg.general.trafficChangeRatio, cfg.general.trafficTimeIncreaseMin,
         cfg.general.trafficTimeIncreaseMax, 42u);
-    // oracle: round(0.1 * 72 边) = 7
-    check(report.changes.size() == 7,
-          "按 traffic_change_ratio=0.1 改动 7 条边（72 边），实际 "
+    // oracle: round(0.1 * 106 边) = 11
+    check(report.changes.size() == 11,
+          "按 traffic_change_ratio=0.1 改动 11 条边（106 边），实际 "
               + std::to_string(report.changes.size()));
 
     std::size_t i = 0;

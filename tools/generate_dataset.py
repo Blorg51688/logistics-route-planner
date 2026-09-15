@@ -84,6 +84,28 @@ DEMANDS = [30, 25, 35, 20, 40, 28, 32, 26, 30, 34, 22, 38, 24, 30, 26,
            42, 28, 20, 36, 30, 24, 26, 32, 28, 34]
 
 
+# 配送点之间的横向连接：把原来的"星形"支路补成网状。
+# 加这 14 对之后，无向道路对数达到 50，满足"路径总数 >= 50"的无向口径（D19）。
+EXTRA_LINKS = [
+    ("D01", "D02"), ("D02", "D03"), ("D03", "D05"), ("D05", "D06"),
+    ("D07", "D08"), ("D08", "D03"),
+    ("D10", "D11"), ("D11", "D12"), ("D12", "D13"), ("D13", "D14"), ("D14", "D15"),
+    ("D18", "D19"), ("D19", "D20"), ("D21", "D22"),
+]
+
+# 单行道（D18）：每条都是"捷径"，其反向可由既有路网绕行到达，
+# 因此不破坏"每个配送点都能往返仓库"的可达性要求。
+# 它们使"有向图"在行为上可与"无向图"区分开。
+ONE_WAY_LINKS = [
+    ("D07", "D10"),   # 反向：D10 -> T01 -> D07
+    ("D16", "D17"),   # 反向：D17 -> T03 -> T02 -> D16
+    ("D22", "D25"),   # 反向：D25 -> T03 -> D22
+    ("D04", "D07"),   # 反向：D07 -> T01 -> D04
+    ("D09", "D14"),   # 反向：D14 -> T02 -> D09
+    ("D13", "D17"),   # 反向：D17 -> T03 -> T02 -> D13
+]
+
+
 def build_links():
     links = [("W01", "T01"), ("W01", "T03"), ("W02", "T02"), ("W02", "T03"),
              ("T01", "T02"), ("T02", "T03"),
@@ -95,7 +117,25 @@ def build_links():
         links.append(("T02", "D%02d" % i))
     for i in range(18, 26):
         links.append(("T03", "D%02d" % i))
+    links.extend(EXTRA_LINKS)
     return links
+
+
+def build_one_way_links():
+    return list(ONE_WAY_LINKS)
+
+
+def nearest_transit(x, y):
+    """最近的集散站编号。配送点据此归属某个中转站的子网络
+    （需求原文：中转站可嵌套子配送网络，如"中转站A下属3个社区配送点"）。"""
+    best, best_d = 0, None
+    for nid, ntype, nx, ny, _name, sub in NODES:
+        if ntype != "transit":
+            continue
+        d = math.hypot(x - nx, y - ny)
+        if best_d is None or d < best_d:
+            best, best_d = sub, d
+    return best
 
 
 def all_nodes():
@@ -103,7 +143,9 @@ def all_nodes():
     for i in range(1, 26):
         nid = "D%02d" % i
         x, y = DELIVERY_COORDS[nid]
-        nodes.append((nid, "delivery", x, y, "客户%02d" % i, 0))
+        # 配送点归属于最近集散站的子网络；这是数据里的**行政归属**，
+        # 多趟规划直接据此划分簇（见 设计 §5.6）
+        nodes.append((nid, "delivery", x, y, "客户%02d" % i, nearest_transit(x, y)))
     return nodes
 
 
@@ -137,11 +179,16 @@ def build_text():
     for n in nodes:
         out.append("%s, %s, %d, %d, %s, %d" % n)
 
-    out += ["", "[edges]", "# from, to, distance_km, time_min, cost_yuan"]
+    out += ["", "[edges]",
+            "# from, to, distance_km, time_min, cost_yuan",
+            "# 双向路发两条；单向路（单行道）只发一条"]
     for a, b in links:
         d, t, c = edge_weights(positions, a, b)
         out.append("%s, %s, %s, %s, %s" % (a, b, d, t, c))
         out.append("%s, %s, %s, %s, %s" % (b, a, d, t, c))
+    for a, b in build_one_way_links():
+        d, t, c = edge_weights(positions, a, b)
+        out.append("%s, %s, %s, %s, %s" % (a, b, d, t, c))
 
     out += ["", "[vehicles]", "# ID, start_node, capacity_kg, depart_time",
             "V01, W01, %d, %s" % (CAPACITY_KG, DEPART_TIME),
@@ -246,8 +293,45 @@ def self_check(text):
         edges[(a, b)] = (d, t, c)
         ratios.add(round(c / d, 6) if d else 0.0)
 
+    # 规模口径（D19）：有向边数与无向道路对数都要达标，避免验收时口径不同而不合格
+    undirected = set()
+    one_way = 0
+    for (a, b) in edges:
+        undirected.add((a, b) if a < b else (b, a))
+    for (a, b) in edges:
+        if (b, a) not in edges:
+            one_way += 1
+
     if len(edges) < 50:
-        problems.append("边总数 %d < 50" % len(edges))
+        problems.append("有向边数 %d < 50" % len(edges))
+    if len(undirected) < 50:
+        problems.append("无向道路对数 %d < 50" % len(undirected))
+    if one_way == 0:
+        problems.append("没有任何单向边——有向图与无向图无从区分（D18）")
+
+    # 中转站语义（D16/D17）：每个中转站的子网络必须至少含 1 个配送点，
+    # 否则该站的"集散/暂存"没有服务对象，子网络划分也失去意义
+    subs = {}
+    for row in sec["nodes"]:
+        f = [x.strip() for x in row.split(",")]
+        if len(f) < 6:
+            continue
+        subs.setdefault(f[5], []).append((f[0], f[1]))
+    for sub, members in subs.items():
+        if sub == "0":
+            continue
+        deliveries = [m for m in members if m[1] == "delivery"]
+        transits = [m for m in members if m[1] == "transit"]
+        if not transits:
+            problems.append("子网络 %s 没有中转站" % sub)
+        if not deliveries:
+            problems.append("子网络 %s 没有归属的配送点" % sub)
+    for nid, ntype in nodes.items():
+        if ntype != "transit":
+            continue
+        found = any(nid in [m[0] for m in members] for sub, members in subs.items() if sub != "0")
+        if not found:
+            problems.append("中转站 %s 未归入任何子网络" % nid)
 
     # 关键预警：cost/dist 比值若处处相同，则最低成本策略必然等价于最短距离策略
     if len(ratios) < 2:
@@ -325,7 +409,7 @@ def main():
         for p in problems:
             print("  - " + p)
         return 1
-    print("[generate_dataset] 自检通过（规模 / 端点 / 可达性 / 载重 / 双策略可分化）")
+    print("[generate_dataset] 自检通过（双口径规模 / 单向边 / 中转站归属 / 端点 / 可达性 / 载重 / 双策略可分化）")
 
     if args.write:
         os.makedirs(os.path.dirname(DEFAULT_INI), exist_ok=True)
