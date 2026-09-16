@@ -49,6 +49,8 @@ public:
     int     tripCount() const;
     // 已经跑完的趟数（趟号的偏移量）
     int     completedTripOffset() const;
+    // 本趟装载量（供 --self-check-actions 核对）
+    double  currentTripLoadKg() const { return currentTripLoadKg_; }
     // 车辆信息面板的文本快照（供 --ui-probe）
     QString vehiclePanelSummary() const;
 
@@ -176,6 +178,12 @@ private:
     // "它刚跑完的那一趟"（该趟终点就是仓库），用 curTrip 会少记一趟，
     // 于是趟号永远停在「第 1 趟」——这正是人工测试反馈的现象。
     int tripsToMergeOnReplan() const;
+    // 换计划时的收尾：若这一趟已跑完（车回到了仓库），新计划的第一趟就是**新的一趟**，
+    // 于是"本趟是否已驶离"要复位，让面板重新按新计划取装载量。
+    // 不这样做的话本趟装载会被永远冻结在最初那一趟的值上（实测一直显示 190kg）。
+    // tripFinished 必须在**换计划之前**算好传进来：换完之后 nodeIndex_ 已归零，
+    // 就再也判断不出「这一趟刚跑完」了。
+    void onPlanReplaced(bool tripFinished);
     QTextBrowser*  routeInfo_ = nullptr;
     QLabel*        vehicleInfo_ = nullptr;
     QTableWidget*  orderTable_ = nullptr;

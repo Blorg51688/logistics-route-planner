@@ -475,6 +475,7 @@ void MainWindow::replan() {
     // 三条重规划路径（本函数 / replanIncremental / insertUrgentOrder）都必须做，
     // 否则界面上的「已送达」会归 0、「停靠 N 站」会缩水、趟号会对不上。
     servedStopsBase_ += static_cast<int>(stopCursor_);
+    const bool tripFinished = tripsToMergeOnReplan() > static_cast<int>(currentTripIndex());
     completedTrips_ += tripsToMergeOnReplan();
     plan_ = logistics::replan(config_.graph, config_.vehicles.front(), remaining, here, now,
                               planWeight_,
@@ -483,6 +484,8 @@ void MainWindow::replan() {
     // 新路线的推进状态归零；当前位置/时刻由显式字段保存，不受本次重算影响
     nodeIndex_ = 0;
     stopCursor_ = 0;
+    // 必须在游标归零之后：它要按新计划、新游标判断"这一趟是否已跑完"
+    onPlanReplaced(tripFinished);
 
     if (plan_.status == logistics::PlanStatus::Ok) {
         appendLog(QStringLiteral("规划成功：%1 站，总距离 %2km，总耗时 %3min，penalty %4min")
@@ -559,6 +562,7 @@ void MainWindow::onSimulateTraffic() {
     // 换计划之前，把"当前计划里已经走过的停靠点"并入记账（三条重规划路径都要做，
     // 否则界面上的「已送达 N 站」会归 0、「停靠 N 站」会缩水成剩余数）
     servedStopsBase_ += static_cast<int>(stopCursor_);
+    const bool tripFinished = tripsToMergeOnReplan() > static_cast<int>(currentTripIndex());
     completedTrips_ += tripsToMergeOnReplan();
     plan_ = logistics::replanIncremental(config_.graph, config_.vehicles.front(),
                                          remainingOrders(), remainder, currentTimeMin(),
@@ -569,6 +573,7 @@ void MainWindow::onSimulateTraffic() {
     // 新路线的起点就是车辆当前位置，推进游标归零
     nodeIndex_ = 0;
     stopCursor_ = 0;
+    onPlanReplaced(tripFinished);
     appendLog(wasSingleTrip
                   ? QStringLiteral("  → 增量式重规划：仅重算受影响的路段，其余原样保留")
                   : QStringLiteral("  → 上一版为多趟方案，退回全量重算"));
@@ -637,9 +642,13 @@ std::string MainWindow::insertUrgentOrderAction() {
         appendLog(QStringLiteral("  ⚠ %1").arg(QString::fromStdString(inserted.warning)));
     }
     servedStopsBase_ += static_cast<int>(stopCursor_);
+    const bool tripFinished = tripsToMergeOnReplan() > static_cast<int>(currentTripIndex());
     completedTrips_ += tripsToMergeOnReplan();
     plan_ = inserted.plan;
     syncStationStock();
+    nodeIndex_ = 0;
+    stopCursor_ = 0;
+    onPlanReplaced(tripFinished);
     syncScene();
     updatePanels();
     return urgent.id;
@@ -1351,6 +1360,17 @@ int MainWindow::tripsToMergeOnReplan() const {
     return curTrip;
 }
 
+void MainWindow::onPlanReplaced(bool tripFinished) {
+    // 已经跑完一整趟（车在仓库）时，新计划的第一趟就是**新的一趟**：
+    // 复位"已驶离"并清空装载量，随后面板会按新计划取到这一趟真正的装载量。
+    // 不这样做的话本趟装载会被永远冻结在最初那一趟的值上（实测一直显示 190kg）。
+    if (tripFinished) {
+        tripDeparted_ = false;
+        currentTripLoadKg_ = 0.0;
+    }
+    // 途中重规划：仍在本趟内，装载量保持冻结——那是既成事实，不得改写。
+}
+
 int MainWindow::tripCount() const {
     return static_cast<int>(plan_.trips.size());
 }
@@ -1514,6 +1534,52 @@ int MainWindow::runActionSelfCheck() {
         expect(completedTripOffset() == before,
                QStringLiteral("纯推进不应改变已完成趟数：%1 -> %2")
                    .arg(before).arg(completedTripOffset()));
+    }
+
+    // ---- 本趟装载必须随趟刷新，且不得小于当前载重 ----
+    //
+    // 曾经为了"出发后冻结"而冻得过头：换到新的一趟后仍显示最初那趟的装载量
+    // （实测一直显示 190kg）。这里用"换趟时装载量必须重新取值"来守。
+    {
+        // 先跑到某趟结束
+        for (int i = 0; i < 6; ++i) {
+            onAdvanceStop();
+            onSimulateTraffic();
+        }
+        const int tripBefore = completedTripOffset();
+        const double loadBefore = currentTripLoadKg();
+        for (int i = 0; i < 12 && completedTripOffset() == tripBefore; ++i) {
+            onAdvanceStop();
+            onSimulateTraffic();
+        }
+        const double loadAtDepot = currentTripLoadKg();
+        expect(loadAtDepot <= 200.0 + 1e-6 && loadAtDepot > 0.0,
+               QStringLiteral("本趟装载应在 (0, 载重上限] 内：%1kg")
+                   .arg(loadAtDepot, 0, 'f', 0));
+        expect(currentLoadKg() <= loadAtDepot + 1e-6,
+               QStringLiteral("当前载重不得大于本趟装载：当前 %1kg > 本趟 %2kg")
+                   .arg(currentLoadKg(), 0, 'f', 0).arg(loadAtDepot, 0, 'f', 0));
+        (void)loadBefore;
+
+        // 定义式断言：车回到仓库时，"本趟装载"必须等于**新计划第一趟**的装载量。
+        // 只查"在 (0,200] 内"是没牙齿的——被冻在上一趟的旧值（实测 190kg）
+        // 同样落在区间里。这条才真正守住"换趟必须重新取值"。
+        int checked = 0;
+        for (int i = 0; i < 40 && checked == 0; ++i) {
+            onAdvanceStop();
+            onSimulateTraffic();
+            const bool atDepot = !config_.vehicles.empty()
+                                 && currentNodeId_ == config_.vehicles.front().startNodeId;
+            if (atDepot && !plan_.trips.empty() && plan_.trips[0].loadKg > 1e-9) {
+                expect(std::fabs(currentTripLoadKg() - plan_.trips[0].loadKg) < 1e-6,
+                       QStringLiteral("在仓库时本趟装载应取新计划第一趟的值："
+                                      "实际 %1kg，新计划第一趟 %2kg")
+                           .arg(currentTripLoadKg(), 0, 'f', 0)
+                           .arg(plan_.trips[0].loadKg, 0, 'f', 0));
+                ++checked;
+            }
+        }
+        expect(checked > 0, QStringLiteral("自检未能跑到「车在仓库」的时刻，守卫未生效"));
     }
 
     // ---- 三处趟号必须一致（人工测试反馈：明细与「共 K 趟」没有继承已完成趟数）----
