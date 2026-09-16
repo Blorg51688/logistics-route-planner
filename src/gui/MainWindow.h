@@ -235,13 +235,6 @@ private:
     void loadForTrip(std::size_t tripIndex);
     // 车在仓库时装载它**即将开始**的那一趟（= 当前趟 + 1）
     void loadForCurrentTrip();
-    // 换计划后，把"车上的货"与计划的**当前趟尚未走过的停靠点**对齐。
-    //
-    // 为什么装载可以由计划决定、而累计量不能：**装载是一个决策**（车上该装什么），
-    // 而"已送达多少站""已发生多少 penalty""跑完几趟"是**既成事实**。
-    // 前者必须与计划一致才可执行（否则会出现"送车上没有的货"这种不可能的事），
-    // 后者一旦被计划改写就是数据错误。两者不可混为一谈。
-    void reconcileOnboardWithPlan();
     // 到达：更新位置与时刻；车回到仓库 = 一趟跑完，推进趟次并装载下一趟
     void arriveAt(const std::string& nodeId, int timeMin);
     // 送达：把该点的货从车上卸下、记账（含超时惩罚与已送达计数）

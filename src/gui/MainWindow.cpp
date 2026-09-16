@@ -326,41 +326,6 @@ void MainWindow::loadForTrip(std::size_t tripIndex) {
     state_.departed = false;
 }
 
-void MainWindow::reconcileOnboardWithPlan() {
-    if (config_.vehicles.empty() || plan_.trips.empty()) {
-        return;
-    }
-    const std::size_t t = currentTripIndex();
-    if (t >= plan_.trips.size()) {
-        return;
-    }
-    // 本趟**尚未走过**的停靠点：用平面序列里的位置判断，避免依赖 stops 的下标
-    const logistics::Trip& trip = plan_.trips[t];
-    std::vector<logistics::OnboardItem> want;
-    for (const logistics::Stop& s : trip.stops) {
-        bool passed = false;
-        for (std::size_t i = 0; i < plan_.nodes.size() && i <= nodeIndex_; ++i) {
-            if (plan_.nodes[i] == s.nodeId) { passed = true; break; }
-        }
-        if (passed) {
-            continue;
-        }
-        double kg = 0.0;
-        for (const logistics::Order& o : config_.orders) {
-            if (o.nodeId == s.nodeId && !o.served) {
-                kg += o.demandKg;
-            }
-        }
-        if (kg > 1e-9) {
-            logistics::OnboardItem item;
-            item.nodeId = s.nodeId;
-            item.kg = kg;
-            want.push_back(item);
-        }
-    }
-    state_.onboard.swap(want);
-    state_.loadKg = state_.sumOnboard();
-}
 
 void MainWindow::loadForCurrentTrip() {
     // 车在仓库时，装载它**即将开始**的那一趟。
@@ -509,9 +474,6 @@ void MainWindow::replan() {
     stopCursor_ = 0;
     // 车若正在仓库，就把计划的当前趟装上车——这是"装载"这一物理事件，
     // 且必须发生在每次（重新）规划之后，否则新计划第一趟的货永远上不了车。
-    // 换计划后：先把车上的货与计划的当前趟对齐（装载是决策，必须与计划一致），
-    // 再处理"车在仓库则该装新的一趟"。
-    reconcileOnboardWithPlan();
     loadForCurrentTrip();
 
     if (plan_.status == logistics::PlanStatus::Ok) {
@@ -599,9 +561,6 @@ void MainWindow::onSimulateTraffic() {
     stopCursor_ = 0;
     // 车若正在仓库，就把计划的当前趟装上车——这是"装载"这一物理事件，
     // 且必须发生在每次（重新）规划之后，否则新计划第一趟的货永远上不了车。
-    // 换计划后：先把车上的货与计划的当前趟对齐（装载是决策，必须与计划一致），
-    // 再处理"车在仓库则该装新的一趟"。
-    reconcileOnboardWithPlan();
     loadForCurrentTrip();
     appendLog(wasSingleTrip
                   ? QStringLiteral("  → 增量式重规划：仅重算受影响的路段，其余原样保留")
@@ -676,9 +635,6 @@ std::string MainWindow::insertUrgentOrderAction() {
     stopCursor_ = 0;
     // 车若正在仓库，就把计划的当前趟装上车——这是"装载"这一物理事件，
     // 且必须发生在每次（重新）规划之后，否则新计划第一趟的货永远上不了车。
-    // 换计划后：先把车上的货与计划的当前趟对齐（装载是决策，必须与计划一致），
-    // 再处理"车在仓库则该装新的一趟"。
-    reconcileOnboardWithPlan();
     loadForCurrentTrip();
     syncScene();
     updatePanels();
@@ -761,10 +717,7 @@ void MainWindow::onAdvanceStop() {
     // 必须在 arriveAt 之后调用（它会更新 tripNumber / departed）。
     if (!wasAtDepot && !config_.vehicles.empty()
         && state_.atNodeId == config_.vehicles.front().startNodeId) {
-        // 换计划后：先把车上的货与计划的当前趟对齐（装载是决策，必须与计划一致），
-    // 再处理"车在仓库则该装新的一趟"。
-    reconcileOnboardWithPlan();
-    loadForCurrentTrip();
+        loadForCurrentTrip();
     }
 
     // 只有**下标与节点对得上**时才认作送达。
