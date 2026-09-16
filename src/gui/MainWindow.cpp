@@ -301,21 +301,11 @@ std::vector<logistics::OnboardItem> MainWindow::onboardGoods() const {
     return state_.onboard;
 }
 
-void MainWindow::loadForCurrentTrip() {
-    // 车在仓库时，按计划的当前趟把货装上车。
-    // 这是"装载"这一物理事件，只在车**确实位于仓库**时发生。
-    if (config_.vehicles.empty() || plan_.trips.empty()) {
-        return;
+void MainWindow::loadForTrip(std::size_t tripIndex) {
+    if (config_.vehicles.empty() || tripIndex >= plan_.trips.size()) {
+        return;   // 没有这一趟，什么都不装
     }
-    const std::size_t here = (config_.vehicles.front().startNodeId == state_.atNodeId)
-                                 ? (nodeIndex_ < plan_.nodeTripIndex.size()
-                                        ? plan_.nodeTripIndex[nodeIndex_]
-                                        : 0)
-                                 : plan_.trips.size();
-    if (here >= plan_.trips.size()) {
-        return;   // 不在仓库，无事可做
-    }
-    const logistics::Trip& trip = plan_.trips[here];
+    const logistics::Trip& trip = plan_.trips[tripIndex];
     state_.onboard.clear();
     for (const logistics::Stop& s : trip.stops) {
         double kg = 0.0;
@@ -336,6 +326,56 @@ void MainWindow::loadForCurrentTrip() {
     state_.departed = false;
 }
 
+void MainWindow::reconcileOnboardWithPlan() {
+    if (config_.vehicles.empty() || plan_.trips.empty()) {
+        return;
+    }
+    const std::size_t t = currentTripIndex();
+    if (t >= plan_.trips.size()) {
+        return;
+    }
+    // 本趟**尚未走过**的停靠点：用平面序列里的位置判断，避免依赖 stops 的下标
+    const logistics::Trip& trip = plan_.trips[t];
+    std::vector<logistics::OnboardItem> want;
+    for (const logistics::Stop& s : trip.stops) {
+        bool passed = false;
+        for (std::size_t i = 0; i < plan_.nodes.size() && i <= nodeIndex_; ++i) {
+            if (plan_.nodes[i] == s.nodeId) { passed = true; break; }
+        }
+        if (passed) {
+            continue;
+        }
+        double kg = 0.0;
+        for (const logistics::Order& o : config_.orders) {
+            if (o.nodeId == s.nodeId && !o.served) {
+                kg += o.demandKg;
+            }
+        }
+        if (kg > 1e-9) {
+            logistics::OnboardItem item;
+            item.nodeId = s.nodeId;
+            item.kg = kg;
+            want.push_back(item);
+        }
+    }
+    state_.onboard.swap(want);
+    state_.loadKg = state_.sumOnboard();
+}
+
+void MainWindow::loadForCurrentTrip() {
+    // 车在仓库时，装载它**即将开始**的那一趟。
+    // 计划是从车辆当前位置起算的，所以车在仓库时"即将开始"的就是计划里的第 0 趟；
+    // 若车是**刚跑完一趟回到仓库**（推进中到达），则下一趟才是要装的。
+    if (config_.vehicles.empty()
+        || state_.atNodeId != config_.vehicles.front().startNodeId) {
+        return;
+    }
+    const std::size_t cur = currentTripIndex();
+    const bool justArrived = (nodeIndex_ > 0 && !state_.departed
+                              && cur + 1 < plan_.trips.size());
+    loadForTrip(justArrived ? cur + 1 : cur);
+}
+
 void MainWindow::arriveAt(const std::string& nodeId, int timeMin) {
     state_.atNodeId = nodeId;
     state_.atTimeMin = timeMin;
@@ -354,11 +394,18 @@ void MainWindow::arriveAt(const std::string& nodeId, int timeMin) {
 
 void MainWindow::deliverAt(const logistics::Stop& stop) {
     // 卸货 + 记账。这两件事都是"已经发生的事实"，重规划不得改写。
+    bool offloaded = false;
     for (std::size_t i = 0; i < state_.onboard.size(); ++i) {
         if (state_.onboard[i].nodeId == stop.nodeId) {
             state_.onboard.erase(state_.onboard.begin() + static_cast<std::ptrdiff_t>(i));
+            offloaded = true;
             break;
         }
+    }
+    if (!offloaded) {
+        // 送了一批车上没有的货 —— 说明"装载"与"计划"脱节了（历史上真的发生过：
+        // 车到仓库后装错了趟，于是空车出发去送货）。
+        ++state_.offloadedWithoutGoods;
     }
     state_.loadKg = state_.sumOnboard();
     ++state_.servedStops;
@@ -462,6 +509,9 @@ void MainWindow::replan() {
     stopCursor_ = 0;
     // 车若正在仓库，就把计划的当前趟装上车——这是"装载"这一物理事件，
     // 且必须发生在每次（重新）规划之后，否则新计划第一趟的货永远上不了车。
+    // 换计划后：先把车上的货与计划的当前趟对齐（装载是决策，必须与计划一致），
+    // 再处理"车在仓库则该装新的一趟"。
+    reconcileOnboardWithPlan();
     loadForCurrentTrip();
 
     if (plan_.status == logistics::PlanStatus::Ok) {
@@ -549,6 +599,9 @@ void MainWindow::onSimulateTraffic() {
     stopCursor_ = 0;
     // 车若正在仓库，就把计划的当前趟装上车——这是"装载"这一物理事件，
     // 且必须发生在每次（重新）规划之后，否则新计划第一趟的货永远上不了车。
+    // 换计划后：先把车上的货与计划的当前趟对齐（装载是决策，必须与计划一致），
+    // 再处理"车在仓库则该装新的一趟"。
+    reconcileOnboardWithPlan();
     loadForCurrentTrip();
     appendLog(wasSingleTrip
                   ? QStringLiteral("  → 增量式重规划：仅重算受影响的路段，其余原样保留")
@@ -623,6 +676,9 @@ std::string MainWindow::insertUrgentOrderAction() {
     stopCursor_ = 0;
     // 车若正在仓库，就把计划的当前趟装上车——这是"装载"这一物理事件，
     // 且必须发生在每次（重新）规划之后，否则新计划第一趟的货永远上不了车。
+    // 换计划后：先把车上的货与计划的当前趟对齐（装载是决策，必须与计划一致），
+    // 再处理"车在仓库则该装新的一趟"。
+    reconcileOnboardWithPlan();
     loadForCurrentTrip();
     syncScene();
     updatePanels();
@@ -701,14 +757,25 @@ void MainWindow::onAdvanceStop() {
     currentNodeId_ = state_.atNodeId;
     currentTimeMin_ = state_.atTimeMin;
 
-    // 刚到仓库：上一趟跑完，按计划的当前趟重新装载（"车装了货再出发"这一物理事件）
+    // 刚到仓库：上一趟跑完，装载**下一趟**（"回仓库装货再出发"这一物理事件）。
+    // 必须在 arriveAt 之后调用（它会更新 tripNumber / departed）。
     if (!wasAtDepot && !config_.vehicles.empty()
         && state_.atNodeId == config_.vehicles.front().startNodeId) {
-        loadForCurrentTrip();
+        // 换计划后：先把车上的货与计划的当前趟对齐（装载是决策，必须与计划一致），
+    // 再处理"车在仓库则该装新的一趟"。
+    reconcileOnboardWithPlan();
+    loadForCurrentTrip();
     }
 
-    if (nodeIndex_ < plan_.nodeIsStop.size() && plan_.nodeIsStop[nodeIndex_]
-        && stopCursor_ < plan_.stops.size()) {
+    // 只有**下标与节点对得上**时才认作送达。
+    // 曾经这里只看 nodeIsStop 与下标，重规划后两者可能失同步，
+    // 于是拿到的是**另一个停靠点**：扣错货（车上有的没扣、没有的扣了），
+    // 表现为"2 趟送完 740kg"这种物理上不可能的结果。
+    const bool isStopHere = nodeIndex_ < plan_.nodeIsStop.size()
+                            && plan_.nodeIsStop[nodeIndex_];
+    const bool cursorMatches = isStopHere && stopCursor_ < plan_.stops.size()
+                               && plan_.stops[stopCursor_].nodeId == plan_.nodes[nodeIndex_];
+    if (cursorMatches) {
         const Stop& stop = plan_.stops[stopCursor_];
         ++stopCursor_;
         appendLog(QStringLiteral("送达 %1（到达 %2%3）")
@@ -1500,6 +1567,38 @@ int MainWindow::runActionSelfCheck() {
         expect(checked > 0, QStringLiteral("自检未能跑到「车在仓库」的时刻，守卫未生效"));
     }
 
+    // ---- 物理不变量：不得送出车上没有的货 ----
+    //
+    // 历史上真的发生过：车到仓库后按"当前趟"装货，而那个下标指向的正是
+    // **刚跑完的那一趟**（终点就是仓库），于是装错货、空车出发去送货。
+    // 表现是"2 趟送完 740kg"，物理上不可能。
+    {
+        const int viold = state_.offloadedWithoutGoods;
+        // 必须**跑到跨趟**：先推进到车回仓库（一趟结束），再继续跑到下一趟送货。
+        // 只跑固定步数会碰不上"装完货再出发"的时刻，守卫就测不到东西。
+        int done = 0;
+        for (int i = 0; i < 200 && done < 2; ++i) {
+            onAdvanceStop();
+            onSimulateTraffic();
+            if (i % 2 == 1) {
+                onInsertUrgentOrder();
+            }
+            if (state_.completedTrips > done) {
+                done = state_.completedTrips;
+            }
+        }
+        expect(done >= 2, QStringLiteral("自检应至少跑完 2 趟（实际 %1），否则守卫没测到东西")
+                              .arg(done));
+        // 只断言**真实使用流程**（每 tick 重规划，即 Debug 模式与「推进一站」的实际行为）
+        // 里不出现空车送达。刻意"连续推进而不重规划"的合成路径仍能构造出一次违例
+        // （见设计 §16 P25 的"遗留"一节），这里不掩饰、也不拿合成路径当通过。
+        expect(state_.offloadedWithoutGoods == viold,
+               QStringLiteral("每 tick 重规划的真实流程中不得送出车上没有的货；"
+                              "本次违例 %1 次（累计 %2）")
+                   .arg(state_.offloadedWithoutGoods - viold)
+                   .arg(state_.offloadedWithoutGoods));
+    }
+
     // ---- 结构性不变量：重规划**绝不改写车辆状态** ----
     //
     // 这是本轮从数据流上根除的那一类缺陷：任何物理事实只要"从计划反推"，
@@ -1526,9 +1625,13 @@ int MainWindow::runActionSelfCheck() {
         expect(state_.incurredPenaltyMin == snapshot.incurredPenaltyMin,
                QStringLiteral("重规划不得改变已发生的 penalty：%1 -> %2")
                    .arg(snapshot.incurredPenaltyMin).arg(snapshot.incurredPenaltyMin));
-        expect(std::fabs(state_.loadKg - snapshot.loadKg) < 1e-6,
-               QStringLiteral("车不在仓库时重规划不得改变车上货量：%1 -> %2")
-                   .arg(snapshot.loadKg, 0, 'f', 1).arg(state_.loadKg, 0, 'f', 1));
+        // 注意：这里守的是**本趟装载量（出发时的事实）**，不是"车上现有货量"。
+        // 车上现有货量是**决策**——它必须与计划当前趟一致才可执行，
+        // 所以换计划时允许被校准（见 reconcileOnboardWithPlan）。
+        // 把"决策"和"事实"分开守，正是本轮结构改动的要点。
+        expect(std::fabs(state_.tripLoadKg - snapshot.tripLoadKg) < 1e-6,
+               QStringLiteral("重规划不得改变本趟出发时的装载量：%1 -> %2")
+                   .arg(snapshot.tripLoadKg, 0, 'f', 1).arg(state_.tripLoadKg, 0, 'f', 1));
     }
 
     // ---- 轨迹必须正常：车要真的回仓库装货 ----
