@@ -681,75 +681,16 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
                         WeightType weight,
                         const std::map<std::string, double>& initialStock,
                         const std::vector<OnboardItem>& onboard) {
-    // ---- ① 顺路寄存 ----
-    std::map<int, std::string> transitBySub;
-    for (const Node& n : graph.nodes()) {
-        if (n.type == NodeType::Transit && n.subNetworkId != 0) {
-            transitBySub[n.subNetworkId] = n.id;
-        }
-    }
-
-    // 先空跑一版，看看哪些在途货**来不及在本次回仓库前送掉**——
-    // 只有那部分才会被白带回仓库，也才是可寄存的。
-    // （把全部在途货都寄存是错的：车马上要送掉的那些不该卸下来。）
-    // 车如果还在仓库没出发，车上就没有任何货 —— 此时传进来的"在途货"
-    // 只能是"待装载的第一批"，直接忽略，否则会给从未装过的货记上存货。
-    const bool startedAtDepot = (startPos == vehicle.startNodeId);
-
-    std::set<std::string> servedBeforeDepot;
-    if (!startedAtDepot) {
-        const std::map<std::string, double> none;
-        // 草稿也要按"在途货先送"来排——否则会把"其实马上就能送掉"的货
-        // 误判成"来不及送"，从而错误地寄存。
-        const RoutePlan draft = multiTripPlanImpl(graph, vehicle, candidates, startPos,
-                                                  startTimeMin, weight,
-                                                  none, false, onboard);
-        bool reachedDepot = false;
-        for (const Trip& t : draft.trips) {
-            for (std::size_t i = 0; i < t.nodes.size() && !reachedDepot; ++i) {
-                if (i < t.nodeIsStop.size() && t.nodeIsStop[i]) {
-                    servedBeforeDepot.insert(t.nodes[i]);
-                }
-                if (t.nodes[i] == vehicle.startNodeId) {
-                    reachedDepot = true;
-                }
-            }
-            if (reachedDepot) {
-                break;
-            }
-        }
-    }
-
+    // ---- 中转站不参与路由，也不再有"顺路寄存" ----
+    //
+    // 第 13 轮实测：让中转站参与排线全面更差（198.2km/13 趟 vs 直达 178.2km/6 趟），
+    // 且车一停在站里就会排出「站 -> 仓库 -> 站」的补货趟，造成车在仓库附近来回跳。
+    // 于是中转站退出路由。**退出之后"寄存"也就失去了意义**：寄存到站里的货
+    // 永远没有路径被取出使用（没有"站 -> 配送点"的配发），只会让同一批货在
+    // "车上 <-> 站里"之间空转，站内存货单调膨胀并污染后续规划。
+    //
+    // 因此这里不再寄存。车辆的载货由调用方以**显式状态**维护（见 MainWindow::VehicleState）。
     std::map<std::string, double> stock = initialStock;
-    std::vector<std::string> bankedNodeIds;   // 本次真正被卸载到站里的节点，回报给调用方
-    const PathResult toDepot = shortestPath(graph, startPos, vehicle.startNodeId, weight);
-    for (const OnboardItem& item : onboard) {
-        if (startedAtDepot || item.kg <= 1e-9
-            || servedBeforeDepot.count(item.nodeId) > 0) {
-            continue;   // 未出发则无在途货；本次会先送掉的也不必寄存
-        }
-        const Node* node = graph.findNode(item.nodeId);
-        if (node == nullptr) {
-            continue;
-        }
-        const std::map<int, std::string>::const_iterator hub = transitBySub.find(node->subNetworkId);
-        if (hub == transitBySub.end()) {
-            continue;   // 不属于任何中转站所服务的簇：没有合法寄存点
-        }
-        if (!toDepot.found) {
-            continue;
-        }
-        // 站必须在回程**路径上**（出发地->站->仓库 不比 出发地->仓库 更远），
-        // 否则寄存要绕路，就不寄存。
-        const PathResult a = shortestPath(graph, startPos, hub->second, weight);
-        const PathResult b = shortestPath(graph, hub->second, vehicle.startNodeId, weight);
-        if (!a.found || !b.found
-            || a.totalWeight + b.totalWeight > toDepot.totalWeight + 1e-6) {
-            continue;
-        }
-        stock[hub->second] += item.kg;
-        bankedNodeIds.push_back(item.nodeId);
-    }
 
     bool hasStock = false;
     for (const auto& kv : stock) {
@@ -760,10 +701,8 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
     }
     if (!hasStock) {
         const std::map<std::string, double> none;
-        RoutePlan only = multiTripPlanImpl(graph, vehicle, candidates, startPos,
-                                           startTimeMin, weight, none, false, onboard);
-        only.bankedNodeIds = bankedNodeIds;
-        return only;
+        return multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
+                                 weight, none, false, onboard);
     }
 
     // ---- ② 两版 ----
@@ -780,12 +719,9 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
         return direct;
     }
     if (viaStation.totalPenaltyMin > direct.totalPenaltyMin) {
-        direct.bankedNodeIds = bankedNodeIds;
         return direct;
     }
-    RoutePlan best = betterPlan(direct, viaStation, weight) ? direct : viaStation;
-    best.bankedNodeIds = bankedNodeIds;
-    return best;
+    return betterPlan(direct, viaStation, weight) ? direct : viaStation;
 }
 
 } // namespace

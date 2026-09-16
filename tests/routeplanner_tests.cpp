@@ -866,11 +866,13 @@ static void testTransitStockNeverMakesPlanWorse() {
     }
 }
 
-// 顺路寄存（前置储存点机制）：车本次要回仓库、而车上还载着**来不及送**的货，
-// 且该货所属簇的中转站就在回程路径上 -> 顺手卸下，变成站里的存货。
-// 关键点：① 只卸在回程路径上的站（零绕路）② 必须是该站所服务簇的货
-//        ③ 本次会先送掉的不卸下来
-static void testOnboardSurplusIsBankedEnRoute() {
+// 中转站退出路由后，"顺路寄存"也一并移除（见设计 §16 P25）。
+//
+// 原机制：车上的货若"来不及在本次回仓库前送掉"，就顺手卸在回程路径上的中转站。
+// 但中转站已经不参与排线（实测全面更差），卸到站里的货**再也没有路径被取出来用**，
+// 只会在"车上 <-> 站里"之间空转，站内存货单调膨胀并污染后续规划。
+// 因此现在的语义是：**中转站不产生任何存货**，车辆的载货由调用方以显式状态维护。
+static void testTransitNeverHoldsStock() {
     logistics::LogisticsGraph g;
     auto mk = [](const char* id, logistics::NodeType t, double x, double y, int sub) {
         logistics::Node n; n.id = id; n.type = t; n.x = x; n.y = y; n.subNetworkId = sub;
@@ -879,70 +881,37 @@ static void testOnboardSurplusIsBankedEnRoute() {
     g.addNode(mk("T", logistics::NodeType::Transit, 10, 0, 1));
     g.addNode(mk("D1", logistics::NodeType::Delivery, 11, 0, 1));
     g.addNode(mk("D2", logistics::NodeType::Delivery, 11, 1, 1));
-    g.addNode(mk("D3", logistics::NodeType::Delivery, 12, 0, 1));
-    g.addNode(mk("D4", logistics::NodeType::Delivery, 13, 0, 1));
     auto link = [&g](const char* a, const char* b, double d) {
         logistics::Edge e; e.fromId = a; e.toId = b;
         e.distanceKm = d; e.timeMin = d; e.costYuan = d; e.baseTimeMin = d;
         g.addEdge(e); e.fromId = b; e.toId = a; g.addEdge(e); };
     link("W", "T", 10); link("T", "D1", 1); link("D1", "D2", 1);
-    link("D1", "D3", 1); link("D3", "D4", 1);
 
     logistics::Vehicle v;
     v.id = "V01"; v.startNodeId = "W"; v.capacityKg = 50.0; v.departTimeMin = 480;
 
     auto ord = [](const char* id, const char* n) {
         logistics::Order o; o.id = id; o.nodeId = n; o.demandKg = 20.0;
-        o.windowStartMin = 0; o.windowEndMin = 1440; return o; };
-    // 关键：必须有一张**货物不在车上**的紧急订单，把车先逼回仓库。
-    // 否则规划器会把在途货就地送掉（那才是对的），也就轮不到寄存。
-    logistics::Order urgent = ord("OU", "D4");
-    urgent.urgent = true;
-    const std::vector<logistics::Order> rest = {ord("O1", "D1"), ord("O3", "D3"),
-                                                ord("O4", "D4"), ord("O2", "D2"), urgent};
+        o.windowStartMin = 0; o.windowEndMin = 24 * 60; o.urgent = false;
+        return o; };
+    const std::vector<logistics::Order> orders = {ord("O1", "D1"), ord("O2", "D2")};
 
-    // 车已到 D1，车上仍载着 D2 的 20kg
-    const std::vector<logistics::OnboardItem> onboard = {{"D2", 20.0}};
-    const std::map<std::string, double> noStock;
-    const logistics::RoutePlan p =
-        logistics::replan(g, v, rest, "D1", 500, logistics::WeightType::Distance,
-                          noStock, onboard);
+    // 车上带着 D2 的货、从 D1 出发——旧机制下这正是"寄存"的场景
+    std::vector<logistics::OnboardItem> onboard;
+    logistics::OnboardItem it; it.nodeId = "D2"; it.kg = 20.0;
+    onboard.push_back(it);
 
-    check(p.status == logistics::PlanStatus::Ok, "寄存场景下仍规划成功");
-    double tStock = 0.0;
-    for (const logistics::TransitStock& st : p.transitStock) {
-        if (st.nodeId == "T") {
-            tStock = st.finalKg;
-        }
+    const std::map<std::string, double> st;
+    const logistics::RoutePlan p = logistics::replan(
+        g, v, orders, "D1", 480, logistics::WeightType::Distance, st, onboard);
+    check(p.status == logistics::PlanStatus::Ok, "带在途货重规划仍成功");
+
+    double finalSum = 0.0;
+    for (const logistics::TransitStock& ts : p.transitStock) {
+        finalSum += ts.finalKg;
     }
-    check(tStock > 1e-9,
-          "在途的 D2 货来不及送、且 T 在回程路径上 -> 被顺路寄存，期末存货 "
-              + std::to_string(tStock) + "kg");
-
-    // 寄存必须**零绕路**：路线不得因为寄存而变长
-    const logistics::RoutePlan noOnboard =
-        logistics::replan(g, v, rest, "D1", 500, logistics::WeightType::Distance,
-                          noStock, std::vector<logistics::OnboardItem>());
-    check(p.totalDistanceKm <= noOnboard.totalDistanceKm + 1e-6,
-          "寄存不得增加里程：" + std::to_string(p.totalDistanceKm) + " vs "
-              + std::to_string(noOnboard.totalDistanceKm));
-
-    // 语义断言（审计提出的歧义点，在此显式固化）：
-    //   寄存后站里那 20kg 是**不记名库存**，不再绑定 D2；
-    //   D2 仍按正常流程被服务（从仓库装货）。所以「D2 被送达」与「站里留 20kg」
-    //   同时成立是**设计意图**（库存由仓库额外供给），不是重复计数。
-    //   反过来若要求"那批货专供 D2"，它一送掉库存就归零，也就攒不起来——
-    //   与"积少成多"的目标不符。
-    bool d2Served = false;
-    for (const logistics::Stop& st : p.stops) {
-        if (st.nodeId == "D2") {
-            d2Served = true;
-        }
-    }
-    check(d2Served, "原订单仍被正常服务（寄存不改变订单的服务状态）");
-    check(tStock > 1e-9 && tStock <= 20.0 + 1e-6,
-          "寄存量成为站里的不记名库存（0 < 存货 <= 寄存量），实际 "
-              + std::to_string(tStock) + "kg");
+    check(finalSum < 1e-9,
+          "中转站不参与路由后不得产生存货，实际 " + std::to_string(finalSum));
 }
 
 // 增量重规划在全量回退时，必须把"站内存货"与"在途货"一并带走。
@@ -1119,7 +1088,7 @@ int main() {
     testIsEdgeOnRoute();
     testStationUsedOnlyWhenStockExists();
     testTransitStockNeverMakesPlanWorse();
-    testOnboardSurplusIsBankedEnRoute();
+    testTransitNeverHoldsStock();
     testIncrementalReplanForwardsStockAndOnboard();
     testNoBankingWhenStillAtDepot();
     testUrgentInsertForwardsStock();

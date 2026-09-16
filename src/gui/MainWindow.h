@@ -26,6 +26,60 @@ class MainWindow : public QMainWindow {
     Q_OBJECT
 
 public:
+    // ---- 车辆状态：所有"物理事实"的唯一权威来源 ----
+    //
+    // 这一组数据是**唯一权威**。重规划会整个重建 plan_，但**绝不允许**改写这里任何一项。
+    //
+    // 本项目反复栽在同一件事上：某个物理事实被"从当前计划反推"，于是重规划一发生，
+    // 它就变错 —— 趟号塌成「第 1 趟」、「已送达」归零、「停靠 N 站」缩水、
+    // 已发生的 penalty 消失、「本趟装载」被重算、在途货被反复寄存。
+    //
+    // 规则（新增功能时请遵守）：
+    //   · 只有车辆**真的做了什么**才能改它 —— 装载 / 到达 / 送达 / 寄存，
+    //     全部发生在 onAdvanceStop() 里的状态转移中；
+    //   · 重规划只**读**它，作为输入喂给规划器；plan_ 只描述"接下来怎么走"，
+    //     不作为任何已经发生过的事实的依据。
+    struct VehicleState {
+        // 位置与时刻
+        std::string atNodeId;             // 此刻在哪
+        int         atTimeMin = 0;        // 此刻时刻
+
+        // 车上载货：**显式**列出具体是哪些货，不再从计划反推
+        double                              loadKg = 0.0;
+        std::vector<logistics::OnboardItem> onboard;
+
+        // 趟次
+        int    tripNumber = 1;            // 正在跑第几趟（绝对编号，1 起）
+        double tripLoadKg = 0.0;          // 本趟出发时装了多少（驶离后冻结）
+        bool   departed = false;          // 本趟是否已驶离
+        int    completedTrips = 0;        // 已跑完几趟
+
+        // 累计量
+        int    servedStops = 0;           // 已送达停靠点总数
+        int    incurredPenaltyMin = 0;    // 已经发生的超时惩罚
+        // 已送达且超时的停靠点：**已经发生**的超时，跨重规划保留
+        struct LateStop {
+            std::string orderId;
+            std::string nodeId;
+            int         arrivalMin = 0;
+            int         penaltyMin = 0;
+        };
+        std::vector<LateStop> deliveredLate;
+
+        // 车辆现有货量之和（单一算法，避免两处各算一遍）
+        double sumOnboard() const {
+            double t = 0.0;
+            for (const logistics::OnboardItem& it : onboard) {
+                t += it.kg;
+            }
+            return t;
+        }
+    };
+
+    // 供 --self-check-actions 核对
+    const VehicleState& vehicleState() const { return state_; }
+
+public:
     explicit MainWindow(logistics::Config config, QWidget* parent = nullptr);
 
     // 交互式显示：把窗口尺寸限制在可用屏幕之内，避免默认尺寸大于屏幕
@@ -50,9 +104,9 @@ public:
     // 已经跑完的趟数（趟号的偏移量）
     int     completedTripOffset() const;
     // 车回过几次仓库（物理事实，供 --self-check-actions）
-    int     depotArrivalCount() const { return depotArrivals_; }
+    int     depotArrivalCount() const { return state_.completedTrips; }
     // 本趟装载量（供 --self-check-actions 核对）
-    double  currentTripLoadKg() const { return currentTripLoadKg_; }
+    double  currentTripLoadKg() const { return state_.tripLoadKg; }
     // 车辆信息面板的文本快照（供 --ui-probe）
     QString vehiclePanelSummary() const;
 
@@ -107,7 +161,6 @@ private:
     // 供下一次重规划作为期初存货传入 —— 这就是"积少成多"的回路。
     void               syncStationStock();
     // 记录本次规划中被「顺路寄存」到站里的货所对应的节点
-    void               rememberBanked(const logistics::RoutePlan& plan);
     void               onShowGraphTables();
     QString            windowTextAt(const std::string& nodeId) const;
     int                currentTimeMin() const;
@@ -116,6 +169,8 @@ private:
     logistics::Config     config_;
     GraphScene*           scene_ = nullptr;
     QGraphicsView*        view_ = nullptr;
+    // 车辆物理状态（唯一权威来源，重规划不得改写）
+    VehicleState          state_;
     logistics::RoutePlan  plan_;
     // 车辆当前位置与当前时刻必须**显式保存**：重规划会用一个全新的
     // plan_ 覆盖旧计划，此时按下标回查 plan_.stops 会索引错位
@@ -146,13 +201,9 @@ private:
     // 物理事实：车回过几次仓库（= 跑完了几趟）。
     // **不能**用"计划内游标 curTrip"来推：Debug 每 tick 都重规划，
     // nodeIndex_ 随之归零，curTrip 永远是 0，偏移量就永远加 0。
-    int    depotArrivals_ = 0;
-    int    completedTrips_ = 0;
-    double currentTripLoadKg_ = 0.0;
     // 本趟是否已经驶离出发点。不能用"车辆是否停在该趟起点"来判断：
     // 重规划后车辆恰好位于新计划的起点，会被误判成"还没出发"，
     // 于是本趟装载被重算成与事实不符的值。
-    bool   tripDeparted_ = false;
 
     // 同样是"既定事实"，不能从 plan_ 反推：
     //   · servedStopsBase_：本次计划之前**已经送达**的停靠点数。
@@ -168,28 +219,26 @@ private:
         int         arrivalMin = 0;
         int         penaltyMin = 0;   // 窗口止在渲染时由订单反查，Stop 里没有这个字段
     };
-    int servedStopsBase_ = 0;
-    int incurredPenaltyMin_ = 0;
-    std::vector<LateStop> deliveredLate_;
     // 已经被「顺路寄存」到中转站的货所对应的节点。
     // 这些货已经不在车上，必须从 onboardGoods() 里剔除，否则每重规划一次
     // 就会被再寄存一次，stationStock_ 单调膨胀并污染后续路由（审计发现的 F5）。
-    std::vector<std::string> bankedNodeIds_;
     // 车辆当前所在的趟在 plan_.trips 里的下标
     std::size_t currentTripIndex() const;
+
+    // ---- 状态转移：只有这四个函数能改 state_ ----
+    //
+    // 装载：车在仓库时，按计划的当前趟把货装上车（并冻结本趟装载量）
+    void loadForCurrentTrip();
+    // 到达：更新位置与时刻；车回到仓库 = 一趟跑完，推进趟次并装载下一趟
+    void arriveAt(const std::string& nodeId, int timeMin);
+    // 送达：把该点的货从车上卸下、记账（含超时惩罚与已送达计数）
+    void deliverAt(const logistics::Stop& stop);
     // 换计划时应把多少"已完成趟"并进 completedTrips_：
     //   · 车在仓库且不是初始位置 -> 刚跑完的那一趟已经结束，记 curTrip + 1
     //   · 否则（途中）-> 当前这一趟还没跑完，只记 curTrip
     // 不能一律用 curTrip：车停在仓库时，它的 nodeTripIndex 指向的正是
     // "它刚跑完的那一趟"（该趟终点就是仓库），用 curTrip 会少记一趟，
     // 于是趟号永远停在「第 1 趟」——这正是人工测试反馈的现象。
-    int tripsToMergeOnReplan() const;
-    // 换计划时的收尾：若这一趟已跑完（车回到了仓库），新计划的第一趟就是**新的一趟**，
-    // 于是"本趟是否已驶离"要复位，让面板重新按新计划取装载量。
-    // 不这样做的话本趟装载会被永远冻结在最初那一趟的值上（实测一直显示 190kg）。
-    // tripFinished 必须在**换计划之前**算好传进来：换完之后 nodeIndex_ 已归零，
-    // 就再也判断不出「这一趟刚跑完」了。
-    void onPlanReplaced(bool tripFinished);
     QTextBrowser*  routeInfo_ = nullptr;
     QLabel*        vehicleInfo_ = nullptr;
     QTableWidget*  orderTable_ = nullptr;
