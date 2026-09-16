@@ -20,6 +20,7 @@
 #include <QPushButton>
 #include <QTableWidget>
 #include <QTabWidget>
+#include <QRegularExpression>
 #include <QTextBrowser>
 #include <QTimer>
 #include <QToolBar>
@@ -1024,11 +1025,16 @@ void MainWindow::updatePanels() {
         // 拆成三段写明，避免"共 K 趟"被误读成"整趟配送总共几趟"：
         //   已完成 = 真的跑完了几趟（事实）
         //   当前第 N 趟 = 绝对趟号（跨重规划连续，不重置）
-        //   本计划共 M 趟 = **本次规划**排出了几趟（重规划会重新分批，所以它会变）
-        route += QStringLiteral("趟次：已完成 %1 趟 · 当前第 %2 趟 · 本计划共 %3 趟\n")
+        //   全部完成约需 T 趟 = 已完成 + 本次规划还需（**含当前趟**）。
+        // 三段之间必须满足：当前 == 已完成 + 1，且 全部完成 >= 当前。
+        // 早先第三段写的是 plan_.trips.size()（"本计划还要跑几趟"），
+        // 它跟已完成无关，会出现「已完成 4 趟 · 当前第 5 趟 · 本计划共 1 趟」这种自相矛盾的显示。
+        const int totalTrips =
+            state_.completedTrips + static_cast<int>(plan_.trips.size());
+        route += QStringLiteral("趟次：已完成 %1 趟 · 当前第 %2 趟 · 全部完成约需 %3 趟\n")
                      .arg(state_.completedTrips)
                      .arg(state_.tripNumber)
-                     .arg(plan_.trips.size());
+                     .arg(totalTrips);
         if (plan_.trips.size() > 1) {
             route += QStringLiteral("\n各趟：\n");
             for (std::size_t i = 0; i < plan_.trips.size(); ++i) {
@@ -1522,6 +1528,48 @@ int MainWindow::runActionSelfCheck() {
             }
         }
         expect(checked > 0, QStringLiteral("自检未能跑到「车在仓库」的时刻，守卫未生效"));
+    }
+
+    // ---- 趟次三段的口径不变量：当前 == 已完成 + 1，且 总数 >= 当前 ----
+    //
+    // 用户提出：路线信息里的趟次应满足 已完成 n / 当前 n+1 / 总趟数 >= n+1。
+    // 第三条曾经不成立——第三段写的是"本次规划还要跑几趟"，与已完成无关，
+    // 会出现「已完成 4 趟 · 当前第 5 趟 · 本计划共 1 趟」这种自相矛盾的显示。
+    {
+        for (int i = 0; i < 30; ++i) {
+            onAdvanceStop();
+            onSimulateTraffic();
+            if (i % 2 == 1) {
+                onInsertUrgentOrder();
+            }
+        }
+        // **必须解析界面上真正显示的文本**，不能自己把公式再算一遍——
+        // 自己算的话，显示那边写错了守卫也发现不了（我第一版就是这么写的，变异测不出来）。
+        const QStringList lines =
+            routeInfo_->toPlainText().split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+        QString tripLine;
+        for (const QString& ln : lines) {
+            if (ln.startsWith(QStringLiteral("趟次："))) {
+                tripLine = ln;
+                break;
+            }
+        }
+        const QRegularExpression re(QStringLiteral(
+            "已完成 (\\d+) 趟 · 当前第 (\\d+) 趟 · 全部完成约需 (\\d+) 趟"));
+        const QRegularExpressionMatch m = re.match(tripLine);
+        expect(m.hasMatch(),
+               QStringLiteral("路线信息里应有一行「趟次：已完成 N 趟 · 当前第 M 趟 · "
+                              "全部完成约需 T 趟」，实际：%1").arg(tripLine));
+        if (m.hasMatch()) {
+            const int done = m.captured(1).toInt();
+            const int cur = m.captured(2).toInt();
+            const int total = m.captured(3).toInt();
+            expect(cur == done + 1,
+                   QStringLiteral("当前趟必须等于已完成 + 1：已完成 %1，当前 %2")
+                       .arg(done).arg(cur));
+            expect(total >= cur,
+                   QStringLiteral("总趟数必须 >= 当前趟：总 %1，当前 %2").arg(total).arg(cur));
+        }
     }
 
     // ---- 物理不变量：不得送出车上没有的货 ----
