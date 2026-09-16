@@ -47,6 +47,8 @@ public:
     QString dockTitles() const;
     // 当前规划的趟数（供 --ui-probe 核对停靠明细的趟号）
     int     tripCount() const;
+    // 已经跑完的趟数（趟号的偏移量）
+    int     completedTripOffset() const;
     // 车辆信息面板的文本快照（供 --ui-probe）
     QString vehiclePanelSummary() const;
 
@@ -127,6 +129,22 @@ private:
     int            debugIntervalMs_ = 1000;
     // 各中转站的当前存货（跨重规划延续）
     std::map<std::string, double> stationStock_;
+
+    // ---- 重规划必须继承的"既定事实" ----
+    //
+    // 重规划会重建整个计划，但有两件事在物理上早已确定，不该被抹掉：
+    //   · completedTrips_：已经跑完了几趟（即回过几次仓库）。趟号要接着往下编，
+    //     否则跑一段时间后最上面一行又变回「第 1 趟」，与"已经完成 2 趟"的事实矛盾。
+    //   · currentTripLoadKg_：本趟**出发时**装了多少。一旦驶离仓库，这一趟的装载量
+    //     就不会再变了；重规划把它重算，会得到与事实不符的值。
+    int    completedTrips_ = 0;
+    double currentTripLoadKg_ = 0.0;
+    // 本趟是否已经驶离出发点。不能用"车辆是否停在该趟起点"来判断：
+    // 重规划后车辆恰好位于新计划的起点，会被误判成"还没出发"，
+    // 于是本趟装载被重算成与事实不符的值。
+    bool   tripDeparted_ = false;
+    // 车辆当前所在的趟在 plan_.trips 里的下标
+    std::size_t currentTripIndex() const;
     QTextBrowser*  routeInfo_ = nullptr;
     QLabel*        vehicleInfo_ = nullptr;
     QTableWidget*  orderTable_ = nullptr;

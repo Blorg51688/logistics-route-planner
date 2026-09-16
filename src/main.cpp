@@ -410,6 +410,25 @@ int main(int argc, char** argv) {
                              window.tripCount(), int(tripNumbers.size()));
                 return 1;
             }
+            // 趟号必须沿行**单调不减**且都 >= 1：重规划后趟号接着往下编，
+            // 不允许出现"已完成的趟又冒出来"或"编号倒退"。
+            {
+                int prev = 0;
+                bool monotone = true;
+                for (const QString& line : lines) {
+                    const int n = tripCell.match(line).captured(1).toInt();
+                    if (n < prev || n < 1) {
+                        monotone = false;
+                        break;
+                    }
+                    prev = n;
+                }
+                if (!monotone) {
+                    std::fprintf(stderr, "[ui-probe] 停靠明细的趟号不是单调不减（起点 %d）\n",
+                                 window.completedTripOffset() + 1);
+                    return 1;
+                }
+            }
             std::printf("[ui-probe] 停靠明细趟号种类 %d 种（共 %d 趟）\n",
                         int(tripNumbers.size()), window.tripCount());
         }

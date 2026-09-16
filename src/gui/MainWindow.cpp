@@ -665,9 +665,25 @@ void MainWindow::onAdvanceStop() {
         return;   // 已结束，不再刷新
     }
 
+    const std::size_t tripBefore = currentTripIndex();
+
     // 逐个节点前进：仓库、中转站、配送点、返程都算一次位置变化
     ++nodeIndex_;
     currentNodeId_ = plan_.nodes[nodeIndex_];
+
+    // 跨到下一趟 = 上一趟已经跑完（车回到了仓库/站点）
+    const std::size_t tripAfter = currentTripIndex();
+    if (tripAfter > tripBefore) {
+        completedTrips_ += static_cast<int>(tripAfter - tripBefore);
+        if (tripAfter < plan_.trips.size()) {
+            // 新的一趟还没出发，装载量以计划为准；一旦驶离就会冻结
+            currentTripLoadKg_ = plan_.trips[tripAfter].loadKg;
+        }
+    }
+    // 只要离开过本趟的起点，本趟装载就冻结
+    if (nodeIndex_ > 0) {
+        tripDeparted_ = true;
+    }
     if (nodeIndex_ < plan_.nodeArrivalMin.size()) {
         currentTimeMin_ = plan_.nodeArrivalMin[nodeIndex_];
     }
@@ -1008,17 +1024,29 @@ void MainWindow::updatePanels() {
     if (!config_.vehicles.empty()) {
         const logistics::Vehicle& v = config_.vehicles.front();
 
-        double tripLoad = 0.0;
-        std::size_t tripNo = 0;
-        if (!plan_.nodes.empty() && !plan_.trips.empty()) {
-            const std::size_t t = (nodeIndex_ < plan_.nodeTripIndex.size())
-                                      ? plan_.nodeTripIndex[nodeIndex_]
-                                      : 0;
-            if (t < plan_.trips.size()) {
-                tripLoad = plan_.trips[t].loadKg;
-                tripNo = t + 1;
+        // 本趟尚未驶离出发点时，装载量以计划为准（还没装）；一经出发即冻结，
+        // 之后的重规划不得改动它——那已经是被执行了的事实。
+        const std::size_t curTrip = currentTripIndex();
+        if (curTrip < plan_.trips.size()) {
+            const std::size_t tripStart =
+                plan_.nodeTripIndex.empty() ? 0 : [&] {
+                    for (std::size_t i = 0; i < plan_.nodeTripIndex.size(); ++i) {
+                        if (plan_.nodeTripIndex[i] == curTrip) {
+                            return i;
+                        }
+                    }
+                    return plan_.nodeTripIndex.size();
+                }();
+            // 只有"本趟尚未驶离"时才以计划为准；驶离之后一律用冻结值，
+            // 因为那已经是被执行了的事实，重规划不得改写。
+            const bool atTripStart = (nodeIndex_ <= tripStart) && !tripDeparted_;
+            if (atTripStart || currentTripLoadKg_ <= 0.0) {
+                currentTripLoadKg_ = plan_.trips[curTrip].loadKg;
             }
         }
+        const double tripLoad = currentTripLoadKg_;
+        const std::size_t tripNo = completedTrips_ + curTrip + 1;
+        const std::size_t tripTotal = completedTrips_ + plan_.trips.size();
 
         double remainingDemand = 0.0;
         for (const Order& o : remainingOrders()) {
@@ -1035,7 +1063,7 @@ void MainWindow::updatePanels() {
                 .arg(minutesToClock(v.departTimeMin))
                 .arg(tripLoad, 0, 'f', 0)
                 .arg(tripNo)
-                .arg(plan_.trips.size())
+                .arg(tripTotal)
                 .arg(currentLoadKg(), 0, 'f', 0)
                 .arg(remainingDemand, 0, 'f', 0));
     }
@@ -1095,8 +1123,10 @@ void MainWindow::updatePanels() {
     for (int i = 0; i < shown; ++i) {
         const std::size_t idx = fromStop + static_cast<std::size_t>(i);
         const Stop& s = plan_.stops[idx];
+        // 趟号 = 已完成趟数 + 当前计划里的趟号。
+        // 这样重规划后趟号接着往下编，而不是又变回「第 1 趟」。
         stopTable_->setItem(i, 0, new QTableWidgetItem(
-            QStringLiteral("第 %1").arg(stopTrip[idx])));
+            QStringLiteral("第 %1").arg(completedTrips_ + stopTrip[idx])));
         stopTable_->setItem(i, 1, new QTableWidgetItem(QString::fromStdString(s.nodeId)));
         stopTable_->setItem(i, 2, new QTableWidgetItem(minutesToClock(s.rawArrivalMin)));
         stopTable_->setItem(i, 3, new QTableWidgetItem(QString::number(s.waitMin)));
@@ -1225,6 +1255,17 @@ QString MainWindow::toolbarActionTexts() const {
     return names.join(QStringLiteral(" | "));
 }
 
+std::size_t MainWindow::currentTripIndex() const {
+    if (plan_.nodeTripIndex.empty() || nodeIndex_ >= plan_.nodeTripIndex.size()) {
+        return 0;
+    }
+    return plan_.nodeTripIndex[nodeIndex_];
+}
+
+int MainWindow::completedTripOffset() const {
+    return completedTrips_;
+}
+
 int MainWindow::tripCount() const {
     return static_cast<int>(plan_.trips.size());
 }
@@ -1280,6 +1321,25 @@ int MainWindow::runActionSelfCheck() {
             ++failures;
         }
     };
+
+    // ---- 重规划必须继承的两条"既定事实" ----
+    //
+    // ① 本趟装载：一旦驶离仓库，这一趟装了多少就是既成事实，重规划不得改写。
+    // ② 趟号：已经跑完的趟不该再出现，编号要接着往下走。
+    {
+        const double loadAtStart = currentTripLoadKg_;
+        onAdvanceStop();               // 驶离仓库
+        const double loadAfterDepart = currentTripLoadKg_;
+        onSimulateTraffic();           // 触发一次重规划
+        const double loadAfterReplan = currentTripLoadKg_;
+        expect(loadAfterDepart > 0.0, QStringLiteral("驶离后本趟装记载荷为正：%1kg")
+                                          .arg(loadAfterDepart, 0, 'f', 0));
+        expect(std::fabs(loadAfterReplan - loadAfterDepart) < 1e-6,
+               QStringLiteral("重规划不得改写本趟装载：重规划后 %1kg，之前 %2kg")
+                   .arg(loadAfterReplan, 0, 'f', 0)
+                   .arg(loadAfterDepart, 0, 'f', 0));
+        (void)loadAtStart;
+    }
 
     const std::size_t ordersBefore = config_.orders.size();
     const std::size_t nodesBefore = config_.graph.nodeCount();
