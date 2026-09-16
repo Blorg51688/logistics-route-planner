@@ -196,10 +196,10 @@ void MainWindow::buildDocks() {
 
     auto* lateDock = new QDockWidget(QStringLiteral("超时订单"), this);
     lateDock->setMinimumWidth(360);
-    lateTable_ = new QTableWidget(0, 5, lateDock);
+    lateTable_ = new QTableWidget(0, 6, lateDock);
     lateTable_->setHorizontalHeaderLabels(
-        {QStringLiteral("订单"), QStringLiteral("配送点"), QStringLiteral("到达"),
-         QStringLiteral("窗口"), QStringLiteral("penalty")});
+        {QStringLiteral("订单"), QStringLiteral("配送点"), QStringLiteral("状态"),
+         QStringLiteral("到达"), QStringLiteral("窗口"), QStringLiteral("penalty(min)")});;
     lateTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     lateTable_->horizontalHeader()->setStretchLastSection(true);
     lateTable_->verticalHeader()->setVisible(false);
@@ -526,6 +526,9 @@ void MainWindow::onSimulateTraffic() {
     const logistics::RoutePlan remainder = logistics::sliceRemainder(plan_, nodeIndex_);
 
     const bool wasSingleTrip = (plan_.trips.size() == 1);
+    // 换计划之前，把"当前计划里已经走过的停靠点"并入记账（三条重规划路径都要做，
+    // 否则界面上的「已送达 N 站」会归 0、「停靠 N 站」会缩水成剩余数）
+    servedStopsBase_ += static_cast<int>(stopCursor_);
     plan_ = logistics::replanIncremental(config_.graph, config_.vehicles.front(),
                                          remainingOrders(), remainder, currentTimeMin(),
                                          planWeight_,
@@ -602,6 +605,7 @@ std::string MainWindow::insertUrgentOrderAction() {
     if (!inserted.warning.empty()) {
         appendLog(QStringLiteral("  ⚠ %1").arg(QString::fromStdString(inserted.warning)));
     }
+    servedStopsBase_ += static_cast<int>(stopCursor_);
     plan_ = inserted.plan;
     syncStationStock();
     syncScene();
@@ -697,6 +701,16 @@ void MainWindow::onAdvanceStop() {
                       .arg(minutesToClock(stop.arrivalMin))
                       .arg(stop.late ? QStringLiteral("，超时 penalty %1min").arg(stop.penaltyMin)
                                      : QString()));
+        // 超时惩罚是**已经发生**的事实，单独记账；否则重规划后总数会往回跳
+        if (stop.late) {
+            incurredPenaltyMin_ += stop.penaltyMin;
+            LateStop ls;
+            ls.orderId = orderIdsAt(stop.nodeId).toStdString();
+            ls.nodeId = stop.nodeId;
+            ls.arrivalMin = stop.arrivalMin;
+            ls.penaltyMin = stop.penaltyMin;
+            deliveredLate_.push_back(ls);
+        }
         for (Order& order : config_.orders) {
             if (order.nodeId == stop.nodeId) {
                 order.served = true;
@@ -967,10 +981,17 @@ void MainWindow::updatePanels() {
                      .arg(plan_.totalTimeMin, 0, 'f', 1)
                      .arg(minutesToClock(static_cast<int>(std::llround(plan_.totalTimeMin))));
         route += QStringLiteral("总成本：%1 元\n").arg(plan_.totalCostYuan, 0, 'f', 1);
-        route += QStringLiteral("总 penalty：%1 min\n").arg(plan_.totalPenaltyMin);
+        // 已经发生的超时惩罚 + 剩余计划预计的惩罚。只显示 plan_.totalPenaltyMin
+        // 会让"已经发生的"在重规划后凭空消失。
+        route += QStringLiteral("总 penalty：%1 min（已发生 %2 + 剩余计划 %3）\n")
+                     .arg(incurredPenaltyMin_ + plan_.totalPenaltyMin)
+                     .arg(incurredPenaltyMin_)
+                     .arg(plan_.totalPenaltyMin);
+        // 「已送达」与「停靠总数」都必须跨重规划累计：
+        // 只看 plan_.stops 的话，重规划后前者归 0、后者缩水成"剩余要送的"。
         route += QStringLiteral("停靠 %1 站，已送达 %2 站，共 %3 趟\n")
-                     .arg(plan_.stops.size())
-                     .arg(stopCursor_)
+                     .arg(servedStopsBase_ + static_cast<int>(plan_.stops.size()))
+                     .arg(servedStopsBase_ + static_cast<int>(stopCursor_))
                      .arg(plan_.trips.size());
         if (plan_.trips.size() > 1) {
             route += QStringLiteral("\n各趟：\n");
@@ -1177,24 +1198,44 @@ void MainWindow::updatePanels() {
         }
     }
 
-    // 超时订单：列出**订单号**而不只是配送点——紧急订单也可能超时，
-    // 只记录地点用处不大；并用"窗口"替代"剩余载重"（后者在这里没有观测价值）。
+    // 超时订单：区分**已经发生**的超时（事实，跨重规划保留）与**剩余计划预计**的超时。
+    //
+    // 只列 plan_.stops 里 late 的那些是不够的：重规划后剩余计划里可能一个都不 late，
+    // 于是"已经超时过"的订单会从表里凭空消失，看起来像超时被抹掉了。
     int lateRows = 0;
+    const auto putLate = [&](const QString& orderText, const std::string& nodeId,
+                             const QString& status, int arrivalMin, int penaltyMin) {
+        lateTable_->setRowCount(lateRows + 1);
+        lateTable_->setItem(lateRows, 0, new QTableWidgetItem(orderText));
+        lateTable_->setItem(lateRows, 1, new QTableWidgetItem(QString::fromStdString(nodeId)));
+        lateTable_->setItem(lateRows, 2, new QTableWidgetItem(status));
+        lateTable_->setItem(lateRows, 3, new QTableWidgetItem(minutesToClock(arrivalMin)));
+        lateTable_->setItem(lateRows, 4, new QTableWidgetItem(windowTextAt(nodeId)));
+        lateTable_->setItem(lateRows, 5, new QTableWidgetItem(QString::number(penaltyMin)));
+        ++lateRows;
+    };
+    for (const LateStop& ls : deliveredLate_) {
+        putLate(QString::fromStdString(ls.orderId), ls.nodeId,
+                QStringLiteral("已超时"), ls.arrivalMin, ls.penaltyMin);
+    }
     if (plan_.status == logistics::PlanStatus::Ok) {
         for (const Stop& s : plan_.stops) {
-            if (!s.late) {
+            if (!s.late || stopCursor_ >= plan_.stops.size()) {
                 continue;
             }
-            lateTable_->setRowCount(lateRows + 1);
-            lateTable_->setItem(lateRows, 0,
-                                new QTableWidgetItem(orderIdsAt(s.nodeId)));
-            lateTable_->setItem(lateRows, 1,
-                                new QTableWidgetItem(QString::fromStdString(s.nodeId)));
-            lateTable_->setItem(lateRows, 2,
-                                new QTableWidgetItem(minutesToClock(s.arrivalMin)));
-            lateTable_->setItem(lateRows, 3, new QTableWidgetItem(windowTextAt(s.nodeId)));
-            lateTable_->setItem(lateRows, 4, new QTableWidgetItem(QString::number(s.penaltyMin)));
-            ++lateRows;
+            // 已经走过的不再重复列（上面已经作为"已超时"列出）
+            bool alreadyDelivered = false;
+            for (std::size_t k = 0; k < stopCursor_ && k < plan_.stops.size(); ++k) {
+                if (plan_.stops[k].nodeId == s.nodeId) {
+                    alreadyDelivered = true;
+                    break;
+                }
+            }
+            if (alreadyDelivered) {
+                continue;
+            }
+            putLate(orderIdsAt(s.nodeId), s.nodeId, QStringLiteral("预计超时"),
+                    s.arrivalMin, s.penaltyMin);
         }
     }
     lateTable_->setRowCount(lateRows);
@@ -1339,6 +1380,36 @@ int MainWindow::runActionSelfCheck() {
                    .arg(loadAfterReplan, 0, 'f', 0)
                    .arg(loadAfterDepart, 0, 'f', 0));
         (void)loadAtStart;
+    }
+
+    // ---- 重规划不得让"已经发生的事实"缩水 ----
+    //
+    // 这三项都曾经因为"从当前计划反推"而在重规划后变错：
+    //   · 「停靠 N 站」缩水成"剩余要送的站数"
+    //   · 「已送达 N 站」归 0
+    //   · 「总 penalty」把已经发生的超时惩罚丢掉
+    {
+        const int stopsTotalBefore =
+            servedStopsBase_ + static_cast<int>(plan_.stops.size());
+        const int servedBefore = servedStopsBase_ + static_cast<int>(stopCursor_);
+
+        onAdvanceStop();
+        onSimulateTraffic();   // 触发重规划
+        onAdvanceStop();
+        onSimulateTraffic();
+
+        const int stopsTotalAfter =
+            servedStopsBase_ + static_cast<int>(plan_.stops.size());
+        const int servedAfter = servedStopsBase_ + static_cast<int>(stopCursor_);
+        expect(stopsTotalAfter >= stopsTotalBefore,
+               QStringLiteral("「停靠 N 站」不得因重规划缩水：重规划后 %1，之前 %2")
+                   .arg(stopsTotalAfter).arg(stopsTotalBefore));
+        expect(servedAfter >= servedBefore,
+               QStringLiteral("「已送达 N 站」不得因重规划减少：重规划后 %1，之前 %2")
+                   .arg(servedAfter).arg(servedBefore));
+        expect(stopsTotalAfter ==
+                   servedStopsBase_ + static_cast<int>(plan_.stops.size()),
+               QStringLiteral("停靠总数应等于「已送 + 剩余」"));
     }
 
     const std::size_t ordersBefore = config_.orders.size();

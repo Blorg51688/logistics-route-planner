@@ -143,6 +143,24 @@ private:
     // 重规划后车辆恰好位于新计划的起点，会被误判成"还没出发"，
     // 于是本趟装载被重算成与事实不符的值。
     bool   tripDeparted_ = false;
+
+    // 同样是"既定事实"，不能从 plan_ 反推：
+    //   · servedStopsBase_：本次计划之前**已经送达**的停靠点数。
+    //     重规划后 plan_.stops 只剩"剩余要送的"，若不记账，
+    //     界面上的「已送达」会归 0、「停靠 N 站」会缩水成剩余数。
+    //   · incurredPenaltyMin_：**已经发生**的超时惩罚合计。
+    //     重规划只算剩余计划的 penalty，不记账的话总数会往回跳。
+    //   · deliveredLate_：已送达且超时的停靠点（订单/配送点/到达/窗口/penalty），
+    //     供"超时订单"表区分「已经超时」与「预计会超时」。
+    struct LateStop {
+        std::string orderId;
+        std::string nodeId;
+        int         arrivalMin = 0;
+        int         penaltyMin = 0;   // 窗口止在渲染时由订单反查，Stop 里没有这个字段
+    };
+    int servedStopsBase_ = 0;
+    int incurredPenaltyMin_ = 0;
+    std::vector<LateStop> deliveredLate_;
     // 车辆当前所在的趟在 plan_.trips 里的下标
     std::size_t currentTripIndex() const;
     QTextBrowser*  routeInfo_ = nullptr;
