@@ -475,7 +475,7 @@ void MainWindow::replan() {
     // 三条重规划路径（本函数 / replanIncremental / insertUrgentOrder）都必须做，
     // 否则界面上的「已送达」会归 0、「停靠 N 站」会缩水、趟号会对不上。
     servedStopsBase_ += static_cast<int>(stopCursor_);
-    completedTrips_ += static_cast<int>(currentTripIndex());
+    completedTrips_ += tripsToMergeOnReplan();
     plan_ = logistics::replan(config_.graph, config_.vehicles.front(), remaining, here, now,
                               planWeight_,
                               stationStock_, onboardGoods());
@@ -559,7 +559,7 @@ void MainWindow::onSimulateTraffic() {
     // 换计划之前，把"当前计划里已经走过的停靠点"并入记账（三条重规划路径都要做，
     // 否则界面上的「已送达 N 站」会归 0、「停靠 N 站」会缩水成剩余数）
     servedStopsBase_ += static_cast<int>(stopCursor_);
-    completedTrips_ += static_cast<int>(currentTripIndex());
+    completedTrips_ += tripsToMergeOnReplan();
     plan_ = logistics::replanIncremental(config_.graph, config_.vehicles.front(),
                                          remainingOrders(), remainder, currentTimeMin(),
                                          planWeight_,
@@ -637,7 +637,7 @@ std::string MainWindow::insertUrgentOrderAction() {
         appendLog(QStringLiteral("  ⚠ %1").arg(QString::fromStdString(inserted.warning)));
     }
     servedStopsBase_ += static_cast<int>(stopCursor_);
-    completedTrips_ += static_cast<int>(currentTripIndex());
+    completedTrips_ += tripsToMergeOnReplan();
     plan_ = inserted.plan;
     syncStationStock();
     syncScene();
@@ -1340,6 +1340,17 @@ int MainWindow::completedTripOffset() const {
     return completedTrips_;
 }
 
+int MainWindow::tripsToMergeOnReplan() const {
+    const int curTrip = static_cast<int>(currentTripIndex());
+    const bool atDepot = !config_.vehicles.empty()
+                         && currentNodeId_ == config_.vehicles.front().startNodeId;
+    // nodeIndex_ > 0 才能说明"出发过又回来了"，否则是计划尚未开始
+    if (atDepot && nodeIndex_ > 0) {
+        return curTrip + 1;
+    }
+    return curTrip;
+}
+
 int MainWindow::tripCount() const {
     return static_cast<int>(plan_.trips.size());
 }
@@ -1503,6 +1514,36 @@ int MainWindow::runActionSelfCheck() {
         expect(completedTripOffset() == before,
                QStringLiteral("纯推进不应改变已完成趟数：%1 -> %2")
                    .arg(before).arg(completedTripOffset()));
+    }
+
+    // ---- 三处趟号必须一致（人工测试反馈：明细与「共 K 趟」没有继承已完成趟数）----
+    //
+    // 断言方式：停靠明细**最后一行**所属的趟，必须等于「已完成趟数 + 计划趟数」。
+    // 这条把"停靠明细的偏移"与"共 K 趟的偏移"绑在一起——两者只要有一个漏了偏移，
+    // 数字就对不上。
+    {
+        for (int i = 0; i < 10; ++i) {
+            onAdvanceStop();
+            onSimulateTraffic();
+            if (i % 2 == 1) {
+                insertUrgentOrderAction();
+            }
+        }
+        const int expectLast = completedTripOffset() + tripCount();
+        int gotLast = -1;
+        for (int r = stopTable_->rowCount() - 1; r >= 0; --r) {
+            QTableWidgetItem* it = stopTable_->item(r, 0);
+            if (it == nullptr) {
+                continue;
+            }
+            gotLast = it->text().remove(QStringLiteral("第 ")).trimmed().toInt();
+            break;
+        }
+        expect(gotLast == expectLast,
+               QStringLiteral("停靠明细末行的趟号应等于「已完成趟 + 计划趟数」："
+                              "实际 %1，期望 %2（已完成 %3 + 计划 %4）")
+                   .arg(gotLast).arg(expectLast)
+                   .arg(completedTripOffset()).arg(tripCount()));
     }
 
     const std::size_t ordersBefore = config_.orders.size();

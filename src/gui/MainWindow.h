@@ -169,6 +169,13 @@ private:
     std::vector<std::string> bankedNodeIds_;
     // 车辆当前所在的趟在 plan_.trips 里的下标
     std::size_t currentTripIndex() const;
+    // 换计划时应把多少"已完成趟"并进 completedTrips_：
+    //   · 车在仓库且不是初始位置 -> 刚跑完的那一趟已经结束，记 curTrip + 1
+    //   · 否则（途中）-> 当前这一趟还没跑完，只记 curTrip
+    // 不能一律用 curTrip：车停在仓库时，它的 nodeTripIndex 指向的正是
+    // "它刚跑完的那一趟"（该趟终点就是仓库），用 curTrip 会少记一趟，
+    // 于是趟号永远停在「第 1 趟」——这正是人工测试反馈的现象。
+    int tripsToMergeOnReplan() const;
     QTextBrowser*  routeInfo_ = nullptr;
     QLabel*        vehicleInfo_ = nullptr;
     QTableWidget*  orderTable_ = nullptr;
