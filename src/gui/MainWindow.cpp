@@ -136,6 +136,15 @@ void MainWindow::buildActions() {
 
     debugTimer_ = new QTimer(this);
     connect(debugTimer_, &QTimer::timeout, this, &MainWindow::onDebugTick);
+
+    // 实时路况：按配置间隔自动模拟（需求 §5.4 实现提示 2 点名要求的行为）。
+    // 间隔来自 traffic_change_interval_sec（默认 30 秒）；比例与增幅同理读配置。
+    trafficTimer_ = new QTimer(this);
+    connect(trafficTimer_, &QTimer::timeout, this, &MainWindow::onTrafficTick);
+    const double intervalSec = config_.general.trafficChangeIntervalSec > 0.0
+                                   ? config_.general.trafficChangeIntervalSec
+                                   : 30.0;
+    trafficTimer_->start(static_cast<int>(intervalSec * 1000.0));
 }
 
 void MainWindow::buildDocks() {
@@ -500,17 +509,21 @@ void MainWindow::onSimulateTraffic() {
     // 界面上的「第 N 趟」全变成「第 1 趟」、「共 N 趟」变成「共 1 趟」。
     const logistics::RoutePlan remainder = logistics::sliceRemainder(plan_, nodeIndex_);
 
-    const bool wasSingleTrip = (plan_.trips.size() == 1);
+    // 由核心**回报**是否真的走了增量，界面不要自己猜。
+    // 曾经这里用 plan_.trips.size()==1 猜，多趟方案下恒为 false，
+    // 于是真的走了增量也打印"退回全量重算"，与实际相反（审计发现的 #17）。
+    bool usedIncremental = false;
     // 换计划之前，把"当前计划里已经走过的停靠点"并入记账（三条重规划路径都要做，
     // 否则界面上的「已送达 N 站」会归 0、「停靠 N 站」会缩水成剩余数）
     plan_ = logistics::replanIncremental(config_.graph, config_.vehicles.front(),
                                          remainingOrders(), remainder, currentTimeMin(),
                                          planWeight_,
-                                         report, config_.general.trafficTimeIncreaseMin, onboardGoods());
+                                         report, config_.general.trafficTimeIncreaseMin,
+                                         onboardGoods(), &usedIncremental);
     afterPlanReplaced();
-    appendLog(wasSingleTrip
+    appendLog(usedIncremental
                   ? QStringLiteral("  → 增量式重规划：仅重算受影响的路段，其余原样保留")
-                  : QStringLiteral("  → 上一版为多趟方案，退回全量重算"));
+                  : QStringLiteral("  → 增量不适用（序列不全或路段已不可达），退回全量重算"));
     syncScene();
     updatePanels();
 }
@@ -723,6 +736,15 @@ void MainWindow::onDebugToggled(bool on) {
         debugTimer_->stop();
         appendLog(QStringLiteral("Debug 模式关闭：自动模拟已停止"));
     }
+}
+
+// 实时路况：每 traffic_change_interval_sec 秒自动模拟一次（默认 30 秒）。
+// 与"点击模拟路况"走同一条逻辑，因此判定阈值/高亮更新/重规划触发完全一致。
+void MainWindow::onTrafficTick() {
+    if (trafficTimer_ == nullptr) {
+        return;
+    }
+    onSimulateTraffic();
 }
 
 void MainWindow::onDebugTick() {
@@ -1372,13 +1394,19 @@ int MainWindow::runActionSelfCheck() {
     // ---- 趟号：已完成趟数只该在换计划时合并，不能与计划内趟号重复相加 ----
     {
         const int before = completedTripOffset();
+        const std::size_t tripsBefore = static_cast<std::size_t>(tripCount());
         for (int i = 0; i < 3; ++i) {
             onAdvanceStop();
         }
-        // 纯推进不换计划：已完成趟数不应变化
-        expect(completedTripOffset() == before,
-               QStringLiteral("纯推进不应改变已完成趟数：%1 -> %2")
+        // 正确的性质是**单调不减**：推进若把车送到了仓库，这一趟就算跑完了，
+        // 已完成趟数**本来就会 +1**。（早先这里断言"纯推进不得改变"，
+        //  是个错误的不变量——它会在车恰好接近仓库时误报。）
+        expect(completedTripOffset() >= before,
+               QStringLiteral("已完成趟数只能增不能减：%1 -> %2")
                    .arg(before).arg(completedTripOffset()));
+        expect(tripCount() >= 1 && tripsBefore >= 1,
+               QStringLiteral("计划趟数应恒为正"));
+        // 而"重规划不得改变已完成趟数"由下面那条结构性守卫负责
     }
 
     // ---- 本趟装载必须随趟刷新，且不得小于当前载重 ----

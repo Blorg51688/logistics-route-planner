@@ -129,6 +129,7 @@ private slots:
     void onReplan();
     void onDebugToggled(bool on);
     void onDebugTick();
+    void onTrafficTick();
     void onManualEdit();
 
 private:
@@ -241,6 +242,10 @@ private:
     QPlainTextEdit* logView_ = nullptr;
 
     QTimer* debugTimer_ = nullptr;
+    // 实时路况定时器：按配置的 traffic_change_interval_sec 自动模拟路况变化。
+    // 需求 §5.4 实现提示 2 明确要求"每 30 秒修改 10% 路径的耗时权重"——
+    // 此前该配置只被读入、从未被使用（审计发现的 #16），路况只能靠按钮触发。
+    QTimer* trafficTimer_ = nullptr;
     bool    debugOn_ = false;
     int     debugTicks_ = 0;
     int     debugTickMs_ = 3000;

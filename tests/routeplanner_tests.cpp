@@ -588,7 +588,11 @@ void testIncrementalReplanIsIdempotentWhenNothingAffected() {
 }
 
 // 范围限制：上一版是多趟时，增量退回全量重算，结果仍须合法
-void testIncrementalReplanFallsBackForMultiTrip() {
+// D22 的契约：增量重规划的结果必须与全量重算一致；且**多趟也要能走增量**。
+//
+// 早期实现只支持"整条剩余路线是单趟"，默认 6 趟方案下只有最后一趟用得上，
+// 其余一律全量——审计认为这实质等于没实现。现在改为**逐趟增量**。
+void testIncrementalReplanHandlesMultiTrip() {
     const LogisticsGraph g = makeTransitClusterGraph();
     const Vehicle v = makeVehicle("W", 20.0, 480);
     const std::vector<Order> orders = {makeOrder("O1", "D1", 15.0, 0, 1440, false),
@@ -597,13 +601,46 @@ void testIncrementalReplanFallsBackForMultiTrip() {
     const RoutePlan multi = planRoute(g, v, orders, WeightType::Distance);
     check(multi.trips.size() > 1, "前提：上一版确为多趟");
 
-    TrafficReport report;   // 空报告
-    const RoutePlan after =
-        replanIncremental(g, v, orders, multi, 480, WeightType::Distance, report, 0.2);
+    // 空报告：没有受影响的路段，走增量应原样保留
+    bool used = false;
+    TrafficReport empty;
+    const RoutePlan same = replanIncremental(g, v, orders, multi, 480,
+                                             WeightType::Distance, empty, 0.2,
+                                             std::vector<logistics::OnboardItem>(), &used);
+    check(used, "多趟剩余路线也必须走增量路径（不再一律退回全量）");
+    check(same.status == PlanStatus::Ok && same.stops.size() == multi.stops.size(),
+          "无路况变化时停靠点应完全保留");
+    check(same.totalDistanceKm == multi.totalDistanceKm,
+          "无路况变化时总距离应不变，实际 "
+              + std::to_string(same.totalDistanceKm) + " vs "
+              + std::to_string(multi.totalDistanceKm));
 
-    check(after.status == PlanStatus::Ok, "退回全量重算后仍可行");
-    check(after.stops.size() == 2, "仍然服务全部配送点");
-    checkRouteIsWalkable(g, after, "W");
+    // 有路况变化：增量结果必须与全量重算**一致**（D22 契约）
+    TrafficReport report;
+    for (const logistics::Edge& e : g.edges()) {
+        logistics::TrafficChange c;
+        c.fromId = e.fromId;
+        c.toId = e.toId;
+        c.congested = true;
+        c.increaseRatio = 0.5;
+        report.changes.push_back(c);
+    }
+    bool used2 = false;
+    const RoutePlan inc = replanIncremental(g, v, orders, multi, 480,
+                                            WeightType::Distance, report, 0.2,
+                                            std::vector<logistics::OnboardItem>(), &used2);
+    check(inc.status == PlanStatus::Ok, "全边拥堵后仍可行");
+    checkRouteIsWalkable(g, inc, "W");
+    check(inc.stops.size() == multi.stops.size(), "停靠点数量不变");
+
+    // 与全量重算对比：停靠顺序与各站到达时刻应一致
+    const RoutePlan full = replan(g, v, orders, "W", 480, WeightType::Distance);
+    check(inc.stops.size() == full.stops.size(), "与全量重算的停靠点数一致");
+    bool sameOrder = (inc.stops.size() == full.stops.size());
+    for (std::size_t i = 0; sameOrder && i < inc.stops.size(); ++i) {
+        sameOrder = (inc.stops[i].nodeId == full.stops[i].nodeId);
+    }
+    check(sameOrder, "增量结果的停靠顺序应与全量重算一致");
 }
 
 bool samePlan(const RoutePlan& a, const RoutePlan& b) {
@@ -777,7 +814,7 @@ int main() {
     testWithinCapacityStaysSingleTrip();
     testIncrementalReplanRecomputesOnlyAffectedLeg();
     testIncrementalReplanIsIdempotentWhenNothingAffected();
-    testIncrementalReplanFallsBackForMultiTrip();
+    testIncrementalReplanHandlesMultiTrip();
     testUnreachableDeliveryIsInfeasibleAndNamesTheNode();
     testReplanFromCurrentPosition();
     testReplanWhenAlreadyAtTheDeliveryNode();

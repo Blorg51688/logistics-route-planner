@@ -134,8 +134,10 @@ RoutePlan sliceRemainder(const RoutePlan& plan, std::size_t fromNodeIndex);
 // 增量式重规划（设计 §5.7 / D22）。
 // 把当前路线按**停靠点**切成若干 leg，只对"走过被路况命中的边"的那些 leg
 // 重新求最短路，其余 leg 原样复用，**停靠顺序不变**。
-// 适用范围：上一版必须是单趟路线；否则（多趟、或某个 leg 重算后不可达）
-// 自动退回全量重算 replan()，调用方无需区分。
+// **逐趟增量**：剩余路线的每一趟各自只重算受影响的 leg，往返趟之间互不影响。
+// 仅当任何一趟增量失败（序列不全 / 受影响 leg 已不可达）时，才整体退回全量重算。
+// 是否真的走了增量由 usedIncremental 回报——**调用方不要自己从趟数猜**：
+// 早期实现按"剩余路线是否单趟"猜，多趟时会把走成增量的情况误报成"退回全量"。
 RoutePlan replanIncremental(const LogisticsGraph& graph,
                             const Vehicle& vehicle,
                             const std::vector<Order>& remainingOrders,
@@ -146,7 +148,9 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
                             double thresholdRatio,
                             // 与 replan 一致：回退到全量重算时在途货必须一并带上
                             const std::vector<OnboardItem>& onboard
-                                = std::vector<OnboardItem>());
+                                = std::vector<OnboardItem>(),
+                            // 回报本函数是否真的走了增量路径（false = 退回了全量）
+                            bool* usedIncremental = nullptr);
 
 // 判断某条有向边是否落在给定路线序列的**相邻两站**之间。
 // GUI 的路径高亮与路况重规划的触发判定共用这一条逻辑。
