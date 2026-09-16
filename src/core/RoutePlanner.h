@@ -85,6 +85,11 @@ struct RoutePlan {
     double totalCostYuan   = 0.0;
     int    totalPenaltyMin = 0;
 
+    // 本次规划中被「顺路寄存」到中转站的货（节点 ID）。
+    // 这些货从车上转到了站里，调用方必须据此把它们从「在途货」里剔除——
+    // 否则每重规划一次就会被再寄存一次，库存单调膨胀（审计实测 40->80->120kg）。
+    std::vector<std::string> bankedNodeIds;
+
     // ---- 多趟结构（D20/D21）----
     // trips 是**真源**；上面的 nodes/nodeArrivalMin/nodeIsStop/stops
     // 是由它展平（flatten）出来的兼容视图，只在一处生成，不会各自维护。

@@ -102,6 +102,8 @@ private:
     // 把最近一次规划的结果里各站的期末存货回写为"当前存货"，
     // 供下一次重规划作为期初存货传入 —— 这就是"积少成多"的回路。
     void               syncStationStock();
+    // 记录本次规划中被「顺路寄存」到站里的货所对应的节点
+    void               rememberBanked(const logistics::RoutePlan& plan);
     void               onShowGraphTables();
     QString            windowTextAt(const std::string& nodeId) const;
     int                currentTimeMin() const;
@@ -161,6 +163,10 @@ private:
     int servedStopsBase_ = 0;
     int incurredPenaltyMin_ = 0;
     std::vector<LateStop> deliveredLate_;
+    // 已经被「顺路寄存」到中转站的货所对应的节点。
+    // 这些货已经不在车上，必须从 onboardGoods() 里剔除，否则每重规划一次
+    // 就会被再寄存一次，stationStock_ 单调膨胀并污染后续路由（审计发现的 F5）。
+    std::vector<std::string> bankedNodeIds_;
     // 车辆当前所在的趟在 plan_.trips 里的下标
     std::size_t currentTripIndex() const;
     QTextBrowser*  routeInfo_ = nullptr;

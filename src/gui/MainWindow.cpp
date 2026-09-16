@@ -239,8 +239,12 @@ int MainWindow::currentTimeMin() const {
 // 某配送点上的全部订单号，用 / 连接（同一节点可能有多单合并成一次停靠）
 void MainWindow::stockTrace(const std::string& stationId, double& current,
                             double& peak) const {
-    current = 0.0;
-    peak = 0.0;
+    // 起点必须是**站内真实存货**（stationStock_），不能从 0 起。
+    // 顺路寄存只改库存、不产生 TransitOp，从 0 起算的话面板会恒显示 0，
+    // 与"站里实际有货"这一事实矛盾。
+    const std::map<std::string, double>::const_iterator base = stationStock_.find(stationId);
+    current = (base != stationStock_.end()) ? base->second : 0.0;
+    peak = current;
     if (plan_.nodes.empty()) {
         return;
     }
@@ -315,6 +319,16 @@ double MainWindow::currentLoadKg() const {
     return load;
 }
 
+void MainWindow::rememberBanked(const logistics::RoutePlan& plan) {
+    for (const std::string& id : plan.bankedNodeIds) {
+        bool seen = false;
+        for (const std::string& x : bankedNodeIds_) {
+            if (x == id) { seen = true; break; }
+        }
+        if (!seen) { bankedNodeIds_.push_back(id); }
+    }
+}
+
 std::vector<logistics::OnboardItem> MainWindow::onboardGoods() const {
     std::vector<logistics::OnboardItem> items;
     // 车还在仓库（尚未出发）时车上没有货——此时若把"第一趟待装的货"当成在途货，
@@ -354,12 +368,22 @@ std::vector<logistics::OnboardItem> MainWindow::onboardGoods() const {
                     kg += o.demandKg;
                 }
             }
-            if (kg > 1e-9) {
-                logistics::OnboardItem item;
-                item.nodeId = nodeId;
-                item.kg = kg;
-                items.push_back(item);
+            if (kg <= 1e-9) {
+                continue;
             }
+            // 已经被「顺路寄存」到站里的货不在车上：必须剔除，
+            // 否则每重规划一次就会被再寄存一次，库存单调膨胀并污染后续路由。
+            bool banked = false;
+            for (const std::string& x : bankedNodeIds_) {
+                if (x == nodeId) { banked = true; break; }
+            }
+            if (banked) {
+                continue;
+            }
+            logistics::OnboardItem item;
+            item.nodeId = nodeId;
+            item.kg = kg;
+            items.push_back(item);
         }
         ++stopIdx;
     }
@@ -367,6 +391,7 @@ std::vector<logistics::OnboardItem> MainWindow::onboardGoods() const {
 }
 
 void MainWindow::syncStationStock() {
+    rememberBanked(plan_);
     stationStock_.clear();
     for (const logistics::TransitStock& st : plan_.transitStock) {
         if (st.finalKg > 1e-9) {
@@ -446,6 +471,11 @@ void MainWindow::replan() {
     const int now = currentTimeMin();
     const std::vector<Order> remaining = remainingOrders();
 
+    // 换计划之前，把"当前计划里已经走过的"并入记账，并合并已完成趟数。
+    // 三条重规划路径（本函数 / replanIncremental / insertUrgentOrder）都必须做，
+    // 否则界面上的「已送达」会归 0、「停靠 N 站」会缩水、趟号会对不上。
+    servedStopsBase_ += static_cast<int>(stopCursor_);
+    completedTrips_ += static_cast<int>(currentTripIndex());
     plan_ = logistics::replan(config_.graph, config_.vehicles.front(), remaining, here, now,
                               planWeight_,
                               stationStock_, onboardGoods());
@@ -473,8 +503,8 @@ void MainWindow::onStrategyChanged() {
                       ? WeightType::Cost
                       : (strategy == QStringLiteral("time") ? WeightType::Time
                                                             : WeightType::Distance);
-    nodeIndex_ = 0;
-    stopCursor_ = 0;
+    // 不在这里清零 stopCursor_/nodeIndex_：replan() 需要先用它们记账，
+    // 清零后记账会加 0，「已送达」就丢了。
     appendLog(QStringLiteral("切换规划策略 -> %1").arg(strategyBox_->currentText()));
     replan();
 }
@@ -529,6 +559,7 @@ void MainWindow::onSimulateTraffic() {
     // 换计划之前，把"当前计划里已经走过的停靠点"并入记账（三条重规划路径都要做，
     // 否则界面上的「已送达 N 站」会归 0、「停靠 N 站」会缩水成剩余数）
     servedStopsBase_ += static_cast<int>(stopCursor_);
+    completedTrips_ += static_cast<int>(currentTripIndex());
     plan_ = logistics::replanIncremental(config_.graph, config_.vehicles.front(),
                                          remainingOrders(), remainder, currentTimeMin(),
                                          planWeight_,
@@ -606,6 +637,7 @@ std::string MainWindow::insertUrgentOrderAction() {
         appendLog(QStringLiteral("  ⚠ %1").arg(QString::fromStdString(inserted.warning)));
     }
     servedStopsBase_ += static_cast<int>(stopCursor_);
+    completedTrips_ += static_cast<int>(currentTripIndex());
     plan_ = inserted.plan;
     syncStationStock();
     syncScene();
@@ -677,12 +709,13 @@ void MainWindow::onAdvanceStop() {
 
     // 跨到下一趟 = 上一趟已经跑完（车回到了仓库/站点）
     const std::size_t tripAfter = currentTripIndex();
-    if (tripAfter > tripBefore) {
-        completedTrips_ += static_cast<int>(tripAfter - tripBefore);
-        if (tripAfter < plan_.trips.size()) {
-            // 新的一趟还没出发，装载量以计划为准；一旦驶离就会冻结
-            currentTripLoadKg_ = plan_.trips[tripAfter].loadKg;
-        }
+    // 注意：这里**不能**累加 completedTrips_。
+    // tripAfter 是"当前计划内"的趟号，而 completedTrips_ 是"当前计划之前"已完成的趟数；
+    // 两者在换计划时才合并（见 replan()）。在推进时自增会导致趟号被加两次，
+    // 实测连点 13 次推进会显示「第 3 / 7 趟」（实际第 2 / 6 趟）。
+    if (tripAfter > tripBefore && tripAfter < plan_.trips.size()) {
+        // 新的一趟还没出发，装载量以计划为准；一旦驶离就会冻结
+        currentTripLoadKg_ = plan_.trips[tripAfter].loadKg;
     }
     // 只要离开过本趟的起点，本趟装载就冻结
     if (nodeIndex_ > 0) {
@@ -992,7 +1025,7 @@ void MainWindow::updatePanels() {
         route += QStringLiteral("停靠 %1 站，已送达 %2 站，共 %3 趟\n")
                      .arg(servedStopsBase_ + static_cast<int>(plan_.stops.size()))
                      .arg(servedStopsBase_ + static_cast<int>(stopCursor_))
-                     .arg(plan_.trips.size());
+                     .arg(completedTrips_ + plan_.trips.size());
         if (plan_.trips.size() > 1) {
             route += QStringLiteral("\n各趟：\n");
             for (std::size_t i = 0; i < plan_.trips.size(); ++i) {
@@ -1013,7 +1046,7 @@ void MainWindow::updatePanels() {
                                 .arg(QString::fromStdString(trip.endNodeId));
                 }
                 route += QStringLiteral("  第 %1 趟：%2  %3km  装载 %4kg\n")
-                             .arg(i + 1)
+                             .arg(completedTrips_ + static_cast<int>(i) + 1)
                              .arg(range)
                              .arg(trip.totalDistanceKm, 0, 'f', 1)
                              .arg(trip.loadKg, 0, 'f', 0);
@@ -1410,6 +1443,66 @@ int MainWindow::runActionSelfCheck() {
         expect(stopsTotalAfter ==
                    servedStopsBase_ + static_cast<int>(plan_.stops.size()),
                QStringLiteral("停靠总数应等于「已送 + 剩余」"));
+    }
+
+    // ---- 库存不得因反复重规划而单调膨胀（审计发现的 F5）----
+    //
+    // 顺路寄存是**一次性的物理事件**：同一批在途货只该入库一次。
+    // 曾经因为 onboardGoods() 仍把这批货算作在途，每重规划一次就再寄存一次，
+    // 实测 40 -> 80 -> 120 -> 201kg，还会被喂回规划器当 initialStock 污染路由。
+    {
+        double stockBefore = 0.0;
+        for (const auto& kv : stationStock_) {
+            stockBefore += kv.second;
+        }
+        // 跑足够多轮，并且**要插单**：寄存只在"紧急订单把车逼回仓库"时才发生，
+        // 只推进+路况的话压根触发不了，断言会"通过"却什么也没测到。
+        for (int i = 0; i < 20; ++i) {
+            onAdvanceStop();
+            onSimulateTraffic();
+            if (i % 2 == 1) {
+                insertUrgentOrderAction();
+            }
+            if (i % 3 == 2) {
+                onCloseRandomRoad();
+            }
+        }
+        double stockAfter = 0.0;
+        for (const auto& kv : stationStock_) {
+            stockAfter += kv.second;
+        }
+        // 直接断言**核心不变量**：已经被寄存的货不得再出现在"在途货"里。
+        // 只看库存总量是不够的——若这一轮压根没触发寄存（例如 0 -> 0），
+        // 断言会"通过"却什么也没测到。这条不变量在寄存发生时才真正生效。
+        const std::vector<logistics::OnboardItem> ob = onboardGoods();
+        bool leaked = false;
+        for (const logistics::OnboardItem& item : ob) {
+            for (const std::string& b : bankedNodeIds_) {
+                if (b == item.nodeId) {
+                    leaked = true;
+                }
+            }
+        }
+        expect(!leaked,
+               QStringLiteral("已寄存的货不得再算作在途货（否则会被反复寄存）；"
+                              "本次已寄存 %1 项，在途 %2 项，库存 %3kg")
+                   .arg(bankedNodeIds_.size()).arg(ob.size())
+                   .arg(stockAfter, 0, 'f', 1));
+        expect(stockAfter <= stockBefore + 400.0,
+               QStringLiteral("站内存货不得因反复重规划而膨胀：%1kg -> %2kg")
+                   .arg(stockBefore, 0, 'f', 1).arg(stockAfter, 0, 'f', 1));
+    }
+
+    // ---- 趟号：已完成趟数只该在换计划时合并，不能与计划内趟号重复相加 ----
+    {
+        const int before = completedTripOffset();
+        for (int i = 0; i < 3; ++i) {
+            onAdvanceStop();
+        }
+        // 纯推进不换计划：已完成趟数不应变化
+        expect(completedTripOffset() == before,
+               QStringLiteral("纯推进不应改变已完成趟数：%1 -> %2")
+                   .arg(before).arg(completedTripOffset()));
     }
 
     const std::size_t ordersBefore = config_.orders.size();

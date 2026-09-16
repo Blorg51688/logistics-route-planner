@@ -721,6 +721,7 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
     }
 
     std::map<std::string, double> stock = initialStock;
+    std::vector<std::string> bankedNodeIds;   // 本次真正被卸载到站里的节点，回报给调用方
     const PathResult toDepot = shortestPath(graph, startPos, vehicle.startNodeId, weight);
     for (const OnboardItem& item : onboard) {
         if (startedAtDepot || item.kg <= 1e-9
@@ -747,6 +748,7 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
             continue;
         }
         stock[hub->second] += item.kg;
+        bankedNodeIds.push_back(item.nodeId);
     }
 
     bool hasStock = false;
@@ -758,8 +760,10 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
     }
     if (!hasStock) {
         const std::map<std::string, double> none;
-        return multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
-                                 weight, none, false, onboard);
+        RoutePlan only = multiTripPlanImpl(graph, vehicle, candidates, startPos,
+                                           startTimeMin, weight, none, false, onboard);
+        only.bankedNodeIds = bankedNodeIds;
+        return only;
     }
 
     // ---- ② 两版 ----
@@ -776,9 +780,12 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
         return direct;
     }
     if (viaStation.totalPenaltyMin > direct.totalPenaltyMin) {
+        direct.bankedNodeIds = bankedNodeIds;
         return direct;
     }
-    return betterPlan(direct, viaStation, weight) ? direct : viaStation;
+    RoutePlan best = betterPlan(direct, viaStation, weight) ? direct : viaStation;
+    best.bankedNodeIds = bankedNodeIds;
+    return best;
 }
 
 } // namespace
