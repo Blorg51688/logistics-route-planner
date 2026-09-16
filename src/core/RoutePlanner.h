@@ -34,12 +34,6 @@ struct Stop {
     double remainingLoadKg = 0.0;  // 离开该站时的剩余载重
 };
 
-// 一趟行程内对某个中转站的暂存操作
-struct TransitOp {
-    std::string nodeId;      // 中转站
-    double      amountKg = 0.0;   // >0 入库（卸货暂存）；<0 出库（取货二次配发）
-};
-
 // 一趟行程：车辆的一段连续行程。
 // 起点 = 上一趟的终点（首趟为规划起点），终点 = 起始仓库或某个中转站。
 struct Trip {
@@ -47,7 +41,6 @@ struct Trip {
     std::vector<int>         nodeArrivalMin;
     std::vector<bool>        nodeIsStop;
     std::vector<Stop>        stops;
-    std::vector<TransitOp>   transitOps;
     // 本趟车上装载的货量（不变量：任一趟都不得超过载重上限）。
     // 与"剩余待送总量"是两回事——多趟模式下车辆不会一次装完全部货物。
     double loadKg = 0.0;
@@ -55,13 +48,6 @@ struct Trip {
     double totalCostYuan   = 0.0;
     double totalTimeMin    = 0.0;
     std::string endNodeId;                  // 本趟终点
-};
-
-// 某个中转站在整个规划过程中的暂存状态
-struct TransitStock {
-    std::string nodeId;
-    double      finalKg = 0.0;   // 终值。不变量：规划结束时必须为 0（不留残余库存）
-    double      peakKg  = 0.0;   // 峰值，供界面展示
 };
 
 struct RoutePlan {
@@ -89,7 +75,6 @@ struct RoutePlan {
     // trips 是**真源**；上面的 nodes/nodeArrivalMin/nodeIsStop/stops
     // 是由它展平（flatten）出来的兼容视图，只在一处生成，不会各自维护。
     std::vector<Trip>         trips;
-    std::vector<TransitStock> transitStock;
 };
 
 // 从车辆起始仓库出发、按其发车时刻规划，服务完全部订单后返回该仓库。
@@ -111,19 +96,14 @@ struct OnboardItem {
     double      kg = 0.0;
 };
 
-// initialStock：各中转站的**期初存货**（前置储存点机制）。
-// 默认空 = 全部为 0，此时中转站完全不参与路由（直达更快就直达）。
-// 只有在站内确实有货、且用它不必绕路时，规划才会把该站当作"前置仓库"使用。
+// 中转站不参与排线（实测参与更差，见设计 §16 P17/P25）。
 RoutePlan replan(const LogisticsGraph& graph,
                  const Vehicle& vehicle,
                  const std::vector<Order>& remainingOrders,
                  const std::string& currentPositionId,
                  int currentTimeMin,
                  WeightType weight,
-                 const std::map<std::string, double>& initialStock
-                     = std::map<std::string, double>(),
-                 const std::vector<OnboardItem>& onboard
-                     = std::vector<OnboardItem>());
+                 const std::vector<OnboardItem>& onboard = std::vector<OnboardItem>());
 
 struct InsertResult {
     RoutePlan   plan;
@@ -143,8 +123,6 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
                                const std::string& currentPositionId,
                                int currentTimeMin,
                                WeightType weight,
-                               const std::map<std::string, double>& initialStock
-                                   = std::map<std::string, double>(),
                                const std::vector<OnboardItem>& onboard
                                    = std::vector<OnboardItem>());
 
@@ -166,11 +144,7 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
                             WeightType weight,
                             const TrafficReport& report,
                             double thresholdRatio,
-                            // 与 replan 保持一致：回退到全量重算时，
-                            // 站内存货与在途货必须一并带上，否则"顺路寄存"与
-                            // "积少成多"的回路会在这条路径上断掉。
-                            const std::map<std::string, double>& initialStock
-                                = std::map<std::string, double>(),
+                            // 与 replan 一致：回退到全量重算时在途货必须一并带上
                             const std::vector<OnboardItem>& onboard
                                 = std::vector<OnboardItem>());
 

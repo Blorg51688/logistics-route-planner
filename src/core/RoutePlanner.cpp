@@ -275,19 +275,8 @@ void flatten(RoutePlan& plan, int startTimeMin, double elapsedMin) {
     plan.totalTimeMin = elapsedMin - static_cast<double>(startTimeMin);
 }
 
-// 收集图中全部中转站，用于统一填充暂存状态（未使用的中转站终值/峰值均为 0）
-void collectTransits(const LogisticsGraph& graph, std::vector<TransitStock>& out) {
-    for (const Node& n : graph.nodes()) {
-        if (n.type == NodeType::Transit) {
-            TransitStock st;
-            st.nodeId = n.id;
-            out.push_back(st);
-        }
-    }
-}
-
 // 多趟 + 中转集散（设计 §5.6）。仅在总需求超过载重上限时进入。
-// 多趟规划的实际实现。allowStation=false 表示**完全不允许**动用中转站
+// 多趟规划的实际实现：分簇 -> 按载重分批 -> 每批一趟。中转站不参与排线。
 // （用于生成"直达"对照版本）。
 RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
                             const Vehicle& vehicle,
@@ -295,8 +284,6 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
                             const std::string& startPos,
                             int startTimeMin,
                             WeightType weight,
-                            const std::map<std::string, double>& initialStock,
-                            bool allowStation,
                             const std::vector<OnboardItem>& onboard) {
     RoutePlan plan;
 
@@ -458,8 +445,6 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
     }
 
     // 期初存货：站里本来就有货时，才可能把它当前置仓库用
-    std::map<std::string, double> stock = initialStock;
-    std::map<std::string, double> peak = initialStock;
 
     for (std::size_t h = 0; h < hubOrder.size(); ++h) {
         const std::string hub = hubOrder[h];
@@ -477,143 +462,49 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
         // 站内存货来自"即将带回仓库的余货顺路寄存"（前置储存点机制，见 §16 P13）。
         // 在那一机制落地之前，stock 恒为 0，此分支不会进入。
         // 中转站**不参与路由**。
-        //
-        // 曾经让它"有货就用"，实测在真实数据上全面更差（198.2km/13 趟 vs
-        // 直达 178.2km/6 趟）；更要命的是，车一旦停在站里，规划就会排出
-        // 「站 -> 仓库 -> 站」的补货趟，于是每次重规划都把车往仓库拽一趟——
-        // 人工测试看到的就是车在 T01 与 W01 之间反复跳跃。
-        //
-        // 中转站因此只保留**库存角色**（顺路寄存 + 界面展示），不参与排线。
-        const bool useStation = false;
-        (void)allowStation;
-
-        if (!useStation) {
-            // 不经中转站：按载重上限分批，每批一趟直接从仓库出发送达后返回。
-            // （簇总货量不超过载重时，这里天然只跑一趟，与单趟路径等价。）
-            while (!pool.empty()) {
-                double batchLoad = 0.0;
-                std::vector<Candidate> batch;
-                for (const Candidate& c : pool) {
-                    if (c.demandKg > vehicle.capacityKg + 1e-9) {
-                        plan.status = PlanStatus::OrderExceedsCapacity;
-                        std::ostringstream os;
-                        os << "订单货量 " << static_cast<long long>(std::lround(c.demandKg))
-                           << "kg 超过载重上限 "
-                           << static_cast<long long>(std::lround(vehicle.capacityKg)) << "kg";
-                        plan.reason = os.str();
-                        return plan;
-                    }
-                    if (batchLoad + c.demandKg <= vehicle.capacityKg + 1e-9) {
-                        batch.push_back(c);
-                        batchLoad += c.demandKg;
-                    }
-                }
-                if (batch.empty()) {
-                    break;   // 兜底，避免死循环
-                }
-                Trip trip;
-                if (!weave(graph, batch, current, elapsed, weight,
-                           vehicle.startNodeId, vehicle.startNodeId, batchLoad, trip, fail)) {
-                    plan.status = PlanStatus::Unreachable;
-                    plan.reason = fail;
+        // 中转站**不参与排线**：实测让它参与全面更差（198.2km/13 趟 vs 直达
+        // 178.2km/6 趟），且车一停在站里就会排出「站 -> 仓库 -> 站」的补货趟，
+        // 造成车在仓库附近来回跳。它只作为节点类型与子网络标识存在。
+        // （原先那条"经中转站"的实现已随本轮代码整理删除。）
+        // 不经中转站：按载重上限分批，每批一趟直接从仓库出发送达后返回。
+        // （簇总货量不超过载重时，这里天然只跑一趟，与单趟路径等价。）
+        while (!pool.empty()) {
+            double batchLoad = 0.0;
+            std::vector<Candidate> batch;
+            for (const Candidate& c : pool) {
+                if (c.demandKg > vehicle.capacityKg + 1e-9) {
+                    plan.status = PlanStatus::OrderExceedsCapacity;
+                    std::ostringstream os;
+                    os << "订单货量 " << static_cast<long long>(std::lround(c.demandKg))
+                       << "kg 超过载重上限 "
+                       << static_cast<long long>(std::lround(vehicle.capacityKg)) << "kg";
+                    plan.reason = os.str();
                     return plan;
                 }
-                plan.trips.push_back(trip);
-                current = vehicle.startNodeId;
-                for (const Candidate& b : batch) {
-                    eraseCandidateByNode(pool, b.nodeId);
+                if (batchLoad + c.demandKg <= vehicle.capacityKg + 1e-9) {
+                    batch.push_back(c);
+                    batchLoad += c.demandKg;
                 }
             }
-            continue;
-        }
-
-        // 经中转站：反复"回仓库补货入库"与"取货二次配发"，直到该簇送完
-        while (!pool.empty()) {
-            double smallest = -1.0;
-            for (const Candidate& c : pool) {
-                if (smallest < 0.0 || c.demandKg < smallest) {
-                    smallest = c.demandKg;
-                }
+            if (batch.empty()) {
+                break;   // 兜底，避免死循环
             }
-            // 单个订单的货量就超过载重：分多少趟都装不下，这才是真正的载重不可行
-            if (smallest > vehicle.capacityKg + 1e-9) {
-                plan.status = PlanStatus::OrderExceedsCapacity;
-                std::ostringstream os;
-                os << "订单货量 " << static_cast<long long>(std::lround(smallest))
-                   << "kg 超过载重上限 "
-                   << static_cast<long long>(std::lround(vehicle.capacityKg)) << "kg";
-                plan.reason = os.str();
+            Trip trip;
+            if (!weave(graph, batch, current, elapsed, weight,
+                       vehicle.startNodeId, vehicle.startNodeId, batchLoad, trip, fail)) {
+                plan.status = PlanStatus::Unreachable;
+                plan.reason = fail;
                 return plan;
             }
-
-            if (stock[hub] + 1e-9 >= smallest) {
-                // 暂存够用：取货并二次配发给该簇的配送点
-                double take = 0.0;
-                std::vector<Candidate> batch;
-                for (const Candidate& c : pool) {
-                    if (take + c.demandKg <= vehicle.capacityKg + 1e-9
-                        && take + c.demandKg <= stock[hub] + 1e-9) {
-                        batch.push_back(c);
-                        take += c.demandKg;
-                    }
-                }
-                if (batch.empty()) {
-                    continue;   // 兜底：理论上不会发生，避免死循环
-                }
-                Trip trip;
-                if (!weave(graph, batch, current, elapsed, weight,
-                           hub, hub, take, trip, fail)) {
-                    plan.status = PlanStatus::Unreachable;
-                    plan.reason = fail;
-                    return plan;
-                }
-                TransitOp op;
-                op.nodeId = hub;
-                op.amountKg = -take;      // 出库
-                trip.transitOps.push_back(op);
-                stock[hub] -= take;
-                plan.trips.push_back(trip);
-                current = hub;
-                for (const Candidate& b : batch) {
-                    eraseCandidateByNode(pool, b.nodeId);
-                }
-            } else {
-                // 暂存不足：回仓库补货，运到中转站入库暂存。本趟不送达任何订单。
-                double load = 0.0;
-                for (const Candidate& c : pool) {
-                    if (load + c.demandKg <= vehicle.capacityKg + 1e-9) {
-                        load += c.demandKg;
-                    }
-                }
-                Trip trip;
-                beginTrip(trip, current, elapsed);
-                if (!appendLeg(graph, trip, elapsed, current, vehicle.startNodeId, weight,
-                               false, fail)) {
-                    plan.status = PlanStatus::Unreachable;
-                    plan.reason = fail;
-                    return plan;
-                }
-                current = vehicle.startNodeId;
-                if (!appendLeg(graph, trip, elapsed, current, hub, weight, false, fail)) {
-                    plan.status = PlanStatus::Unreachable;
-                    plan.reason = fail;
-                    return plan;
-                }
-                current = hub;
-                TransitOp op;
-                op.nodeId = hub;
-                op.amountKg = load;       // 入库
-                trip.transitOps.push_back(op);
-                trip.loadKg = load;       // 本趟车上装载的就是这一批
-                trip.endNodeId = hub;
-                stock[hub] += load;
-                if (stock[hub] > peak[hub]) {
-                    peak[hub] = stock[hub];
-                }
-                plan.trips.push_back(trip);
+            plan.trips.push_back(trip);
+            current = vehicle.startNodeId;
+            for (const Candidate& b : batch) {
+                eraseCandidateByNode(pool, b.nodeId);
             }
         }
-    }
+        continue;
+
+}
 
     // 收尾：车辆从当前位置返回起始仓库
     if (current != vehicle.startNodeId) {
@@ -630,37 +521,8 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
         current = vehicle.startNodeId;
     }
 
-    // 暂存状态：全部中转站都记录（未使用的终值与峰值均为 0）
-    collectTransits(graph, plan.transitStock);
-    for (TransitStock& st : plan.transitStock) {
-        st.finalKg = stock[st.nodeId];
-        st.peakKg = peak[st.nodeId];
-    }
     flatten(plan, startTimeMin, elapsed);
     return plan;
-}
-
-// 按当前策略的目标比较两版方案；目标相同则比 penalty，再比趟数。
-// 用"取更优者"而不是"有货就用"，把"中转站绝不使结果更差"变成**构造性保证**：
-// 实测证明仅凭"有货就用"是会算差的（每站存满一个载重时距离 179.6 > 直达 178.2）。
-static double objectiveOf(const RoutePlan& p, WeightType weight) {
-    switch (weight) {
-        case WeightType::Time: return p.totalTimeMin;
-        case WeightType::Cost: return p.totalCostYuan;
-        default:               return p.totalDistanceKm;
-    }
-}
-
-static bool betterPlan(const RoutePlan& a, const RoutePlan& b, WeightType weight) {
-    const double oa = objectiveOf(a, weight);
-    const double ob = objectiveOf(b, weight);
-    if (std::fabs(oa - ob) > 1e-6) {
-        return oa < ob;
-    }
-    if (a.totalPenaltyMin != b.totalPenaltyMin) {
-        return a.totalPenaltyMin < b.totalPenaltyMin;
-    }
-    return a.trips.size() < b.trips.size();
 }
 
 // 多趟规划入口。
@@ -673,55 +535,21 @@ static bool betterPlan(const RoutePlan& a, const RoutePlan& b, WeightType weight
 //      该站所服务的簇**；不满足就原样带回去，绝不为了寄存而绕路。
 //   ② 算两版：一版完全不许用中转站（直达），一版允许把中转站当前置仓库用。
 //   ③ 取更优者（用站版 penalty 更差则一票否决），使"绝不更差"成为构造保证。
+// 多趟规划入口：把所有剩余订单排成若干趟。
+//
+// 历史上这里做过"直达 vs 经中转站"两版取优（先把"中转站绝不使结果更差"变成
+// 构造性保证）。第 13 轮实测证明经站路全面更差，中转站因此退出排线；
+// 两版随之变成**参数完全相同**的两次调用——保留它只会误导读者，
+// 故收敛为单次调用。若将来要重新引入"备用方案取优"，请连同判据一起加回来。
 RoutePlan multiTripPlan(const LogisticsGraph& graph,
                         const Vehicle& vehicle,
                         const std::vector<Candidate>& candidates,
                         const std::string& startPos,
                         int startTimeMin,
                         WeightType weight,
-                        const std::map<std::string, double>& initialStock,
                         const std::vector<OnboardItem>& onboard) {
-    // ---- 中转站不参与路由，也不再有"顺路寄存" ----
-    //
-    // 第 13 轮实测：让中转站参与排线全面更差（198.2km/13 趟 vs 直达 178.2km/6 趟），
-    // 且车一停在站里就会排出「站 -> 仓库 -> 站」的补货趟，造成车在仓库附近来回跳。
-    // 于是中转站退出路由。**退出之后"寄存"也就失去了意义**：寄存到站里的货
-    // 永远没有路径被取出使用（没有"站 -> 配送点"的配发），只会让同一批货在
-    // "车上 <-> 站里"之间空转，站内存货单调膨胀并污染后续规划。
-    //
-    // 因此这里不再寄存。车辆的载货由调用方以**显式状态**维护（见 MainWindow::VehicleState）。
-    std::map<std::string, double> stock = initialStock;
-
-    bool hasStock = false;
-    for (const auto& kv : stock) {
-        if (kv.second > 1e-9) {
-            hasStock = true;
-            break;
-        }
-    }
-    if (!hasStock) {
-        const std::map<std::string, double> none;
-        return multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
-                                 weight, none, false, onboard);
-    }
-
-    // ---- ② 两版 ----
-    RoutePlan direct = multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
-                                         weight, stock, false, onboard);
-    RoutePlan viaStation = multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
-                                             weight, stock, true, onboard);
-
-    // ---- ③ 取更优 ----
-    if (direct.status != PlanStatus::Ok) {
-        return viaStation;
-    }
-    if (viaStation.status != PlanStatus::Ok) {
-        return direct;
-    }
-    if (viaStation.totalPenaltyMin > direct.totalPenaltyMin) {
-        return direct;
-    }
-    return betterPlan(direct, viaStation, weight) ? direct : viaStation;
+    return multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
+                             weight, onboard);
 }
 
 } // namespace
@@ -732,7 +560,6 @@ RoutePlan replan(const LogisticsGraph& graph,
                  const std::string& currentPositionId,
                  int currentTimeMin,
                  WeightType weight,
-                 const std::map<std::string, double>& initialStock,
                  const std::vector<OnboardItem>& onboard) {
     RoutePlan plan;
 
@@ -748,7 +575,7 @@ RoutePlan replan(const LogisticsGraph& graph,
     if (total > vehicle.capacityKg + 1e-9) {
         // 总需求超过载重：改走多趟 + 中转集散（D21），不再判为不可行
         return multiTripPlan(graph, vehicle, remaining, currentPositionId, currentTimeMin,
-                             weight, initialStock, onboard);
+                             weight, onboard);
     }
 
     // 单趟：车辆在起点已装载全部货物，直接贪心串联后回仓库（与历史行为一致）
@@ -763,14 +590,6 @@ RoutePlan replan(const LogisticsGraph& graph,
     }
     plan.trips.push_back(trip);
 
-    collectTransits(graph, plan.transitStock);
-    // 单趟分支不经中转站，但**存货必须原样带回**：GUI 用 finalKg 回写 stationStock_，
-    // 若这里置 0，积累起来的存货会在一次单趟规划后被静默抹掉（审计发现的守恒缺口）。
-    for (TransitStock& st : plan.transitStock) {
-        const std::map<std::string, double>::const_iterator it = initialStock.find(st.nodeId);
-        st.finalKg = (it != initialStock.end()) ? it->second : 0.0;
-        st.peakKg = st.finalKg;
-    }
     flatten(plan, currentTimeMin, elapsed);
     return plan;
 }
@@ -862,7 +681,6 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
                             WeightType weight,
                             const TrafficReport& report,
                             double thresholdRatio,
-                            const std::map<std::string, double>& initialStock,
                             const std::vector<OnboardItem>& onboard) {
     const std::string startPos =
         previous.nodes.empty() ? vehicle.startNodeId : previous.nodes.front();
@@ -872,7 +690,7 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
         || previous.nodes.size() < 2
         || previous.nodes.back() != vehicle.startNodeId) {
         return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
-                      weight, initialStock, onboard);
+                      weight, onboard);
     }
 
     const std::vector<Candidate> pool = buildCandidates(remainingOrders);
@@ -911,7 +729,7 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
             if (!r.found) {
                 // 该段已不可达：退回全量重算，由它给出统一的原因
                 return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
-                              weight, initialStock, onboard);
+                              weight, onboard);
             }
             path = r.nodes;
         } else {
@@ -942,7 +760,7 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
             const Edge* edge = graph.findEdge(path[i - 1], path[i]);
             if (edge == nullptr) {
                 return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
-                              weight, initialStock, onboard);
+                              weight, onboard);
             }
             elapsed += edge->timeMin;
             trip.totalDistanceKm += edge->distanceKm;
@@ -958,7 +776,7 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
         const Candidate* chosen = findCandidate(pool, path.back());
         if (chosen == nullptr) {
             return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
-                          weight, initialStock, onboard);
+                          weight, onboard);
         }
         const Stop stop = makeStop(*chosen, elapsed, load);
         // 停靠节点记录实际送达时刻（等窗口开启之后）
@@ -968,7 +786,6 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
 
     trip.endNodeId = vehicle.startNodeId;
     plan.trips.push_back(trip);
-    collectTransits(graph, plan.transitStock);
     flatten(plan, currentTimeMin, elapsed);
     return plan;
 }
@@ -999,7 +816,6 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
                                const std::string& currentPositionId,
                                int currentTimeMin,
                                WeightType weight,
-                               const std::map<std::string, double>& initialStock,
                                const std::vector<OnboardItem>& onboard) {
     InsertResult result;
 
@@ -1026,7 +842,7 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
     }
 
     result.plan = replan(graph, vehicle, all, currentPositionId, currentTimeMin,
-                         weight, initialStock, onboard);
+                         weight, onboard);
     return result;
 }
 

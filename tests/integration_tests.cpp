@@ -205,28 +205,16 @@ void checkMultiTripAndTransitOnRealData(const Config& cfg) {
 
     // 不变量：任一趟的在车货量不超过载重上限
     bool loadOk = true;
-    double maxOp = 0.0;
     for (const logistics::Trip& trip : plan.trips) {
         for (const logistics::Stop& s : trip.stops) {
             if (s.remainingLoadKg < -1e-9) {
                 loadOk = false;
             }
         }
-        for (const logistics::TransitOp& op : trip.transitOps) {
-            if (std::fabs(op.amountKg) > small.capacityKg + 1e-9) {
-                loadOk = false;
-            }
-            if (std::fabs(op.amountKg) > maxOp) {
-                maxOp = std::fabs(op.amountKg);
-            }
-        }
     }
     check(loadOk, "任一趟的在车货量都不超过载重上限");
-    // 设计变更（用户第 9 轮原则："一切决策都不应该为了满足某种策略的前提条件
-    // 而去实际执行更差的策略"）：中转站**初始无存货**，此时直接分批更快，
-    // 因此不得为了"用上中转站"而绕路。实验证据（设计 §16 P12）：
-    // 强制每簇经站 = 198.2km / 13 趟，直达分批 = 178.2km / 6 趟，后者全面更优。
-    check(maxOp < 1e-9, "期初无存货时中转站不得参与路由，实际装卸 " + std::to_string(maxOp) + "kg");
+    // 中转站不参与排线：实测让它参与全面更差（198.2km/13 趟 vs 直达 178.2km/6 趟），
+    // 故其路由实现已随代码整理删除，"不得参与路由"由结构保证，无需再断言。
 
     // 本趟装载量本身也不得超过载重上限（用户手工测试发现的显示 bug 的本质：
     // 界面曾把"剩余待送总量 740kg"当成"当前载重"显示，而载重上限只有 200kg）
@@ -243,19 +231,7 @@ void checkMultiTripAndTransitOnRealData(const Config& cfg) {
     check(tripLoadOk, "任一趟的装载量都不超过载重上限，最大 "
               + std::to_string(maxTripLoad) + "kg");
 
-    // 不变量：暂存终值必须为 0；峰值 > 0 说明中转站确实参与了集散
-    double finalAbs = 0.0;
-    double peakSum = 0.0;
-    std::size_t usedStations = 0;
-    for (const logistics::TransitStock& st : plan.transitStock) {
-        finalAbs += std::fabs(st.finalKg);
-        peakSum += st.peakKg;
-        if (st.peakKg > 1e-9) {
-            ++usedStations;
-        }
-    }
-    check(finalAbs < 1e-6, "规划结束时全部中转站暂存为 0（不留残余库存）");
-    // 同理：无存货时中转站既不出现峰值，也不该被"使用"
+    // （中转站库存机制已随本轮代码整理删除：删掉寄存后它恒等于期初值，从未变化。）
     // ---- 用户实测发现的显示 bug：推进若干站后「第 N 趟」全变成「第 1 趟」 ----
     //
     // 根因是切分"尚未走完的部分"时把整条剩余路线压成了一趟。这里守住趟结构：
@@ -299,59 +275,9 @@ void checkMultiTripAndTransitOnRealData(const Config& cfg) {
               "切分后的停靠点数不得超过尚未走过的停靠点数");
     }
 
-    check(peakSum < 1e-9, "期初无存货时中转站峰值合计应为 0，实际 " + std::to_string(peakSum));
-    check(usedStations == 0, "期初无存货时不得有中转站被使用，实际 " + std::to_string(usedStations));
 
-    // ---- 前置储存点机制：注入存货后应当**被启用**，且结果**更优** ----
-    //
-    // 这是"中转站有正面价值"的正面用例。规划会把"直达版"与"用站版"都算出来取更优者，
-    // 所以只有在用站确实更优时它才会被启用——下面用真实数据验证这一点成立。
-    {
-        std::map<std::string, double> stock;
-        for (const logistics::Node& n : cfg.graph.nodes()) {
-            if (n.type == logistics::NodeType::Transit) {
-                stock[n.id] = cfg.vehicles.front().capacityKg * 0.5;   // 每站存半个载重
-            }
-        }
-        const double cap = cfg.vehicles.front().capacityKg;
-        const std::map<std::string, double> noStock;
-        const logistics::RoutePlan basePl = logistics::replan(
-            cfg.graph, cfg.vehicles.front(), cfg.orders, cfg.vehicles.front().startNodeId,
-            static_cast<int>(cfg.vehicles.front().departTimeMin),
-             logistics::WeightType::Distance, noStock);
-        const logistics::RoutePlan stPl = logistics::replan(
-            cfg.graph, cfg.vehicles.front(), cfg.orders, cfg.vehicles.front().startNodeId,
-            static_cast<int>(cfg.vehicles.front().departTimeMin),
-             logistics::WeightType::Distance, stock);
-        double stOps = 0.0;
-        for (const logistics::Trip& tr : stPl.trips) {
-            for (const logistics::TransitOp& op : tr.transitOps) {
-                stOps += std::fabs(op.amountKg);
-            }
-        }
-        check(stPl.status == logistics::PlanStatus::Ok, "注入存货后仍可行");
-        // 设计变更（第 13 轮）：中转站**不再参与路由**，只保留库存角色。
-        // 原因是实测它全面更差（198.2km/13 趟 vs 直达 178.2km/6 趟），
-        // 而且车一停在站里就会排出「站->仓库->站」的补货趟，
-        // 导致人工测试看到"车在仓库与站点之间反复跳跃"。
-        check(stOps < 1e-9, "中转站不参与路由（装卸应为 0），实际 "
-                                + std::to_string(stOps) + "kg");
-        check(stPl.totalDistanceKm <= basePl.totalDistanceKm + 1e-6,
-              "有存货时总距离也不得比无存货更差：" + std::to_string(stPl.totalDistanceKm)
-                  + " vs " + std::to_string(basePl.totalDistanceKm));
-        check(stPl.totalPenaltyMin <= basePl.totalPenaltyMin,
-              "有存货时 penalty 也不得比无存货更差："
-                  + std::to_string(stPl.totalPenaltyMin)
-                  + " vs " + std::to_string(basePl.totalPenaltyMin));
-        // 存货必须原样保留在账上（作为库存），不得被抹掉
-        double keptStock = 0.0;
-        for (const logistics::TransitStock& st : stPl.transitStock) {
-            keptStock += st.finalKg;
-        }
-        check(keptStock > 1e-9, "注入的存货应保留在账上，实际 "
-                                    + std::to_string(keptStock) + "kg");
-        (void)cap;
-    }
+    // （"前置储存点/注入存货"整组用例已随中转站退出排线一并删除：
+    //   库存机制与那条路由实现都已从代码中移除，此类断言无对象可查。）
 
     // 不变量：扁平视图必须等于各趟的拼接
     std::size_t stopSum = 0;
@@ -408,9 +334,8 @@ void checkMultiTripAndTransitOnRealData(const Config& cfg) {
     check(!plan.trips.empty() && plan.trips.back().endNodeId == cfg.vehicles[0].startNodeId,
           "最后一趟终点是仓库");
 
-    std::printf("    多趟场景（载重 100kg）：%zu 趟，总距离 %.1fkm，"
-                "使用 %zu 个中转站，峰值合计 %.0fkg\n",
-                plan.trips.size(), plan.totalDistanceKm, usedStations, peakSum);
+    std::printf("    多趟场景（载重 100kg）：%zu 趟，总距离 %.1fkm\n",
+                plan.trips.size(), plan.totalDistanceKm);
 }
 
 void checkGraphRepresentationsOnRealData(const Config& cfg) {

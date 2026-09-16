@@ -385,7 +385,7 @@ LogisticsGraph makeTransitClusterGraph() {
 
 // 切片 6（D21 核心）：总需求超过载重上限**不再不可行**，
 // 而是多趟 + 中转站暂存 + 二次配发。
-void testTotalDemandOverCapacityBecomesMultiTripViaTransit() {
+void testTotalDemandOverCapacityBecomesMultiTrip() {
     const LogisticsGraph g = makeTransitClusterGraph();
     const Vehicle v = makeVehicle("W", 20.0, 480);   // 载重 20，总需求 30
     const std::vector<Order> orders = {makeOrder("O1", "D1", 15.0, 0, 1440, false),
@@ -406,11 +406,6 @@ void testTotalDemandOverCapacityBecomesMultiTripViaTransit() {
                 loadOk = false;
             }
         }
-        for (const logistics::TransitOp& op : trip.transitOps) {
-            if (std::fabs(op.amountKg) > v.capacityKg + 1e-9) {
-                loadOk = false;
-            }
-        }
         // 本趟装载量本身也必须 <= 载重上限
         if (trip.loadKg > v.capacityKg + 1e-9) {
             loadOk = false;
@@ -418,27 +413,8 @@ void testTotalDemandOverCapacityBecomesMultiTripViaTransit() {
     }
     check(loadOk, "任一趟的在车货量都不超过载重上限");
 
-    // 不变量 3/4：暂存始终非负，且规划结束时为 0
-    bool stockNonNegative = true;
-    bool stockEndsZero = true;
-    bool stationUsed = false;
-    for (const logistics::TransitStock& st : plan.transitStock) {
-        if (st.peakKg < -1e-9 || st.finalKg < -1e-9) {
-            stockNonNegative = false;
-        }
-        if (st.finalKg > 1e-9) {
-            stockEndsZero = false;
-        }
-        if (st.peakKg > 1e-9) {
-            stationUsed = true;
-        }
-    }
-    check(stockNonNegative, "中转站暂存量始终非负");
-    check(stockEndsZero, "规划结束时每个中转站暂存必须为 0");
-    // 设计变更（用户第 9 轮原则"不为满足策略前提去执行更差的方案"）：
-    // 中转站**初始无存货**，因此这里**不得**参与路由——直达更快就直达。
-    // 这条断言正是用来守住该原则：一旦有人把"每簇必经站"加回来，它立刻失败。
-    check(!stationUsed, "期初无存货时中转站不得参与路由（不为用站而绕路）");
+    // 中转站不参与排线——本轮代码整理已把那条路由实现整体删除，
+    // 因此"暂存非负""终值为 0""不为用站而绕路"都由**结构**保证，无需再断言。
 
     // 不变量 5：需求超载 -> 必须多于一趟
     check(plan.trips.size() > 1, "多趟配送，实际 " + std::to_string(plan.trips.size()) + " 趟");
@@ -475,13 +451,6 @@ void testWithinCapacityStaysSingleTrip() {
     check(plan.trips.size() == 1, "不超载时只有一趟，实际 "
               + std::to_string(plan.trips.size()));
     checkRouteIsWalkable(g, plan, "W");
-    bool allZero = true;
-    for (const logistics::TransitStock& st : plan.transitStock) {
-        if (st.peakKg > 1e-9 || st.finalKg > 1e-9) {
-            allZero = false;
-        }
-    }
-    check(allZero, "不超载时不经过中转站，暂存全程为 0");
 }
 
 // 切片 5：存在无法到达的配送点 -> Unreachable，且原因要能定位到具体节点
@@ -750,173 +719,9 @@ void testIsEdgeOnRoute() {
 
 } // namespace
 
-// 前置储存点机制：**只有站内确实有存货时**，规划才会把该站当前置仓库使用。
-// 这是"中转站不强行参与路由"的另一面——有货则用、无货则完全绕开。
-static void testStationUsedOnlyWhenStockExists() {
-    const logistics::LogisticsGraph g = makeTransitClusterGraph();
-    logistics::Vehicle v;
-    v.id = "V01";
-    v.startNodeId = "W";
-    v.capacityKg = 40.0;
-    v.departTimeMin = 480;
-
-    // 该测试图里只有 D1 / D2 两个配送点，合计 60kg > 载重 40kg，必然多趟
-    std::vector<logistics::Order> orders;
-    for (const char* id : {"D1", "D2"}) {
-        logistics::Order o;
-        o.id = std::string("O") + id[1];
-        o.nodeId = id;
-        o.demandKg = 30.0;
-        o.windowStartMin = 540;
-        o.windowEndMin = 1080;
-        orders.push_back(o);
-    }
-
-    const auto stationOps = [](const logistics::RoutePlan& p) {
-        double sum = 0.0;
-        for (const logistics::Trip& t : p.trips) {
-            for (const logistics::TransitOp& op : t.transitOps) {
-                sum += std::fabs(op.amountKg);
-            }
-        }
-        return sum;
-    };
-
-    const std::map<std::string, double> noStock;
-    const std::map<std::string, double> withStock{{"T", 30.0}};
-
-    const logistics::RoutePlan a =
-        logistics::replan(g, v, orders, "W", 480, logistics::WeightType::Distance, noStock);
-    const logistics::RoutePlan b =
-        logistics::replan(g, v, orders, "W", 480, logistics::WeightType::Distance, withStock);
-
-    check(a.status == logistics::PlanStatus::Ok && b.status == logistics::PlanStatus::Ok,
-          "有无期初存货都应规划成功");
-    check(std::fabs(stationOps(a)) < 1e-9, "期初无存货：中转站装卸为 0，完全绕开");
-    // 期初**有**存货时不强制要求被使用：规划会把"用站版"与"直达版"都算出来取更优者，
-    // 若这一情形下用站并不更优，就会退回直达版（这正是"绝不更差"的构造保证）。
-    // 因此这里断言的是"结果不更差"，而不是"一定被使用"；
-    // "确实会被使用"的正面用例由集成测试在真实数据上覆盖。
-    check(b.status == logistics::PlanStatus::Ok, "期初有存货时仍可行");
-    check(b.totalDistanceKm <= a.totalDistanceKm + 1e-6
-              && b.totalPenaltyMin <= a.totalPenaltyMin,
-          "期初有存货时结果不得更差（装卸 " + std::to_string(stationOps(b)) + "kg）");
-
-    // 存货守恒：用掉的不超过期初 + 卸入，期末余量非负
-    for (const logistics::TransitStock& st : b.transitStock) {
-        check(st.finalKg >= -1e-9, "期末暂存非负: " + st.nodeId);
-        check(st.peakKg >= st.finalKg - 1e-9, "峰值不小于期末值: " + st.nodeId);
-    }
-}
-
-// 守住用户第 9 轮定的性质：**中转站绝不会让结果更差**。
-// 该性质不是靠推理保证，而是靠"把直达版与用站版都算出来、取更优者"构造保证的；
-// 这条测试就是它的守卫——注入任意存货量，结果都不许比无存货时差。
-static void testTransitStockNeverMakesPlanWorse() {
-    const logistics::LogisticsGraph g = makeTransitClusterGraph();
-    logistics::Vehicle v;
-    v.id = "V01";
-    v.startNodeId = "W";
-    v.capacityKg = 40.0;
-    v.departTimeMin = 480;
-
-    std::vector<logistics::Order> orders;
-    for (const char* id : {"D1", "D2"}) {
-        logistics::Order o;
-        o.id = std::string("O") + id[1];
-        o.nodeId = id;
-        o.demandKg = 30.0;
-        o.windowStartMin = 540;
-        o.windowEndMin = 1080;
-        orders.push_back(o);
-    }
-
-    const logistics::WeightType weights[] = {logistics::WeightType::Distance,
-                                              logistics::WeightType::Time,
-                                              logistics::WeightType::Cost};
-    const auto objective = [](const logistics::RoutePlan& p, logistics::WeightType w) {
-        switch (w) {
-            case logistics::WeightType::Time: return p.totalTimeMin;
-            case logistics::WeightType::Cost: return p.totalCostYuan;
-            default:                          return p.totalDistanceKm;
-        }
-    };
-
-    for (logistics::WeightType w : weights) {
-        const logistics::RoutePlan base = logistics::replan(
-            g, v, orders, "W", 480, w, std::map<std::string, double>());
-
-        // 注入从 0 到"整个载重"的各种存货量，逐个核对不许变差
-        for (double stock = 5.0; stock <= v.capacityKg; stock += 5.0) {
-            const std::map<std::string, double> st{{"T", stock}};
-            const logistics::RoutePlan p =
-                logistics::replan(g, v, orders, "W", 480, w, st);
-            const std::string tag = "（存货 " + std::to_string(static_cast<int>(stock))
-                                    + "kg）";
-            check(p.status == logistics::PlanStatus::Ok, "注入存货后仍可行 " + tag);
-            check(objective(p, w) <= objective(base, w) + 1e-6,
-                  "注入存货后目标不得更差 " + tag + "："
-                      + std::to_string(objective(p, w)) + " vs "
-                      + std::to_string(objective(base, w)));
-            check(p.totalPenaltyMin <= base.totalPenaltyMin,
-                  "注入存货后 penalty 不得更差 " + tag + "："
-                      + std::to_string(p.totalPenaltyMin) + " vs "
-                      + std::to_string(base.totalPenaltyMin));
-        }
-    }
-}
-
-// 中转站退出路由后，"顺路寄存"也一并移除（见设计 §16 P25）。
-//
-// 原机制：车上的货若"来不及在本次回仓库前送掉"，就顺手卸在回程路径上的中转站。
-// 但中转站已经不参与排线（实测全面更差），卸到站里的货**再也没有路径被取出来用**，
-// 只会在"车上 <-> 站里"之间空转，站内存货单调膨胀并污染后续规划。
-// 因此现在的语义是：**中转站不产生任何存货**，车辆的载货由调用方以显式状态维护。
-static void testTransitNeverHoldsStock() {
-    logistics::LogisticsGraph g;
-    auto mk = [](const char* id, logistics::NodeType t, double x, double y, int sub) {
-        logistics::Node n; n.id = id; n.type = t; n.x = x; n.y = y; n.subNetworkId = sub;
-        return n; };
-    g.addNode(mk("W", logistics::NodeType::Warehouse, 0, 0, 0));
-    g.addNode(mk("T", logistics::NodeType::Transit, 10, 0, 1));
-    g.addNode(mk("D1", logistics::NodeType::Delivery, 11, 0, 1));
-    g.addNode(mk("D2", logistics::NodeType::Delivery, 11, 1, 1));
-    auto link = [&g](const char* a, const char* b, double d) {
-        logistics::Edge e; e.fromId = a; e.toId = b;
-        e.distanceKm = d; e.timeMin = d; e.costYuan = d; e.baseTimeMin = d;
-        g.addEdge(e); e.fromId = b; e.toId = a; g.addEdge(e); };
-    link("W", "T", 10); link("T", "D1", 1); link("D1", "D2", 1);
-
-    logistics::Vehicle v;
-    v.id = "V01"; v.startNodeId = "W"; v.capacityKg = 50.0; v.departTimeMin = 480;
-
-    auto ord = [](const char* id, const char* n) {
-        logistics::Order o; o.id = id; o.nodeId = n; o.demandKg = 20.0;
-        o.windowStartMin = 0; o.windowEndMin = 24 * 60; o.urgent = false;
-        return o; };
-    const std::vector<logistics::Order> orders = {ord("O1", "D1"), ord("O2", "D2")};
-
-    // 车上带着 D2 的货、从 D1 出发——旧机制下这正是"寄存"的场景
-    std::vector<logistics::OnboardItem> onboard;
-    logistics::OnboardItem it; it.nodeId = "D2"; it.kg = 20.0;
-    onboard.push_back(it);
-
-    const std::map<std::string, double> st;
-    const logistics::RoutePlan p = logistics::replan(
-        g, v, orders, "D1", 480, logistics::WeightType::Distance, st, onboard);
-    check(p.status == logistics::PlanStatus::Ok, "带在途货重规划仍成功");
-
-    double finalSum = 0.0;
-    for (const logistics::TransitStock& ts : p.transitStock) {
-        finalSum += ts.finalKg;
-    }
-    check(finalSum < 1e-9,
-          "中转站不参与路由后不得产生存货，实际 " + std::to_string(finalSum));
-}
-
 // 增量重规划在全量回退时，必须把"站内存货"与"在途货"一并带走。
 // 否则这条路径上寄存与"积少成多"会静默断掉（审计时发现的缺口）。
-static void testIncrementalReplanForwardsStockAndOnboard() {
+static void testIncrementalReplanForwardsOnboard() {
     const logistics::LogisticsGraph g = makeTransitClusterGraph();
     logistics::Vehicle v;
     v.id = "V01"; v.startNodeId = "W"; v.capacityKg = 40.0; v.departTimeMin = 480;
@@ -939,132 +744,24 @@ static void testIncrementalReplanForwardsStockAndOnboard() {
     ch.congested = true; ch.increaseRatio = 50.0;   // 极大增幅，逼它回退全量重算
     report.changes.push_back(ch);
 
-    const std::map<std::string, double> stock{{"T", 30.0}};
+    // 车上带着 D2 的货：重规划（含回退全量）必须把它当成"车不是空的"
     const std::vector<logistics::OnboardItem> onboard{{"D2", 30.0}};
-
     const logistics::RoutePlan base = logistics::replan(
         g, v, orders, "W", 480, logistics::WeightType::Distance);
     const logistics::RoutePlan inc = logistics::replanIncremental(
-        g, v, orders, base, 480, logistics::WeightType::Distance, report, 0.2,
-        stock, onboard);
+        g, v, orders, base, 480, logistics::WeightType::Distance, report, 0.2, onboard);
 
-    // 只要带上了存货，期末存货就不该是 0（哪怕全量回退也不许把它丢掉）
-    double finalKg = 0.0;
-    for (const logistics::TransitStock& st : inc.transitStock) {
-        finalKg += st.finalKg;
-    }
-    check(finalKg > 1e-9,
-          "增量重规划（含全量回退）必须保留站内存货，实际期末合计 "
-              + std::to_string(finalKg) + "kg");
-}
-
-// 车**还在仓库没出发**时车上没有任何货。此时若调用方错误地传了"在途货"
-// （例如把第一趟待装的货当成在途货），规划器必须忽略，不得给从未装过车的货
-// 记上站内存货——那会让同一批货既被送达、又被记成站里有货。
-//
-// 注意断言的是"有没有动用中转站"，而不是期末存货：虚增的存货若被"用站版"
-// 消耗掉，期末同样是 0，从 finalKg 看不出来（这一点是构造测试时才发现的）。
-static void testNoBankingWhenStillAtDepot() {
-    logistics::LogisticsGraph g;
-    auto mk = [](const char* id, logistics::NodeType t, double x, double y, int sub) {
-        logistics::Node n; n.id = id; n.type = t; n.x = x; n.y = y; n.subNetworkId = sub;
-        return n; };
-    g.addNode(mk("W", logistics::NodeType::Warehouse, 0, 0, 0));
-    g.addNode(mk("T", logistics::NodeType::Transit, 10, 0, 1));
-    g.addNode(mk("D1", logistics::NodeType::Delivery, 11, 0, 1));
-    g.addNode(mk("D2", logistics::NodeType::Delivery, 12, 0, 1));
-    auto link = [&g](const char* a, const char* b, double d) {
-        logistics::Edge e; e.fromId = a; e.toId = b;
-        e.distanceKm = d; e.timeMin = d; e.costYuan = d; e.baseTimeMin = d;
-        g.addEdge(e); e.fromId = b; e.toId = a; g.addEdge(e); };
-    link("W", "T", 10); link("T", "D1", 1); link("D1", "D2", 1);
-
-    logistics::Vehicle v;
-    v.id = "V01"; v.startNodeId = "W"; v.capacityKg = 50.0; v.departTimeMin = 480;
-
-    std::vector<logistics::Order> orders;
-    for (const char* id : {"D1", "D2"}) {
-        logistics::Order o;
-        o.id = std::string("O") + id[1];
-        o.nodeId = id;
-        o.demandKg = 30.0;
-        o.windowStartMin = 0;
-        o.windowEndMin = 1440;
-        orders.push_back(o);
-    }
-
-    const std::map<std::string, double> noStock;
-    const std::vector<logistics::OnboardItem> bogus{{"D1", 30.0}};   // 尚未装车
-    const logistics::RoutePlan p =
-        logistics::replan(g, v, orders, "W", 480, logistics::WeightType::Distance,
-                          noStock, bogus);
-
-    double stationOps = 0.0;
-    for (const logistics::Trip& t : p.trips) {
-        for (const logistics::TransitOp& op : t.transitOps) {
-            stationOps += std::fabs(op.amountKg);
+    check(inc.status == logistics::PlanStatus::Ok, "带在途货的增量重规划应成功");
+    // D2 的货已在车上，故本趟装载只需覆盖它之外的量
+    bool carriesD2 = false;
+    for (const logistics::Trip& t : inc.trips) {
+        for (const logistics::Stop& st : t.stops) {
+            if (st.nodeId == "D2") {
+                carriesD2 = true;
+            }
         }
     }
-    check(stationOps < 1e-9,
-          "车未出发时不得动用中转站（否则等于给从未装过的货记了存货），实际装卸 "
-              + std::to_string(stationOps) + "kg");
-    // 期末存货同样必须是 0：虚增的存货即使没被本趟用掉，也会留在账上
-    double phantom = 0.0;
-    for (const logistics::TransitStock& st : p.transitStock) {
-        phantom += st.finalKg;
-    }
-    check(phantom < 1e-9,
-          "车未出发时不得在站里留下存货，实际 " + std::to_string(phantom) + "kg");
-    check(p.status == logistics::PlanStatus::Ok, "该情形下仍应规划成功");
-}
-
-// 审计发现：insertUrgentOrder 虽然加了 initialStock/onboard 形参，但底层调 replan 时
-// 没转发，导致这条路径上存货与在途货全丢、GUI 回写时把存货清空。
-static void testUrgentInsertForwardsStock() {
-    const logistics::LogisticsGraph g = makeTransitClusterGraph();
-    logistics::Vehicle v;
-    v.id = "V01"; v.startNodeId = "W"; v.capacityKg = 40.0; v.departTimeMin = 480;
-
-    logistics::Order o1 = makeOrder("O1", "D1", 30.0, 0, 1440, false);
-    logistics::Order o2 = makeOrder("O2", "D2", 30.0, 0, 1440, false);
-    const std::vector<logistics::Order> rest = {o1, o2};
-
-    const std::map<std::string, double> stock{{"T", 25.0}};
-    logistics::Order urgent = makeOrder("U1", "D1", 5.0, 0, 1440, true);
-    const logistics::InsertResult r =
-        logistics::insertUrgentOrder(g, v, rest, urgent, "W", 480, logistics::WeightType::Distance, stock);
-
-    double finalKg = 0.0;
-    for (const logistics::TransitStock& st : r.plan.transitStock) {
-        finalKg += st.finalKg;
-    }
-    check(finalKg > 1e-9,
-          "紧急插单必须把站内存货带下去（实际期末合计 "
-              + std::to_string(finalKg) + "kg）——丢了的话 GUI 回写会把存货清空");
-}
-
-// 审计发现：单趟分支（总需求 ≤ 载重）不读 initialStock，
-// collectTransits 把 finalKg 置 0 —— 攒起来的存货会在一次单趟规划后被抹掉。
-static void testSingleTripPlanPreservesStationStock() {
-    const logistics::LogisticsGraph g = makeTransitClusterGraph();
-    logistics::Vehicle v;
-    v.id = "V01"; v.startNodeId = "W"; v.capacityKg = 100.0; v.departTimeMin = 480;
-
-    // 单个订单 30kg ≤ 载重 100 -> 走单趟分支
-    const std::vector<logistics::Order> orders = {makeOrder("O1", "D1", 30.0, 0, 1440, false)};
-    const std::map<std::string, double> stock{{"T", 20.0}};
-    const logistics::RoutePlan p = logistics::replan(
-        g, v, orders, "W", 480, logistics::WeightType::Distance, stock);
-
-    check(p.status == logistics::PlanStatus::Ok, "单趟分支应规划成功");
-    check(p.trips.size() == 1, "该情形确实是单趟");
-    double finalKg = 0.0;
-    for (const logistics::TransitStock& st : p.transitStock) {
-        finalKg += st.finalKg;
-    }
-    check(finalKg > 19.9 && finalKg < 20.1,
-          "单趟分支必须原样带回站内存货（实际 " + std::to_string(finalKg)
-              + "kg）——否则 GUI 回写会把它抹掉");
+    check(carriesD2, "在途货所属的 D2 仍应被服务");
 }
 
 int main() {
@@ -1076,7 +773,7 @@ int main() {
     testLateArrivalIsMarkedWithPenalty();
     testMultipleOrdersOnSameNodeMergeIntoOneStop();
     testSingleOrderExceedingCapacityIsInfeasible();
-    testTotalDemandOverCapacityBecomesMultiTripViaTransit();
+    testTotalDemandOverCapacityBecomesMultiTrip();
     testWithinCapacityStaysSingleTrip();
     testIncrementalReplanRecomputesOnlyAffectedLeg();
     testIncrementalReplanIsIdempotentWhenNothingAffected();
@@ -1086,13 +783,7 @@ int main() {
     testReplanWhenAlreadyAtTheDeliveryNode();
     testPlanRouteEqualsReplanFromDepot();
     testIsEdgeOnRoute();
-    testStationUsedOnlyWhenStockExists();
-    testTransitStockNeverMakesPlanWorse();
-    testTransitNeverHoldsStock();
-    testIncrementalReplanForwardsStockAndOnboard();
-    testNoBankingWhenStillAtDepot();
-    testUrgentInsertForwardsStock();
-    testSingleTripPlanPreservesStationStock();
+    testIncrementalReplanForwardsOnboard();
 
     return testutil::summarize("routeplanner_tests");
 }

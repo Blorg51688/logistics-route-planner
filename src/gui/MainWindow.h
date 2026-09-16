@@ -105,8 +105,6 @@ public:
     int     tripCount() const;
     // 已经跑完的趟数（趟号的偏移量）
     int     completedTripOffset() const;
-    // 车回过几次仓库（物理事实，供 --self-check-actions）
-    int     depotArrivalCount() const { return state_.completedTrips; }
     // 本趟装载量（供 --self-check-actions 核对）
     double  currentTripLoadKg() const { return state_.tripLoadKg; }
     // 车辆信息面板的文本快照（供 --ui-probe）
@@ -148,21 +146,11 @@ private:
 
     std::string        currentPositionId() const;
     QString            orderIdsAt(const std::string& nodeId) const;
-    // 某中转站**截至当前推进位置**的暂存货量（不是规划终值——终值必为 0，
-    // 那样界面上这一列永远是 0，没有观测价值）
-    // 中转站暂存：截至当前推进位置的**当前值**与**历史峰值**。
-    // 二者都随推进实时变化——峰值不是在规划时定死的，而是"存进去时才比较是否刷新"。
-    void               stockTrace(const std::string& stationId, double& current,
-                                  double& peak) const;
     // 车辆**当前**载着的货量（随送达递减），不是本趟出发时的装载量
     double             currentLoadKg() const;
-    // 车辆此刻**已经载在车上**的货（当前趟里还没经过的停靠点）。
+    // 车辆此刻**已经载在车上**的货（显式状态，不从计划反推）。
     // 重规划时交给规划器，才能让它知道"车不是空的"。
     std::vector<logistics::OnboardItem> onboardGoods() const;
-    // 把最近一次规划的结果里各站的期末存货回写为"当前存货"，
-    // 供下一次重规划作为期初存货传入 —— 这就是"积少成多"的回路。
-    void               syncStationStock();
-    // 记录本次规划中被「顺路寄存」到站里的货所对应的节点
     void               onShowGraphTables();
     QString            windowTextAt(const std::string& nodeId) const;
     int                currentTimeMin() const;
@@ -191,7 +179,6 @@ private:
     // Debug 模拟间隔固定 1 秒（用户要求删掉速度选择卡片以节约工具栏空间）
     int            debugIntervalMs_ = 1000;
     // 各中转站的当前存货（跨重规划延续）
-    std::map<std::string, double> stationStock_;
 
     // ---- 重规划必须继承的"既定事实" ----
     //
@@ -221,9 +208,6 @@ private:
         int         arrivalMin = 0;
         int         penaltyMin = 0;   // 窗口止在渲染时由订单反查，Stop 里没有这个字段
     };
-    // 已经被「顺路寄存」到中转站的货所对应的节点。
-    // 这些货已经不在车上，必须从 onboardGoods() 里剔除，否则每重规划一次
-    // 就会被再寄存一次，stationStock_ 单调膨胀并污染后续路由（审计发现的 F5）。
     // 车辆当前所在的趟在 plan_.trips 里的下标
     std::size_t currentTripIndex() const;
 
@@ -235,6 +219,8 @@ private:
     void loadForTrip(std::size_t tripIndex);
     // 车在仓库时装载它**即将开始**的那一趟（= 当前趟 + 1）
     void loadForCurrentTrip();
+    // 换计划后的统一收尾（三处重规划路径共用）
+    void afterPlanReplaced();
     // 到达：更新位置与时刻；车回到仓库 = 一趟跑完，推进趟次并装载下一趟
     void arriveAt(const std::string& nodeId, int timeMin);
     // 送达：把该点的货从车上卸下、记账（含超时惩罚与已送达计数）
