@@ -49,6 +49,8 @@ public:
     int     tripCount() const;
     // 已经跑完的趟数（趟号的偏移量）
     int     completedTripOffset() const;
+    // 车回过几次仓库（物理事实，供 --self-check-actions）
+    int     depotArrivalCount() const { return depotArrivals_; }
     // 本趟装载量（供 --self-check-actions 核对）
     double  currentTripLoadKg() const { return currentTripLoadKg_; }
     // 车辆信息面板的文本快照（供 --ui-probe）
@@ -141,6 +143,10 @@ private:
     //     否则跑一段时间后最上面一行又变回「第 1 趟」，与"已经完成 2 趟"的事实矛盾。
     //   · currentTripLoadKg_：本趟**出发时**装了多少。一旦驶离仓库，这一趟的装载量
     //     就不会再变了；重规划把它重算，会得到与事实不符的值。
+    // 物理事实：车回过几次仓库（= 跑完了几趟）。
+    // **不能**用"计划内游标 curTrip"来推：Debug 每 tick 都重规划，
+    // nodeIndex_ 随之归零，curTrip 永远是 0，偏移量就永远加 0。
+    int    depotArrivals_ = 0;
     int    completedTrips_ = 0;
     double currentTripLoadKg_ = 0.0;
     // 本趟是否已经驶离出发点。不能用"车辆是否停在该趟起点"来判断：

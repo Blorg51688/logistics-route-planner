@@ -476,7 +476,7 @@ void MainWindow::replan() {
     // 否则界面上的「已送达」会归 0、「停靠 N 站」会缩水、趟号会对不上。
     servedStopsBase_ += static_cast<int>(stopCursor_);
     const bool tripFinished = tripsToMergeOnReplan() > static_cast<int>(currentTripIndex());
-    completedTrips_ += tripsToMergeOnReplan();
+    // 偏移量在 onPlanReplaced() 里按物理计数重设，这里不累加
     plan_ = logistics::replan(config_.graph, config_.vehicles.front(), remaining, here, now,
                               planWeight_,
                               stationStock_, onboardGoods());
@@ -563,7 +563,7 @@ void MainWindow::onSimulateTraffic() {
     // 否则界面上的「已送达 N 站」会归 0、「停靠 N 站」会缩水成剩余数）
     servedStopsBase_ += static_cast<int>(stopCursor_);
     const bool tripFinished = tripsToMergeOnReplan() > static_cast<int>(currentTripIndex());
-    completedTrips_ += tripsToMergeOnReplan();
+    // 偏移量在 onPlanReplaced() 里按物理计数重设，这里不累加
     plan_ = logistics::replanIncremental(config_.graph, config_.vehicles.front(),
                                          remainingOrders(), remainder, currentTimeMin(),
                                          planWeight_,
@@ -643,7 +643,7 @@ std::string MainWindow::insertUrgentOrderAction() {
     }
     servedStopsBase_ += static_cast<int>(stopCursor_);
     const bool tripFinished = tripsToMergeOnReplan() > static_cast<int>(currentTripIndex());
-    completedTrips_ += tripsToMergeOnReplan();
+    // 偏移量在 onPlanReplaced() 里按物理计数重设，这里不累加
     plan_ = inserted.plan;
     syncStationStock();
     nodeIndex_ = 0;
@@ -729,6 +729,12 @@ void MainWindow::onAdvanceStop() {
     // 只要离开过本趟的起点，本趟装载就冻结
     if (nodeIndex_ > 0) {
         tripDeparted_ = true;
+    }
+    // 车回到仓库 = 物理上跑完了一趟。这是**不依赖计划**的事实，
+    // 也正因如此才能在"每 tick 都重规划"的 Debug 模式下正确累计。
+    if (nodeIndex_ > 0 && !config_.vehicles.empty()
+        && currentNodeId_ == config_.vehicles.front().startNodeId) {
+        ++depotArrivals_;
     }
     if (nodeIndex_ < plan_.nodeArrivalMin.size()) {
         currentTimeMin_ = plan_.nodeArrivalMin[nodeIndex_];
@@ -1368,6 +1374,9 @@ void MainWindow::onPlanReplaced(bool tripFinished) {
         tripDeparted_ = false;
         currentTripLoadKg_ = 0.0;
     }
+    // 偏移量直接取"回过几次仓库"这个物理事实，且**冻结在当前计划内**：
+    // 计划不变时趟号由计划自己的相对编号推进，加了偏移会重复计数。
+    completedTrips_ = depotArrivals_;
     // 途中重规划：仍在本趟内，装载量保持冻结——那是既成事实，不得改写。
 }
 
@@ -1580,6 +1589,24 @@ int MainWindow::runActionSelfCheck() {
             }
         }
         expect(checked > 0, QStringLiteral("自检未能跑到「车在仓库」的时刻，守卫未生效"));
+    }
+
+    // ---- 已完成趟数只能来自"回过仓库"这个物理事实 ----
+    //
+    // 不能用"计划内游标"推：Debug 每 tick 都重规划、nodeIndex_ 随之归零，
+    // 从计划反推的进度永远是 0，偏移量就永远加 0（实测真 Debug 跑 28 tick，
+    // 已完成始终 0，而「共 X 趟」随剩余计划缩水 6->5->4）。
+    {
+        const int arrivalsBefore = depotArrivals_;
+        int pushes = 0;
+        for (int i = 0; i < 60 && depotArrivals_ == arrivalsBefore; ++i) {
+            onAdvanceStop();
+            ++pushes;
+        }
+        // 纯推进必须能真的走到仓库（否则后面所有断言都没意义）
+        expect(depotArrivals_ > arrivalsBefore,
+               QStringLiteral("推进 %1 步内车应回到仓库一次（物理事实才可作偏移量依据）")
+                   .arg(pushes));
     }
 
     // ---- 三处趟号必须一致（人工测试反馈：明细与「共 K 趟」没有继承已完成趟数）----
