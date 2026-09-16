@@ -1063,13 +1063,19 @@ void MainWindow::updatePanels() {
         // 「已送达」与「停靠总数」都必须跨重规划累计：
         // 只看 plan_.stops 的话，重规划后前者归 0、后者缩水成"剩余要送的"。
         // 三者全部来自车辆状态：已送达是累计事实；"停靠 N 站"= 已送达 + 尚未走完的；
-        // "共 K 趟"= 已跑完的 + 本计划还要跑的。
         const std::size_t remainingStops =
             plan_.stops.size() > stopCursor_ ? plan_.stops.size() - stopCursor_ : 0;
-        route += QStringLiteral("停靠 %1 站，已送达 %2 站，共 %3 趟\n")
+        route += QStringLiteral("停靠 %1 站，已送达 %2 站\n")
                      .arg(state_.servedStops + static_cast<int>(remainingStops))
-                     .arg(state_.servedStops)
-                     .arg(state_.completedTrips + plan_.trips.size());
+                     .arg(state_.servedStops);
+        // 拆成三段写明，避免"共 K 趟"被误读成"整趟配送总共几趟"：
+        //   已完成 = 真的跑完了几趟（事实）
+        //   当前第 N 趟 = 绝对趟号（跨重规划连续，不重置）
+        //   本计划共 M 趟 = **本次规划**排出了几趟（重规划会重新分批，所以它会变）
+        route += QStringLiteral("趟次：已完成 %1 趟 · 当前第 %2 趟 · 本计划共 %3 趟\n")
+                     .arg(state_.completedTrips)
+                     .arg(state_.tripNumber)
+                     .arg(plan_.trips.size());
         if (plan_.trips.size() > 1) {
             route += QStringLiteral("\n各趟：\n");
             for (std::size_t i = 0; i < plan_.trips.size(); ++i) {
@@ -1127,7 +1133,6 @@ void MainWindow::updatePanels() {
         // 本趟装载与趟号都来自车辆状态，重规划不改写
         const double tripLoad = state_.tripLoadKg;
         const std::size_t tripNo = static_cast<std::size_t>(state_.tripNumber);
-        const std::size_t tripTotal = state_.completedTrips + plan_.trips.size();
 
         double remainingDemand = 0.0;
         for (const Order& o : remainingOrders()) {
@@ -1136,15 +1141,14 @@ void MainWindow::updatePanels() {
 
         vehicleInfo_->setText(
             QStringLiteral("ID：%1\n起始仓库：%2\n载重上限：%3 kg\n发车：%4\n"
-                           "本趟装载：%5 kg（第 %6 / %7 趟）\n当前载重：%8 kg\n"
-                           "剩余待送：%9 kg")
+                           "本趟装载：%5 kg（第 %6 趟）\n当前载重：%7 kg\n"
+                           "剩余待送：%8 kg")
                 .arg(QString::fromStdString(v.id))
                 .arg(QString::fromStdString(v.startNodeId))
                 .arg(v.capacityKg, 0, 'f', 0)
                 .arg(minutesToClock(v.departTimeMin))
                 .arg(tripLoad, 0, 'f', 0)
                 .arg(tripNo)
-                .arg(tripTotal)
                 .arg(currentLoadKg(), 0, 'f', 0)
                 .arg(remainingDemand, 0, 'f', 0));
     }
