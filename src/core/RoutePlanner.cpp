@@ -107,7 +107,6 @@ bool weave(const LogisticsGraph& graph,
            std::vector<Candidate> pool,
            const std::string& startPos,
            double& elapsedMin,
-           double serviceTimeMin,
            WeightType weight,
            const std::string& pickupNode,
            const std::string& endNode,
@@ -196,8 +195,7 @@ bool weave(const LogisticsGraph& graph,
         // 而不是 appendLeg 记下的未经等待的原始到达时刻。
         trip.nodeArrivalMin[trip.nodeArrivalMin.size() - 1] = stop.arrivalMin;
 
-        elapsedMin = arrival + serviceTimeMin;
-        stop.departureMin = static_cast<int>(std::lround(elapsedMin));
+        elapsedMin = arrival;
 
         loadKg -= chosen.demandKg;
         stop.remainingLoadKg = loadKg;
@@ -296,7 +294,6 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
                             const std::vector<Candidate>& candidates,
                             const std::string& startPos,
                             int startTimeMin,
-                            double serviceTimeMin,
                             WeightType weight,
                             const std::map<std::string, double>& initialStock,
                             bool allowStation,
@@ -353,7 +350,7 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
         }
         Trip trip;
         std::string fail;
-        if (!weave(graph, batch, current, elapsed, serviceTimeMin, weight,
+        if (!weave(graph, batch, current, elapsed, weight,
                    vehicle.startNodeId, vehicle.startNodeId, batchLoad, trip, fail)) {
             plan.status = PlanStatus::Unreachable;
             plan.reason = fail;
@@ -412,7 +409,7 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
             std::string fail;
             const double load = totalDemand(carried);
             // 从**当前位置**直接出发（车上的货不需要回仓库取），终点仍是仓库
-            if (weave(graph, carried, startPos, elapsed, serviceTimeMin, weight,
+            if (weave(graph, carried, startPos, elapsed, weight,
                       startPos, vehicle.startNodeId, load, trip, fail)) {
                 plan.trips.push_back(trip);
                 current = trip.endNodeId;
@@ -515,7 +512,7 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
                     break;   // 兜底，避免死循环
                 }
                 Trip trip;
-                if (!weave(graph, batch, current, elapsed, serviceTimeMin, weight,
+                if (!weave(graph, batch, current, elapsed, weight,
                            vehicle.startNodeId, vehicle.startNodeId, batchLoad, trip, fail)) {
                     plan.status = PlanStatus::Unreachable;
                     plan.reason = fail;
@@ -564,7 +561,7 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
                     continue;   // 兜底：理论上不会发生，避免死循环
                 }
                 Trip trip;
-                if (!weave(graph, batch, current, elapsed, serviceTimeMin, weight,
+                if (!weave(graph, batch, current, elapsed, weight,
                            hub, hub, take, trip, fail)) {
                     plan.status = PlanStatus::Unreachable;
                     plan.reason = fail;
@@ -681,7 +678,6 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
                         const std::vector<Candidate>& candidates,
                         const std::string& startPos,
                         int startTimeMin,
-                        double serviceTimeMin,
                         WeightType weight,
                         const std::map<std::string, double>& initialStock,
                         const std::vector<OnboardItem>& onboard) {
@@ -706,7 +702,7 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
         // 草稿也要按"在途货先送"来排——否则会把"其实马上就能送掉"的货
         // 误判成"来不及送"，从而错误地寄存。
         const RoutePlan draft = multiTripPlanImpl(graph, vehicle, candidates, startPos,
-                                                  startTimeMin, serviceTimeMin, weight,
+                                                  startTimeMin, weight,
                                                   none, false, onboard);
         bool reachedDepot = false;
         for (const Trip& t : draft.trips) {
@@ -763,14 +759,14 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
     if (!hasStock) {
         const std::map<std::string, double> none;
         return multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
-                                 serviceTimeMin, weight, none, false, onboard);
+                                 weight, none, false, onboard);
     }
 
     // ---- ② 两版 ----
     RoutePlan direct = multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
-                                         serviceTimeMin, weight, stock, false, onboard);
+                                         weight, stock, false, onboard);
     RoutePlan viaStation = multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
-                                             serviceTimeMin, weight, stock, true, onboard);
+                                             weight, stock, true, onboard);
 
     // ---- ③ 取更优 ----
     if (direct.status != PlanStatus::Ok) {
@@ -792,7 +788,6 @@ RoutePlan replan(const LogisticsGraph& graph,
                  const std::vector<Order>& remainingOrders,
                  const std::string& currentPositionId,
                  int currentTimeMin,
-                 double serviceTimeMin,
                  WeightType weight,
                  const std::map<std::string, double>& initialStock,
                  const std::vector<OnboardItem>& onboard) {
@@ -810,14 +805,14 @@ RoutePlan replan(const LogisticsGraph& graph,
     if (total > vehicle.capacityKg + 1e-9) {
         // 总需求超过载重：改走多趟 + 中转集散（D21），不再判为不可行
         return multiTripPlan(graph, vehicle, remaining, currentPositionId, currentTimeMin,
-                             serviceTimeMin, weight, initialStock, onboard);
+                             weight, initialStock, onboard);
     }
 
     // 单趟：车辆在起点已装载全部货物，直接贪心串联后回仓库（与历史行为一致）
     double elapsed = static_cast<double>(currentTimeMin);
     Trip trip;
     std::string fail;
-    if (!weave(graph, remaining, currentPositionId, elapsed, serviceTimeMin, weight,
+    if (!weave(graph, remaining, currentPositionId, elapsed, weight,
                std::string(), vehicle.startNodeId, total, trip, fail)) {
         plan.status = PlanStatus::Unreachable;
         plan.reason = fail;
@@ -849,8 +844,7 @@ const Candidate* findCandidate(const std::vector<Candidate>& pool, const std::st
 }
 
 // 从停靠记录生成一个 Stop（时间推进口径与 weave 完全一致）
-Stop makeStop(const Candidate& chosen, double& elapsedMin, double serviceTimeMin,
-              double& loadKg) {
+Stop makeStop(const Candidate& chosen, double& elapsedMin, double& loadKg) {
     Stop stop;
     stop.nodeId = chosen.nodeId;
     const double rawArrival = elapsedMin;
@@ -864,8 +858,7 @@ Stop makeStop(const Candidate& chosen, double& elapsedMin, double serviceTimeMin
     stop.late = arrival > static_cast<double>(chosen.windowEndMin);
     stop.penaltyMin = stop.late
         ? static_cast<int>(std::lround(arrival - static_cast<double>(chosen.windowEndMin))) : 0;
-    elapsedMin = arrival + serviceTimeMin;
-    stop.departureMin = static_cast<int>(std::lround(elapsedMin));
+    elapsedMin = arrival;
     loadKg -= chosen.demandKg;
     stop.remainingLoadKg = loadKg;
     return stop;
@@ -923,7 +916,6 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
                             const std::vector<Order>& remainingOrders,
                             const RoutePlan& previous,
                             int currentTimeMin,
-                            double serviceTimeMin,
                             WeightType weight,
                             const TrafficReport& report,
                             double thresholdRatio,
@@ -937,7 +929,7 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
         || previous.nodes.size() < 2
         || previous.nodes.back() != vehicle.startNodeId) {
         return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
-                      serviceTimeMin, weight, initialStock, onboard);
+                      weight, initialStock, onboard);
     }
 
     const std::vector<Candidate> pool = buildCandidates(remainingOrders);
@@ -976,7 +968,7 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
             if (!r.found) {
                 // 该段已不可达：退回全量重算，由它给出统一的原因
                 return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
-                              serviceTimeMin, weight, initialStock, onboard);
+                              weight, initialStock, onboard);
             }
             path = r.nodes;
         } else {
@@ -1007,7 +999,7 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
             const Edge* edge = graph.findEdge(path[i - 1], path[i]);
             if (edge == nullptr) {
                 return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
-                              serviceTimeMin, weight, initialStock, onboard);
+                              weight, initialStock, onboard);
             }
             elapsed += edge->timeMin;
             trip.totalDistanceKm += edge->distanceKm;
@@ -1023,9 +1015,9 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
         const Candidate* chosen = findCandidate(pool, path.back());
         if (chosen == nullptr) {
             return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
-                          serviceTimeMin, weight, initialStock, onboard);
+                          weight, initialStock, onboard);
         }
-        const Stop stop = makeStop(*chosen, elapsed, serviceTimeMin, load);
+        const Stop stop = makeStop(*chosen, elapsed, load);
         // 停靠节点记录实际送达时刻（等窗口开启之后）
         trip.nodeArrivalMin[trip.nodeArrivalMin.size() - 1] = stop.arrivalMin;
         trip.stops.push_back(stop);
@@ -1052,10 +1044,9 @@ bool isEdgeOnRoute(const std::vector<std::string>& routeNodes,
 RoutePlan planRoute(const LogisticsGraph& graph,
                     const Vehicle& vehicle,
                     const std::vector<Order>& orders,
-                    double serviceTimeMin,
                     WeightType weight) {
     return replan(graph, vehicle, orders, vehicle.startNodeId,
-                  vehicle.departTimeMin, serviceTimeMin, weight);
+                  vehicle.departTimeMin, weight);
 }
 
 InsertResult insertUrgentOrder(const LogisticsGraph& graph,
@@ -1064,7 +1055,6 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
                                const Order& newOrder,
                                const std::string& currentPositionId,
                                int currentTimeMin,
-                               double serviceTimeMin,
                                WeightType weight,
                                const std::map<std::string, double>& initialStock,
                                const std::vector<OnboardItem>& onboard) {
@@ -1093,7 +1083,7 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
     }
 
     result.plan = replan(graph, vehicle, all, currentPositionId, currentTimeMin,
-                         serviceTimeMin, weight, initialStock, onboard);
+                         weight, initialStock, onboard);
     return result;
 }
 

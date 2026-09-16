@@ -188,7 +188,7 @@ int main(int argc, char** argv) {
         }
         const logistics::RoutePlan plan =
             logistics::planRoute(config.graph, config.vehicles.front(), config.orders,
-                                 config.general.serviceTimeMin, planWeight);
+                                 planWeight);
         if (plan.status != logistics::PlanStatus::Ok) {
             std::printf("不可行：%s\n", plan.reason.c_str());
             return 0;
@@ -256,7 +256,7 @@ int main(int argc, char** argv) {
             }
             const logistics::RoutePlan plan =
                 logistics::planRoute(config.graph, config.vehicles.front(), config.orders,
-                                     config.general.serviceTimeMin, planWeight);
+                                     planWeight);
             if (plan.status == logistics::PlanStatus::Ok) {
                 scene.highlightRoute(plan.nodes);
                 std::printf("规划（%s）：距离 %.1fkm  耗时 %.1fmin  成本 %.1f元  "
@@ -381,7 +381,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::printf("[ui-probe] 停靠明细 %zu 行"
-                    "（趟|配送点|原始到达|等待(分)|送达|离开|送后余载(kg)）\n", stopRows);
+                    "（趟|配送点|原始到达|等待(分)|送达|送后余载(kg)）\n", stopRows);
         // 打前几行实际数值：这是"数值对不对"的核对依据，光有行数不够
         {
             const QStringList lines = stopPanel.split(QLatin1Char('\n'), Qt::SkipEmptyParts);

@@ -73,7 +73,7 @@ int windowSpanMinutes(const Config& cfg, const std::string& nodeId) {
 
 RoutePlan checkPlanCoversAllOrders(const Config& cfg, WeightType weight, const char* label) {
     const Vehicle& v = cfg.vehicles[0];
-    const RoutePlan plan = planRoute(cfg.graph, v, cfg.orders, cfg.general.serviceTimeMin, weight);
+    const RoutePlan plan = planRoute(cfg.graph, v, cfg.orders,  weight);
 
     check(plan.status == PlanStatus::Ok,
           std::string(label) + "：默认数据可规划出可行路线（reason: " + plan.reason + "）");
@@ -195,7 +195,7 @@ void checkMultiTripAndTransitOnRealData(const Config& cfg) {
     small.capacityKg = 100.0;   // 远小于总需求 740kg
 
     const RoutePlan plan = planRoute(cfg.graph, small, cfg.orders,
-                                     cfg.general.serviceTimeMin, WeightType::Distance);
+                                      WeightType::Distance);
 
     check(plan.status == PlanStatus::Ok, "载重远小于总需求时不再是不可行");
     check(plan.stops.size() == distinctOrderNodes(cfg),
@@ -262,7 +262,7 @@ void checkMultiTripAndTransitOnRealData(const Config& cfg) {
     // 走到中途后，剩余部分**必须仍然分成多趟**（默认数据共 6 趟）。
     {
         const logistics::RoutePlan full = logistics::planRoute(
-            cfg.graph, cfg.vehicles.front(), cfg.orders, cfg.general.serviceTimeMin,
+            cfg.graph, cfg.vehicles.front(), cfg.orders, 
             logistics::WeightType::Distance);
         check(full.trips.size() >= 4, "默认数据应为多趟，实际 "
                                           + std::to_string(full.trips.size()));
@@ -318,11 +318,11 @@ void checkMultiTripAndTransitOnRealData(const Config& cfg) {
         const logistics::RoutePlan basePl = logistics::replan(
             cfg.graph, cfg.vehicles.front(), cfg.orders, cfg.vehicles.front().startNodeId,
             static_cast<int>(cfg.vehicles.front().departTimeMin),
-            cfg.general.serviceTimeMin, logistics::WeightType::Distance, noStock);
+             logistics::WeightType::Distance, noStock);
         const logistics::RoutePlan stPl = logistics::replan(
             cfg.graph, cfg.vehicles.front(), cfg.orders, cfg.vehicles.front().startNodeId,
             static_cast<int>(cfg.vehicles.front().departTimeMin),
-            cfg.general.serviceTimeMin, logistics::WeightType::Distance, stock);
+             logistics::WeightType::Distance, stock);
         double stOps = 0.0;
         for (const logistics::Trip& tr : stPl.trips) {
             for (const logistics::TransitOp& op : tr.transitOps) {
@@ -467,9 +467,7 @@ void checkGraphRepresentationsOnRealData(const Config& cfg) {
 void checkTrafficAndUrgentOrderOnRealData(const Config& cfg) {
     LogisticsGraph g = cfg.graph;   // 副本：路况变化会改写边耗时，不能污染原配置
     const Vehicle& v = cfg.vehicles[0];
-    const double service = cfg.general.serviceTimeMin;
-
-    const RoutePlan before = planRoute(g, v, cfg.orders, service, WeightType::Distance);
+    const RoutePlan before = planRoute(g, v, cfg.orders, WeightType::Distance);
     check(before.status == PlanStatus::Ok, "拥堵前默认数据可规划");
     if (before.status != PlanStatus::Ok || before.stops.size() < 6) {
         return;
@@ -501,7 +499,7 @@ void checkTrafficAndUrgentOrderOnRealData(const Config& cfg) {
     // 车已服务前 5 站，停在第 5 站；剩余订单为其余配送点
     const std::size_t served = 5;
     const std::string here = before.stops[served - 1].nodeId;
-    const int nowMin = before.stops[served - 1].departureMin;
+    const int nowMin = before.stops[served - 1].arrivalMin;
 
     std::vector<logistics::Order> remaining;
     for (const logistics::Order& o : cfg.orders) {
@@ -523,7 +521,7 @@ void checkTrafficAndUrgentOrderOnRealData(const Config& cfg) {
                 served, here.c_str(), nowMin, report.changes.size(), trigger ? "是" : "否");
 
     if (trigger) {
-        const RoutePlan replanned = replan(g, v, remaining, here, nowMin, service,
+        const RoutePlan replanned = replan(g, v, remaining, here, nowMin,
                                            WeightType::Distance);
         check(replanned.status == PlanStatus::Ok, "路况重规划后仍可行");
         check(replanned.stops.size() == remaining.size(), "重规划恰好覆盖全部剩余订单");
@@ -541,8 +539,7 @@ void checkTrafficAndUrgentOrderOnRealData(const Config& cfg) {
     urgent.windowEndMin = 1440;
     urgent.urgent = true;
 
-    const InsertResult inserted = insertUrgentOrder(g, v, remaining, urgent, here, nowMin,
-                                                    service, WeightType::Distance);
+    const InsertResult inserted = insertUrgentOrder(g, v, remaining, urgent, here, nowMin, WeightType::Distance);
     check(inserted.plan.status == PlanStatus::Ok, "插入紧急订单后仍可行");
     check(inserted.warning.empty(), "窗口充裕时不应冲突，实际: " + inserted.warning);
     check(!inserted.plan.stops.empty() && inserted.plan.stops[0].nodeId == urgent.nodeId,

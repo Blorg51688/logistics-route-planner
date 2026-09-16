@@ -44,7 +44,6 @@ TRUNK_COST_FACTOR = 1.6    # 主干道 元/km
 BRANCH_TIME_FACTOR = 2.4
 BRANCH_COST_FACTOR = 1.2
 
-SERVICE_TIME_MIN = 5
 TRAFFIC_CHANGE_INTERVAL_SEC = 30
 TRAFFIC_CHANGE_RATIO = 0.1
 TRAFFIC_TIME_INCREASE_MIN = 0.2
@@ -169,7 +168,6 @@ def build_text():
     links = build_links()
 
     out = ["[general]",
-           "service_time_min = %d" % SERVICE_TIME_MIN,
            "traffic_change_interval_sec = %d" % TRAFFIC_CHANGE_INTERVAL_SEC,
            "traffic_change_ratio = %s" % TRAFFIC_CHANGE_RATIO,
            "traffic_time_increase_min = %s" % TRAFFIC_TIME_INCREASE_MIN,

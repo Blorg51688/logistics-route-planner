@@ -29,7 +29,6 @@ struct Stop {
     int    rawArrivalMin   = 0;    // 未经等待修正的到达时刻
     int    waitMin         = 0;    // 早到等待时长
     int    arrivalMin      = 0;    // 送达时刻 = max(窗口起, rawArrival)
-    int    departureMin    = 0;    // = arrival + serviceTime
     bool   late            = false;
     int    penaltyMin      = 0;    // = max(0, arrival - 窗口止)
     double remainingLoadKg = 0.0;  // 离开该站时的剩余载重
@@ -101,7 +100,6 @@ struct RoutePlan {
 RoutePlan planRoute(const LogisticsGraph& graph,
                     const Vehicle& vehicle,
                     const std::vector<Order>& orders,
-                    double serviceTimeMin,
                     WeightType weight);
 
 // 从指定位置与指定时刻出发，对剩余未服务订单重新规划，最后返回车辆起始仓库。
@@ -121,7 +119,6 @@ RoutePlan replan(const LogisticsGraph& graph,
                  const std::vector<Order>& remainingOrders,
                  const std::string& currentPositionId,
                  int currentTimeMin,
-                 double serviceTimeMin,
                  WeightType weight,
                  const std::map<std::string, double>& initialStock
                      = std::map<std::string, double>(),
@@ -145,7 +142,6 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
                                const Order& newOrder,
                                const std::string& currentPositionId,
                                int currentTimeMin,
-                               double serviceTimeMin,
                                WeightType weight,
                                const std::map<std::string, double>& initialStock
                                    = std::map<std::string, double>(),
@@ -167,7 +163,6 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
                             const std::vector<Order>& remainingOrders,
                             const RoutePlan& previous,
                             int currentTimeMin,
-                            double serviceTimeMin,
                             WeightType weight,
                             const TrafficReport& report,
                             double thresholdRatio,

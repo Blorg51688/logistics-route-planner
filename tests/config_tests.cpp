@@ -176,7 +176,8 @@ void testLoadDefaultConfig() {
           "单个订单最大货量 " + std::to_string(maxOrderDemand) + " ≤ 载重");
 
     // [general] 参数
-    check(cfg.general.serviceTimeMin == 5.0, "service_time_min == 5");
+    // 注：service_time_min 已移除——要求原文从未提及服务时间（搜「服务/停留/装卸」
+    // 均为 0 处），按用户要求删掉，到达时刻即离开时刻。
     check(cfg.general.trafficChangeRatio == 0.1, "traffic_change_ratio == 0.1");
     check(cfg.general.trafficTimeIncreaseMin == 0.2, "traffic_time_increase_min == 0.2");
 }
@@ -390,7 +391,8 @@ void testBoundaryCases() {
         std::string error;
         const bool ok = ConfigLoader::parse(kMinimalConfig, cfg, error);
         check(ok, "无 [general] 节时使用默认值（错误: " + error + "）");
-        check(ok && cfg.general.serviceTimeMin == 5.0, "默认 service_time_min == 5");
+        check(ok && cfg.general.trafficChangeRatio == 0.1,
+              "默认 traffic_change_ratio == 0.1");
     }
 }
 

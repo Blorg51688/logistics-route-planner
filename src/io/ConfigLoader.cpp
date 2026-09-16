@@ -102,7 +102,6 @@ bool loadGeneral(const IniFile& ini, GeneralConfig& out, std::string& error) {
         double*     target;
     };
     const Binder binders[] = {
-        {"service_time_min", &out.serviceTimeMin},
         {"traffic_change_interval_sec", &out.trafficChangeIntervalSec},
         {"traffic_change_ratio", &out.trafficChangeRatio},
         {"traffic_time_increase_min", &out.trafficTimeIncreaseMin},

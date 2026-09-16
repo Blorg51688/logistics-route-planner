@@ -447,7 +447,7 @@ void MainWindow::replan() {
     const std::vector<Order> remaining = remainingOrders();
 
     plan_ = logistics::replan(config_.graph, config_.vehicles.front(), remaining, here, now,
-                              config_.general.serviceTimeMin, planWeight_,
+                              planWeight_,
                               stationStock_, onboardGoods());
     syncStationStock();
     // 新路线的推进状态归零；当前位置/时刻由显式字段保存，不受本次重算影响
@@ -528,7 +528,7 @@ void MainWindow::onSimulateTraffic() {
     const bool wasSingleTrip = (plan_.trips.size() == 1);
     plan_ = logistics::replanIncremental(config_.graph, config_.vehicles.front(),
                                          remainingOrders(), remainder, currentTimeMin(),
-                                         config_.general.serviceTimeMin, planWeight_,
+                                         planWeight_,
                                          report, config_.general.trafficTimeIncreaseMin,
                                          stationStock_, onboardGoods());
     syncStationStock();
@@ -585,7 +585,7 @@ std::string MainWindow::insertUrgentOrderAction() {
 
     const logistics::InsertResult inserted = logistics::insertUrgentOrder(
         config_.graph, config_.vehicles.front(), pending, urgent, currentPositionId(),
-        currentTimeMin(), config_.general.serviceTimeMin, planWeight_,
+        currentTimeMin(), planWeight_,
         stationStock_, onboardGoods());
 
     // 关键：必须并入 config_.orders。
@@ -1085,17 +1085,23 @@ void MainWindow::updatePanels() {
             }
         }
     }
-    stopTable_->setRowCount(static_cast<int>(plan_.stops.size()));
-    for (int i = 0; i < static_cast<int>(plan_.stops.size()); ++i) {
-        const Stop& s = plan_.stops[static_cast<std::size_t>(i)];
+    // 只列**尚未走过**的停靠点：推进一站与重规划应当有一致的效果，
+    // 都表现为"已送达的那一行从表里消失"。此前推进不改计划、表也就不动，
+    // 与重规划后表被重建的行为不一致，容易被误判为卡住。
+    const std::size_t fromStop =
+        (stopCursor_ < plan_.stops.size()) ? stopCursor_ : plan_.stops.size();
+    const int shown = static_cast<int>(plan_.stops.size() - fromStop);
+    stopTable_->setRowCount(shown);
+    for (int i = 0; i < shown; ++i) {
+        const std::size_t idx = fromStop + static_cast<std::size_t>(i);
+        const Stop& s = plan_.stops[idx];
         stopTable_->setItem(i, 0, new QTableWidgetItem(
-            QStringLiteral("第 %1").arg(stopTrip[static_cast<std::size_t>(i)])));
+            QStringLiteral("第 %1").arg(stopTrip[idx])));
         stopTable_->setItem(i, 1, new QTableWidgetItem(QString::fromStdString(s.nodeId)));
         stopTable_->setItem(i, 2, new QTableWidgetItem(minutesToClock(s.rawArrivalMin)));
         stopTable_->setItem(i, 3, new QTableWidgetItem(QString::number(s.waitMin)));
         stopTable_->setItem(i, 4, new QTableWidgetItem(minutesToClock(s.arrivalMin)));
-        stopTable_->setItem(i, 5, new QTableWidgetItem(minutesToClock(s.departureMin)));
-        stopTable_->setItem(i, 6, new QTableWidgetItem(QString::number(s.remainingLoadKg, 'f', 0)));
+        stopTable_->setItem(i, 5, new QTableWidgetItem(QString::number(s.remainingLoadKg, 'f', 0)));
     }
 
     // 中转站 / 集散：子网络标识 + 下属配送点数 + 暂存货量

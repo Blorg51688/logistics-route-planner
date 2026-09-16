@@ -10,7 +10,6 @@ namespace logistics {
 
 // [general] 节的全局参数
 struct GeneralConfig {
-    double serviceTimeMin = 5.0;            // 每个停靠点的服务时间
     double trafficChangeIntervalSec = 30.0; // 路况模拟间隔
     double trafficChangeRatio = 0.1;        // 每次变化的边占比
     double trafficTimeIncreaseMin = 0.2;    // 耗时增加比例下限

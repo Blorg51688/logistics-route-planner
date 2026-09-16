@@ -57,34 +57,34 @@ std::string join(const std::vector<std::string>& nodes) {
 //   wait              540 - 490 = 50（早到等待）
 //   arrival(D1)       540          未超时 -> penalty 0
 //   departure(D1)     540 + 5 = 545
-//   回到 W             545 + 10 = 555
+//   回到 W             540 + 10 = 550（服务时间已移除，离开==送达）
 //   totalDistance     5.0 + 5.0 = 10.0
-//   totalTime         555 - 480 = 75
+//   totalTime         550 - 480 = 70
 //   totalCost         4.0 + 4.0 = 8.0
 void testSingleOrderRouteIsFullyCorrect() {
     const LogisticsGraph g = makeWtoD1Graph();
     const Vehicle v = makeVehicle("W", 1000.0, 480);
     const std::vector<Order> orders = {makeOrder("O1", "D1", 10.0, 540, 1080, false)};
 
-    const RoutePlan plan = planRoute(g, v, orders, 5.0, WeightType::Distance);
+    const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
 
     check(plan.status == PlanStatus::Ok, "规划成功");
     check(plan.nodes == std::vector<std::string>{"W", "D1", "W"},
           "完整序列为 W -> D1 -> W，实际 " + join(plan.nodes));
     check(fixtures::nearlyEqual(plan.totalDistanceKm, 10.0),
           "总距离 10.0，实际 " + std::to_string(plan.totalDistanceKm));
-    check(fixtures::nearlyEqual(plan.totalTimeMin, 75.0),
+    check(fixtures::nearlyEqual(plan.totalTimeMin, 70.0),
           "总耗时 75（含等待与服务），实际 " + std::to_string(plan.totalTimeMin));
-    // 抵达仓库的时刻（oracle 值 555）
-    check(plan.returnArrivalMin == 555,
-          "返回仓库时刻 555，实际 " + std::to_string(plan.returnArrivalMin));
+    // 抵达仓库的时刻（oracle 值 550）
+    check(plan.returnArrivalMin == 550,
+          "返回仓库时刻 550，实际 " + std::to_string(plan.returnArrivalMin));
 
     // 逐节点到达时刻与"是否停靠"标记，供界面逐个节点推进
     check(plan.nodeArrivalMin.size() == plan.nodes.size(), "到达时刻序列与节点序列等长");
     check(plan.nodeIsStop.size() == plan.nodes.size(), "停靠标记序列与节点序列等长");
-    // W(出发 480) -> D1(送达 540) -> W(回到 555)
-    check(plan.nodeArrivalMin == std::vector<int>({480, 540, 555}),
-          "逐节点到达时刻应为 480 / 540 / 555");
+    // W(出发 480) -> D1(送达 540) -> W(回到 550)
+    check(plan.nodeArrivalMin == std::vector<int>({480, 540, 550}),
+          "逐节点到达时刻应为 480 / 540 / 550");
     check(plan.nodeIsStop == std::vector<bool>({false, true, false}),
           "只有中间那个配送点才是停靠");
     check(fixtures::nearlyEqual(plan.totalCostYuan, 8.0),
@@ -98,7 +98,6 @@ void testSingleOrderRouteIsFullyCorrect() {
         check(s.rawArrivalMin == 490, "rawArrival 490，实际 " + std::to_string(s.rawArrivalMin));
         check(s.waitMin == 50, "等待 50，实际 " + std::to_string(s.waitMin));
         check(s.arrivalMin == 540, "arrival 540，实际 " + std::to_string(s.arrivalMin));
-        check(s.departureMin == 545, "departure 545，实际 " + std::to_string(s.departureMin));
         check(!s.late, "未超时");
         check(s.penaltyMin == 0, "penalty 0");
         check(fixtures::nearlyEqual(s.remainingLoadKg, 0.0),
@@ -111,7 +110,7 @@ void testEmptyOrdersDegeneratesToNoMovement() {
     const LogisticsGraph g = makeWtoD1Graph();
     const Vehicle v = makeVehicle("W", 1000.0, 480);
 
-    const RoutePlan plan = planRoute(g, v, std::vector<Order>{}, 5.0, WeightType::Distance);
+    const RoutePlan plan = planRoute(g, v, std::vector<Order>{}, WeightType::Distance);
 
     check(plan.status == PlanStatus::Ok, "空订单规划成功");
     check(plan.nodes == std::vector<std::string>{"W"},
@@ -138,7 +137,7 @@ void testGreedyServesNearestCandidateFirst() {
         makeOrder("O2", "D2", 10.0, 0, 1440, false),
     };
 
-    const RoutePlan plan = planRoute(g, v, orders, 5.0, WeightType::Distance);
+    const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
 
     check(plan.status == PlanStatus::Ok, "规划成功");
     // W->D1 = 1.0，W->D2 = 5.0，故先 D1；随后 D1->D2 = 2.0。
@@ -170,7 +169,7 @@ void testTieBreakIsDeterministicByNodeId() {
         makeOrder("OA", "DA", 10.0, 0, 1440, false),
     };
 
-    const RoutePlan plan = planRoute(g, v, orders, 5.0, WeightType::Distance);
+    const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
 
     check(plan.status == PlanStatus::Ok, "并列场景规划成功");
     check(plan.stops.size() == 2 && plan.stops[0].nodeId == "DA",
@@ -196,7 +195,7 @@ void testUrgentOrderIsServedFirstDespiteBeingFarther() {
         makeOrder("O1", "D1", 10.0, 0, 1440, false),
         makeOrder("O2", "D2", 10.0, 0, 1440, true),   // 远，但紧急
     };
-    const RoutePlan urgentPlan = planRoute(g, v, withUrgent, 5.0, WeightType::Distance);
+    const RoutePlan urgentPlan = planRoute(g, v, withUrgent, WeightType::Distance);
 
     check(urgentPlan.status == PlanStatus::Ok, "紧急单场景规划成功");
     check(urgentPlan.stops.size() == 2 && urgentPlan.stops[0].nodeId == "D2",
@@ -213,7 +212,7 @@ void testUrgentOrderIsServedFirstDespiteBeingFarther() {
         makeOrder("O1", "D1", 10.0, 0, 1440, false),
         makeOrder("O2", "D2", 10.0, 0, 1440, false),
     };
-    const RoutePlan plainPlan = planRoute(g, v, withoutUrgent, 5.0, WeightType::Distance);
+    const RoutePlan plainPlan = planRoute(g, v, withoutUrgent, WeightType::Distance);
     check(plainPlan.stops.size() == 2 && plainPlan.stops[0].nodeId == "D1",
           "非紧急对照组应按距离先服务 D1");
 }
@@ -226,7 +225,7 @@ void testLateArrivalIsMarkedWithPenalty() {
     const Vehicle v = makeVehicle("W", 1000.0, 480);
     const std::vector<Order> orders = {makeOrder("O1", "D1", 10.0, 480, 485, false)};
 
-    const RoutePlan plan = planRoute(g, v, orders, 5.0, WeightType::Distance);
+    const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
 
     check(plan.status == PlanStatus::Ok, "规划成功");
     check(plan.stops.size() == 1, "1 个停靠点");
@@ -253,7 +252,7 @@ void testMultipleOrdersOnSameNodeMergeIntoOneStop() {
         makeOrder("O2", "D1", 20.0, 840, 900, false),
     };
 
-    const RoutePlan plan = planRoute(g, v, orders, 5.0, WeightType::Distance);
+    const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
 
     check(plan.status == PlanStatus::Ok, "规划成功");
     check(plan.stops.size() == 1,
@@ -265,13 +264,12 @@ void testMultipleOrdersOnSameNodeMergeIntoOneStop() {
         const logistics::Stop& s = plan.stops[0];
         check(s.nodeId == "D1", "停靠点是 D1");
         check(s.arrivalMin == 490, "arrival 490，实际 " + std::to_string(s.arrivalMin));
-        check(s.departureMin == 495, "departure 495，实际 " + std::to_string(s.departureMin));
         // 两单需求量求和 30+20 = 50，一次卸完 -> 剩余 0
         check(fixtures::nearlyEqual(s.remainingLoadKg, 0.0),
               "合并后一次卸完 50kg，剩余 0，实际 " + std::to_string(s.remainingLoadKg));
     }
     // 490 送达 -> 495 离开 -> 505 回到仓库；总耗时 505-480 = 25
-    check(fixtures::nearlyEqual(plan.totalTimeMin, 25.0),
+    check(fixtures::nearlyEqual(plan.totalTimeMin, 20.0),
           "总耗时 25（若未合并会因等待 840 而暴增），实际 " + std::to_string(plan.totalTimeMin));
     check(fixtures::nearlyEqual(plan.totalDistanceKm, 10.0), "总距离 10.0");
 }
@@ -283,7 +281,7 @@ void testSingleOrderExceedingCapacityIsInfeasible() {
     const Vehicle v = makeVehicle("W", 10.0, 480);   // 载重仅 10
     const std::vector<Order> orders = {makeOrder("O1", "D1", 20.0, 0, 1440, false)};
 
-    const RoutePlan plan = planRoute(g, v, orders, 5.0, WeightType::Distance);
+    const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
 
     check(plan.status == PlanStatus::OrderExceedsCapacity, "状态为 OrderExceedsCapacity");
     check(plan.nodes.empty(), "不可行时不生成路线（nodes 为空）");
@@ -393,7 +391,7 @@ void testTotalDemandOverCapacityBecomesMultiTripViaTransit() {
     const std::vector<Order> orders = {makeOrder("O1", "D1", 15.0, 0, 1440, false),
                                        makeOrder("O2", "D2", 15.0, 0, 1440, false)};
 
-    const RoutePlan plan = planRoute(g, v, orders, 5.0, WeightType::Distance);
+    const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
 
     // 不变量 1：全部订单被服务（否则才叫不可行）
     check(plan.status == PlanStatus::Ok, "总需求超载不再是不可行");
@@ -471,7 +469,7 @@ void testWithinCapacityStaysSingleTrip() {
     const std::vector<Order> orders = {makeOrder("O1", "D1", 15.0, 0, 1440, false),
                                        makeOrder("O2", "D2", 15.0, 0, 1440, false)};
 
-    const RoutePlan plan = planRoute(g, v, orders, 5.0, WeightType::Distance);
+    const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
 
     check(plan.status == PlanStatus::Ok, "可行");
     check(plan.trips.size() == 1, "不超载时只有一趟，实际 "
@@ -494,7 +492,7 @@ void testUnreachableDeliveryIsInfeasibleAndNamesTheNode() {
     const Vehicle v = makeVehicle("W", 1000.0, 480);
     const std::vector<Order> orders = {makeOrder("O1", "D9", 10.0, 0, 1440, false)};
 
-    const RoutePlan plan = planRoute(g, v, orders, 5.0, WeightType::Distance);
+    const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
 
     check(plan.status == PlanStatus::Unreachable, "状态为 Unreachable");
     check(plan.stops.empty(), "不可行时无停靠点");
@@ -530,7 +528,7 @@ void testIncrementalReplanRecomputesOnlyAffectedLeg() {
     const std::vector<Order> orders = {makeOrder("O1", "D1", 10.0, 0, 1440, false),
                                        makeOrder("O2", "D2", 10.0, 0, 1440, false)};
 
-    const RoutePlan before = planRoute(g, v, orders, 5.0, WeightType::Time);
+    const RoutePlan before = planRoute(g, v, orders, WeightType::Time);
     check(before.status == PlanStatus::Ok, "初始规划可行");
     check(before.nodes == std::vector<std::string>({"W", "D1", "D2", "W"}),
           "初始序列 W->D1->D2->W");
@@ -556,10 +554,10 @@ void testIncrementalReplanRecomputesOnlyAffectedLeg() {
     report.changes.push_back(c);
 
     // 重规划前那条路线在**拥堵后**的耗时，作为比较基准
-    const RoutePlan congestedSameRoute = replan(g, v, orders, "W", 480, 5.0, WeightType::Time);
+    const RoutePlan congestedSameRoute = replan(g, v, orders, "W", 480, WeightType::Time);
 
     const RoutePlan after =
-        replanIncremental(g, v, orders, before, 480, 5.0, WeightType::Time, report, 0.2);
+        replanIncremental(g, v, orders, before, 480, WeightType::Time, report, 0.2);
 
     check(after.status == PlanStatus::Ok, "增量重规划可行");
 
@@ -600,7 +598,7 @@ void testIncrementalReplanIsIdempotentWhenNothingAffected() {
     const std::vector<Order> orders = {makeOrder("O1", "D1", 10.0, 0, 1440, false),
                                        makeOrder("O2", "D2", 10.0, 0, 1440, false)};
 
-    const RoutePlan before = planRoute(g, v, orders, 5.0, WeightType::Time);
+    const RoutePlan before = planRoute(g, v, orders, WeightType::Time);
 
     // 报告里只有一条**不在路线上的**边（D1->D3 是绕行边，当前路线没走）
     TrafficReport report;
@@ -612,7 +610,7 @@ void testIncrementalReplanIsIdempotentWhenNothingAffected() {
     report.changes.push_back(c);
 
     const RoutePlan after =
-        replanIncremental(g, v, orders, before, 480, 5.0, WeightType::Time, report, 0.2);
+        replanIncremental(g, v, orders, before, 480, WeightType::Time, report, 0.2);
 
     check(after.nodes == before.nodes, "无 leg 受影响时，节点序列逐位不变");
     check(after.stops.size() == before.stops.size(), "停靠点数不变");
@@ -627,12 +625,12 @@ void testIncrementalReplanFallsBackForMultiTrip() {
     const std::vector<Order> orders = {makeOrder("O1", "D1", 15.0, 0, 1440, false),
                                        makeOrder("O2", "D2", 15.0, 0, 1440, false)};
 
-    const RoutePlan multi = planRoute(g, v, orders, 5.0, WeightType::Distance);
+    const RoutePlan multi = planRoute(g, v, orders, WeightType::Distance);
     check(multi.trips.size() > 1, "前提：上一版确为多趟");
 
     TrafficReport report;   // 空报告
     const RoutePlan after =
-        replanIncremental(g, v, orders, multi, 480, 5.0, WeightType::Distance, report, 0.2);
+        replanIncremental(g, v, orders, multi, 480, WeightType::Distance, report, 0.2);
 
     check(after.status == PlanStatus::Ok, "退回全量重算后仍可行");
     check(after.stops.size() == 2, "仍然服务全部配送点");
@@ -674,14 +672,14 @@ void testReplanFromCurrentPosition() {
     // 车已在 D2，时刻 600，剩余一个 D1 的订单
     const std::vector<Order> remaining = {makeOrder("O1", "D1", 10.0, 0, 1440, false)};
 
-    const RoutePlan plan = replan(g, v, remaining, "D2", 600, 5.0, WeightType::Distance);
+    const RoutePlan plan = replan(g, v, remaining, "D2", 600, WeightType::Distance);
 
     check(plan.status == PlanStatus::Ok, "重规划成功");
-    // D2->D1 = 4min -> 604 到达；服务 5min -> 609；D1->W = 2min -> 611
+    // D2->D1 = 4min -> 604 到达；D1->W = 2min -> 606（服务时间已移除）
     check(plan.nodes == std::vector<std::string>{"D2", "D1", "W"},
           "序列为 D2->D1->W，实际 " + join(plan.nodes));
-    check(fixtures::nearlyEqual(plan.totalTimeMin, 11.0),
-          "总耗时 611-600 = 11，实际 " + std::to_string(plan.totalTimeMin));
+    check(fixtures::nearlyEqual(plan.totalTimeMin, 6.0),
+          "总耗时 606-600 = 6，实际 " + std::to_string(plan.totalTimeMin));
     check(fixtures::nearlyEqual(plan.totalDistanceKm, 3.0),
           "总距离 2.0+1.0 = 3.0，实际 " + std::to_string(plan.totalDistanceKm));
     check(plan.stops.size() == 1 && plan.stops[0].rawArrivalMin == 604,
@@ -694,7 +692,7 @@ void testReplanWhenAlreadyAtTheDeliveryNode() {
     const Vehicle v = makeVehicle("W", 1000.0, 480);
     const std::vector<Order> remaining = {makeOrder("O1", "D1", 10.0, 0, 1440, false)};
 
-    const RoutePlan plan = replan(g, v, remaining, "D1", 600, 5.0, WeightType::Distance);
+    const RoutePlan plan = replan(g, v, remaining, "D1", 600, WeightType::Distance);
 
     check(plan.status == PlanStatus::Ok, "重规划成功");
     check(plan.nodes == std::vector<std::string>{"D1", "W"},
@@ -723,9 +721,9 @@ void testPlanRouteEqualsReplanFromDepot() {
         makeOrder("O2", "D2", 10.0, 0, 1440, true),
     };
 
-    const RoutePlan viaPlanRoute = planRoute(g, v, orders, 5.0, WeightType::Distance);
+    const RoutePlan viaPlanRoute = planRoute(g, v, orders, WeightType::Distance);
     const RoutePlan viaReplan =
-        replan(g, v, orders, v.startNodeId, v.departTimeMin, 5.0, WeightType::Distance);
+        replan(g, v, orders, v.startNodeId, v.departTimeMin, WeightType::Distance);
 
     check(samePlan(viaPlanRoute, viaReplan),
           "planRoute 与 replan(仓库, 发车时刻) 结果必须完全一致");
@@ -788,9 +786,9 @@ static void testStationUsedOnlyWhenStockExists() {
     const std::map<std::string, double> withStock{{"T", 30.0}};
 
     const logistics::RoutePlan a =
-        logistics::replan(g, v, orders, "W", 480, 5.0, logistics::WeightType::Distance, noStock);
+        logistics::replan(g, v, orders, "W", 480, logistics::WeightType::Distance, noStock);
     const logistics::RoutePlan b =
-        logistics::replan(g, v, orders, "W", 480, 5.0, logistics::WeightType::Distance, withStock);
+        logistics::replan(g, v, orders, "W", 480, logistics::WeightType::Distance, withStock);
 
     check(a.status == logistics::PlanStatus::Ok && b.status == logistics::PlanStatus::Ok,
           "有无期初存货都应规划成功");
@@ -846,13 +844,13 @@ static void testTransitStockNeverMakesPlanWorse() {
 
     for (logistics::WeightType w : weights) {
         const logistics::RoutePlan base = logistics::replan(
-            g, v, orders, "W", 480, 5.0, w, std::map<std::string, double>());
+            g, v, orders, "W", 480, w, std::map<std::string, double>());
 
         // 注入从 0 到"整个载重"的各种存货量，逐个核对不许变差
         for (double stock = 5.0; stock <= v.capacityKg; stock += 5.0) {
             const std::map<std::string, double> st{{"T", stock}};
             const logistics::RoutePlan p =
-                logistics::replan(g, v, orders, "W", 480, 5.0, w, st);
+                logistics::replan(g, v, orders, "W", 480, w, st);
             const std::string tag = "（存货 " + std::to_string(static_cast<int>(stock))
                                     + "kg）";
             check(p.status == logistics::PlanStatus::Ok, "注入存货后仍可行 " + tag);
@@ -907,7 +905,7 @@ static void testOnboardSurplusIsBankedEnRoute() {
     const std::vector<logistics::OnboardItem> onboard = {{"D2", 20.0}};
     const std::map<std::string, double> noStock;
     const logistics::RoutePlan p =
-        logistics::replan(g, v, rest, "D1", 500, 5.0, logistics::WeightType::Distance,
+        logistics::replan(g, v, rest, "D1", 500, logistics::WeightType::Distance,
                           noStock, onboard);
 
     check(p.status == logistics::PlanStatus::Ok, "寄存场景下仍规划成功");
@@ -923,7 +921,7 @@ static void testOnboardSurplusIsBankedEnRoute() {
 
     // 寄存必须**零绕路**：路线不得因为寄存而变长
     const logistics::RoutePlan noOnboard =
-        logistics::replan(g, v, rest, "D1", 500, 5.0, logistics::WeightType::Distance,
+        logistics::replan(g, v, rest, "D1", 500, logistics::WeightType::Distance,
                           noStock, std::vector<logistics::OnboardItem>());
     check(p.totalDistanceKm <= noOnboard.totalDistanceKm + 1e-6,
           "寄存不得增加里程：" + std::to_string(p.totalDistanceKm) + " vs "
@@ -976,9 +974,9 @@ static void testIncrementalReplanForwardsStockAndOnboard() {
     const std::vector<logistics::OnboardItem> onboard{{"D2", 30.0}};
 
     const logistics::RoutePlan base = logistics::replan(
-        g, v, orders, "W", 480, 5.0, logistics::WeightType::Distance);
+        g, v, orders, "W", 480, logistics::WeightType::Distance);
     const logistics::RoutePlan inc = logistics::replanIncremental(
-        g, v, orders, base, 480, 5.0, logistics::WeightType::Distance, report, 0.2,
+        g, v, orders, base, 480, logistics::WeightType::Distance, report, 0.2,
         stock, onboard);
 
     // 只要带上了存货，期末存货就不该是 0（哪怕全量回退也不许把它丢掉）
@@ -1029,7 +1027,7 @@ static void testNoBankingWhenStillAtDepot() {
     const std::map<std::string, double> noStock;
     const std::vector<logistics::OnboardItem> bogus{{"D1", 30.0}};   // 尚未装车
     const logistics::RoutePlan p =
-        logistics::replan(g, v, orders, "W", 480, 5.0, logistics::WeightType::Distance,
+        logistics::replan(g, v, orders, "W", 480, logistics::WeightType::Distance,
                           noStock, bogus);
 
     double stationOps = 0.0;
@@ -1065,8 +1063,7 @@ static void testUrgentInsertForwardsStock() {
     const std::map<std::string, double> stock{{"T", 25.0}};
     logistics::Order urgent = makeOrder("U1", "D1", 5.0, 0, 1440, true);
     const logistics::InsertResult r =
-        logistics::insertUrgentOrder(g, v, rest, urgent, "W", 480, 5.0,
-                                     logistics::WeightType::Distance, stock);
+        logistics::insertUrgentOrder(g, v, rest, urgent, "W", 480, logistics::WeightType::Distance, stock);
 
     double finalKg = 0.0;
     for (const logistics::TransitStock& st : r.plan.transitStock) {
@@ -1088,7 +1085,7 @@ static void testSingleTripPlanPreservesStationStock() {
     const std::vector<logistics::Order> orders = {makeOrder("O1", "D1", 30.0, 0, 1440, false)};
     const std::map<std::string, double> stock{{"T", 20.0}};
     const logistics::RoutePlan p = logistics::replan(
-        g, v, orders, "W", 480, 5.0, logistics::WeightType::Distance, stock);
+        g, v, orders, "W", 480, logistics::WeightType::Distance, stock);
 
     check(p.status == logistics::PlanStatus::Ok, "单趟分支应规划成功");
     check(p.trips.size() == 1, "该情形确实是单趟");
