@@ -18,6 +18,7 @@
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
+#include <QStatusBar>
 #include <QStringList>
 #include <QLineEdit>
 #include <QPlainTextEdit>
@@ -165,6 +166,13 @@ void MainWindow::buildActions() {
 }
 
 void MainWindow::buildDocks() {
+    // ---- 状态栏：常驻显示**软件内时间** ----
+    // 放在状态栏而不是右侧面板：① 永远可见（面板可被拖走/折叠、日志会被刷掉）；
+    // ② 不与其他面板抢宽度；③ "现在是模拟里的几点"属于全局状态，不属于某一类对象。
+    clockLabel_ = new QLabel(this);
+    clockLabel_->setTextFormat(Qt::PlainText);
+    statusBar()->addPermanentWidget(clockLabel_);
+
     auto* routeDock = new QDockWidget(QStringLiteral("路线信息"), this);
     routeDock->setMinimumWidth(360);
     routeInfo_ = new QTextBrowser(routeDock);
@@ -216,12 +224,14 @@ void MainWindow::buildDocks() {
     auto* stopDock = new QDockWidget(QStringLiteral("停靠明细"), this);
     stopDock->setMinimumWidth(360);
     // 列里必须有「趟」：停靠明细是**跨趟拉平**的，不加这一列的话
-    // "剩余载重"会从 0 跳回几十公斤，看起来像数据错了，其实是新的一趟开始装货。
+    // "送后余货"会从 0 跳回几十公斤，看起来像数据错了，其实是新的一趟开始装货。
+    // 列名用"**余货**"而不是"余载"：该值只统计**订单货**（`Stop::remainingLoadKg`），
+    // 而车上还可能有不属于任何订单的缓冲货——叫"余载"会与"车上真实载重"混淆。
     stopTable_ = new QTableWidget(0, 6, stopDock);
     stopTable_->setHorizontalHeaderLabels(
         {QStringLiteral("趟"), QStringLiteral("配送点"), QStringLiteral("原始到达"),
          QStringLiteral("等待(分)"), QStringLiteral("送达"),
-         QStringLiteral("送后余载(kg)")});
+         QStringLiteral("送后余货(kg)")});
     stopTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     stopTable_->horizontalHeader()->setStretchLastSection(true);
     stopTable_->verticalHeader()->setVisible(false);
@@ -1169,6 +1179,12 @@ void MainWindow::onManualEdit() {
 }
 
 void MainWindow::updatePanels() {
+    // 状态栏的软件内时间：无条件刷新（没有车辆、计划不可行时照样要能看到"现在几点"）
+    if (clockLabel_ != nullptr) {
+        clockLabel_->setText(QStringLiteral("软件内时间：%1")
+                                 .arg(minutesToClock(currentTimeMin())));
+    }
+
     // 路线信息
     QString route;
     if (plan_.status == logistics::PlanStatus::Ok) {
@@ -1194,6 +1210,15 @@ void MainWindow::updatePanels() {
         route += QStringLiteral("停靠 %1 站，已送达 %2 站\n")
                      .arg(state_.servedStops + static_cast<int>(remainingStops))
                      .arg(state_.servedStops);
+        // 缓冲库存合计（新机制的可见面）：站内 + 车上。二者都是**权威物理量**，
+        // 分别由"车真的卸了/取了"改动；不作为规划依据显示预测值。
+        double stationStockTotal = 0.0;
+        for (const std::map<std::string, double>::value_type& kv : state_.stationStock) {
+            stationStockTotal += kv.second;
+        }
+        route += QStringLiteral("缓冲库存：站内 %1 kg，车上 %2 kg\n")
+                     .arg(stationStockTotal, 0, 'f', 1)
+                     .arg(state_.bufferKg, 0, 'f', 1);
         // 拆成三段写明，避免"共 K 趟"被误读成"整趟配送总共几趟"：
         //   已完成 = 真的跑完了几趟（事实）
         //   当前第 N 趟 = 绝对趟号（跨重规划连续，不重置）
@@ -1265,15 +1290,23 @@ void MainWindow::updatePanels() {
 
         vehicleInfo_->setText(
             QStringLiteral("ID：%1\n起始仓库：%2\n载重上限：%3 kg\n发车：%4\n"
-                           "本趟装载：%5 kg（第 %6 趟）\n当前载重：%7 kg\n"
-                           "剩余待送：%8 kg")
+                           "软件内时间：%5\n"
+                           "车上载重：%6 kg ＝ 订单货 %7 kg ＋ 缓冲货 %8 kg\n"
+                           "本趟出发装载：%9 kg（第 %10 趟，仅订单货）\n"
+                           "剩余待送：%11 kg")
                 .arg(QString::fromStdString(v.id))
                 .arg(QString::fromStdString(v.startNodeId))
                 .arg(v.capacityKg, 0, 'f', 0)
                 .arg(minutesToClock(v.departTimeMin))
+                .arg(minutesToClock(currentTimeMin()))
+                // 「车上载重」才是**物理事实**：订单货 + 不属于任何订单的缓冲货。
+                // 缓冲库存机制上线后，只报订单货会让"本趟装载"名不副实
+                // （车上明明还有 40kg 缓冲，面板却只写 160）。
+                .arg(currentLoadKg() + state_.bufferKg, 0, 'f', 0)
+                .arg(currentLoadKg(), 0, 'f', 0)
+                .arg(state_.bufferKg, 0, 'f', 0)
                 .arg(tripLoad, 0, 'f', 0)
                 .arg(tripNo)
-                .arg(currentLoadKg(), 0, 'f', 0)
                 .arg(remainingDemand, 0, 'f', 0));
     }
 
@@ -1471,6 +1504,10 @@ QString MainWindow::transitPanelSummary() const {
 
 QString MainWindow::vehiclePanelSummary() const {
     return vehicleInfo_ != nullptr ? vehicleInfo_->text() : QString();
+}
+
+QString MainWindow::statusClockSummary() const {
+    return clockLabel_ != nullptr ? clockLabel_->text() : QString();
 }
 
 QString MainWindow::toolbarActionTexts() const {

@@ -383,31 +383,68 @@ int main(int argc, char** argv) {
         const QByteArray transit = panel.toUtf8();
         std::printf("[ui-probe] 中转站面板（%s）:\n%s", "中转站|子网络|下属配送点|当前库存",
                     transit.constData());
-        // 车辆面板：断言**界面上显示的"本趟装载"**不超过载重上限。
-        // 用户手工测试发现过：面板把"剩余待送总量 740kg"当成"当前载重"显示，
-        // 而载重上限只有 200kg —— 数据层没错，是显示口径错了，所以必须查显示值本身。
+        // 车辆面板：断言**界面上显示的载重**不超过载重上限，且**分解式自洽**。
+        //
+        // 两段历史：① 用户手工测试发现面板把"剩余待送总量 740kg"当成"当前载重"显示，
+        // 而载重上限只有 200kg —— 数据层没错，是显示口径错了，所以必须查显示值本身；
+        // ② 缓冲库存机制上线后，"只报订单货"的旧口径又变得**名不副实**（车上明明还有
+        // 不属于任何订单的缓冲货）。故改为：**车上载重 = 订单货 + 缓冲货**，
+        // 三者都印在面板上，这里逐项校验（读用户看得到的文本，不重算公式）。
         const QString vehiclePanel = window.vehiclePanelSummary();
         {
             const double cap = config.vehicles.empty() ? 0.0 : config.vehicles.front().capacityKg;
-            const char* labels[] = {"本趟装载", "当前载重"};
-            for (const char* label : labels) {
-                const QRegularExpression re(
-                    QStringLiteral("%1：([0-9.]+) kg").arg(QString::fromUtf8(label)));
-                const QRegularExpressionMatch match = re.match(vehiclePanel);
-                if (!match.hasMatch()) {
-                    std::fprintf(stderr, "[ui-probe] 车辆面板没有\"%s\"一行\n", label);
-                    return 1;
-                }
-                const double shown = match.captured(1).toDouble();
-                if (shown > cap + 1e-6) {
-                    std::fprintf(stderr,
-                                 "[ui-probe] 面板显示的%s %.1fkg 超过载重上限 %.1fkg\n",
-                                 label, shown, cap);
-                    return 1;
-                }
-                std::printf("[ui-probe] 车辆面板%s %.1fkg <= 载重上限 %.1fkg\n",
-                            label, shown, cap);
+            // 「车上载重」是物理事实，必须 <= 载重上限
+            const QRegularExpression totalRe(
+                QStringLiteral("车上载重：([0-9.]+) kg"));
+            const QRegularExpression breakdownRe(
+                QStringLiteral("订单货 ([0-9.]+) kg ＋ 缓冲货 ([0-9.]+) kg"));
+            const QRegularExpression tripRe(
+                QStringLiteral("本趟出发装载：([0-9.]+) kg"));
+
+            const QRegularExpressionMatch total = totalRe.match(vehiclePanel);
+            const QRegularExpressionMatch parts = breakdownRe.match(vehiclePanel);
+            const QRegularExpressionMatch trip = tripRe.match(vehiclePanel);
+            if (!total.hasMatch() || !parts.hasMatch() || !trip.hasMatch()) {
+                std::fprintf(stderr,
+                             "[ui-probe] 车辆面板缺少「车上载重 / 订单货+缓冲货 / 本趟出发装载」"
+                             "三处口径之一：\n%s\n",
+                             vehiclePanel.toUtf8().constData());
+                return 1;
             }
+            const double shownTotal = total.captured(1).toDouble();
+            const double orders = parts.captured(1).toDouble();
+            const double buffer = parts.captured(2).toDouble();
+            const double shownTrip = trip.captured(1).toDouble();
+
+            if (std::fabs((orders + buffer) - shownTotal) > 0.05) {
+                std::fprintf(stderr,
+                             "[ui-probe] 车辆面板分解式不自洽：订单货 %.1f + 缓冲货 %.1f "
+                             "!= 车上载重 %.1f\n",
+                             orders, buffer, shownTotal);
+                return 1;
+            }
+            if (shownTotal > cap + 1e-6 || shownTrip > cap + 1e-6) {
+                std::fprintf(stderr,
+                             "[ui-probe] 面板显示的载重超过上限 %.1fkg：车上载重 %.1f、"
+                             "本趟出发装载 %.1f\n",
+                             cap, shownTotal, shownTrip);
+                return 1;
+            }
+            std::printf("[ui-probe] 车辆面板 车上载重 %.1fkg（= 订单货 %.1f + 缓冲货 %.1f）"
+                        " <= 载重上限 %.1fkg；本趟出发装载 %.1fkg\n",
+                        shownTotal, orders, buffer, cap, shownTrip);
+
+            // 时间必须常驻可见：软件内时间是事件刻/窗口/penalty 的共同基准，
+            // 只在日志里出现等于"一滚就没了"。这里查状态栏确实带着它。
+            const QString clockText = window.statusClockSummary();
+            if (!clockText.contains(QStringLiteral("软件内时间"))
+                || !clockText.contains(QStringLiteral(":"))) {
+                std::fprintf(stderr,
+                             "[ui-probe] 状态栏没有常驻显示软件内时间，实际：%s\n",
+                             clockText.toUtf8().constData());
+                return 1;
+            }
+            std::printf("[ui-probe] 状态栏时间：%s\n", clockText.toUtf8().constData());
         }
 
         // 停靠明细必须每个停靠点一行（这些字段此前只有测试在读，界面上看不到）
@@ -419,7 +456,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::printf("[ui-probe] 停靠明细 %zu 行"
-                    "（趟|配送点|原始到达|等待(分)|送达|送后余载(kg)）\n", stopRows);
+                    "（趟|配送点|原始到达|等待(分)|送达|送后余货(kg)）\n", stopRows);
         // 打前几行实际数值：这是"数值对不对"的核对依据，光有行数不够
         {
             const QStringList lines = stopPanel.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
@@ -428,14 +465,14 @@ int main(int argc, char** argv) {
             }
             // 表头守卫：停靠明细必须恰好 6 列、列名与数据字段一一对应。
             // 此前服务时间移除时只改了数据填充、漏改表头，于是表头 7 列而数据
-            // 只填 6 列——"离开"下挂着剩余载重、"送后余载(kg)"整列空白。
+            // 只填 6 列——"离开"下挂着剩余载重、"送后余货(kg)"整列空白。
             // 这类错位只有读**真实表头**才看得见：旧 printf 只是硬编码描述，不校验。
             {
                 const QStringList headers = window.stopPanelHeaders();
                 const QStringList expect{
                     QStringLiteral("趟"),   QStringLiteral("配送点"),
                     QStringLiteral("原始到达"), QStringLiteral("等待(分)"),
-                    QStringLiteral("送达"), QStringLiteral("送后余载(kg)")};
+                    QStringLiteral("送达"), QStringLiteral("送后余货(kg)")};
                 if (headers != expect) {
                     std::fprintf(stderr,
                                  "[ui-probe] 停靠明细表头不符：实际 [%s]，预期 [%s]\n",

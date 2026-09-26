@@ -130,7 +130,8 @@ public:
     double  currentTripLoadKg() const { return state_.tripLoadKg; }
     // 车辆信息面板的文本快照（供 --ui-probe）
     QString vehiclePanelSummary() const;
-
+    // 状态栏"软件内时间"的文本快照（供 --ui-probe 断言它确实常驻可见）
+    QString statusClockSummary() const;
     // 供 --self-check-actions 使用：自动验证两个由人工测试发现的缺陷不再复现
     //   ① 连续插入多个紧急订单不得丢单，且它们必须整体优先于普通订单
     //   ② 模拟新客户必须带来订单，且新节点必须被纳入配送
@@ -271,6 +272,9 @@ private:
     // 于是趟号永远停在「第 1 趟」——这正是人工测试反馈的现象。
     QTextBrowser*  routeInfo_ = nullptr;
     QLabel*        vehicleInfo_ = nullptr;
+    // 状态栏上的**软件内时间**：它是这套模拟的核心驱动量（事件刻、订单窗口、
+    // penalty 全按它算），但此前只出现在日志里，一滚就看不见了。
+    QLabel*        clockLabel_ = nullptr;
     QTableWidget*  orderTable_ = nullptr;
     QTableWidget*  transitTable_ = nullptr;
     QTableWidget*  stopTable_ = nullptr;
