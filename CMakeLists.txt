@@ -125,6 +125,10 @@ if(Qt6_FOUND)
         # 向导的"关卡选择"逻辑（输入 0 跑全部 / 关号 / 关名 / 片段）
         add_test(NAME wizard_stage_pick
                  COMMAND bash ${CMAKE_SOURCE_DIR}/tools/check_wizard_stage_pick.sh)
+        # 「双击人工测试向导.sh 无反应」的兜底：没有终端时入口必须自己开终端，
+        # 而不是打印一段没人看得到的拒绝信息（本机 KIO 双击 = 不分配终端）。
+        add_test(NAME wizard_terminal_launch
+                 COMMAND bash ${CMAKE_SOURCE_DIR}/tools/check_wizard_terminal.sh)
     endif()
 
     # UI 完整性：工具栏与侧栏必须真的被构造出来。

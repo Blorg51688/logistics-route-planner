@@ -3,7 +3,8 @@
 # 入口：人工测试向导（8 关，逐关引导你验证图形界面）
 #
 #   终端里：  bash 人工测试向导.sh
-#   文件管理器里：双击本文件（选「在终端中运行」）
+#   文件管理器里：双击本文件。没有终端时它会**自动在终端模拟器里重启自己**
+#                 （见下方「双击兜底」）——因为向导要读你的按键。
 #
 # 它是干什么的：单元/集成测试覆盖不了 GUI 的观感与交互（箭头是否画对、标签是否遮挡、
 # 拖动节点时边是否跟随、按钮反馈是否符合直觉）。本向导逐关告诉你「现在该点哪里、
@@ -63,6 +64,57 @@ if (( want_help )); then
       缺 Qt6（没有图形界面）时，看界面的关卡都跑不了，请改用 `cd build && ctest`。
 USAGE
     exit 0
+fi
+
+# ============================ 双击兜底 ============================
+# 文件管理器「双击」在多数桌面（含本机 KDE：~/.config/kiorc 的
+# behaviourOnLaunch=execute）里 = **直接运行、不分配终端**。向导必须读你的按键，
+# 于是它会打印一段"请在终端里运行"——可这段输出没有任何终端可显示，
+# 用户看到的就是「双击毫无反应」。
+#
+# 这里主动在终端模拟器里重启自己。判据：stdin 不是终端，**且**没有控制终端
+# （`/dev/tty` 打不开）。后半条很关键——「在终端里 `... < file`」是有意拒绝的
+# 用法（脚本头部写明"管道/重定向里运行会明确拒绝"），那种情况有控制终端，
+# 不能误判成双击而去另开一个终端。
+if [[ ! -t 0 ]] && [[ -z "${WIZARD_RELAUNCHED:-}" ]] \
+   && ! (exec 3</dev/tty) 2>/dev/null \
+   && (( want_list == 0 && want_help == 0 )); then
+    # 重启命令：置标记（防止终端也没给 TTY 时无限自我重启）+ 原样带回参数
+    printf -v _wiz_cmd 'WIZARD_RELAUNCHED=1 exec bash %q' "$ROOT/人工测试向导.sh"
+    for _a in "$@"; do printf -v _wiz_cmd '%s %q' "$_wiz_cmd" "$_a"; done
+
+    _wiz_term=""
+    for _t in konsole gnome-terminal xfce4-terminal mate-terminal tilix kgx \
+              alacritty kitty x-terminal-emulator xterm; do
+        if command -v "$_t" >/dev/null 2>&1; then _wiz_term="$_t"; break; fi
+    done
+
+    if [[ -n "$_wiz_term" ]]; then
+        case "$_wiz_term" in
+            gnome-terminal)
+                setsid "$_wiz_term" -- bash -c "$_wiz_cmd" >/dev/null 2>&1 & ;;
+            *)
+                setsid "$_wiz_term" -e bash -c "$_wiz_cmd" >/dev/null 2>&1 & ;;
+        esac
+        exit 0
+    fi
+
+    # 连终端都没有：至少把"无反应"变成"看得见、可照做"的一句话。
+    _wiz_msg="无法自动打开终端来运行人工测试向导。请打开终端后执行：  bash 人工测试向导.sh"
+    if [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+        if command -v kdialog >/dev/null 2>&1; then
+            setsid kdialog --error "$_wiz_msg" >/dev/null 2>&1 &
+            exit 0
+        elif command -v zenity >/dev/null 2>&1; then
+            setsid zenity --error --text="$_wiz_msg" >/dev/null 2>&1 &
+            exit 0
+        elif command -v xmessage >/dev/null 2>&1; then
+            setsid xmessage -center "$_wiz_msg" >/dev/null 2>&1 &
+            exit 0
+        fi
+    fi
+    printf '%s\n' "$_wiz_msg" >&2
+    exit 2
 fi
 
 # shellcheck source=scripts/ensure_build.sh
