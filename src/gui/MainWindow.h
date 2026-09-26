@@ -111,6 +111,12 @@ public:
     // 供 UI 完整性探针使用（--ui-probe）
     int toolbarActionCount() const;
     int dockCount() const;
+    // ---- 运行日志导出（「导出运行日志…」按钮与 --export-log 共用同一条代码路径）----
+    // 记录：每次**事件触发**、每次**到达配送点时的车辆载重明细**（订单货 / 缓冲货 /
+    // 车上载重）、每次**出仓装车**与**顺路寄存**、以及紧急单的处置方式。
+    // 目的：把"确实会出现的问题"变成可以直接带出界面的证据，而不是要求对方复现。
+    QString runLogText() const;
+    bool exportRunLogTo(const QString& path) const;
     // 中转站面板的文本快照，供 --ui-probe 在无头环境下确定性核对
     QString transitPanelSummary() const;
     // 停靠明细面板的文本快照（供 --ui-probe）
@@ -156,6 +162,9 @@ private slots:
     void onSimModeTriggered(QAction* action);
     void onSimTick();
     void onManualEdit();
+    // 「导出运行日志…」：把本次模拟的事件触发与每个配送点到达时的载重明细写成文件，
+    // 好把"确实出现过的问题"作为证据交给别人（而不必要求对方复现）。
+    void onExportRunLog();
 
 private:
     void buildActions();
@@ -168,7 +177,14 @@ private:
     void replan();
     void syncScene();
     void updatePanels();
-    void appendLog(const QString& text);
+    // atMin < 0 = 用"当前时刻"做运行记录的前缀；>= 0 = 用调用方给的那个时刻
+    // （事件行必须用它自己的事件刻，否则批量结算时会全部记成同一时刻）。
+    void appendLog(const QString& text, int atMin = -1);
+    // 运行记录：与界面日志同源（每条带软件内时刻），另外还收录**只在导出文件里**
+    // 才需要的载重明细。不受日志控件行数上限影响。
+    void recordRun(const QString& text, int atMin = -1);
+    QStringList runLog_;
+    int         runEventCount_ = 0;   // 本次模拟抽到的事件次数（供汇总行）
 
     // ---- 软件内时间的事件模型（设计 §7 / D24）----
     //

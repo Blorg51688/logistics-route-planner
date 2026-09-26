@@ -19,6 +19,10 @@
 #include <QHeaderView>
 #include <QLabel>
 #include <QStatusBar>
+#include <QFile>
+#include <QFileDialog>
+#include <QDateTime>
+#include <QTextStream>
 #include <QStringList>
 #include <QLineEdit>
 #include <QPlainTextEdit>
@@ -141,6 +145,7 @@ void MainWindow::buildActions() {
     bar->addAction(QStringLiteral("推进一刻"), this, &MainWindow::onAdvanceMoment);
     bar->addAction(QStringLiteral("重新规划"), this, &MainWindow::onReplan);
     bar->addAction(QStringLiteral("手工增删…"), this, &MainWindow::onManualEdit);
+    bar->addAction(QStringLiteral("导出运行日志…"), this, &MainWindow::onExportRunLog);
     bar->addAction(QStringLiteral("图表示…"), this, &MainWindow::onShowGraphTables);
 
     // 两种**模拟模式**并列，且互斥（同一 QActionGroup）：
@@ -322,6 +327,20 @@ void MainWindow::loadForTrip(std::size_t tripIndex) {
     // 缓冲货：出仓时按计划装满，**不属于任何订单**（因此不进 loadKg/onboard）。
     // 装载读计划是合法的（与 onboard 同源）；装载之后的**后果**才由 state_ 记账。
     state_.bufferKg = trip.bufferKg;
+    // 导出用的出仓台帐：这一趟出发时车上装了什么（订单货 / 缓冲货 / 合计）。
+    // 这正是"是否真的满载出仓"的直接证据，所以每次装车都记一条。
+    {
+        const double cap = config_.vehicles.empty() ? 0.0 : config_.vehicles.front().capacityKg;
+        recordRun(QStringLiteral("出仓装车（第 %1 趟）：订单货 %2 kg ＋ 缓冲货 %3 kg "
+                                 "＝ 车上载重 %4 kg（载重上限 %5 kg，%6）")
+                      .arg(tripIndex + 1)
+                      .arg(trip.loadKg, 0, 'f', 1)
+                      .arg(trip.bufferKg, 0, 'f', 1)
+                      .arg(trip.loadKg + trip.bufferKg, 0, 'f', 1)
+                      .arg(cap, 0, 'f', 0)
+                      .arg(trip.loadKg + trip.bufferKg >= cap - 1e-6
+                               ? QStringLiteral("已满载") : QStringLiteral("未满载")));
+    }
     state_.departed = false;
 }
 
@@ -799,6 +818,19 @@ void MainWindow::onAdvanceStop() {
                       .arg(minutesToClock(stop.arrivalMin))
                       .arg(stop.late ? QStringLiteral("，超时 penalty %1min").arg(stop.penaltyMin)
                                      : QString()));
+        // 导出用的**到达时载重明细**（在卸货之前记，反映"到达这一刻车上载着什么"）。
+        // 这是用户要向缺陷修复对话出示的核心证据，所以细到 订单货/缓冲货/合计 三项
+        // ——只报一个合计数的话，正是"看不出问题"的老路。
+        {
+            const double cap = config_.vehicles.empty() ? 0.0 : config_.vehicles.front().capacityKg;
+            recordRun(QStringLiteral("    └ 到达 %1 时车上载重：订单货 %2 kg ＋ 缓冲货 %3 kg "
+                                     "＝ %4 kg（载重上限 %5 kg）")
+                          .arg(QString::fromStdString(stop.nodeId))
+                          .arg(state_.loadKg, 0, 'f', 1)
+                          .arg(state_.bufferKg, 0, 'f', 1)
+                          .arg(state_.loadKg + state_.bufferKg, 0, 'f', 1)
+                          .arg(cap, 0, 'f', 0));
+        }
         deliverAt(stop);
         for (Order& order : config_.orders) {
             if (order.nodeId == stop.nodeId) {
@@ -1006,12 +1038,17 @@ void MainWindow::settleEventsUpTo(int timeMin) {
         }
 
         const logistics::SimEventKind kind = logistics::pickEvent(w, rng_);
+        // **传事件刻 mark**：一次推进可能跨过好几个事件刻（"推进一刻"或按站模拟跨 15min），
+        // 那些事件是在同一瞬间被批量结算的。若用当前时刻做前缀，导出文件会写成
+        // 「09:00 [事件] 08:15 抽取…」——把"记录时刻"误当"事件时刻"，正是最容易被
+        // 误读的地方。事件行一律用**它自己的时刻**。
         appendLog(QStringLiteral("[事件] %1 抽取：%2%3")
                       .arg(minutesToClock(mark))
                       .arg(QString::fromUtf8(logistics::simEventName(kind)))
                       .arg(urgentCapped
                                ? QStringLiteral("（紧急订单待处理已满，本次抽签不含紧急订单）")
-                               : QString()));
+                               : QString()),
+                  mark);
 
         switch (kind) {
             case logistics::SimEventKind::Traffic:     onSimulateTraffic();       break;
@@ -1463,8 +1500,78 @@ void MainWindow::updatePanels() {
     lateTable_->setRowCount(lateRows);
 }
 
-void MainWindow::appendLog(const QString& text) {
+void MainWindow::appendLog(const QString& text, int atMin) {
     logView_->appendPlainText(text);
+    // 同一条内容也进运行记录（带软件内时刻），供「导出运行日志…」带出界面。
+    recordRun(text, atMin);
+}
+
+void MainWindow::recordRun(const QString& text, int atMin) {
+    if (text.contains(QStringLiteral("抽取："))) {
+        ++runEventCount_;
+    }
+    const int stamp = (atMin >= 0) ? atMin : currentTimeMin();
+    runLog_ << QStringLiteral("%1  %2").arg(minutesToClock(stamp), text);
+}
+
+QString MainWindow::runLogText() const {
+    QString out;
+    out += QStringLiteral("电商物流配送路径规划系统 —— 运行日志导出\n");
+    out += QStringLiteral("用途：把「确实出现过的问题」作为证据带出界面。\n");
+    out += QStringLiteral("内容：每次事件触发、每次到达配送点时的车辆载重明细、"
+                          "每次出仓装车与顺路寄存、以及紧急单的处置方式。\n");
+    out += QStringLiteral("策略：%1    载重上限：%2 kg    事件间隔：每 %3 min（软件内时间）\n")
+               .arg(strategyBox_ != nullptr ? strategyBox_->currentText() : QString())
+               .arg(config_.vehicles.empty() ? 0.0 : config_.vehicles.front().capacityKg, 0, 'f', 0)
+               .arg(config_.general.eventIntervalMin);
+    out += QString(72, QLatin1Char('=')) + QStringLiteral("\n");
+    for (const QString& line : runLog_) {
+        out += line + QStringLiteral("\n");
+    }
+    out += QString(72, QLatin1Char('=')) + QStringLiteral("\n");
+    double stationTotal = 0.0;
+    for (const std::map<std::string, double>::value_type& kv : state_.stationStock) {
+        stationTotal += kv.second;
+    }
+    out += QStringLiteral("汇总：事件 %1 次 ｜ 已送达 %2 站 ｜ 期末站内库存 %3 kg ｜ "
+                          "期末车上缓冲 %4 kg\n")
+               .arg(runEventCount_)
+               .arg(state_.servedStops)
+               .arg(stationTotal, 0, 'f', 1)
+               .arg(state_.bufferKg, 0, 'f', 1);
+    return out;
+}
+
+bool MainWindow::exportRunLogTo(const QString& path) const {
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        return false;
+    }
+    QTextStream stream(&file);
+    stream << runLogText();
+    file.close();
+    return true;
+}
+
+void MainWindow::onExportRunLog() {
+    // 默认文件名带时间戳：连续导出不会互相覆盖，也便于按时间对照
+    const QString suggested = QStringLiteral("运行日志-%1.txt")
+                                  .arg(QDateTime::currentDateTime().toString(
+                                      QStringLiteral("yyyyMMdd-HHmmss")));
+    const QString path = QFileDialog::getSaveFileName(
+        this, QStringLiteral("导出运行日志（事件触发 + 到达配送点时的载重明细）"),
+        suggested, QStringLiteral("文本文件 (*.txt)"));
+    if (path.isEmpty()) {
+        return;   // 用户取消
+    }
+    if (exportRunLogTo(path)) {
+        appendLog(QStringLiteral("已导出运行日志：%1（本次记录事件 %2 次、送达 %3 站）")
+                      .arg(path)
+                      .arg(runEventCount_)
+                      .arg(state_.servedStops));
+    } else {
+        appendLog(QStringLiteral("导出失败（无法写入）：%1").arg(path));
+    }
 }
 
 void MainWindow::runDemoActions(int rounds) {
@@ -2267,6 +2374,24 @@ int MainWindow::runActionSelfCheck() {
                QStringLiteral("中转站面板「当前库存」必须等于 VehicleState 的权威库存"
                               "（检查了 %1 行）")
                    .arg(checked));
+    }
+
+    // ⑦（导出证据）运行日志必须真的记下「事件触发 + 到达配送点时的载重明细」。
+    // 这条守卫读的是**导出文件的文本本身**——那正是要交给别人的那份证据，
+    // 所以必须证明它含够信息，而不是"生成了一个文件"。
+    {
+        const QString text = runLogText();
+        expect(text.contains(QStringLiteral("出仓装车")) && text.contains(QStringLiteral("已满载")),
+               QStringLiteral("运行日志应含出仓装车记录、并标出是否满载（证明「出仓必满载」）"));
+        // 用**只在该明细行出现**的特征串，别用"到达"这种到处都有的词
+        // （否则把明细行删掉守卫照样通过——这是本项目"守卫必须真的测到东西"的老坑）。
+        expect(text.contains(QStringLiteral("时车上载重：订单货")),
+               QStringLiteral("运行日志应含「到达某配送点**时**的载重明细」"
+                              "（订单货 / 缓冲货 / 合计）"));
+        expect(text.contains(QStringLiteral("抽取：")),
+               QStringLiteral("运行日志应含每一次事件触发"));
+        expect(text.contains(QStringLiteral("汇总：")),
+               QStringLiteral("运行日志应有汇总行（事件次数/已送达/期末库存）"));
     }
 
     // ⑤ 车辆位置标记必须与当前位置一致（画布刷新的依据）

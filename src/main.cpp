@@ -37,6 +37,7 @@ struct Options {
     bool                   selfCheckActions = false;
     std::string            planSummary;      // "" / "distance" / "cost"
     int                    demoRounds = 0;
+    std::string            exportLogPath;   // 空表示不导出
     std::string            planStrategy;   // 空表示不高亮任何路线
     bool                   allLabels = false;
     logistics::WeightType  weight = logistics::WeightType::Distance;
@@ -80,6 +81,7 @@ void usage() {
         "  --render-window PATH.png   离屏渲染完整窗口（工具栏+侧栏）成 PNG 后退出\n"
         "                              （注意 --width/--height 对交互窗口无效——它总是最大化）\n"
         "  --demo N                   渲染窗口前先自动执行 N 次「推进一站」（按站模拟；验证交互后状态）\n"
+        "  --export-log PATH          导出本次运行的日志（事件触发 + 到达配送点时的载重明细）\n"
         "  --dump-graph [list|matrix|both]  输出邻接表 / 邻接矩阵后退出（B3）\n"
         "  --ui-probe                 检查工具栏与侧栏是否完整构造后退出\n"
         "  --self-check-actions       自动验证插单不丢单 / 新客户会被配送后退出\n"
@@ -124,6 +126,8 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "--dump-graph 只接受 list / matrix / both\n");
                 return 2;
             }
+        } else if (flag == "--export-log") {
+            takeNext(opt.exportLogPath);
         } else if (flag == "--demo") {
             std::string value;
             takeNext(value);
@@ -554,6 +558,14 @@ int main(int argc, char** argv) {
 
     if (opt.demoRounds > 0) {
         window.runDemoActions(opt.demoRounds);
+        if (!opt.exportLogPath.empty()) {
+            const bool ok = window.exportRunLogTo(QString::fromStdString(opt.exportLogPath));
+            if (!ok) {
+                std::fprintf(stderr, "[export-log] 无法写入 %s\n", opt.exportLogPath.c_str());
+                return 1;
+            }
+            std::printf("[export-log] 已导出 -> %s\n", opt.exportLogPath.c_str());
+        }
     }
 
     if (!opt.windowRenderPath.empty()) {
