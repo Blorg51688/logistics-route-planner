@@ -1263,6 +1263,101 @@ void testEveryDepotTripIsFullyLoaded() {
     everyDepotTripFull(withUrgent, "插入紧急单后");
 }
 
+// ---- 用车在途中插紧急单后，计划各趟必须首尾相接（「出仓必满载」的上游不变量）----
+//
+// 缺陷背景（人工测试导出日志发现）：车在途中（位置 T）、车上还载着在途货，
+// 此时插入一张紧急单。紧急批**先执行**且以仓库收尾（`current = 仓库`），
+// 但"接着送车上已有的货"那一趟却从 `startPos`（车出发时的客户点）起算，
+// 排出一趟"起点是车早已离开的客户点"的趟。后果：
+//   · 计划各趟首尾不接（车凭空从仓库跳回客户点再开出去）；
+//   · 该趟起点非仓库 ⇒ `bufferKg=0`、`loadedFromDepot=false`；
+//   · 界面在车**到达仓库**时装载它 ⇒ 车只带着在途那点订单货离开仓库
+//     （导出日志实测「接着送…20.0kg」，与"每次出仓必满载"冲突）。
+// 本守卫直接断言**首尾相接**（车不能凭空移动）——这是"出仓必满载"的上游前提：
+// 一旦某趟起点不是车的真实位置，"哪一趟该满载"就无从谈起。
+//
+// 为什么既有 `testEveryDepotTripIsFullyLoaded` 没抓到：它按 `nodes.front()==仓库`
+// 筛"出仓趟"，而这趟的 front 是客户点、被直接跳过。本守卫补上这个盲区。
+void testTripContinuityAfterUrgentInsertWhileEnRoute() {
+    LogisticsGraph g;
+    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
+    Node t = makeNode("T", NodeType::Transit, "中转站");
+    t.subNetworkId = 1;
+    g.addNode(t);
+    Node d1 = makeNode("D1", NodeType::Delivery, "客户1");
+    d1.subNetworkId = 1;
+    g.addNode(d1);
+    Node d2 = makeNode("D2", NodeType::Delivery, "客户2");
+    d2.subNetworkId = 1;
+    g.addNode(d2);
+    Node d3 = makeNode("D3", NodeType::Delivery, "客户3");
+    d3.subNetworkId = 1;
+    g.addNode(d3);
+    addTwoWay(g, "W", "T", 5.0, 10.0, 4.0);
+    addTwoWay(g, "T", "D1", 5.0, 10.0, 4.0);
+    addTwoWay(g, "W", "D2", 3.0, 6.0, 2.0);
+    addTwoWay(g, "W", "D3", 4.0, 8.0, 3.0);
+
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+
+    // 车已在途中（位置 T），车上载着 D2 的 30kg；未服务订单 D2 30kg + D3 80kg。
+    std::vector<Order> pending;
+    pending.push_back(makeOrder("O2", "D2", 30.0, 0, 1440));
+    pending.push_back(makeOrder("O3", "D3", 80.0, 0, 1440));
+    std::vector<logistics::OnboardItem> onboard;
+    logistics::OnboardItem item;
+    item.nodeId = "D2";
+    item.kg = 30.0;
+    onboard.push_back(item);
+
+    const Order urgent = makeOrder("U1", "D1", 10.0, 0, 1440, true);
+    const InsertResult res = insertUrgentOrder(g, v, pending, urgent, "T", 500,
+                                               WeightType::Distance, onboard, 0.0,
+                                               std::map<std::string, double>());
+    const RoutePlan& p = res.plan;
+
+    std::string seq;
+    for (std::size_t i = 0; i < p.trips.size(); ++i) {
+        seq += "[" + std::to_string(i + 1) + "] " + p.trips[i].nodes.front() + ".."
+               + p.trips[i].endNodeId + "  ";
+    }
+
+    // 不变量：第一趟必须从车辆当前位置出发；此后每趟的起点必须等于上一趟的终点。
+    bool chainOk = true;
+    std::string bad;
+    if (!p.trips.empty() && p.trips[0].nodes.front() != "T") {
+        chainOk = false;
+        bad = "第 1 趟起点 " + p.trips[0].nodes.front() + " != 车辆位置 T";
+    }
+    for (std::size_t i = 1; i < p.trips.size(); ++i) {
+        if (p.trips[i].nodes.front() != p.trips[i - 1].endNodeId) {
+            chainOk = false;
+            bad = "第 " + std::to_string(i + 1) + " 趟起点 " + p.trips[i].nodes.front()
+                  + " != 第 " + std::to_string(i) + " 趟终点 " + p.trips[i - 1].endNodeId;
+        }
+    }
+    check(chainOk, "各趟必须首尾相接（车不能凭空移动）：" + bad + "；实际 " + seq);
+
+    // 任何"从仓库出发"的趟都必须满载（判据用起点，不依赖 loadedFromDepot 标记——
+    // 标记本身也是被检查对象：从仓库出发却声称"没在仓库装货"就是缺陷）
+    bool fullOk = true;
+    std::string fullBad;
+    for (const logistics::Trip& tr : p.trips) {
+        if (tr.nodes.empty() || tr.nodes.front() != v.startNodeId) {
+            continue;
+        }
+        const bool marked = tr.loadedFromDepot;
+        const bool full = std::fabs(tr.bufferKg - (v.capacityKg - tr.loadKg)) <= 1e-6;
+        if (!marked || !full) {
+            fullOk = false;
+            fullBad = "起点 " + tr.nodes.front() + " 订单货 " + std::to_string(tr.loadKg)
+                      + " 缓冲 " + std::to_string(tr.bufferKg)
+                      + (marked ? "" : "（未标成出仓装货）");
+        }
+    }
+    check(fullOk, "从仓库出发的趟必须满载：" + fullBad);
+}
+
 int main() {
     testSingleOrderRouteIsFullyCorrect();
     testEmptyOrdersDegeneratesToNoMovement();
@@ -1290,6 +1385,7 @@ int main() {
     testUrgentBufferInPlaceDelivery();
     testUrgentBufferChoiceIsNeverWorse();
     testEveryDepotTripIsFullyLoaded();
+    testTripContinuityAfterUrgentInsertWhileEnRoute();
 
     return testutil::summarize("routeplanner_tests");
 }

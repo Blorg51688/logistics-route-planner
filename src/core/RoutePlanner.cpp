@@ -607,17 +607,24 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
             Trip trip;
             std::string fail;
             const double load = totalDemand(carried);
-            // 从**当前位置**直接出发（车上的货不需要回仓库取），终点仍是仓库
-            if (weave(graph, carried, startPos, elapsed, weight,
-                      startPos, vehicle.startNodeId, load, trip, fail)) {
-                // 这一趟是"接着送车上已有的货"：**从当前位置出发**，走去程装货点=当前位置。
-                //   · 若当前位置**不是**仓库 —— 它确实不是出仓，**不装缓冲**：
+            // 从**当前位置**直接出发（车上的货不需要回仓库取），终点仍是仓库。
+            //
+            // 起点必须是 `current` 而**不是** `startPos`：紧急批先执行，且它每趟都以
+            // 仓库收尾（`current = vehicle.startNodeId`）。若这里还用`startPos`（车出发时
+            // 那个客户点），就会排出一趟"起点是车早已离开的客户点"的趟：计划各趟首尾不接，
+            // 且因起点非仓库而 bufferKg=0。界面在车**到达仓库**时装载这趟，于是车只带着
+            // 在途那点订单货就离开仓库（实测导出日志「接着送…20.0kg」后车从 W 又开回 D10），
+            // 违反"每次出仓必满载"。用 `current` 后，这一趟的起点恒为车的真实位置。
+            if (weave(graph, carried, current, elapsed, weight,
+                      current, vehicle.startNodeId, load, trip, fail)) {
+                // 这一趟是"接着送车上已有的货"：从**车的真实位置**出发，走去程装货点=该位置。
+                //   · 若该位置**不是**仓库 —— 它确实不是出仓，**不装缓冲**：
                 //     货早在前一趟出仓时装过一次，再算会重复计数。
-                //   · 若当前位置**就是仓库** —— 那它就是名副其实的**出仓**，必须装满
+                //   · 若该位置**就是仓库** —— 那它就是名副其实的**出仓**，必须装满
                 //     （装载读计划是合法的；这条曾经漏掉，导出日志里表现为
                 //      「出仓装车（第 2 趟）：订单货 135 ＋ 缓冲货 0 ＝ 135（未满载）」）。
                 // 判据统一成"是否从仓库出发"，与界面/守卫的口径一致。
-                if (startPos == vehicle.startNodeId && load > 1e-9) {
+                if (current == vehicle.startNodeId && load > 1e-9) {
                     fillBufferFromDepot(vehicle, load, trip);
                     TransitOp banked;
                     if (bankBufferEnRoute(graph, tripHub(graph, transitBySub, trip),
