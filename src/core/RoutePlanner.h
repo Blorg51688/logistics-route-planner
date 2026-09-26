@@ -66,6 +66,14 @@ struct Trip {
     // 本趟装载的"不属于任何订单的缓冲货"（= 满载出仓时本趟订单用不到的那部分）。
     // 不变量：loadKg + bufferKg <= 车辆载重上限，且 bufferKg >= 0。
     double bufferKg = 0.0;
+    // 本趟是否**在仓库装过货**（"出仓"）。用于把"出仓装车"与"接着送车上已有的货"
+    // 在导出证据里区分开——否则用车上/站内存货就地满足的那趟（bufferKg 本就该是 0）
+    // 会被误报成"出仓却未满载"，把读证据的人引去追不存在的 bug。
+    bool loadedFromDepot = false;
+    // 本趟是"用车上缓冲/站内库存**就地满足**紧急单"——它**没在仓库装过货**，
+    // 因此 bufferKg 本就该是 0，而不是"出仓却未满载"。与上一标记一起，把三种趟分开，
+    // 导出证据才不会把合法的 0 误报成缺陷。
+    bool supplyInPlace = false;
     // 本趟在返程顺路处把缓冲卸进站的入库操作（至多一条；不顺路则为空）。
     std::vector<TransitOp> bankOps;
     double totalDistanceKm = 0.0;

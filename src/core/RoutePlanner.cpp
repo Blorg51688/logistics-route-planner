@@ -461,6 +461,7 @@ bool bankBufferEnRoute(const LogisticsGraph& graph,
 void fillBufferFromDepot(const Vehicle& vehicle, double batchLoadKg, Trip& trip) {
     const double spare = vehicle.capacityKg - batchLoadKg;
     trip.bufferKg = (spare > 0.0) ? spare : 0.0;
+    trip.loadedFromDepot = true;
 }
 
 RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
@@ -544,6 +545,7 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
             // 用缓冲/站内存货就地满足：这一批**不是出仓**（没回仓库装货）
             // ⇒ 不计缓冲；站内取用由 insertUrgentOrder 在选定方案后记账。
             trip.bufferKg = 0.0;
+            trip.supplyInPlace = true;
         } else {
             // 出仓装满：本批订单之外的载重空位装成**缓冲货**（不属任何订单）
             fillBufferFromDepot(vehicle, batchLoad, trip);
@@ -608,8 +610,21 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
             // 从**当前位置**直接出发（车上的货不需要回仓库取），终点仍是仓库
             if (weave(graph, carried, startPos, elapsed, weight,
                       startPos, vehicle.startNodeId, load, trip, fail)) {
-                // **不装缓冲**：这一趟是从当前位置接着送车上已有的货，不是"出仓"。
-                // 它的货早在前一趟出仓时就装过一次了，这里再算一次缓冲会**重复计数**。
+                // 这一趟是"接着送车上已有的货"：**从当前位置出发**，走去程装货点=当前位置。
+                //   · 若当前位置**不是**仓库 —— 它确实不是出仓，**不装缓冲**：
+                //     货早在前一趟出仓时装过一次，再算会重复计数。
+                //   · 若当前位置**就是仓库** —— 那它就是名副其实的**出仓**，必须装满
+                //     （装载读计划是合法的；这条曾经漏掉，导出日志里表现为
+                //      「出仓装车（第 2 趟）：订单货 135 ＋ 缓冲货 0 ＝ 135（未满载）」）。
+                // 判据统一成"是否从仓库出发"，与界面/守卫的口径一致。
+                if (startPos == vehicle.startNodeId && load > 1e-9) {
+                    fillBufferFromDepot(vehicle, load, trip);
+                    TransitOp banked;
+                    if (bankBufferEnRoute(graph, tripHub(graph, transitBySub, trip),
+                                          vehicle.startNodeId, weight, trip, &banked)) {
+                        plan.transitOps.push_back(banked);
+                    }
+                }
                 plan.trips.push_back(trip);
                 current = trip.endNodeId;
                 for (const Candidate& b : carried) {
@@ -829,6 +844,43 @@ RoutePlan replan(const LogisticsGraph& graph,
         plan.status = PlanStatus::Unreachable;
         plan.reason = fail;
         return plan;
+    }
+    // **单趟路径同样要"出仓满载"**。这条分支原先完全没有生产者：
+    // 剩余需求 ≤ 载重时就会走到这里，于是车在仓库也只装订单货就出发
+    // （路线跑到后段剩余货量变小 ⇒ 频繁触发）——正是用户观察到的现象。
+    if (currentPositionId == vehicle.startNodeId && total > 1e-9) {
+        fillBufferFromDepot(vehicle, total, trip);
+        std::map<int, std::string> transitBySub;
+        for (const Node& n : graph.nodes()) {
+            if (n.type == NodeType::Transit && n.subNetworkId != 0) {
+                transitBySub[n.subNetworkId] = n.id;
+            }
+        }
+        TransitOp banked;
+        if (bankBufferEnRoute(graph, tripHub(graph, transitBySub, trip),
+                              vehicle.startNodeId, weight, trip, &banked)) {
+            plan.transitOps.push_back(banked);
+        }
+        // 单趟没有多趟汇总那一段，库存快照在这里补上
+        for (std::map<int, std::string>::const_iterator it = transitBySub.begin();
+             it != transitBySub.end(); ++it) {
+            bool seen = false;
+            for (const TransitStock& st : plan.transitStock) {
+                if (st.nodeId == it->second) { seen = true; break; }
+            }
+            if (seen) { continue; }
+            TransitStock st;
+            st.nodeId = it->second;
+            const std::map<std::string, double>::const_iterator s0 = initialStock.find(st.nodeId);
+            st.initialKg = (s0 != initialStock.end()) ? s0->second : 0.0;
+            st.finalKg = st.initialKg;
+            plan.transitStock.push_back(st);
+        }
+        for (const TransitOp& op : plan.transitOps) {
+            for (TransitStock& st : plan.transitStock) {
+                if (st.nodeId == op.nodeId) { st.finalKg += op.kgDelta; break; }
+            }
+        }
     }
     plan.trips.push_back(trip);
 

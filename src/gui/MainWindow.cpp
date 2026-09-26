@@ -327,10 +327,43 @@ void MainWindow::loadForTrip(std::size_t tripIndex) {
     // 缓冲货：出仓时按计划装满，**不属于任何订单**（因此不进 loadKg/onboard）。
     // 装载读计划是合法的（与 onboard 同源）；装载之后的**后果**才由 state_ 记账。
     state_.bufferKg = trip.bufferKg;
-    // 导出用的出仓台帐：这一趟出发时车上装了什么（订单货 / 缓冲货 / 合计）。
-    // 这正是"是否真的满载出仓"的直接证据，所以每次装车都记一条。
+    // 导出用的装车台帐：这一趟出发时车上装了什么（订单货 / 缓冲货 / 合计）。
+    //
+    // **必须区分"出仓"与"接着送"**：只有 `nodes.front()` 是起始仓库的趟才是出仓。
+    // 早先把每一次装载都写成「出仓装车…未满载」——那些趟的起点其实是 D01 / T03
+    // （在途货续送），于是导出文件里凭空多出三条"出仓未满载"，会把读证据的人
+    // 引去追一个**根本不存在**的 bug。误报比没有证据更糟，所以这里分开写。
     {
         const double cap = config_.vehicles.empty() ? 0.0 : config_.vehicles.front().capacityKg;
+        // 用 core 明确打上的标记，而不是"起点是不是仓库"来猜：
+        // 用车上/站内存货就地满足的紧急趟也可能从仓库出发，但它**没在仓库装货**，
+        // bufferKg 本就该是 0——猜的话会把它误报成"出仓却未满载"。
+        const bool fromDepot = trip.loadedFromDepot;
+        if (trip.supplyInPlace) {
+            recordRun(QStringLiteral("就地满足紧急单（第 %1 趟，起点 %2，**非出仓装货**，"
+                                     "用的是车上缓冲/站内库存）：订单货 %3 kg ＋ 缓冲货 %4 kg")
+                          .arg(tripIndex + 1)
+                          .arg(QString::fromStdString(trip.nodes.empty() ? std::string("?")
+                                                                         : trip.nodes.front()))
+                          .arg(trip.loadKg, 0, 'f', 1)
+                          .arg(trip.bufferKg, 0, 'f', 1)
+                          .arg(trip.loadKg, 0, 'f', 1)
+                          .arg(trip.bufferKg, 0, 'f', 1));
+            state_.departed = false;
+            return;
+        }
+        if (!fromDepot) {
+            recordRun(QStringLiteral("接着送车上已有的货（第 %1 趟，起点 %2，**非出仓**，"
+                                     "不计缓冲）：订单货 %3 kg ＋ 缓冲货 %4 kg ＝ %5 kg")
+                          .arg(tripIndex + 1)
+                          .arg(QString::fromStdString(trip.nodes.empty() ? std::string("?")
+                                                                         : trip.nodes.front()))
+                          .arg(trip.loadKg, 0, 'f', 1)
+                          .arg(trip.bufferKg, 0, 'f', 1)
+                          .arg(trip.loadKg + trip.bufferKg, 0, 'f', 1));
+            state_.departed = false;
+            return;
+        }
         recordRun(QStringLiteral("出仓装车（第 %1 趟）：订单货 %2 kg ＋ 缓冲货 %3 kg "
                                  "＝ 车上载重 %4 kg（载重上限 %5 kg，%6）")
                       .arg(tripIndex + 1)
@@ -2392,6 +2425,42 @@ int MainWindow::runActionSelfCheck() {
                QStringLiteral("运行日志应含每一次事件触发"));
         expect(text.contains(QStringLiteral("汇总：")),
                QStringLiteral("运行日志应有汇总行（事件次数/已送达/期末库存）"));
+        // 「出仓必满载」在**导出证据**上也要成立：不得出现「出仓装车…未满载」。
+        // 同时"接着送"的趟必须被单独标注（起点不是仓库），不许冒充出仓——
+        // 早先正是这一点让导出文件凭空多出三条"出仓未满载"，会把人引去追不存在的 bug。
+        bool anyUnderloaded = false;
+        bool hasContinuationLabel = false;
+        for (const QString& line : text.split(QLatin1Char('\n'))) {
+            if (line.contains(QStringLiteral("出仓装车"))
+                && line.contains(QStringLiteral("未满载"))) {
+                anyUnderloaded = true;
+            }
+            if (line.contains(QStringLiteral("非出仓"))) {
+                hasContinuationLabel = true;
+            }
+        }
+        expect(!anyUnderloaded,
+               QStringLiteral("导出证据里不得出现「出仓装车…未满载」（出仓必须满载）"));
+        // **非循环**判据：凡标为"接着送"的趟，其**起点绝不能是起始仓库**。
+        // （只查"出仓行是否满载"是不够的——那个标签来自"是否装过货"这个同一个标记，
+        //   一旦某条路径不再装货，它就会改标成"接着送"从而绕过守卫。已实测踩到。）
+        bool mislabeled = false;
+        const std::string depotId = config_.vehicles.empty()
+                                        ? std::string()
+                                        : config_.vehicles.front().startNodeId;
+        for (const QString& line : text.split(QLatin1Char('\n'))) {
+            if (line.contains(QStringLiteral("接着送车上已有的货"))
+                && line.contains(QStringLiteral("起点 %1").arg(QString::fromStdString(depotId)))) {
+                mislabeled = true;
+            }
+        }
+        expect(!mislabeled,
+               QStringLiteral("「接着送」的趟起点不得是仓库 %1——从仓库出发就是出仓，"
+                              "必须满载并标为「出仓装车」")
+                   .arg(QString::fromStdString(depotId)));
+        // 若本次运行确实出现过"接着送"的趟，它必须被标注出来（否则读者会把它当成出仓）
+        expect(!text.contains(QStringLiteral("接着送")) || hasContinuationLabel,
+               QStringLiteral("运行日志里若出现「接着送」的趟，必须被标注为「非出仓」"));
     }
 
     // ⑤ 车辆位置标记必须与当前位置一致（画布刷新的依据）
