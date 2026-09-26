@@ -184,6 +184,26 @@ void checkDataQualityInvariants(const Config& cfg, const RoutePlan& byDistance,
           "黄金值·成本策略总距离 186.3，实际 " + std::to_string(byCost.totalDistanceKm));
     check(fixtures::nearlyEqual(byCost.totalCostYuan, 235.9, 0.01),
           "黄金值·成本策略总成本 235.9，实际 " + std::to_string(byCost.totalCostYuan));
+
+    // 6) 缓冲库存的「弹药量」（守卫：生产者记账的量级不得漂移）。
+    //    口径 = F1「读法 2」（仓库可发不属于任何订单的缓冲货）在默认数据上的静态规划总量。
+    //    期望值来源：.omd/decisions/transit-stock-full-load.md 的 F1 实测（2026-09-26），
+    //    由 .omd/decisions/probes/probeF 独立复现；实现 T2 后逐位对齐（T01=138 T02=158
+    //    T03=138 → 434；成本策略 T03=142 → 438）。
+    //    与上面的黄金值同类：是**捕获值**，用于检测非预期漂移，不用于证明最优性。
+    //    （缓冲货不参与选路，所以黄金值不会因为本机制而变化——守卫必须落在“量”上。）
+    double stockByDistance = 0.0;
+    for (const logistics::TransitStock& st : byDistance.transitStock) {
+        stockByDistance += st.finalKg;
+    }
+    double stockByCost = 0.0;
+    for (const logistics::TransitStock& st : byCost.transitStock) {
+        stockByCost += st.finalKg;
+    }
+    check(fixtures::nearlyEqual(stockByDistance, 434.0, 0.01),
+          "缓冲库存·距离策略站内总量 434kg，实际 " + std::to_string(stockByDistance));
+    check(fixtures::nearlyEqual(stockByCost, 438.0, 0.01),
+          "缓冲库存·成本策略站内总量 438kg，实际 " + std::to_string(stockByCost));
 }
 
 // B3：两种图表示在真实规模（30 节点）上的形状检查
@@ -213,8 +233,10 @@ void checkMultiTripAndTransitOnRealData(const Config& cfg) {
         }
     }
     check(loadOk, "任一趟的在车货量都不超过载重上限");
-    // 中转站不参与排线：实测让它参与全面更差（198.2km/13 趟 vs 直达 178.2km/6 趟），
-    // 故其路由实现已随代码整理删除，"不得参与路由"由结构保证，无需再断言。
+    // 中转站不参与**常规排线**：实测让它参与全面更差（198.2km/13 趟 vs 直达 178.2km/6 趟），
+    // 那条"有货就用"的路由实现仍不存在。但 2026-09-26 用户裁定恢复了"缓冲库存**只服务
+    // 紧急单**"这一窄机制 ⇒ "暂存非负/终值为 0/不为用站而绕路"**不再**由结构保证，
+    // 已改由 routeplanner_tests 的 testTransitBufferProducer()（守卫 G1/G2/G4）显式断言。
 
     // 本趟装载量本身也不得超过载重上限（用户手工测试发现的显示 bug 的本质：
     // 界面曾把"剩余待送总量 740kg"当成"当前载重"显示，而载重上限只有 200kg）
@@ -231,7 +253,10 @@ void checkMultiTripAndTransitOnRealData(const Config& cfg) {
     check(tripLoadOk, "任一趟的装载量都不超过载重上限，最大 "
               + std::to_string(maxTripLoad) + "kg");
 
-    // （中转站库存机制已随本轮代码整理删除：删掉寄存后它恒等于期初值，从未变化。）
+    // （缓冲库存机制 2026-09-26 按用户裁定恢复，但**只服务紧急单**：
+    //   本夹具里没有紧急单，所以它只进不出——期初 0 -> 期末 > 0，
+    //   且"常规趟绝不进站"意味着 transitOps 里不得有任何出库。见
+    //   testTransitBufferProducer() 与 checkMultiTripAndTransitOnRealData 的守卫。）
     // ---- 用户实测发现的显示 bug：推进若干站后「第 N 趟」全变成「第 1 趟」 ----
     //
     // 根因是切分"尚未走完的部分"时把整条剩余路线压成了一趟。这里守住趟结构：

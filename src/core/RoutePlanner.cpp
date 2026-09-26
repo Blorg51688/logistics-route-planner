@@ -4,6 +4,7 @@
 #include <sstream>
 #include <cstddef>
 #include <map>
+#include <set>
 
 namespace logistics {
 
@@ -276,6 +277,96 @@ void flatten(RoutePlan& plan, int startTimeMin, double elapsedMin) {
 
 // 多趟分批（设计 §5.6）。仅在总需求超过载重上限时进入。
 // 实际实现：分簇 -> 按载重分批 -> 每批一趟。中转站不参与排线。
+
+// ---- 中转站缓冲库存（2026-09-26 用户裁定恢复；**仅服务紧急单**）----
+//
+// 生产端：每次**出仓装满**，本趟订单用不到的那部分记作 trip.bufferKg
+// （不属于任何订单的缓冲货）。返程若顺路经过本趟所属簇的中转站，就地把缓冲卸进站。
+//
+// 为什么是零成本：`appendLeg` 会把最短路上的**全部途经节点**写进 trip.nodes，
+// 所以"顺路"意味着该站**本来就在序列里**——寄存不新增节点、不改时刻、不改里程。
+// （本项目停靠无服务时间，故距离/耗时/成本/penalty 一个字节都不动。）
+
+// 求一趟停靠点所属的**唯一**簇站。跨簇 / 无站 / 无停靠点 ⇒ 返回空串（不寄存）。
+std::string tripHub(const LogisticsGraph& graph,
+                    const std::map<int, std::string>& transitBySub,
+                    const Trip& trip) {
+    std::set<int> subs;
+    for (const Stop& s : trip.stops) {
+        const Node* n = graph.findNode(s.nodeId);
+        if (n != nullptr && transitBySub.find(n->subNetworkId) != transitBySub.end()) {
+            subs.insert(n->subNetworkId);
+        }
+    }
+    if (subs.size() != 1) {
+        return std::string();
+    }
+    const std::map<int, std::string>::const_iterator it = transitBySub.find(*subs.begin());
+    return (it != transitBySub.end()) ? it->second : std::string();
+}
+
+// 顺路寄存（**纯记账**）。成立则往 trip.bankOps 记一条，并通过 out 回报。
+//
+// 判定**以实际序列为准**：该站必须真的出现在"最后一个停靠点之后"的回程段里。
+// 只信距离等式是不够的——并列最短路时等式可能成立，而车其实没走那条路；
+// 那时记一条寄存就等于"把货卸在车没去过的站"（守卫 G1② 正是守这件事）。
+// 距离等式再作一次交叉核对，两边都成立才寄存。
+bool bankBufferEnRoute(const LogisticsGraph& graph,
+                       const std::string& hub,
+                       const std::string& depotId,
+                       WeightType weight,
+                       Trip& trip,
+                       TransitOp* out) {
+    if (hub.empty() || trip.bufferKg <= 1e-9) {
+        return false;
+    }
+    std::size_t lastStopIdx = trip.nodes.size();
+    for (std::size_t i = 0; i < trip.nodeIsStop.size() && i < trip.nodes.size(); ++i) {
+        if (trip.nodeIsStop[i]) {
+            lastStopIdx = i;
+        }
+    }
+    if (lastStopIdx + 1 >= trip.nodes.size()) {
+        return false;   // 停靠点之后没有回程段
+    }
+    std::size_t hubIdx = trip.nodes.size();
+    for (std::size_t i = lastStopIdx + 1; i < trip.nodes.size(); ++i) {
+        if (trip.nodes[i] == hub) {
+            hubIdx = i;
+            break;
+        }
+    }
+    if (hubIdx >= trip.nodes.size()) {
+        return false;   // 回程没真的经过该站 ⇒ 不寄存
+    }
+    const std::string& lastStopNode = trip.nodes[lastStopIdx];
+    const PathResult back = shortestPath(graph, lastStopNode, depotId, weight);
+    const PathResult lh = shortestPath(graph, lastStopNode, hub, weight);
+    const PathResult hw = shortestPath(graph, hub, depotId, weight);
+    if (!back.found || !lh.found || !hw.found) {
+        return false;
+    }
+    if (lh.totalWeight + hw.totalWeight - back.totalWeight > 1e-6) {
+        return false;   // 顺路等式不成立 ⇒ 不寄存（缓冲跟车回仓库）
+    }
+    TransitOp op;
+    op.nodeId = hub;
+    op.kgDelta = trip.bufferKg;
+    op.atMin = trip.nodeArrivalMin[hubIdx];
+    trip.bankOps.push_back(op);
+    if (out != nullptr) {
+        *out = op;
+    }
+    return true;
+}
+
+// 装满车厢：本趟订单货量之外的空位全部装成**缓冲货**（不属于任何订单）。
+// 只在"这一趟是在仓库装货出发"时调用——在途货趟与收尾趟都不是出仓，不得凭空计缓冲。
+void fillBufferFromDepot(const Vehicle& vehicle, double batchLoadKg, Trip& trip) {
+    const double spare = vehicle.capacityKg - batchLoadKg;
+    trip.bufferKg = (spare > 0.0) ? spare : 0.0;
+}
+
 RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
                             const Vehicle& vehicle,
                             const std::vector<Candidate>& candidates,
@@ -342,6 +433,15 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
             plan.reason = fail;
             return plan;
         }
+        // 出仓装满：本批订单之外的载重空位装成**缓冲货**（不属任何订单）
+        fillBufferFromDepot(vehicle, batchLoad, trip);
+        {
+            TransitOp banked;
+            if (bankBufferEnRoute(graph, tripHub(graph, transitBySub, trip),
+                                  vehicle.startNodeId, weight, trip, &banked)) {
+                plan.transitOps.push_back(banked);
+            }
+        }
         plan.trips.push_back(trip);
         current = vehicle.startNodeId;
         for (const Candidate& b : batch) {
@@ -397,6 +497,8 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
             // 从**当前位置**直接出发（车上的货不需要回仓库取），终点仍是仓库
             if (weave(graph, carried, startPos, elapsed, weight,
                       startPos, vehicle.startNodeId, load, trip, fail)) {
+                // **不装缓冲**：这一趟是从当前位置接着送车上已有的货，不是"出仓"。
+                // 它的货早在前一趟出仓时就装过一次了，这里再算一次缓冲会**重复计数**。
                 plan.trips.push_back(trip);
                 current = trip.endNodeId;
                 for (const Candidate& b : carried) {
@@ -486,6 +588,15 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
                 plan.reason = fail;
                 return plan;
             }
+            // 出仓装满 + 返程顺路寄存（同紧急批；簇批一定是"从仓库装货出发"）
+            fillBufferFromDepot(vehicle, batchLoad, trip);
+            {
+                TransitOp banked;
+                if (bankBufferEnRoute(graph, tripHub(graph, transitBySub, trip),
+                                      vehicle.startNodeId, weight, trip, &banked)) {
+                    plan.transitOps.push_back(banked);
+                }
+            }
             plan.trips.push_back(trip);
             current = vehicle.startNodeId;
             for (const Candidate& b : batch) {
@@ -509,6 +620,42 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
         trip.endNodeId = vehicle.startNodeId;
         plan.trips.push_back(trip);
         current = vehicle.startNodeId;
+    }
+
+    // ---- 站内库存汇总：期初（来自 initialStock）+ 本次规划期间的全部寄存 ----
+    // 只列"数据里确实存在的站"（transitBySub 的值，去重），保证界面与守恒断言口径一致。
+    {
+        std::vector<std::string> stations;
+        for (std::map<int, std::string>::const_iterator it = transitBySub.begin();
+             it != transitBySub.end(); ++it) {
+            bool seen = false;
+            for (const std::string& s : stations) {
+                if (s == it->second) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                stations.push_back(it->second);
+            }
+        }
+        for (const std::string& id : stations) {
+            TransitStock st;
+            st.nodeId = id;
+            const std::map<std::string, double>::const_iterator it = initialStock.find(id);
+            st.initialKg = (it != initialStock.end()) ? it->second : 0.0;
+            st.finalKg = st.initialKg;
+            plan.transitStock.push_back(st);
+        }
+        // 记账：每一条 bankOps 都要落到对应站的期末库存上（守恒由守卫 G3 核）
+        for (const TransitOp& op : plan.transitOps) {
+            for (TransitStock& st : plan.transitStock) {
+                if (st.nodeId == op.nodeId) {
+                    st.finalKg += op.kgDelta;
+                    break;
+                }
+            }
+        }
     }
 
     flatten(plan, startTimeMin, elapsed);

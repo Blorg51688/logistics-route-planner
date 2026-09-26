@@ -1,5 +1,7 @@
 // RoutePlanner 的行为测试。
 // 期望值全部来自手工推导的字面量，不复用实现中的任何计算。
+#include <cmath>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -414,8 +416,10 @@ void testTotalDemandOverCapacityBecomesMultiTrip() {
     }
     check(loadOk, "任一趟的在车货量都不超过载重上限");
 
-    // 中转站不参与排线——本轮代码整理已把那条路由实现整体删除，
-    // 因此"暂存非负""终值为 0""不为用站而绕路"都由**结构**保证，无需再断言。
+    // 中转站不参与**常规排线**：那条"有货就用"的路由实现仍不存在。
+    // 但 2026-09-26 用户裁定恢复了"缓冲库存**只服务紧急单**"这一窄机制，
+    // 所以"暂存非负""寄存只发生在顺路经过的站""库存守恒"**不再**由结构保证——
+    // 它们已改由 testTransitBufferProducer() 的守卫 G1/G2/G4 显式断言。
 
     // 不变量 5：需求超载 -> 必须多于一趟
     check(plan.trips.size() > 1, "多趟配送，实际 " + std::to_string(plan.trips.size()) + " 趟");
@@ -890,6 +894,112 @@ static void testIncrementalReplanForwardsOnboard() {
     check(carriesD2, "在途货所属的 D2 仍应被服务");
 }
 
+// ---- 中转站缓冲库存：生产者（满载出仓 + 返程顺路寄存）----
+//
+// 夹具：W(仓库) —T(中转站,子网络1)— D1(客户,子网络1)，另加 W —D2(客户,子网络1)。
+//   · D1 的最短路是 W-T-D1 ⇒ 回程 D1-T-W **真的经过 T**（顺路 ⇒ 应当寄存）；
+//   · D2 直连仓库 ⇒ 回程不经过 T（不顺路 ⇒ 缓冲**跟车回仓库**，不寄存）。
+// 载重 100、D1/D2 各 60kg ⇒ 总需求 120 > 100 ⇒ 两趟，每趟订单货量 60、空位 40。
+LogisticsGraph makeBufferGraph() {
+    LogisticsGraph g;
+    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
+    Node t = makeNode("T", NodeType::Transit, "中转站");
+    t.subNetworkId = 1;
+    g.addNode(t);
+    Node d1 = makeNode("D1", NodeType::Delivery, "客户1");
+    d1.subNetworkId = 1;
+    g.addNode(d1);
+    Node d2 = makeNode("D2", NodeType::Delivery, "客户2");
+    d2.subNetworkId = 1;
+    g.addNode(d2);
+    addTwoWay(g, "W", "T", 5.0, 10.0, 4.0);
+    addTwoWay(g, "T", "D1", 5.0, 10.0, 4.0);
+    addTwoWay(g, "W", "D2", 3.0, 6.0, 2.0);
+    return g;
+}
+
+void testTransitBufferProducer() {
+    const LogisticsGraph g = makeBufferGraph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+    std::vector<Order> orders;
+    orders.push_back(makeOrder("O1", "D1", 60.0, 0, 1440));
+    orders.push_back(makeOrder("O2", "D2", 60.0, 0, 1440));
+
+    const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
+
+    check(plan.status == PlanStatus::Ok, "缓冲夹具应当可规划");
+    check(plan.trips.size() == 2, "两个 60kg 订单 + 载重 100 ⇒ 两趟，实际 "
+                                      + std::to_string(plan.trips.size()) + " 趟");
+
+    // G4：缓冲不得超载、不得为负；I5：缓冲 == 载重上限 − 本趟订单货量
+    bool capOk = true, nonNeg = true, fullOk = true;
+    for (const logistics::Trip& t : plan.trips) {
+        if (t.loadKg + t.bufferKg > v.capacityKg + 1e-9) { capOk = false; }
+        if (t.bufferKg < -1e-9) { nonNeg = false; }
+        if (t.bufferKg > 1e-9
+            && std::fabs(t.bufferKg - (v.capacityKg - t.loadKg)) > 1e-9) {
+            fullOk = false;
+        }
+    }
+    check(capOk, "本趟订单货量 + 缓冲货 不得超过载重上限");
+    check(nonNeg, "缓冲货不得为负");
+    check(fullOk, "缓冲货 = 载重上限 − 本趟订单货量（「装满」的确切含义）");
+
+    // G1①：常规规划（无紧急单）不得出现任何站内**出库**
+    bool noOutbound = true;
+    for (const logistics::TransitOp& op : plan.transitOps) {
+        if (op.kgDelta < -1e-9) { noOutbound = false; }
+    }
+    check(noOutbound, "无紧急单时不得有任何站内出库（中转站只服务紧急单）");
+
+    // G1②：寄存在的站必须**真的出现在该趟自己的节点序列里**，且时刻对得上。
+    // 这条是"零成本"的实质检查：只有站本来就在序列里，才谈得上"不新增节点"。
+    bool bankTraceable = true;
+    std::size_t bankCount = 0;
+    for (const logistics::Trip& t : plan.trips) {
+        for (const logistics::TransitOp& op : t.bankOps) {
+            ++bankCount;
+            bool hit = false;
+            for (std::size_t k = 0; k < t.nodes.size() && k < t.nodeArrivalMin.size(); ++k) {
+                if (t.nodes[k] == op.nodeId && t.nodeArrivalMin[k] == op.atMin) { hit = true; }
+            }
+            if (!hit) { bankTraceable = false; }
+        }
+    }
+    check(bankCount == 1, "夹具里应恰好 1 次寄存（第 1 趟回程顺路经过 T），实际 "
+                              + std::to_string(bankCount) + " 次");
+    check(bankTraceable, "寄存在的站必须在该趟自己的节点序列里，且 atMin == 该处到达时刻");
+
+    double stock = 0.0;
+    for (const logistics::TransitStock& st : plan.transitStock) { stock += st.finalKg; }
+    check(std::fabs(stock - 40.0) < 1e-6,
+          "顺路的那趟应寄存 40kg 进站，实际站内合计 " + std::to_string(stock) + "kg");
+
+    // 守恒（规格 I3 的生产者部分）：所有寄存之和 == 站内库存增量
+    double opsSum = 0.0;
+    for (const logistics::TransitOp& op : plan.transitOps) { opsSum += op.kgDelta; }
+    check(std::fabs(opsSum - stock) < 1e-6, "所有寄存之和 == 站内库存增量");
+
+    // G2：**库存不得影响选路** —— 同一输入、空库存 vs 有 123kg 存货，路线逐位相同
+    std::map<std::string, double> seeded;
+    seeded["T"] = 123.0;
+    const RoutePlan seededPlan = planRoute(g, v, orders, WeightType::Distance, seeded);
+    const bool routeUnchanged =
+        std::fabs(seededPlan.totalDistanceKm - plan.totalDistanceKm) < 1e-9
+        && std::fabs(seededPlan.totalTimeMin - plan.totalTimeMin) < 1e-9
+        && std::fabs(seededPlan.totalCostYuan - plan.totalCostYuan) < 1e-9
+        && seededPlan.totalPenaltyMin == plan.totalPenaltyMin
+        && seededPlan.trips.size() == plan.trips.size();
+    check(routeUnchanged, "期初库存不得改变路径/耗时/成本/penalty/趟数（寄存是纯记账）");
+
+    double seededStock = 0.0;
+    for (const logistics::TransitStock& st : seededPlan.transitStock) {
+        seededStock += st.finalKg;
+    }
+    check(std::fabs(seededStock - (stock + 123.0)) < 1e-6,
+          "期末库存 = 期初库存 + 本次寄存量");
+}
+
 int main() {
     testSingleOrderRouteIsFullyCorrect();
     testEmptyOrdersDegeneratesToNoMovement();
@@ -913,6 +1023,7 @@ int main() {
     testNodeIndexAtTimeReturnsSegmentStart();
     testNodeIndexAtTimeOnEmptyPlanAndClamp();
     testNodeIndexAtTimeIsMonotonicInTime();
+    testTransitBufferProducer();
 
     return testutil::summarize("routeplanner_tests");
 }
