@@ -37,6 +37,21 @@ struct Stop {
 
 // 一趟行程：车辆的一段连续行程。
 // 起点 = 上一趟的终点（首趟为规划起点），终点 = 起始仓库。
+// 一次站内装卸（缓冲库存机制的记账单元）。
+// kgDelta > 0 = 入库（返程顺路寄存缓冲货）；< 0 = 出库（紧急单就地取用）。
+struct TransitOp {
+    std::string nodeId;        // 中转站
+    double      kgDelta = 0.0; // 变动量（kg）
+    int         atMin   = 0;   // 发生的软件内时刻
+};
+
+// 站内库存快照：供界面显示与测试核对。
+struct TransitStock {
+    std::string nodeId;
+    double      initialKg = 0.0;   // 本次规划开始时的库存
+    double      finalKg   = 0.0;    // 本次规划结束时的库存
+};
+
 // （注 2026-09-26：中转站不参与排线，故每趟终点都是起始仓库，见 docs/设计.md §16 P25/P30。）
 struct Trip {
     std::vector<std::string> nodes;         // 含本趟起点
@@ -45,7 +60,14 @@ struct Trip {
     std::vector<Stop>        stops;
     // 本趟车上装载的货量（不变量：任一趟都不得超过载重上限）。
     // 与"剩余待送总量"是两回事——多趟模式下车辆不会一次装完全部货物。
+    // **口径提醒**：loadKg 只统计"订单货量"，缓冲货一律计入 bufferKg，两者绝不混用；
+    // 界面「本趟装载」与既有的装载/容量一致性守卫都只读 loadKg。
     double loadKg = 0.0;
+    // 本趟装载的"不属于任何订单的缓冲货"（= 满载出仓时本趟订单用不到的那部分）。
+    // 不变量：loadKg + bufferKg <= 车辆载重上限，且 bufferKg >= 0。
+    double bufferKg = 0.0;
+    // 本趟在返程顺路处把缓冲卸进站的入库操作（至多一条；不顺路则为空）。
+    std::vector<TransitOp> bankOps;
     double totalDistanceKm = 0.0;
     double totalCostYuan   = 0.0;
     double totalTimeMin    = 0.0;
@@ -78,6 +100,12 @@ struct RoutePlan {
     // trips 是**真源**；上面的 nodes/nodeArrivalMin/nodeIsStop/stops
     // 是由它展平（flatten）出来的兼容视图，只在一处生成，不会各自维护。
     std::vector<Trip>         trips;
+
+    // ---- 中转站缓冲库存（2026-09-26 用户裁定恢复；仅服务紧急单）----
+    // 各站期末库存快照（含期初值，便于核对守恒）。
+    std::vector<TransitStock> transitStock;
+    // 展平后的全部站内装卸（按时刻），供界面按时刻回放与守恒断言。
+    std::vector<TransitOp>    transitOps;
 };
 
 // 从车辆起始仓库出发、按其发车时刻规划，服务完全部订单后返回该仓库。
@@ -88,7 +116,12 @@ struct RoutePlan {
 RoutePlan planRoute(const LogisticsGraph& graph,
                     const Vehicle& vehicle,
                     const std::vector<Order>& orders,
-                    WeightType weight);
+                    WeightType weight,
+                    // 期初站内库存（缓冲库存机制）。默认空 = 无库存可用（黄金值口径）。
+                    // 仓库可发出不属于任何订单的缓冲货——2026-09-26 用户裁定，见
+                    // .omd/plans/transit-urgent-buffer.md 的"建模前提"。
+                    const std::map<std::string, double>& initialStock
+                        = std::map<std::string, double>());
 
 // 从指定位置与指定时刻出发，对剩余未服务订单重新规划，最后返回车辆起始仓库。
 // 供"配送过程中插入紧急订单"与"路况变化触发重规划"复用同一套贪心逻辑。
@@ -106,7 +139,12 @@ RoutePlan replan(const LogisticsGraph& graph,
                  const std::string& currentPositionId,
                  int currentTimeMin,
                  WeightType weight,
-                 const std::vector<OnboardItem>& onboard = std::vector<OnboardItem>());
+                 const std::vector<OnboardItem>& onboard = std::vector<OnboardItem>(),
+                 // **当前时刻**的站内库存快照（语义：不是"规划期初"，因为本函数
+                 // 就是从当前位置与当前时刻重算）。**不回传**——期末库存由
+                 // RoutePlan::transitStock 输出。
+                 const std::map<std::string, double>& initialStock
+                     = std::map<std::string, double>());
 
 struct InsertResult {
     RoutePlan   plan;
@@ -127,7 +165,14 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
                                int currentTimeMin,
                                WeightType weight,
                                const std::vector<OnboardItem>& onboard
-                                   = std::vector<OnboardItem>());
+                                   = std::vector<OnboardItem>(),
+                               // 车上当前剩余的**缓冲货**（不属于任何订单）。紧急单可先用它
+                               // 就地满足，无需回仓库。与 onboard（订单货）是两回事：本机制
+                               // 绝不动本趟要送的订单货（不借货）。
+                               double carBufferKg = 0.0,
+                               // **当前时刻**的站内库存快照（语义同 replan）。
+                               const std::map<std::string, double>& initialStock
+                                   = std::map<std::string, double>());
 
 // 从已规划好的 plan 中切出"尚未走完的部分"，**保留趟结构**。
 // 供增量式重规划使用：若把整条剩余路线压成一趟，增量重规划之后
@@ -153,7 +198,11 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
                             const std::vector<OnboardItem>& onboard
                                 = std::vector<OnboardItem>(),
                             // 回报本函数是否真的走了增量路径（false = 退回了全量）
-                            bool* usedIncremental = nullptr);
+                            bool* usedIncremental = nullptr,
+                            // 与 replan 一致：**当前时刻**的站内库存快照。
+                            // 增量路径必须把它**带走**（否则路况重规划后库存凭空归零）。
+                            const std::map<std::string, double>& initialStock
+                                = std::map<std::string, double>());
 
 // 判断某条有向边是否落在给定路线序列的**相邻两站**之间。
 // GUI 的路径高亮与路况重规划的触发判定共用这一条逻辑。

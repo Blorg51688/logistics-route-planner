@@ -13,6 +13,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <string>
 
 #include "core/Config.h"
@@ -186,9 +187,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "配置中没有车辆\n");
             return 1;
         }
+        // 命令行首次规划：站里还没有任何缓冲库存（仓库发缓冲货要跑完一趟才可能寄存），
+        // 故显式传空库存 —— 与 planRoute 的默认值等价，只为让调用形状与其余四个入口一致。
+        const std::map<std::string, double> initialStock;
         const logistics::RoutePlan plan =
             logistics::planRoute(config.graph, config.vehicles.front(), config.orders,
-                                 planWeight);
+                                 planWeight, initialStock);
         if (plan.status != logistics::PlanStatus::Ok) {
             std::printf("不可行：%s\n", plan.reason.c_str());
             return 0;
@@ -254,9 +258,11 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "配置中没有车辆，无法规划\n");
                 return 1;
             }
+            // 同上：首次规划时站内无库存，显式传空以统一调用形状。
+            const std::map<std::string, double> initialStock;
             const logistics::RoutePlan plan =
                 logistics::planRoute(config.graph, config.vehicles.front(), config.orders,
-                                     planWeight);
+                                     planWeight, initialStock);
             if (plan.status == logistics::PlanStatus::Ok) {
                 scene.highlightRoute(plan.nodes);
                 std::printf("规划（%s）：距离 %.1fkm  耗时 %.1fmin  成本 %.1f元  "

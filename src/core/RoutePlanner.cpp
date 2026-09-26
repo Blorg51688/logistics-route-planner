@@ -282,7 +282,8 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
                             const std::string& startPos,
                             int startTimeMin,
                             WeightType weight,
-                            const std::vector<OnboardItem>& onboard) {
+                            const std::vector<OnboardItem>& onboard,
+                            const std::map<std::string, double>& initialStock) {
     RoutePlan plan;
 
     // 子网络编号 → 该子网络的中转站。配送点按 sub_network_id 归属，
@@ -526,9 +527,10 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
                         const std::string& startPos,
                         int startTimeMin,
                         WeightType weight,
-                        const std::vector<OnboardItem>& onboard) {
+                        const std::vector<OnboardItem>& onboard,
+                        const std::map<std::string, double>& initialStock) {
     return multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
-                             weight, onboard);
+                             weight, onboard, initialStock);
 }
 
 } // namespace
@@ -539,7 +541,8 @@ RoutePlan replan(const LogisticsGraph& graph,
                  const std::string& currentPositionId,
                  int currentTimeMin,
                  WeightType weight,
-                 const std::vector<OnboardItem>& onboard) {
+                 const std::vector<OnboardItem>& onboard,
+                 const std::map<std::string, double>& initialStock) {
     RoutePlan plan;
 
     if (graph.findNode(currentPositionId) == nullptr) {
@@ -554,7 +557,7 @@ RoutePlan replan(const LogisticsGraph& graph,
     if (total > vehicle.capacityKg + 1e-9) {
         // 总需求超过载重：改走多趟分批（D21），不再判为不可行
         return multiTripPlan(graph, vehicle, remaining, currentPositionId, currentTimeMin,
-                             weight, onboard);
+                             weight, onboard, initialStock);
     }
 
     // 单趟：车辆在起点已装载全部货物，直接贪心串联后回仓库（与历史行为一致）
@@ -643,12 +646,20 @@ RoutePlan sliceRemainder(const RoutePlan& plan, std::size_t fromNodeIndex) {
         }
         trip.endNodeId = trip.nodes.back();
         trip.loadKg = plan.trips[t].loadKg;
+        // 缓冲货与寄存记账必须**随趟一起带走**：否则切出"剩余路线"后本趟的缓冲凭空消失，
+        // 随后的紧急单取优就看不到车上还有货了。
+        trip.bufferKg = plan.trips[t].bufferKg;
+        trip.bankOps = plan.trips[t].bankOps;
         remainder.trips.push_back(trip);
         for (std::size_t i = 0; i < trip.nodes.size(); ++i) {
             remainder.nodes.push_back(trip.nodes[i]);
             remainder.nodeIsStop.push_back(trip.nodeIsStop[i]);
         }
     }
+    // 库存快照必须带到"剩余路线"上：否则路况重规划/增量重算之后库存凭空归零，
+    // 守恒断言（规格 I3 / 守卫 G3）会失效。
+    remainder.transitStock = plan.transitStock;
+    remainder.transitOps = plan.transitOps;
     return remainder;
 }
 
@@ -765,7 +776,8 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
                             const TrafficReport& report,
                             double thresholdRatio,
                             const std::vector<OnboardItem>& onboard,
-                            bool* usedIncremental) {
+                            bool* usedIncremental,
+                            const std::map<std::string, double>& initialStock) {
     if (usedIncremental != nullptr) {
         *usedIncremental = false;
     }
@@ -851,9 +863,10 @@ std::size_t nodeIndexAtTime(const RoutePlan& plan, int timeMin) {
 RoutePlan planRoute(const LogisticsGraph& graph,
                     const Vehicle& vehicle,
                     const std::vector<Order>& orders,
-                    WeightType weight) {
+                    WeightType weight,
+                    const std::map<std::string, double>& initialStock) {
     return replan(graph, vehicle, orders, vehicle.startNodeId,
-                  vehicle.departTimeMin, weight);
+                  vehicle.departTimeMin, weight, std::vector<OnboardItem>(), initialStock);
 }
 
 InsertResult insertUrgentOrder(const LogisticsGraph& graph,
@@ -863,7 +876,9 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
                                const std::string& currentPositionId,
                                int currentTimeMin,
                                WeightType weight,
-                               const std::vector<OnboardItem>& onboard) {
+                               const std::vector<OnboardItem>& onboard,
+                               double carBufferKg,
+                               const std::map<std::string, double>& initialStock) {
     InsertResult result;
 
     // 插入的订单一律按紧急处理，调用方传入的 urgent 不作数
