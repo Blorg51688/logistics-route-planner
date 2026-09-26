@@ -26,7 +26,7 @@ case "$rc" in
     2)
         eb_err "无法启动图形界面：本机没有编译出 GUI 程序（多半缺 Qt6 开发包，见上方提示）。"
         eb_err "  装上后重试：  sudo zypper install qt6-base-devel"
-        eb_err "  在此之前可用：cd build && ctest    （跑一遍 718 项自动化断言，无需图形界面）"
+        eb_err "  在此之前可用：cd build && ctest    （跑一遍 790 项自动化断言，无需图形界面）"
         exit 3
         ;;
     *)

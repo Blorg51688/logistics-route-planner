@@ -28,6 +28,7 @@
 #include <QTextBrowser>
 #include <QTimer>
 #include <QToolBar>
+#include <QToolButton>
 #include <QVBoxLayout>
 #include <QDockWidget>
 #include <QGuiApplication>
@@ -35,7 +36,6 @@
 
 #include <algorithm>
 #include <memory>
-#include <cstdio>
 #include <cstdio>
 #include <cmath>
 #include <utility>
@@ -155,8 +155,10 @@ void MainWindow::buildActions() {
     simGroup->addAction(stationSimAction_);
     simGroup->addAction(timeSimAction_);
     simGroup->setExclusive(true);
-    connect(stationSimAction_, &QAction::toggled, this, &MainWindow::onStationSimToggled);
-    connect(timeSimAction_, &QAction::toggled, this, &MainWindow::onTimeSimToggled);
+    // 状态只在 QActionGroup::triggered 一处收口（不用 toggled，原因见头文件注释）。
+    // exclusive 组保证"勾一个自动取消另一个"；"再点一次正在运行的那个"由
+    // onSimModeTriggered 显式取消勾选（向导第 7 关要求取消后必须立刻停下）。
+    connect(simGroup, &QActionGroup::triggered, this, &MainWindow::onSimModeTriggered);
 
     simTimer_ = new QTimer(this);
     connect(simTimer_, &QTimer::timeout, this, &MainWindow::onSimTick);
@@ -437,6 +439,11 @@ void MainWindow::syncScene() {
 void MainWindow::afterPlanReplaced() {
     nodeIndex_ = 0;      // 新路线从车辆当前位置起算，推进游标归零
     stopCursor_ = 0;
+    // 新计划里还有路要走 => 重新允许"到终点播报一次"。
+    // 否则跑完一次后再「重新规划」，第二次跑完就再也播报不出来了。
+    if (!atRouteEnd()) {
+        routeFinishedReported_ = false;
+    }
     // 车若正在仓库，就把计划的当前趟装上车——装载必须在每次（重新）规划之后发生，
     // 否则新计划第一趟的货永远上不了车。
     loadForCurrentTrip();
@@ -741,31 +748,44 @@ void MainWindow::onReplan() {
 //
 // 事件**不**由"推进次数"或"真实秒数"触发，而由**软件内时钟跨过事件刻**触发。
 // 两种模式的差别只在推进粒度：按站模拟 = 一站；按时间模拟 = 一刻（下一个事件刻）。
-void MainWindow::onStationSimToggled(bool on) {
-    if (on) {
-        simMode_ = 1;
+//
+// 所有状态迁移都收口在本函数：QActionGroup::triggered 每次点击恰发一次。
+//   · 点到"另一个模式"      -> 切换：旧的已被 exclusive 组自动取消，这里只启新表
+//   · 点到"正在运行的模式"  -> 再点一次 = 停止：主动取消勾选 + 停表
+// 之所以不用 QAction::toggled：它在 triggered **之前**发出，且 exclusive 组不允许
+// 用户把已选中的动作取消勾选 —— 两者叠加会令"首次勾选"被误判成"请求停止"。
+void MainWindow::onSimModeTriggered(QAction* action) {
+    if (action == nullptr) {
+        return;
+    }
+    const int mode = (action == timeSimAction_) ? 2 : 1;
+
+    if (simMode_ == mode) {
+        // 再点一次正在运行的模式 = 请求停止。
+        if (action->isChecked()) {
+            action->setChecked(false);   // exclusive 组里必须程序化取消
+        }
+        simMode_ = 0;
+        if (simTimer_ != nullptr) {
+            simTimer_->stop();
+        }
+        appendLog(mode == 1 ? QStringLiteral("按站模拟关闭：自动推进已停止")
+                            : QStringLiteral("按时间模拟关闭：自动推进已停止"));
+        return;
+    }
+
+    simMode_ = mode;
+    if (simTimer_ != nullptr) {
+        simTimer_->start(simIntervalMs_);   // 1 秒/步，两种模式共用同一节奏
+    }
+    if (mode == 1) {
         appendLog(QStringLiteral("按站模拟开启：每 1 秒自动推进一站；"
                                  "事件仍按软件内时间每 %1min 抽取")
                       .arg(config_.general.eventIntervalMin));
-        simTimer_->start(simIntervalMs_);
-    } else if (simMode_ == 1) {
-        simMode_ = 0;
-        simTimer_->stop();
-        appendLog(QStringLiteral("按站模拟关闭：自动推进已停止"));
-    }
-}
-
-void MainWindow::onTimeSimToggled(bool on) {
-    if (on) {
-        simMode_ = 2;
+    } else {
         appendLog(QStringLiteral("按时间模拟开启：每 1 秒自动推进一刻"
                                  "（= 下一个事件刻，每 %1min 一个）")
                       .arg(config_.general.eventIntervalMin));
-        simTimer_->start(simIntervalMs_);
-    } else if (simMode_ == 2) {
-        simMode_ = 0;
-        simTimer_->stop();
-        appendLog(QStringLiteral("按时间模拟关闭：自动推进已停止"));
     }
 }
 
@@ -779,7 +799,11 @@ void MainWindow::onSimTick() {
         onAdvanceMoment();
     }
     if (atRouteEnd()) {
-        stopSim(QStringLiteral("路线已走完"));
+        // 两种模拟模式共用这一条停机路径（停表 + 清除勾选）；
+        // 但**播报要分两种**：不可行不是"完成"，播成完成就是假成功。
+        stopSim(routeTrulyFinished()
+                    ? QStringLiteral("本次配送已完成，模拟结束")
+                    : QStringLiteral("计划不可行或为空，模拟停止"));
     }
 }
 
@@ -820,6 +844,13 @@ bool MainWindow::atRouteEnd() const {
            || nodeIndex_ + 1 >= plan_.nodes.size();
 }
 
+// 「走完了」与「计划不可行/为空」是两件事：后者也满足 atRouteEnd()，
+// 但把它当成"配送完成"会播报假成功（界面上同时写着「规划不可行」）。
+bool MainWindow::routeTrulyFinished() const {
+    return plan_.status == logistics::PlanStatus::Ok && !plan_.nodes.empty()
+           && nodeIndex_ + 1 >= plan_.nodes.size();
+}
+
 void MainWindow::reportRouteFinishedOnce() {
     if (routeFinishedReported_) {
         return;   // 终点只播报一次，消除原来"每个 tick 都刷一遍"的噪音
@@ -834,16 +865,17 @@ void MainWindow::stopSim(const QString& reason) {
         simTimer_->stop();
     }
     simMode_ = 0;
-    // setChecked(false) 会再次触发 toggled —— 用信号屏蔽器挡住重复日志
-    if (stationSimAction_ != nullptr && stationSimAction_->isChecked()) {
-        const QSignalBlocker blocker(stationSimAction_);
+    // 勾选状态只由 QActionGroup::triggered 收口，**没有**接 QAction::toggled；
+    // 程序化 setChecked(false) 也不会发 triggered —— 所以这里不需要信号屏蔽器。
+    // （曾用 QSignalBlocker 挡住一个并不存在的递归触发，属死代码，已删。）
+    if (stationSimAction_ != nullptr) {
         stationSimAction_->setChecked(false);
     }
-    if (timeSimAction_ != nullptr && timeSimAction_->isChecked()) {
-        const QSignalBlocker blocker(timeSimAction_);
+    if (timeSimAction_ != nullptr) {
         timeSimAction_->setChecked(false);
     }
-    appendLog(QStringLiteral("模拟结束（%1）").arg(reason));
+    // 播报**一次**（调用方把整句文案传进来，如「本次配送已完成，模拟结束」）
+    appendLog(reason);
 }
 
 // 时间流逝也是一次物理事件——但它**只动时刻、不动位置**：
@@ -891,7 +923,7 @@ void MainWindow::settleEventsUpTo(int timeMin) {
                       .arg(minutesToClock(mark))
                       .arg(QString::fromUtf8(logistics::simEventName(kind)))
                       .arg(urgentCapped
-                               ? QStringLiteral("（紧急订单待处理已达上限，本次改抽其它事件）")
+                               ? QStringLiteral("（紧急订单待处理已满，本次抽签不含紧急订单）")
                                : QString()));
 
         switch (kind) {
@@ -1360,9 +1392,14 @@ QString MainWindow::vehiclePanelSummary() const {
 
 QString MainWindow::toolbarActionTexts() const {
     QStringList names;
-    for (QAction* a : findChildren<QAction*>()) {
-        if (a != nullptr && !a->text().isEmpty() && a->isEnabled()) {
-            names << a->text();
+    // 只列**工具栏**上的动作名。原先用 findChildren<QAction*>()，会把各停靠面板的
+    // 切换动作也一起列进来（列出的名字比"工具栏动作 N 个"的口径多），
+    // 而面板名另有 dockTitles() 提供 —— 名字与语义不符，也容易被同名面板动作满足。
+    for (const QToolBar* bar : findChildren<QToolBar*>()) {
+        for (QAction* a : bar->actions()) {
+            if (a != nullptr && !a->text().isEmpty() && a->isEnabled()) {
+                names << a->text();
+            }
         }
     }
     names.removeDuplicates();
@@ -1480,8 +1517,17 @@ int MainWindow::runActionSelfCheck() {
             }
             const int markBefore = s->nextEventMark_;
             const int T = markBefore;
+            // 内层重放循环**同样**必须有上界：它的终止只靠一条不变量
+            // （onAdvanceStop() 除已到终点外必然 ++nodeIndex_）。一旦那条不变量被破坏，
+            // 外层 refGuard 管不到这里，守卫就会挂住而不是失败。
+            int replayGuard = 0;
             while (!s->atRouteEnd() && s->nodeIndex_ + 1 < s->plan_.nodeArrivalMin.size()
                    && s->plan_.nodeArrivalMin[s->nodeIndex_ + 1] <= T) {
+                if (++replayGuard > 10000) {
+                    expect(false, QStringLiteral("（守卫自身）内层重放超过 10000 步仍未结束，"
+                                                 "疑似 onAdvanceStop 不再推进下标"));
+                    break;
+                }
                 s->onAdvanceStop();
             }
             if (!s->atRouteEnd() && s->state_.atTimeMin < T) {
@@ -1528,6 +1574,80 @@ int MainWindow::runActionSelfCheck() {
                               "下一事件刻 %1 应 > 当前 %2min（有事件被拖欠）")
                    .arg(m->nextEventMark_)
                    .arg(m->state_.atTimeMin));
+
+        // 「推进一站」同样必须结算它跨过的事件刻（判据 #2 的直接守卫）。
+        // 与上面的等价性断言互补：等价性比的是**两条路径的一致性**，而这条直接检查
+        // "推进一站"这条路径本身有没有拖欠事件 —— 把 settleEventsUpTo 从
+        // onAdvanceStop 里摘掉，nextEventMark_ 会停在已跨过的那个刻上，这里必失败。
+        {
+            std::unique_ptr<MainWindow> u(new MainWindow(config_));
+            const int firstMark = u->nextEventMark_;
+            bool crossed = false;
+            for (int i = 0; i < 40 && !u->atRouteEnd(); ++i) {
+                u->onAdvanceStop();
+                if (u->state_.atTimeMin >= firstMark) {
+                    crossed = true;
+                    break;
+                }
+            }
+            expect(crossed,
+                   QStringLiteral("（前置）「推进一站」应能跨过首个事件刻 %1min").arg(firstMark));
+            expect(u->nextEventMark_ > u->state_.atTimeMin,
+                   QStringLiteral("「推进一站」也必须结算沿途事件刻：到达 %1min 后"
+                                  "下一未结算事件刻仍是 %2min（<= 到达时刻 = 拖欠事件）")
+                       .arg(u->state_.atTimeMin)
+                       .arg(u->nextEventMark_));
+        }
+
+        // 两种模拟模式的勾选行为（向导第 7 关的人工判据，这里做成可回归的自动化守卫）：
+        //   ① 勾一个自动取消另一个（互斥）② 再点一次当前模式 = 取消勾选并停止。
+        // 走**真实控件路径**（QToolButton::click -> QActionGroup::triggered），
+        // 而不是直接调 onSimModeTriggered —— 这样"换成 QAction::toggled 实现"这类
+        // 回归（exclusive 组不允许取消勾选）才会被抓住。
+        {
+            std::unique_ptr<MainWindow> v(new MainWindow(config_));
+            const auto clickAction = [](MainWindow* win, QAction* act) {
+                for (QToolButton* button : win->findChildren<QToolButton*>()) {
+                    if (button->defaultAction() == act) {
+                        button->click();
+                        return true;
+                    }
+                }
+                return false;
+            };
+            expect(clickAction(v.get(), v->stationSimAction_),
+                   QStringLiteral("（前置）工具栏应存在「按站模拟」按钮"));
+            expect(v->simMode_ == 1 && v->stationSimAction_->isChecked(),
+                   QStringLiteral("点「按站模拟」应进入按站模拟且按钮为勾选态"));
+            expect(clickAction(v.get(), v->timeSimAction_),
+                   QStringLiteral("（前置）工具栏应存在「按时间模拟」按钮"));
+            expect(v->simMode_ == 2 && v->timeSimAction_->isChecked()
+                       && !v->stationSimAction_->isChecked(),
+                   QStringLiteral("两种模拟模式必须互斥：勾「按时间模拟」应自动取消「按站模拟」"));
+            expect(clickAction(v.get(), v->timeSimAction_),
+                   QStringLiteral("（前置）再次点击应能送达「按时间模拟」按钮"));
+            expect(v->simMode_ == 0 && !v->timeSimAction_->isChecked(),
+                   QStringLiteral("再点一次「按时间模拟」必须取消勾选并停止（exclusive 组"
+                                  "不允许用户取消勾选，需显式处理）"));
+        }
+
+        // 「计划不可行」≠「配送完成」。两者都满足 atRouteEnd()，但只有前者为假时
+        // 才能播报"本次配送已完成"——否则界面会同时写着「规划不可行」和"已完成"（假成功）。
+        {
+            Config bad = config_;   // 从一个有订单的配送点删掉节点 -> 计划不可行
+            const std::string victim =
+                config_.orders.empty() ? std::string() : config_.orders.front().nodeId;
+            if (!victim.empty()) {
+                bad.graph.removeNode(victim);
+                std::unique_ptr<MainWindow> x(new MainWindow(bad));
+                expect(x->atRouteEnd(),
+                       QStringLiteral("（前置）删掉配送点 %1 后应判定为「不能继续推进」")
+                           .arg(QString::fromStdString(victim)));
+                expect(!x->routeTrulyFinished(),
+                       QStringLiteral("计划不可行/为空时**不得**算作「配送完成」"
+                                      "（否则会播报假成功）"));
+            }
+        }
 
         // 判据 #4：车在半路时，位置必须是**所在路段的起点**
         //（= "最后一个到达时刻 <= 当前时刻"的节点）。

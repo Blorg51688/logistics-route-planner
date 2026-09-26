@@ -11,6 +11,7 @@
 #include "core/WeightType.h"
 
 class GraphScene;
+class QAction;
 class QComboBox;
 class QGraphicsView;
 class QLabel;
@@ -35,8 +36,12 @@ public:
     // 已发生的 penalty 消失、「本趟装载」被重算、在途货被反复寄存。
     //
     // 规则（新增功能时请遵守）：
-    //   · 只有车辆**真的做了什么**才能改它 —— 装载 / 到达 / 送达 / 寄存，
-    //     全部发生在 onAdvanceStop() 里的状态转移中；
+    //   · 只有车辆**真的做了什么**才能改它 —— 装载 / 到达 / 送达，全部发生在
+    //     onAdvanceStop() 里的状态转移中；
+    //   · **第五条、也是唯一的例外：时间流逝**（advanceClockTo）——它只把 atTimeMin
+    //     往前推，绝不改 atNodeId / loadKg / onboard / 各项累计量；"车停在半路"时
+    //     时刻领先于位置是**正常**的（位置留在所在路段的起点）。调用方必须满足
+    //     "不得越过下一个节点的到达时刻"，且推进后立刻 settleEventsUpTo()。
     //   · 重规划只**读**它，作为输入喂给规划器；plan_ 只描述"接下来怎么走"，
     //     不作为任何已经发生过的事实的依据。
     struct VehicleState {
@@ -132,8 +137,10 @@ private slots:
     void onAdvanceStop();
     void onAdvanceMoment();
     void onReplan();
-    void onStationSimToggled(bool on);
-    void onTimeSimToggled(bool on);
+    // 两种模拟模式共用一个入口：状态只在这里收口，"再点一次正在运行的模式"= 停止。
+    // （不用 QAction::toggled：它在 QActionGroup::triggered 之前发出，且 exclusive 组
+    //   不允许用户直接取消勾选，两件事叠起来会把"首次勾选"误判成"请求停止"。）
+    void onSimModeTriggered(QAction* action);
     void onSimTick();
     void onManualEdit();
 
@@ -156,7 +163,11 @@ private:
     // 「推进一站」与「推进一刻」看到的是同一串事件（等价性断言的前提）。
     void settleEventsUpTo(int timeMin);   // 结算所有 <= timeMin 的事件刻（每刻恰 1 个事件）
     void advanceClockTo(int timeMin);     // 让"时间流逝"走到 timeMin（车留在所在段的起点）
-    bool atRouteEnd() const;              // 路线是否已走完
+    bool atRouteEnd() const;              // 路线是否已走完（**含"计划不可行/为空"**）
+    // 与 atRouteEnd() 的区别：只有"计划可行且路线真的走完"才算**配送完成**。
+    // 计划不可行/为空时 atRouteEnd() 也为真，但那不是"送完了"——
+    // 此时播报「本次配送已完成，模拟结束」会与界面上的「规划不可行」自相矛盾。
+    bool routeTrulyFinished() const;
     void stopSim(const QString& reason);  // 停止模拟：停表 + 取消勾选 + 记一次日志
     void reportRouteFinishedOnce();       // 终点只播报一次（消除原来每 tick 重复刷的噪音）
 
@@ -226,7 +237,7 @@ private:
     // 车辆当前所在的趟在 plan_.trips 里的下标
     std::size_t currentTripIndex() const;
 
-    // ---- 状态转移：只有这四个函数能改 state_ ----
+    // ---- 状态转移：只有这几处能改 state_ ----
     //
     // 装载：车在仓库时，按计划的当前趟把货装上车（并冻结本趟装载量）
     // 装载指定的一趟。**必须显式给趟号**：车停在仓库时，nodeIndex_ 指向的是

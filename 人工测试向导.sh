@@ -140,7 +140,7 @@ case "$rc" in
             eb_err "本机没有编译出 GUI 程序（多半缺 Qt6 开发包），因此**看界面**的关卡都跑不了。"
             eb_err "  装上后重试：  sudo zypper install qt6-base-devel"
             eb_err "  现在就能跑、不需要图形界面的："
-            eb_err "    · 自动化测试：cd build && ctest   （718 项断言）"
+            eb_err "    · 自动化测试：cd build && ctest   （790 项断言）"
             eb_err "    · 关卡名单：  bash 人工测试向导.sh --list"
             exit 3
         fi

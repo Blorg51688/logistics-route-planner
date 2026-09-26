@@ -116,7 +116,7 @@ ensure_build() {
         eb_warn "编译成功，但没有生成图形界面程序 app（$build_dir/app）。"
         eb_warn "最常见原因：本机缺少 Qt6 开发包（CMake 找不到 Qt6 时会自动跳过 GUI 目标）。"
         eb_warn "  · 装上后重试：  sudo zypper install qt6-base-devel"
-        eb_warn "  · 不装也能验证核心逻辑：cd build && ctest   （718 项自动化断言，不需要图形界面）"
+        eb_warn "  · 不装也能验证核心逻辑：cd build && ctest   （790 项自动化断言，不需要图形界面）"
         return 2
     fi
 

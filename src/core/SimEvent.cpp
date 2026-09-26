@@ -17,7 +17,10 @@ SimEventKind pickEvent(const EventWeights& weights, Rng& rng) {
         }
     }
     // 保底：全零 / 全负权重。返回 Traffic 而不是死循环或除零。
+    // 仍然**消耗一次随机数**：契约是"一次抽签 = 一次 rng 消耗"，否则两条本该看到
+    // 同一串事件的路径（按站模拟 / 推进一刻）可能因保底分支而错位。
     if (total <= 0) {
+        (void)rng.nextU32();
         return SimEventKind::Traffic;
     }
 

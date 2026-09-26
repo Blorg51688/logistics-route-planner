@@ -307,12 +307,24 @@ int main(int argc, char** argv) {
         std::printf("[ui-probe] 工具栏动作 %d 个，停靠面板 %d 个\n", actions, docks);
         // 打印实际的动作名与面板名：向导里让用户点的按钮必须真实存在，
         // 由 check_wizard_ui_names.py 逐条比对，避免向导指示一个不存在的按钮。
-        std::printf("[ui-probe] 动作: %s\n", window.toolbarActionTexts().toUtf8().constData());
+        const QString actionTexts = window.toolbarActionTexts();
+        std::printf("[ui-probe] 动作: %s\n", actionTexts.toUtf8().constData());
         std::printf("[ui-probe] 面板: %s\n", window.dockTitles().toUtf8().constData());
-        if (actions < 9 || docks < 5) {
+        // 下限随模拟模式重做同步：原「Debug 模式」更名并新增「推进一刻」「按时间模拟」，
+        // 工具栏动作由 15 个增至 17 个（见 .omd/plans/sim-time-events.md §7.1）。
+        if (actions < 17 || docks < 5) {
             std::fprintf(stderr,
-                         "[ui-probe] UI 不完整：预期至少 9 个工具栏动作、5 个停靠面板\n");
+                         "[ui-probe] UI 不完整：预期至少 17 个工具栏动作、5 个停靠面板\n");
             return 1;
+        }
+        // 动作名清单同步：这些名字是向导第 7 关让用户去点的按钮，必须**真实存在**。
+        // 读的是界面上真正的动作名（findChildren<QAction*>），不是把预期列表再背一遍。
+        for (const char* need : {"按站模拟", "按时间模拟", "推进一刻", "推进一站"}) {
+            const QString name = QString::fromUtf8(need);
+            if (!actionTexts.contains(name)) {
+                std::fprintf(stderr, "[ui-probe] 工具栏缺少动作「%s」\n", need);
+                return 1;
+            }
         }
         // 中转站面板必须为图中每个中转站列一行，且子网络编号非 0
         // （D17：sub_network_id 必须真正接上行为，不能是死字段）
