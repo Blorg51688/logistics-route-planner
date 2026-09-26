@@ -33,7 +33,7 @@ struct TrafficReport {
 //   **baseTimeMin 始终不变**——它是判断"耗时增加 ≥20%"的基准。
 //
 // 手写 xorshift32 保证可复现：同一种子必得完全相同的改动集合与增幅。
-// 不使用 <random>：核心层不引入类库（§10.1），且确定性种子让测试不 flaky。
+// 不用 <random> 是**可复现性**的选择（§10.1 并未禁用标准库辅助设施），确定性种子让测试不 flaky。
 TrafficReport simulateTrafficChange(LogisticsGraph& graph,
                                     double ratio,
                                     double minRatio,
