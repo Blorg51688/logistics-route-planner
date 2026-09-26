@@ -1179,6 +1179,7 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
     std::string bPickup;      // 空串 = 车上已有
     std::string bStation;     // 从哪个站取（空 = 不从站取）
     double      bTakeKg = 0.0;
+    double      supplyDemandKg = 0.0;   // 该紧急停靠点的（合并后）需求
     {
         std::map<int, std::string> transitBySub;
         for (const Node& n : graph.nodes()) {
@@ -1193,6 +1194,7 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
         // 会出现"车上只有 10kg 却把这个停靠点的 70kg 送掉"——正是 P25 那类
         // "车送它没装的货"。按停靠点需求算，物理故事才自洽。
         const double d = candidateDemand(allCandidates, inserted.nodeId);
+        supplyDemandKg = d;
         const std::string hub = hubOfNode(graph, transitBySub, inserted.nodeId);
         const double avail = (carBufferKg > 0.0) ? carBufferKg : 0.0;
         const double stock = stockOf(initialStock, hub);
@@ -1244,8 +1246,20 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
 
     // 守恒的**消费端**：真的从站里取用了才记账，且 atMin 实读自
     // "服务该紧急单的那一趟"的节点序列（读不到就不记——守卫 G3 要求可追溯）。
-    if (chooseB && !bStation.empty()) {
-        recordStationDraw(result.plan, bStation, inserted.nodeId, bTakeKg);
+    if (chooseB) {
+        bool stationDrawn = false;
+        if (!bStation.empty()) {
+            stationDrawn = recordStationDraw(result.plan, bStation, inserted.nodeId, bTakeKg);
+        }
+        if (stationDrawn) {
+            result.stationUsed = bStation;
+            result.stationUsedKg = bTakeKg;
+        }
+        // 车上缓冲的净消耗 = 该停靠点需求 − 真的从站里取到的量。
+        // 把这两个数回报给调用方，界面才能把"车真的取了货"落成物理事实，不用自己猜。
+        const double fromStation = stationDrawn ? bTakeKg : 0.0;
+        result.carBufferUsedKg =
+            (supplyDemandKg > fromStation) ? (supplyDemandKg - fromStation) : 0.0;
     }
     sortTransitOpsByTime(result.plan.transitOps);
     return result;

@@ -149,6 +149,12 @@ RoutePlan replan(const LogisticsGraph& graph,
 struct InsertResult {
     RoutePlan   plan;
     std::string warning;   // 空表示无冲突
+
+    // ---- 就地满足（缓冲库存机制）的**取用明细**，供调用方把它们落成物理事实 ----
+    // 全为 0 / 空 表示这一次走的是现状（候选 A：独立紧急趟回仓库装货）。
+    double      carBufferUsedKg = 0.0;   // 车上缓冲被消耗的货量
+    std::string stationUsed;             // 被取用的中转站（空 = 没动站内库存）
+    double      stationUsedKg = 0.0;     // 从该站取走多少
 };
 
 // 动态插入紧急订单（§5.3）：

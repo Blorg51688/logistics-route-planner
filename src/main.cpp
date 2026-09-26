@@ -359,8 +359,29 @@ int main(int argc, char** argv) {
         }
 
         // 中转站面板的内容快照：无头环境下据此确定性核对（不必靠肉眼裁图）
+        //
+        // G7（缓冲库存 T4）：第 4 列「当前库存」必须存在且为数字——
+        // 它把"中转站真的攒下货了"这件事变成用户能看到的东西。
+        for (const QString& row : panelRows) {
+            const QStringList cells = row.split(QStringLiteral(" | "));
+            if (cells.size() < 4) {
+                const QByteArray bad = row.toUtf8();
+                std::fprintf(stderr,
+                             "[ui-probe] 中转站面板应有 4 列（含「当前库存」），实际不足：%s\n",
+                             bad.constData());
+                return 1;
+            }
+            bool numberOk = false;
+            cells[3].trimmed().toDouble(&numberOk);
+            if (!numberOk) {
+                const QByteArray bad = row.toUtf8();
+                std::fprintf(stderr, "[ui-probe] 中转站「当前库存」列不是数字：%s\n",
+                             bad.constData());
+                return 1;
+            }
+        }
         const QByteArray transit = panel.toUtf8();
-        std::printf("[ui-probe] 中转站面板（%s）:\n%s", "中转站|子网络|下属配送点",
+        std::printf("[ui-probe] 中转站面板（%s）:\n%s", "中转站|子网络|下属配送点|当前库存",
                     transit.constData());
         // 车辆面板：断言**界面上显示的"本趟装载"**不超过载重上限。
         // 用户手工测试发现过：面板把"剩余待送总量 740kg"当成"当前载重"显示，
