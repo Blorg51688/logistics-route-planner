@@ -75,6 +75,13 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME dataset_selfcheck
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_dataset.py)
+    # 文档里的相对链接必须指向真实存在的文件。
+    # 曾经发生过：文档导航.md 放在根目录，链接却按 docs/ 位置写 → 11 条链接全失效，
+    # 而它正是"可点到的文档入口"这件事本身，死链等于入口失效。
+    # 放在这一块（而非 Qt6_FOUND 内）：它是纯 Python 检查，缺 Qt6 时也该照跑。
+    add_test(NAME doc_links_lint
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_doc_links.py)
 else()
     message(STATUS "未找到 python3，跳过 oracle_selfcheck 测试")
 endif()
