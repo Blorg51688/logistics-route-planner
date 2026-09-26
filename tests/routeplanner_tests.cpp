@@ -23,6 +23,10 @@ using logistics::WeightType;
 using logistics::nodeIndexAtTime;
 using logistics::planRoute;
 using logistics::replan;
+using logistics::insertUrgentOrder;
+using logistics::InsertResult;
+using logistics::TransitOp;
+using logistics::TransitStock;
 using testutil::check;
 
 namespace {
@@ -1000,6 +1004,202 @@ void testTransitBufferProducer() {
           "期末库存 = 期初库存 + 本次寄存量");
 }
 
+// ---- 中转站缓冲库存：消费者（紧急单三链 + 两版取优）----
+//
+// 夹具：W(仓库) —T(中转站,子网络1)— D1、D3；W —D2（直连，不经 T）。
+// 载重 100、三个 60kg 订单 ⇒ 三趟；第 1、3 趟回程都顺路经过 T ⇒ T 攒下 80kg。
+// 车停在 D1（**远离仓库**）时插入一张到 D3 的紧急单：现状必须"回仓库装货"（绕远），
+// 而站内库存就在去 D3 的路上 ⇒ 就地满足应当更省。
+LogisticsGraph makeUrgentBufferGraph() {
+    LogisticsGraph g;
+    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
+    Node t = makeNode("T", NodeType::Transit, "中转站");
+    t.subNetworkId = 1;
+    g.addNode(t);
+    for (const char* id : {"D1", "D2", "D3"}) {
+        Node d = makeNode(id, NodeType::Delivery, std::string("客户") + id);
+        d.subNetworkId = 1;
+        g.addNode(d);
+    }
+    addTwoWay(g, "W", "T", 5.0, 10.0, 4.0);
+    addTwoWay(g, "T", "D1", 5.0, 10.0, 4.0);
+    addTwoWay(g, "W", "D2", 3.0, 6.0, 2.0);
+    addTwoWay(g, "T", "D3", 5.0, 10.0, 4.0);
+    return g;
+}
+
+void testUrgentBufferInPlaceDelivery() {
+    const LogisticsGraph g = makeUrgentBufferGraph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+    std::vector<Order> orders;
+    orders.push_back(makeOrder("O1", "D1", 60.0, 0, 1440));
+    orders.push_back(makeOrder("O2", "D2", 60.0, 0, 1440));
+    orders.push_back(makeOrder("O3", "D3", 60.0, 0, 1440));
+
+    const RoutePlan base = planRoute(g, v, orders, WeightType::Distance);
+    std::map<std::string, double> initialStock;
+    double seeded = 0.0;
+    for (const logistics::TransitStock& st : base.transitStock) {
+        initialStock[st.nodeId] = st.finalKg;
+        seeded += st.finalKg;
+    }
+    check(std::fabs(seeded - 80.0) < 1e-6,
+          "基线应给 T 攒下 80kg（第 1、3 趟各顺路寄存 40），实际 "
+              + std::to_string(seeded) + "kg");
+
+    const Order urgent = makeOrder("U1", "D3", 10.0, 0, 1440, true);
+    const InsertResult inserted = insertUrgentOrder(
+        g, v, orders, urgent, "D1", 500, WeightType::Distance,
+        std::vector<logistics::OnboardItem>(), 0.0, initialStock);
+    check(inserted.plan.status == PlanStatus::Ok, "插入紧急单后应当可规划");
+    const RoutePlan& chosen = inserted.plan;
+
+    // 对照：候选 A（现状——独立紧急趟**先回仓库装货**）
+    std::vector<Order> all = orders;
+    all.push_back(urgent);
+    const RoutePlan variantA = replan(g, v, all, "D1", 500, WeightType::Distance,
+                                      std::vector<logistics::OnboardItem>(), initialStock);
+
+    // G6：绝不更差（penalty 一票否决 -> 目标值 -> 趟数）
+    check(chosen.totalPenaltyMin <= variantA.totalPenaltyMin,
+          "取优不得让 penalty 变差：选中 " + std::to_string(chosen.totalPenaltyMin)
+              + "min vs 现状 " + std::to_string(variantA.totalPenaltyMin) + "min");
+    check(chosen.totalDistanceKm < variantA.totalDistanceKm - 1e-9,
+          "本夹具里就地满足应当真的更省：现状 " + std::to_string(variantA.totalDistanceKm)
+              + "km，选中 " + std::to_string(chosen.totalDistanceKm) + "km");
+
+    // G5：E3 优先性不得被取优牺牲——紧急单所在停靠点必须早于**所有**其他停靠点
+    int urgentArrival = -1;
+    int firstOtherArrival = 1 << 30;
+    for (const logistics::Trip& t : chosen.trips) {
+        for (const logistics::Stop& s : t.stops) {
+            if (s.nodeId == "D3") {
+                urgentArrival = s.arrivalMin;
+            } else if (s.arrivalMin < firstOtherArrival) {
+                firstOtherArrival = s.arrivalMin;
+            }
+        }
+    }
+    check(urgentArrival >= 0, "紧急单所在停靠点必须被服务");
+    check(urgentArrival <= firstOtherArrival,
+          "紧急单必须早于所有普通停靠点：紧急 " + std::to_string(urgentArrival)
+              + "min vs 最早普通 " + std::to_string(firstOtherArrival) + "min");
+
+    // G3：守恒 + 可追溯
+    double opsSum = 0.0;
+    bool stockNonNeg = true;
+    for (const logistics::TransitOp& op : chosen.transitOps) { opsSum += op.kgDelta; }
+    double stockDelta = 0.0;
+    for (const logistics::TransitStock& st : chosen.transitStock) {
+        stockDelta += st.finalKg - st.initialKg;
+        if (st.finalKg < -1e-9) { stockNonNeg = false; }
+    }
+    check(std::fabs(opsSum - stockDelta) < 1e-6,
+          "所有站内装卸之和 == 期末 − 期初（守恒）");
+    check(stockNonNeg, "任何时刻站内库存不得为负");
+
+    bool traceable = true;
+    for (const logistics::TransitOp& op : chosen.transitOps) {
+        bool hit = false;
+        for (const logistics::Trip& t : chosen.trips) {
+            for (std::size_t k = 0; k < t.nodes.size() && k < t.nodeArrivalMin.size(); ++k) {
+                if (t.nodes[k] == op.nodeId && t.nodeArrivalMin[k] == op.atMin) { hit = true; }
+            }
+        }
+        if (!hit) { traceable = false; }
+    }
+    check(traceable, "每一次站内装卸的 atMin 都必须能追溯到某趟的到达时刻");
+
+    // 就地满足必须**真的**发生：紧急趟在紧急停靠点之前到过 T ⇒ 必须有一条对应该站的出库
+    bool tookFromStation = false;
+    for (const logistics::TransitOp& op : chosen.transitOps) {
+        if (op.kgDelta < -1e-9 && op.nodeId == "T") { tookFromStation = true; }
+    }
+    check(tookFromStation, "本夹具里车上无缓冲 ⇒ 必须从 T 出库才能就地满足");
+
+    // 车上缓冲足够时**不得**再动站内库存（先车上、后站内的顺序）
+    const InsertResult withCar = insertUrgentOrder(
+        g, v, orders, urgent, "D1", 500, WeightType::Distance,
+        std::vector<logistics::OnboardItem>(), 100.0, initialStock);
+    bool anyDraw = false;
+    for (const logistics::TransitOp& op : withCar.plan.transitOps) {
+        if (op.kgDelta < -1e-9) { anyDraw = true; }
+    }
+    check(!anyDraw, "车上缓冲已够时不得再动用站内库存");
+}
+
+// 反例夹具：**站不在路上**。W —D6 直连；W —T 与 T —D6 各 5km（绕路）。
+// 另有一个只能经 T 到达的 D5，用来让生产者把库存攒在 T 上。
+// 这样"就地满足"反而绕远 ⇒ 取优必须**退回现状 A**。
+LogisticsGraph makeOffRouteStationGraph() {
+    LogisticsGraph g;
+    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
+    Node t = makeNode("T", NodeType::Transit, "中转站");
+    t.subNetworkId = 1;
+    g.addNode(t);
+    Node d4 = makeNode("D4", NodeType::Delivery, "客户4");
+    d4.subNetworkId = 1;
+    g.addNode(d4);
+    Node d5 = makeNode("D5", NodeType::Delivery, "客户5");
+    d5.subNetworkId = 1;
+    g.addNode(d5);
+    Node d6 = makeNode("D6", NodeType::Delivery, "客户6");
+    d6.subNetworkId = 1;
+    g.addNode(d6);
+    addTwoWay(g, "W", "D4", 5.0, 10.0, 4.0);
+    addTwoWay(g, "W", "D6", 5.0, 10.0, 4.0);   // D6 **直连仓库** ⇒ T 不在去 D6 的路上
+    addTwoWay(g, "W", "T", 5.0, 10.0, 4.0);
+    addTwoWay(g, "T", "D5", 5.0, 10.0, 4.0);
+    addTwoWay(g, "T", "D6", 5.0, 10.0, 4.0);
+    return g;
+}
+
+void testUrgentBufferChoiceIsNeverWorse() {
+    const LogisticsGraph g = makeOffRouteStationGraph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+    std::vector<Order> orders;
+    orders.push_back(makeOrder("O4", "D4", 60.0, 0, 1440));
+    orders.push_back(makeOrder("O5", "D5", 60.0, 0, 1440));
+
+    const RoutePlan base = planRoute(g, v, orders, WeightType::Distance);
+    std::map<std::string, double> initialStock;
+    double seeded = 0.0;
+    for (const logistics::TransitStock& st : base.transitStock) {
+        initialStock[st.nodeId] = st.finalKg;
+        seeded += st.finalKg;
+    }
+    check(seeded > 1e-9, "反例夹具也应先在 T 上攒到库存，实际 "
+                             + std::to_string(seeded) + "kg");
+
+    // 紧急单打在直连客户 D6 上（车在仓库）：现状 = W->D6->W = 10km；
+    // 经站 = W->T->D6->W = 20km ⇒ 取优必须选现状。
+    const Order urgent = makeOrder("U2", "D6", 10.0, 0, 1440, true);
+    const InsertResult inserted = insertUrgentOrder(
+        g, v, orders, urgent, "W", 480, WeightType::Distance,
+        std::vector<logistics::OnboardItem>(), 0.0, initialStock);
+    const RoutePlan& chosen = inserted.plan;
+    check(chosen.status == PlanStatus::Ok, "反例夹具应当可规划");
+
+    std::vector<Order> all = orders;
+    all.push_back(urgent);
+    const RoutePlan variantA = replan(g, v, all, "W", 480, WeightType::Distance,
+                                      std::vector<logistics::OnboardItem>(), initialStock);
+
+    check(std::fabs(chosen.totalDistanceKm - variantA.totalDistanceKm) < 1e-9,
+          "站不在路上时取优必须退回现状（不得\"有货就用\"）：选中 "
+              + std::to_string(chosen.totalDistanceKm) + "km vs 现状 "
+              + std::to_string(variantA.totalDistanceKm) + "km");
+    check(chosen.totalPenaltyMin <= variantA.totalPenaltyMin,
+          "退回现状后 penalty 也不得变差");
+
+    // 而且**不得**因为"选了现状"却还去扣站内库存
+    bool anyDraw = false;
+    for (const logistics::TransitOp& op : chosen.transitOps) {
+        if (op.kgDelta < -1e-9) { anyDraw = true; }
+    }
+    check(!anyDraw, "没选就地满足时不得记任何站内出库（账要跟方案一致）");
+}
+
 int main() {
     testSingleOrderRouteIsFullyCorrect();
     testEmptyOrdersDegeneratesToNoMovement();
@@ -1024,6 +1224,8 @@ int main() {
     testNodeIndexAtTimeOnEmptyPlanAndClamp();
     testNodeIndexAtTimeIsMonotonicInTime();
     testTransitBufferProducer();
+    testUrgentBufferInPlaceDelivery();
+    testUrgentBufferChoiceIsNeverWorse();
 
     return testutil::summarize("routeplanner_tests");
 }

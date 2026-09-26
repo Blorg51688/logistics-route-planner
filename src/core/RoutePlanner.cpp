@@ -287,6 +287,102 @@ void flatten(RoutePlan& plan, int startTimeMin, double elapsedMin) {
 // 所以"顺路"意味着该站**本来就在序列里**——寄存不新增节点、不改时刻、不改里程。
 // （本项目停靠无服务时间，故距离/耗时/成本/penalty 一个字节都不动。）
 
+// 缓冲库存机制：把**指定的那一张**紧急单的取货点从"仓库"改到"车上缓冲 / 中转站"。
+// `nodeId` 为空 = 不启用（= 候选 A：独立紧急趟先回仓库装货）。
+//
+// 纪律：只换**取货点**。紧急批仍然排在所有普通停靠点之前（E3 优先性不得被取优牺牲），
+// 也不动本趟要送的订单货（不借货）。
+struct UrgentSupply {
+    std::string nodeId;   // 目标紧急单的配送点
+    std::string pickup;   // 取货点；**空串 = 车上已有，不新增节点**
+};
+
+// 把站内装卸按时刻排好。规格要求 transitOps 是"展平后**按时刻**"的序列，
+// 而"趟收尾时记账 + 紧急单取用时补记"两个来源天然会插乱顺序。
+// 手写插入排序：本项目的 STL 口径禁止把算法主体交给标准库（std::sort 不可用）。
+void sortTransitOpsByTime(std::vector<TransitOp>& ops) {
+    for (std::size_t i = 1; i < ops.size(); ++i) {
+        const TransitOp key = ops[i];
+        std::size_t j = i;
+        while (j > 0 && ops[j - 1].atMin > key.atMin) {
+            ops[j] = ops[j - 1];
+            --j;
+        }
+        ops[j] = key;
+    }
+}
+
+// 求某个配送点在候选集里的（**合并后**）需求量。同一配送点上的多张订单会被
+// buildCandidates 合并成同一个停靠点，所以"这一张订单的货量"≠"这个停靠点要送的货量"。
+double candidateDemand(const std::vector<Candidate>& candidates, const std::string& nodeId) {
+    for (const Candidate& c : candidates) {
+        if (c.nodeId == nodeId) {
+            return c.demandKg;
+        }
+    }
+    return 0.0;
+}
+
+// 读取某站当前的库存（不在表里 = 0）
+double stockOf(const std::map<std::string, double>& stock, const std::string& stationId) {
+    const std::map<std::string, double>::const_iterator it = stock.find(stationId);
+    return (it != stock.end()) ? it->second : 0.0;
+}
+
+// 记一次**站内出库**（紧急单就地取用）：扣减期末库存 + 写一条负的 TransitOp。
+//
+// atMin 必须取"车**真的**到过该站"的时刻——从计划自己的节点序列里实读。
+// 读不到就不记账（宁可不记，也不记一条追溯不到的出库：守卫 G3 要求每一次库存变动
+// 都能追溯到某趟的 nodeArrivalMin）。
+bool recordStationDraw(RoutePlan& plan, const std::string& stationId,
+                       const std::string& urgentNodeId, double kg) {
+    if (stationId.empty() || kg <= 1e-9) {
+        return false;
+    }
+    for (const Trip& t : plan.trips) {
+        bool servesUrgent = false;   // 只认"服务了该紧急单的那一趟"
+        for (const Stop& s : t.stops) {
+            if (s.nodeId == urgentNodeId) {
+                servesUrgent = true;
+            }
+        }
+        if (!servesUrgent) {
+            continue;
+        }
+        for (std::size_t k = 0; k < t.nodes.size() && k < t.nodeArrivalMin.size(); ++k) {
+            if (t.nodes[k] != stationId) {
+                continue;
+            }
+            TransitOp op;
+            op.nodeId = stationId;
+            op.kgDelta = -kg;
+            op.atMin = t.nodeArrivalMin[k];
+            plan.transitOps.push_back(op);
+            for (TransitStock& st : plan.transitStock) {
+                if (st.nodeId == stationId && st.finalKg + 1e-9 >= kg) {
+                    st.finalKg -= kg;
+                    return true;
+                }
+            }
+            plan.transitOps.pop_back();   // 库存不够：撤回这条，宁可不记
+            return false;
+        }
+    }
+    return false;
+}
+
+// 求一个配送点所属子网络的中转站（空串 = 无站）
+std::string hubOfNode(const LogisticsGraph& graph,
+                      const std::map<int, std::string>& transitBySub,
+                      const std::string& nodeId) {
+    const Node* n = graph.findNode(nodeId);
+    if (n == nullptr) {
+        return std::string();
+    }
+    const std::map<int, std::string>::const_iterator it = transitBySub.find(n->subNetworkId);
+    return (it != transitBySub.end()) ? it->second : std::string();
+}
+
 // 求一趟停靠点所属的**唯一**簇站。跨簇 / 无站 / 无停靠点 ⇒ 返回空串（不寄存）。
 std::string tripHub(const LogisticsGraph& graph,
                     const std::map<int, std::string>& transitBySub,
@@ -374,7 +470,8 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
                             int startTimeMin,
                             WeightType weight,
                             const std::vector<OnboardItem>& onboard,
-                            const std::map<std::string, double>& initialStock) {
+                            const std::map<std::string, double>& initialStock,
+                            const UrgentSupply& supply) {
     RoutePlan plan;
 
     // 子网络编号 → 该子网络的中转站。配送点按 sub_network_id 归属，
@@ -427,15 +524,29 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
         }
         Trip trip;
         std::string fail;
+        // 缓冲库存机制：若这一批里有"目标紧急单"，它的取货点可以被换成车上缓冲 / 中转站。
+        // 只换**取货点**——批次结构（紧急在先、独立成趟）一律不动。
+        std::string pickupNode = vehicle.startNodeId;
+        bool supplyUsed = false;
+        for (const Candidate& c : batch) {
+            if (!supply.nodeId.empty() && c.nodeId == supply.nodeId) {
+                pickupNode = supply.pickup;
+                supplyUsed = true;
+            }
+        }
         if (!weave(graph, batch, current, elapsed, weight,
-                   vehicle.startNodeId, vehicle.startNodeId, batchLoad, trip, fail)) {
+                   pickupNode, vehicle.startNodeId, batchLoad, trip, fail)) {
             plan.status = PlanStatus::Unreachable;
             plan.reason = fail;
             return plan;
         }
-        // 出仓装满：本批订单之外的载重空位装成**缓冲货**（不属任何订单）
-        fillBufferFromDepot(vehicle, batchLoad, trip);
-        {
+        if (supplyUsed) {
+            // 用缓冲/站内存货就地满足：这一批**不是出仓**（没回仓库装货）
+            // ⇒ 不计缓冲；站内取用由 insertUrgentOrder 在选定方案后记账。
+            trip.bufferKg = 0.0;
+        } else {
+            // 出仓装满：本批订单之外的载重空位装成**缓冲货**（不属任何订单）
+            fillBufferFromDepot(vehicle, batchLoad, trip);
             TransitOp banked;
             if (bankBufferEnRoute(graph, tripHub(graph, transitBySub, trip),
                                   vehicle.startNodeId, weight, trip, &banked)) {
@@ -658,6 +769,7 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
         }
     }
 
+    sortTransitOpsByTime(plan.transitOps);
     flatten(plan, startTimeMin, elapsed);
     return plan;
 }
@@ -675,9 +787,10 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
                         int startTimeMin,
                         WeightType weight,
                         const std::vector<OnboardItem>& onboard,
-                        const std::map<std::string, double>& initialStock) {
+                        const std::map<std::string, double>& initialStock,
+                        const UrgentSupply& supply = UrgentSupply()) {
     return multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
-                             weight, onboard, initialStock);
+                             weight, onboard, initialStock, supply);
 }
 
 } // namespace
@@ -1050,8 +1163,91 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
         }
     }
 
-    result.plan = replan(graph, vehicle, all, currentPositionId, currentTimeMin,
-                         weight, onboard);
+    // ---- 候选 A：现状（独立紧急趟**先回仓库装货**）----
+    const RoutePlan planA = replan(graph, vehicle, all, currentPositionId, currentTimeMin,
+                                   weight, onboard, initialStock);
+
+    // ---- 候选 B：用「车上缓冲 + 该紧急点上属站的库存」就地满足 ----
+    //
+    // 可用条件（规格 §4）：
+    //   avail >= d               -> 取货点 = 车上（不新增节点）
+    //   否则 H 非空且库存够补足（avail + stock[H] >= d） -> 取货点 = H
+    //   否则候选 B 不可用，直接退回 A（连参与取优的资格都没有）。
+    // 只换**取货点**：紧急批仍独立成趟且排在所有普通停靠点之前（E3 优先性不动）。
+    RoutePlan planB;
+    bool        bUsable = false;
+    std::string bPickup;      // 空串 = 车上已有
+    std::string bStation;     // 从哪个站取（空 = 不从站取）
+    double      bTakeKg = 0.0;
+    {
+        std::map<int, std::string> transitBySub;
+        for (const Node& n : graph.nodes()) {
+            if (n.type == NodeType::Transit && n.subNetworkId != 0) {
+                transitBySub[n.subNetworkId] = n.id;
+            }
+        }
+        const std::vector<Candidate> allCandidates = buildCandidates(all);
+        // **用"停靠点的合并需求"，不用"这一张订单的需求"**。
+        // 规格 §4 写的是 `d = 紧急单需求`，但那默认了该配送点只有这一张紧急单；
+        // 若同点还有普通订单，它们会与紧急单合并成同一个停靠点，此时按 10kg 去凑
+        // 会出现"车上只有 10kg 却把这个停靠点的 70kg 送掉"——正是 P25 那类
+        // "车送它没装的货"。按停靠点需求算，物理故事才自洽。
+        const double d = candidateDemand(allCandidates, inserted.nodeId);
+        const std::string hub = hubOfNode(graph, transitBySub, inserted.nodeId);
+        const double avail = (carBufferKg > 0.0) ? carBufferKg : 0.0;
+        const double stock = stockOf(initialStock, hub);
+
+        if (d > 1e-9 && avail >= d - 1e-9) {
+            bUsable = true;                      // 车上缓冲足够，不新增节点
+        } else if (d > 1e-9 && !hub.empty() && stock > 1e-9 && avail + stock >= d - 1e-9) {
+            bUsable = true;
+            bPickup = hub;
+            bStation = hub;
+            bTakeKg = d - avail;
+        }
+
+        // 只有"总需求会走多趟路径"时 B 才有意义：总量不超载时单趟路径本来就不回仓库。
+        if (bUsable && totalDemand(allCandidates) > vehicle.capacityKg + 1e-9) {
+            UrgentSupply supply;
+            supply.nodeId = inserted.nodeId;
+            supply.pickup = bPickup;
+            planB = multiTripPlan(graph, vehicle, allCandidates, currentPositionId,
+                                  currentTimeMin, weight, onboard, initialStock, supply);
+            bUsable = (planB.status == PlanStatus::Ok);
+        } else {
+            bUsable = false;
+        }
+    }
+
+    // ---- 取优：「绝不更差」必须是**构造保证**，不能靠"顺路所以零成本"的推理 ----
+    //   penalty 更差 -> 一票否决，选 A
+    //   否则目标值更小者胜；目标值相同再看趟数；再平选 A（保守）
+    bool chooseB = false;
+    if (bUsable) {
+        const double targetA = (weight == WeightType::Distance) ? planA.totalDistanceKm
+                             : (weight == WeightType::Time)     ? planA.totalTimeMin
+                                                                : planA.totalCostYuan;
+        const double targetB = (weight == WeightType::Distance) ? planB.totalDistanceKm
+                             : (weight == WeightType::Time)     ? planB.totalTimeMin
+                                                                : planB.totalCostYuan;
+        if (planB.totalPenaltyMin > planA.totalPenaltyMin) {
+            chooseB = false;                                          // penalty 一票否决
+        } else if (targetB < targetA - 1e-9) {
+            chooseB = true;
+        } else if (std::fabs(targetB - targetA) <= 1e-9
+                   && planB.trips.size() < planA.trips.size()) {
+            chooseB = true;
+        }
+    }
+
+    result.plan = chooseB ? planB : planA;
+
+    // 守恒的**消费端**：真的从站里取用了才记账，且 atMin 实读自
+    // "服务该紧急单的那一趟"的节点序列（读不到就不记——守卫 G3 要求可追溯）。
+    if (chooseB && !bStation.empty()) {
+        recordStationDraw(result.plan, bStation, inserted.nodeId, bTakeKg);
+    }
+    sortTransitOpsByTime(result.plan.transitOps);
     return result;
 }
 

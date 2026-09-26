@@ -2113,6 +2113,83 @@ int MainWindow::runActionSelfCheck() {
                                                              : std::string()))
                .arg(QString::fromStdString(currentNodeId_)));
 
+    // ⑥（规格 §1 C7）紧急单"就地满足"必须**真的**发生，并打印省下的 km。
+    // 判据读的是规划产物本身（transitOps 里有没有出库、两版距离差多少），
+    // 不是自己把公式重算一遍。
+    {
+        const logistics::RoutePlan base =
+            logistics::planRoute(config_.graph, config_.vehicles.front(), config_.orders,
+                                 logistics::WeightType::Distance);
+        std::map<std::string, double> stock;
+        double seeded = 0.0;
+        for (const logistics::TransitStock& st : base.transitStock) {
+            stock[st.nodeId] = st.finalKg;
+            seeded += st.finalKg;
+        }
+        expect(seeded > 1e-9,
+               QStringLiteral("（前置）默认数据上生产者应先攒到站内库存，实际 %1kg")
+                   .arg(seeded, 0, 'f', 1));
+
+        const char* positions[] = {"W02", "T01", "T02", "T03"};
+        const char* targets[] = {"D05", "D06", "D09", "D10", "D11", "D13", "D17", "D25"};
+        bool happened = false;
+        QString detail;
+        for (const char* pos : positions) {
+            if (happened) {
+                break;
+            }
+            for (const char* tgt : targets) {
+                if (std::string(pos) == std::string(tgt)) {
+                    continue;
+                }
+                logistics::Order urgent;
+                urgent.id = "UCHECK";
+                urgent.nodeId = tgt;
+                urgent.demandKg = 6.0;
+                urgent.windowStartMin = 0;
+                urgent.windowEndMin = 1440;
+                urgent.urgent = true;
+
+                const logistics::InsertResult r = logistics::insertUrgentOrder(
+                    config_.graph, config_.vehicles.front(), config_.orders, urgent, pos, 600,
+                    logistics::WeightType::Distance,
+                    std::vector<logistics::OnboardItem>(), 0.0, stock);
+
+                std::vector<logistics::Order> all = config_.orders;
+                all.push_back(urgent);
+                const logistics::RoutePlan variantA = logistics::replan(
+                    config_.graph, config_.vehicles.front(), all, pos, 600,
+                    logistics::WeightType::Distance,
+                    std::vector<logistics::OnboardItem>(), stock);
+
+                bool drew = false;
+                for (const logistics::TransitOp& op : r.plan.transitOps) {
+                    if (op.kgDelta < -1e-9) {
+                        drew = true;
+                    }
+                }
+                const double saved = variantA.totalDistanceKm - r.plan.totalDistanceKm;
+                if (drew && saved > 1e-9) {
+                    detail = QStringLiteral("车在 %1 -> 紧急单 %2：现状 %3km，就地满足 %4km，"
+                                            "省 %5km（并记 1 次站内出库）")
+                                 .arg(pos)
+                                 .arg(tgt)
+                                 .arg(variantA.totalDistanceKm, 0, 'f', 1)
+                                 .arg(r.plan.totalDistanceKm, 0, 'f', 1)
+                                 .arg(saved, 0, 'f', 1);
+                    happened = true;
+                    break;
+                }
+            }
+        }
+        expect(happened,
+               QStringLiteral("至少发生 1 次紧急单就地满足（车上缓冲 + 站内库存）并省下里程"));
+        if (happened) {
+            // 单独打一行，便于肉眼与 grep 核对（C7 要求"打印省下的 km"）
+            std::printf("[self-check] --  紧急单就地满足：%s\n", detail.toUtf8().constData());
+        }
+    }
+
     std::printf("[self-check] %s（失败 %d 项）\n",
                 failures == 0 ? "全部通过" : "存在失败", failures);
     return failures;
