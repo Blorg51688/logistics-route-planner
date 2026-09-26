@@ -98,6 +98,10 @@ public:
     QString transitPanelSummary() const;
     // 停靠明细面板的文本快照（供 --ui-probe）
     QString stopPanelSummary() const;
+    // 停靠明细面板**真实表头**（供 --ui-probe 校验表头与数据不错位）。
+    // 守卫必须读界面上真正的列名，而不是把预期列表再背一遍——本项目
+    // 正是因此漏过"表头 7 列、数据只填 6 列"的错位。
+    QStringList stopPanelHeaders() const;
     // 工具栏动作名与面板标题（供 --ui-probe，供向导检查器比对）
     QString toolbarActionTexts() const;
     QString dockTitles() const;

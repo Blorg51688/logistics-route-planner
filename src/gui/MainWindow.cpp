@@ -191,17 +191,19 @@ void MainWindow::buildDocks() {
     transitDock->setWidget(transitTable_);
     addDockWidget(Qt::RightDockWidgetArea, transitDock);
 
-    // 停靠明细：把每个停靠点的原始到达/等待/送达/离开/剩余载重摊开。
+    // 停靠明细：把每个停靠点的原始到达/等待/送达/送后余载摊开。
+    // （"离开"列已随服务时间一并删除：服务时间移除后「离开 == 送达」是恒等式，
+    //   再单列一列只会与"送达"重复，见 docs/设计.md §16 P-history 与 §4.6。）
     // 这些字段是设计 §4.6 明确要求记录的，此前只有测试在读、界面上看不到；
     // 报告要求【需求分析】⑵ 也要求呈现"到达时间"，而"等待"能解释早到的影响。
     auto* stopDock = new QDockWidget(QStringLiteral("停靠明细"), this);
     stopDock->setMinimumWidth(360);
     // 列里必须有「趟」：停靠明细是**跨趟拉平**的，不加这一列的话
     // "剩余载重"会从 0 跳回几十公斤，看起来像数据错了，其实是新的一趟开始装货。
-    stopTable_ = new QTableWidget(0, 7, stopDock);
+    stopTable_ = new QTableWidget(0, 6, stopDock);
     stopTable_->setHorizontalHeaderLabels(
         {QStringLiteral("趟"), QStringLiteral("配送点"), QStringLiteral("原始到达"),
-         QStringLiteral("等待(分)"), QStringLiteral("送达"), QStringLiteral("离开"),
+         QStringLiteral("等待(分)"), QStringLiteral("送达"),
          QStringLiteral("送后余载(kg)")});
     stopTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     stopTable_->horizontalHeader()->setStretchLastSection(true);
@@ -1289,6 +1291,15 @@ QString MainWindow::stopPanelSummary() const {
             cells << (item != nullptr ? item->text() : QString());
         }
         out += cells.join(QStringLiteral(" | ")) + QLatin1Char('\n');
+    }
+    return out;
+}
+
+QStringList MainWindow::stopPanelHeaders() const {
+    QStringList out;
+    for (int col = 0; col < stopTable_->columnCount(); ++col) {
+        const QTableWidgetItem* item = stopTable_->horizontalHeaderItem(col);
+        out << (item != nullptr ? item->text() : QString());
     }
     return out;
 }

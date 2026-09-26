@@ -74,4 +74,4 @@ bash 人工测试向导.sh              # 8 关人工测试向导（需要真实
   `entry-points`（根目录入口结构）、`build-gotchas`（构建坑）、`test-targets`（17/18 双层口径）、
   `commit-policy`（提交/推送授权与边界）。
 - `.omd/notepad.md` 的 **priority 区**（脚本安全教训：路径归属判定、`rm -rf` 穿透符号链接等）。
-- `docs/设计.md` §16（P0–P31 开发史，含每个真实缺陷的根因与修法）、`.omd/handoffs/`（历次阶段交接）。
+- `docs/设计.md` §16（P0–P32 开发史，含每个真实缺陷的根因与修法）、`.omd/handoffs/`（历次阶段交接）。

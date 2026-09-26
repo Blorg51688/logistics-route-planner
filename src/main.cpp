@@ -387,6 +387,46 @@ int main(int argc, char** argv) {
             for (int i = 0; i < lines.size() && i < 3; ++i) {
                 std::printf("[ui-probe]   %s\n", lines[i].toUtf8().constData());
             }
+            // 表头守卫：停靠明细必须恰好 6 列、列名与数据字段一一对应。
+            // 此前服务时间移除时只改了数据填充、漏改表头，于是表头 7 列而数据
+            // 只填 6 列——"离开"下挂着剩余载重、"送后余载(kg)"整列空白。
+            // 这类错位只有读**真实表头**才看得见：旧 printf 只是硬编码描述，不校验。
+            {
+                const QStringList headers = window.stopPanelHeaders();
+                const QStringList expect{
+                    QStringLiteral("趟"),   QStringLiteral("配送点"),
+                    QStringLiteral("原始到达"), QStringLiteral("等待(分)"),
+                    QStringLiteral("送达"), QStringLiteral("送后余载(kg)")};
+                if (headers != expect) {
+                    std::fprintf(stderr,
+                                 "[ui-probe] 停靠明细表头不符：实际 [%s]，预期 [%s]\n",
+                                 headers.join(QStringLiteral(" | ")).toUtf8().constData(),
+                                 expect.join(QStringLiteral(" | ")).toUtf8().constData());
+                    return 1;
+                }
+                // 每一行的单元格数必须等于表头列数，且不得有空白单元格：
+                // "用户看得到的表"里不该出现空列或列名与内容对不上的格子。
+                for (const QString& line : lines) {
+                    const QStringList cells = line.split(QStringLiteral(" | "));
+                    if (cells.size() != headers.size()) {
+                        std::fprintf(stderr,
+                                     "[ui-probe] 停靠明细行列数 %d != 表头列数 %d：%s\n",
+                                     int(cells.size()), int(headers.size()),
+                                     line.toUtf8().constData());
+                        return 1;
+                    }
+                    for (const QString& c : cells) {
+                        if (c.isEmpty()) {
+                            std::fprintf(stderr,
+                                         "[ui-probe] 停靠明细出现空白单元格：%s\n",
+                                         line.toUtf8().constData());
+                            return 1;
+                        }
+                    }
+                }
+                std::printf("[ui-probe] 停靠明细表头 6 列且每行 %d 格非空\n",
+                            int(headers.size()));
+            }
             // 每一行的第一列都必须是「第 N」：趟号映射一旦坏掉，
             // 停靠明细里"余载从 0 跳回几十"就会重新变成看不懂的数字。
             const QRegularExpression tripCell(QStringLiteral("^第 ([0-9]+) \\|"));
