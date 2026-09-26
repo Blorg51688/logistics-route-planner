@@ -73,7 +73,7 @@ void usage() {
         "用法: app [选项]\n"
         "  --config PATH              配置文件（默认内置 config/default.ini）\n"
         "  --weight distance|time|cost  权重标签显示的维度（默认 distance）\n"
-        "  --plan distance|cost       规划并高亮该策略的路线\n"
+        "  --plan distance|time|cost  规划并高亮该策略的路线\n"
         "  --labels all|route         权重标签显示全部边还是仅高亮路线（默认 route）\n"
         "  --render PATH.png          离屏渲染图形场景成 PNG 后退出\n"
         "  --render-window PATH.png   离屏渲染完整窗口（工具栏+侧栏）成 PNG 后退出\n"
@@ -82,7 +82,7 @@ void usage() {
         "  --dump-graph [list|matrix|both]  输出邻接表 / 邻接矩阵后退出（B3）\n"
         "  --ui-probe                 检查工具栏与侧栏是否完整构造后退出\n"
         "  --self-check-actions       自动验证插单不丢单 / 新客户会被配送后退出\n"
-        "  --plan-summary distance|cost  打印该策略的规划汇总后退出（供人工测试核对）\n"
+        "  --plan-summary distance|time|cost  打印该策略的规划汇总后退出（供人工测试核对）\n"
         "  --width N --height N       窗口/图像尺寸\n");
 }
 

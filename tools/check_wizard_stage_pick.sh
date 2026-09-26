@@ -74,7 +74,112 @@ if (( n_funcs != ${#STAGE_NAMES[@]} )); then
     fail=1
 fi
 
+if [[ "$TOTAL_STAGES" != "${#STAGE_NAMES[@]}" ]]; then
+    echo "FAIL  总关数 TOTAL_STAGES=$TOTAL_STAGES 与注册表 ${#STAGE_NAMES[@]} 关不一致"
+    fail=1
+fi
+
+# ---------------------------------------------------------------------------
+# 记录忠实性：声称覆盖的关数必须等于用户真正看到的表格行数。
+#
+# 缺陷背景：write_record 曾用硬编码总关数写"共 8 关"，且只要 FAIL==0 且
+# SKIP==0 就无条件打印"全部关卡通过"。于是 --only 单关模式实际只跑 1 关，
+# 产出的 docs/人工测试记录.md（要交给教师当证据）却写着"共 8 关 / 全部关卡通过"。
+#
+# 这里直接构造 RESULTS_* 驱动 write_record 落临时文件，再**读回这份用户可见的
+# 记录**做断言——不重算脚本内部的公式，防止守卫只验证"我以为的算法"。
+# ---------------------------------------------------------------------------
+
+reset_results() {
+    RESULTS_NAME=(); RESULTS_STATE=(); RESULTS_NOTE=()
+    PASS=0; FAIL=0; SKIP=0; ONLY_STAGE=""
+}
+
+# 用户可见表格的数据行数：表头与分隔行不算
+record_rows() { grep -cE '^\| [0-9]+ \|' "$1"; }
+# 用户可见的"本次执行 N 关"声明值；没有该字样的旧格式返回空
+record_declared_executed() {
+    sed -n 's/.*本次执行 \([0-9][0-9]*\) 关.*/\1/p' "$1" | head -1
+}
+
+live_commit="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo '未知')"
+
+check_declared_matches_rows() {  # check_declared_matches_rows <记录文件> <标签>
+    local rec="$1" tag="$2" declared rows
+    declared="$(record_declared_executed "$rec")"
+    rows="$(record_rows "$rec")"
+    if [[ -z "$declared" ]]; then
+        echo "FAIL  $tag 记录里没有「本次执行 N 关」字样（旧格式？）：$(grep -m1 "^- 结果" "$rec")"
+        fail=1
+        return
+    fi
+    if [[ "$declared" != "$rows" ]]; then
+        echo "FAIL  $tag 记录声称「本次执行 ${declared} 关」，但表格只有 ${rows} 行"
+        fail=1
+    fi
+}
+
+# 场景 A：单关模式（--only 第 7 关），实际只执行 1 关 -> 绝不得说"全部关卡通过"
+reset_results
+RECORD="$(mktemp)"
+ONLY_STAGE="${STAGE_NAMES[6]}"
+RESULTS_NAME+=("$ONLY_STAGE"); RESULTS_STATE+=("通过"); RESULTS_NOTE+=(""); PASS=1
+write_record
+if grep -q "全部关卡通过" "$RECORD"; then
+    echo "FAIL  单关模式（实际执行 1 关）的记录仍声称「全部关卡通过」——字面误导"
+    fail=1
+fi
+if ! grep -q "本次仅执行第 7 关（${ONLY_STAGE}）" "$RECORD"; then
+    echo "FAIL  单关模式记录未写明「本次仅执行第 7 关（${ONLY_STAGE}）」"
+    echo "      实际：$(sed -n '5p' "$RECORD")"
+    fail=1
+fi
+if ! grep -qF -- "- 提交：$live_commit" "$RECORD"; then
+    echo "FAIL  记录里的「提交」不是现场 git rev-parse 的 $live_commit"
+    fail=1
+fi
+check_declared_matches_rows "$RECORD" "单关模式"
+rm -f "$RECORD"
+
+# 场景 B：全量模式，实际执行关数 == 总关数 -> 必须仍然说"全部关卡通过"
+reset_results
+RECORD="$(mktemp)"
+for n in "${STAGE_NAMES[@]}"; do
+    RESULTS_NAME+=("$n"); RESULTS_STATE+=("通过"); RESULTS_NOTE+=("")
+done
+PASS=${#STAGE_NAMES[@]}
+write_record
+if ! grep -q "全部关卡通过" "$RECORD"; then
+    echo "FAIL  全量模式（跑满 ${#STAGE_NAMES[@]} 关）的记录不再说「全部关卡通过」——正常路径被改坏"
+    fail=1
+fi
+if [[ "$(record_declared_executed "$RECORD")" != "${#STAGE_NAMES[@]}" ]]; then
+    echo "FAIL  全量模式记录未声称「本次执行 ${#STAGE_NAMES[@]} 关」"
+    fail=1
+fi
+check_declared_matches_rows "$RECORD" "全量模式"
+rm -f "$RECORD"
+
+# 场景 C：非单关的中途中断（执行 3 关就落盘）也不得说"全部关卡通过"
+reset_results
+RECORD="$(mktemp)"
+for i in 0 1 2; do
+    RESULTS_NAME+=("${STAGE_NAMES[$i]}"); RESULTS_STATE+=("通过"); RESULTS_NOTE+=("")
+done
+PASS=3
+write_record
+if grep -q "全部关卡通过" "$RECORD"; then
+    echo "FAIL  只执行 3/$((${#STAGE_NAMES[@]})) 关的记录仍声称「全部关卡通过」"
+    fail=1
+fi
+check_declared_matches_rows "$RECORD" "部分执行"
+rm -f "$RECORD"
+
+# 清空结果数组，避免 EXIT trap 里的 cleanup 又写一份记录
+reset_results
+RECORD=""
+
 if [[ "$fail" -eq 0 ]]; then
-    echo "check_wizard_stage_pick: 关卡选择逻辑正常（共 ${#STAGE_NAMES[@]} 关）"
+    echo "check_wizard_stage_pick: 关卡选择逻辑与记录覆盖声明正常（共 ${#STAGE_NAMES[@]} 关）"
 fi
 exit "$fail"

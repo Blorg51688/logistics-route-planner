@@ -179,7 +179,6 @@ private:
     QComboBox*     weightBox_ = nullptr;
     // Debug 模拟间隔固定 1 秒（用户要求删掉速度选择卡片以节约工具栏空间）
     int            debugIntervalMs_ = 1000;
-    // 各中转站的当前存货（跨重规划延续）
 
     // ---- 重规划必须继承的"既定事实" ----
     //

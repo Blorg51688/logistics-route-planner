@@ -274,9 +274,8 @@ void flatten(RoutePlan& plan, int startTimeMin, double elapsedMin) {
     plan.totalTimeMin = elapsedMin - static_cast<double>(startTimeMin);
 }
 
-// 多趟 + 中转集散（设计 §5.6）。仅在总需求超过载重上限时进入。
-// 多趟规划的实际实现：分簇 -> 按载重分批 -> 每批一趟。中转站不参与排线。
-// （用于生成"直达"对照版本）。
+// 多趟分批（设计 §5.6）。仅在总需求超过载重上限时进入。
+// 实际实现：分簇 -> 按载重分批 -> 每批一趟。中转站不参与排线。
 RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
                             const Vehicle& vehicle,
                             const std::vector<Candidate>& candidates,
@@ -353,7 +352,7 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
     //
     // 顺序：紧急订单 -> 在途货 -> 其余按簇分批。
     //   · 紧急订单必须最先（E3）；它的货不在车上，车得先回仓库取，
-    //     而这正是"顺路寄存"发生的时机——在途货会被卸在回程路径上的站里。
+    //     因此车必须回仓库取货（"顺路寄存"机制已移除，见设计 §16 P25/P30）。
     //   · 紧急批次之后才轮到在途货：它们已经在车上，从**当前位置**直接出发
     //     即可，不必跑一趟仓库。
     // 这一步不能省：若规划器对在途货一无所知，它会按"货物都在仓库"来排线，
@@ -443,7 +442,7 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
         }
     }
 
-    // 期初存货：站里本来就有货时，才可能把它当前置仓库用
+    // 逐簇处理：下面按载重上限分批，不再有"动用中转站"的分支。
 
     for (std::size_t h = 0; h < hubOrder.size(); ++h) {
         const std::string hub = hubOrder[h];
@@ -451,20 +450,11 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
         const double clusterTotal = totalDemand(pool);
         std::string fail;
 
-        // 是否动用中转站：**只有站内确实有存货时才考虑**。
-        //
-        // 这是用户第 9 轮定的原则："一切决策都不应该为了满足某种策略的前提条件
-        // 而去实际执行更差的策略。" 实验（设计 §16 P12）证明：让每个簇都强行经站，
-        // 在单车辆模型下比直达分批全面更差（198.2 vs 178.2km、13 趟 vs 6 趟）。
-        // 中转站初始无存货，因此默认数据一律走下面的直达分批。
-        //
-        // 站内存货来自"即将带回仓库的余货顺路寄存"（前置储存点机制，见 §16 P13）。
-        // 在那一机制落地之前，stock 恒为 0，此分支不会进入。
-        // 中转站**不参与路由**。
-        // 中转站**不参与排线**：实测让它参与全面更差（198.2km/13 趟 vs 直达
-        // 178.2km/6 趟），且车一停在站里就会排出「站 -> 仓库 -> 站」的补货趟，
-        // 造成车在仓库附近来回跳。它只作为节点类型与子网络标识存在。
-        // （原先那条"经中转站"的实现已随本轮代码整理删除。）
+        // 中转站不参与路由，也不参与排线：实测让它参与全面更差
+        // （198.2km/13 趟 vs 直达 178.2km/6 趟），且车一停在站里就会排出
+        // 「站 -> 仓库 -> 站」的补货趟，造成车在仓库附近来回跳。
+        // 它只作为节点类型与子网络标识存在；原先那条"经中转站"的实现
+        // 已随代码整理删除（设计 §16 P25/P30）。
         // 不经中转站：按载重上限分批，每批一趟直接从仓库出发送达后返回。
         // （簇总货量不超过载重时，这里天然只跑一趟，与单趟路径等价。）
         while (!pool.empty()) {
@@ -524,16 +514,6 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
     return plan;
 }
 
-// 多趟规划入口。
-//
-// 三件事，按顺序：
-//   ① **顺路寄存**：在途货里那些"车本次要回仓库、于是会白带一趟"的部分，
-//      若它所属簇的中转站就在回程路径上，就顺手卸在站里——**零成本**，
-//      只是把那部分货从"跟着车白跑"变成"站里的期初存货"。
-//      安全约束（用户第 10 轮确认）：只卸在**回程路径上的站**，且**必须属于
-//      该站所服务的簇**；不满足就原样带回去，绝不为了寄存而绕路。
-//   ② 算两版：一版完全不许用中转站（直达），一版允许把中转站当前置仓库用。
-//   ③ 取更优者（用站版 penalty 更差则一票否决），使"绝不更差"成为构造保证。
 // 多趟规划入口：把所有剩余订单排成若干趟。
 //
 // 历史上这里做过"直达 vs 经中转站"两版取优（先把"中转站绝不使结果更差"变成
@@ -572,7 +552,7 @@ RoutePlan replan(const LogisticsGraph& graph,
     const double total = totalDemand(remaining);
 
     if (total > vehicle.capacityKg + 1e-9) {
-        // 总需求超过载重：改走多趟 + 中转集散（D21），不再判为不可行
+        // 总需求超过载重：改走多趟分批（D21），不再判为不可行
         return multiTripPlan(graph, vehicle, remaining, currentPositionId, currentTimeMin,
                              weight, onboard);
     }

@@ -24,7 +24,9 @@ cd "$ROOT" || exit 1
 
 RECORD="docs/人工测试记录.md"
 APP="./build/app"
-TOTAL_STAGES=8
+# 总关数由关卡注册表长度决定（见下方 STAGE_NAMES 之后），不写死数字，
+# 避免"改了注册表却忘了改总数"。
+TOTAL_STAGES=0
 STAGE=0
 APP_PID=""
 
@@ -174,23 +176,34 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 write_record() {
-    local stamp commit
+    local stamp commit executed
     stamp="$(date '+%Y-%m-%d %H:%M')"
     commit="$(git rev-parse --short HEAD 2>/dev/null || echo '未知')"
+    # 本次**实际执行**的关数 = 表里真实有几行，而不是脚本总关数。
+    # 单关模式（--only）只跑 1 关，此前却按总关数写"共 8 关 / 全部关卡通过"，
+    # 让这份交给教师当测试证据的文件字面误导。
+    executed=${#RESULTS_NAME[@]}
 
     mkdir -p "$(dirname "$RECORD")"
     {
         printf '# 人工测试记录\n\n'
         printf -- '- 时间：%s\n' "$stamp"
         printf -- '- 提交：%s\n' "$commit"
-        printf -- '- 结果：**通过 %d / 失败 %d / 跳过 %d**（共 %d 关）\n\n' \
-               "$PASS" "$FAIL" "$SKIP" "$TOTAL_STAGES"
-        if [[ "$FAIL" -eq 0 && "$SKIP" -eq 0 ]]; then
-            printf -- '> 全部关卡通过。\n\n'
-        elif [[ "$FAIL" -eq 0 ]]; then
-            printf -- '> 无失败，但有 %d 关被跳过。\n\n' "$SKIP"
-        else
+        printf -- '- 结果：**通过 %d / 失败 %d / 跳过 %d**（本次执行 %d 关；脚本共 %d 关）\n\n' \
+               "$PASS" "$FAIL" "$SKIP" "$executed" "$TOTAL_STAGES"
+        if [[ "$FAIL" -gt 0 ]]; then
             printf -- '> **存在失败关卡，需修复后重测。**\n\n'
+        elif [[ "$SKIP" -gt 0 ]]; then
+            printf -- '> 无失败，但有 %d 关被跳过。\n\n' "$SKIP"
+        elif [[ "$executed" -eq "$TOTAL_STAGES" ]]; then
+            # 只有本次真的跑满全部关卡，才配说"全部关卡通过"
+            printf -- '> 全部关卡通过。\n\n'
+        elif [[ -n "$ONLY_STAGE" && "$executed" -eq 1 ]]; then
+            printf -- '> 本次仅执行第 %d 关（%s），其余 %d 关未验证。\n\n' \
+                   "$(stage_number_of "$ONLY_STAGE")" "$ONLY_STAGE" "$((TOTAL_STAGES - 1))"
+        else
+            printf -- '> 本次仅执行 %d 关（共 %d 关），其余 %d 关未验证。\n\n' \
+                   "$executed" "$TOTAL_STAGES" "$((TOTAL_STAGES - executed))"
         fi
         printf '| # | 关卡 | 结果 | 备注 |\n|---|---|---|---|\n'
         local i
@@ -242,9 +255,21 @@ ONLY_STAGE=""
     STAGE_NAMES+=("Debug 模式（A1）")
     STAGE_NAMES+=("边界：制造不可行场景")
 
+TOTAL_STAGES=${#STAGE_NAMES[@]}
+
 # 当前这一关是否被选中（未指定 ONLY_STAGE 时全选）
 stage_wanted() {
     [[ -z "$ONLY_STAGE" || "$ONLY_STAGE" == "$1" ]]
+}
+
+# 关卡名 -> 第几关（1 起）。记录里写"本次仅执行第 N 关"要用。
+stage_number_of() {
+    local i=0 n
+    for n in "${STAGE_NAMES[@]}"; do
+        i=$((i + 1))
+        [[ "$n" == "$1" ]] && { echo "$i"; return 0; }
+    done
+    return 1
 }
 
 # 列出所有关卡名，供 --list 与输入错误时提示
