@@ -16,12 +16,17 @@ APP = os.path.join(ROOT, "build", "app")
 # 这些「」不是界面元素（是概念、状态或对话框内的字段说明），不参与比对
 WHITELIST = {
     "不可行", "规划策略", "权重标签", "手工增删", "模拟路况", "插入紧急订单", "模拟新客户",
-    "模拟道路封闭", "推进一站", "重新规划", "图表示", "Debug 模式",
+    "模拟道路封闭", "推进一站", "重新规划", "图表示",
     "节点 ID（删除用）", "节点 ID", "起点/终点 ID", "添加边", "删除边", "删除节点",
     "中转站 / 集散", "停靠明细", "超时订单", "订单列表", "路线信息", "车辆信息",
     "最短距离策略", "最低耗时策略", "最低成本策略", "显示距离", "显示耗时", "显示成本",
     "规划成功", "送达", "经过",
 }
+
+# 上面的 WHITELIST 是**豁免比对**名单（写进去 = 不查它）。所以「按站模拟」等
+# 模拟按钮**刻意不放进 WHITELIST**，改由这里显式断言"必须真实存在"——
+# 否则向导让用户点的按钮哪怕改名/被删也查不出来（本文件的存在理由）。
+REQUIRED_UI_ACTIONS = ("按站模拟", "按时间模拟", "推进一刻")
 
 
 def probe():
@@ -67,14 +72,25 @@ def main():
                 continue
             bad.append((lineno, name))
 
-    if bad:
-        print("check_wizard_ui_names: %d 处向导提到的界面元素并不存在：" % len(bad))
-        for lineno, name in bad:
-            print("  manual_test_wizard.sh:%d  「%s」" % (lineno, name))
+    missing = [n for n in REQUIRED_UI_ACTIONS
+               if not (n in actions or any(n in a for a in actions))]
+
+    if bad or missing:
+        if bad:
+            print("check_wizard_ui_names: %d 处向导提到的界面元素并不存在：" % len(bad))
+            for lineno, name in bad:
+                print("  manual_test_wizard.sh:%d  「%s」" % (lineno, name))
+        if missing:
+            print("check_wizard_ui_names: 向导让用户点击的模拟按钮在界面里不存在（%d 个）："
+                  % len(missing))
+            for name in missing:
+                print("  「%s」" % name)
         print("  实际动作: " + " | ".join(sorted(actions)))
         print("  实际面板: " + " | ".join(sorted(docks)))
         sys.exit(1)
-    print("check_wizard_ui_names: 向导提到的 %d 处界面元素都真实存在" % checked)
+    print("check_wizard_ui_names: 向导提到的 %d 处界面元素都真实存在；"
+          "%d 个模拟按钮（%s）齐备"
+          % (checked, len(REQUIRED_UI_ACTIONS), " / ".join(REQUIRED_UI_ACTIONS)))
 
 
 if __name__ == "__main__":

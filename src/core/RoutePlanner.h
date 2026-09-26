@@ -161,4 +161,20 @@ bool isEdgeOnRoute(const std::vector<std::string>& routeNodes,
                    const std::string& fromId,
                    const std::string& toId);
 
+// 软件内时刻 timeMin 时，车辆恰好已到达的**最后一个节点下标**：
+// 即最大的 i 使 plan.nodeArrivalMin[i] <= timeMin；若没有任何节点满足则返回 0。
+//
+// **这个函数的语义就是「半路显示所在段的起点」**：车在 i -> i+1 途中时，返回 i。
+// 例：A -> B -> C 都已过、正驶向 D，则停在 C —— 显示的就是 C（段的起点），
+// 而不是"还没到的 D"，也不是"已经离开的 B"。
+//
+// 边界：
+//   - 早于首节点到达时刻      -> 0（车停在起点）
+//   - 恰等于某节点到达时刻    -> 返回该节点下标（"恰好已到达"算作到了）
+//   - 落在两节点之间          -> 返回**前一个**节点下标（段起点）
+//   - 超过末节点到达时刻      -> 末节点下标
+//   - plan.nodes 为空         -> 返回 0（下标无法有意义，**调用方需自行判空**）
+// 下标一律 clamp 到 [0, nodes.size()-1]。
+std::size_t nodeIndexAtTime(const RoutePlan& plan, int timeMin);
+
 } // namespace logistics

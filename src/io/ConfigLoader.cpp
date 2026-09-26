@@ -102,11 +102,20 @@ bool loadGeneral(const IniFile& ini, GeneralConfig& out, std::string& error) {
         double*     target;
     };
     const Binder binders[] = {
-        {"traffic_change_interval_sec", &out.trafficChangeIntervalSec},
         {"traffic_change_ratio", &out.trafficChangeRatio},
         {"traffic_time_increase_min", &out.trafficTimeIncreaseMin},
         {"traffic_time_increase_max", &out.trafficTimeIncreaseMax},
-        {"urgent_order_interval_sec", &out.urgentOrderIntervalSec},
+    };
+    struct IntBinder {
+        const char* key;
+        int*        target;
+    };
+    const IntBinder intBinders[] = {
+        {"event_interval_min", &out.eventIntervalMin},
+        {"event_weight_traffic", &out.eventWeightTraffic},
+        {"event_weight_urgent", &out.eventWeightUrgent},
+        {"event_weight_customer", &out.eventWeightCustomer},
+        {"event_weight_closure", &out.eventWeightClosure},
     };
     for (const Binder& b : binders) {
         const IniRecord* rec = sec->findValue(b.key);
@@ -116,6 +125,18 @@ bool loadGeneral(const IniFile& ini, GeneralConfig& out, std::string& error) {
         double value = 0.0;
         if (!parseDouble(rec->value, value)) {
             fail(error, rec->lineNo, "general", std::string(b.key) + " 不是合法数值: " + rec->value);
+            return false;
+        }
+        *b.target = value;
+    }
+    for (const IntBinder& b : intBinders) {
+        const IniRecord* rec = sec->findValue(b.key);
+        if (rec == nullptr) {
+            continue;
+        }
+        int value = 0;
+        if (!parseInt(rec->value, value)) {
+            fail(error, rec->lineNo, "general", std::string(b.key) + " 不是合法整数: " + rec->value);
             return false;
         }
         *b.target = value;

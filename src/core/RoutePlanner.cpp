@@ -818,6 +818,36 @@ bool isEdgeOnRoute(const std::vector<std::string>& routeNodes,
     return false;
 }
 
+std::size_t nodeIndexAtTime(const RoutePlan& plan, int timeMin) {
+    if (plan.nodes.empty()) {
+        return 0;   // 没有节点时下标无意义，按契约返回 0（调用方需自行判空）
+    }
+
+    // **语义 = 「半路显示所在段的起点」**：取最大的 i 使 nodeArrivalMin[i] <= timeMin。
+    // 车在 i -> i+1 途中时，最后一个已到达的节点就是 i，显示 i 即段的起点。
+    // 不依赖"到达时刻单调不减"这一前提（虽然它成立），全表扫描取**最后一个**满足者，
+    // 这样即使上游给了非单调的序列，返回值仍严格符合上面的字面定义。
+    const std::size_t n = plan.nodeArrivalMin.size() < plan.nodes.size()
+                              ? plan.nodeArrivalMin.size()
+                              : plan.nodes.size();
+    std::size_t best = 0;
+    bool found = false;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (plan.nodeArrivalMin[i] <= timeMin) {
+            best = i;
+            found = true;
+        }
+    }
+    if (!found) {
+        return 0;   // 早于首节点到达时刻：车还在起点
+    }
+    // 下标一律 clamp 到 [0, nodes.size()-1]
+    if (best >= plan.nodes.size()) {
+        best = plan.nodes.size() - 1;
+    }
+    return best;
+}
+
 RoutePlan planRoute(const LogisticsGraph& graph,
                     const Vehicle& vehicle,
                     const std::vector<Order>& orders,

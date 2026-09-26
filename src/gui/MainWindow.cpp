@@ -1,11 +1,15 @@
 #include "gui/MainWindow.h"
 
+#include "core/SimEvent.h"
+
 #include <QAction>
+#include <QActionGroup>
 #include <QPainter>
 #include <QComboBox>
 #include <QDialog>
 #include <QDir>
 #include <QScreen>
+#include <QSignalBlocker>
 #include <QFileInfo>
 #include <QDialogButtonBox>
 #include <QFormLayout>
@@ -30,6 +34,7 @@
 #include <QToolBar>
 
 #include <algorithm>
+#include <memory>
 #include <cstdio>
 #include <cstdio>
 #include <cmath>
@@ -87,6 +92,12 @@ MainWindow::MainWindow(Config config, QWidget* parent)
         state_.tripNumber = 1;
     }
 
+    // 事件刻：绝对时刻对齐（08:00 = 480 是 15 的整数倍，故首个事件落在 08:15）。
+    // 事件只由软件内时钟驱动，见 settleEventsUpTo。
+    const int eventInterval = config_.general.eventIntervalMin > 0
+                                  ? config_.general.eventIntervalMin : 15;
+    nextEventMark_ = logistics::nextEventTimeMin(state_.atTimeMin, eventInterval);
+
     buildActions();
     buildDocks();
 
@@ -126,25 +137,29 @@ void MainWindow::buildActions() {
     bar->addAction(QStringLiteral("模拟道路封闭"), this, &MainWindow::onCloseRandomRoad);
     bar->addSeparator();
     bar->addAction(QStringLiteral("推进一站"), this, &MainWindow::onAdvanceStop);
+    bar->addAction(QStringLiteral("推进一刻"), this, &MainWindow::onAdvanceMoment);
     bar->addAction(QStringLiteral("重新规划"), this, &MainWindow::onReplan);
     bar->addAction(QStringLiteral("手工增删…"), this, &MainWindow::onManualEdit);
     bar->addAction(QStringLiteral("图表示…"), this, &MainWindow::onShowGraphTables);
 
-    QAction* debugAction = bar->addAction(QStringLiteral("Debug 模式"));
-    debugAction->setCheckable(true);
-    connect(debugAction, &QAction::toggled, this, &MainWindow::onDebugToggled);
+    // 两种**模拟模式**并列，且互斥（同一 QActionGroup）：
+    //   按站模拟：每步推进一站；按时间模拟：每步推进一刻（= 下一个 15min 事件刻）。
+    // 两者共用同一步进节奏（1 秒/步）。事件都不再"按推进次数"或"按真实秒数"触发，
+    // 而是由**软件内时钟**跨过事件刻决定（见 settleEventsUpTo）。
+    stationSimAction_ = bar->addAction(QStringLiteral("按站模拟"));
+    stationSimAction_->setCheckable(true);
+    timeSimAction_ = bar->addAction(QStringLiteral("按时间模拟"));
+    timeSimAction_->setCheckable(true);
 
-    debugTimer_ = new QTimer(this);
-    connect(debugTimer_, &QTimer::timeout, this, &MainWindow::onDebugTick);
+    auto* simGroup = new QActionGroup(this);
+    simGroup->addAction(stationSimAction_);
+    simGroup->addAction(timeSimAction_);
+    simGroup->setExclusive(true);
+    connect(stationSimAction_, &QAction::toggled, this, &MainWindow::onStationSimToggled);
+    connect(timeSimAction_, &QAction::toggled, this, &MainWindow::onTimeSimToggled);
 
-    // 实时路况：按配置间隔自动模拟（需求 §5.4 实现提示 2 点名要求的行为）。
-    // 间隔来自 traffic_change_interval_sec（默认 30 秒）；比例与增幅同理读配置。
-    trafficTimer_ = new QTimer(this);
-    connect(trafficTimer_, &QTimer::timeout, this, &MainWindow::onTrafficTick);
-    const double intervalSec = config_.general.trafficChangeIntervalSec > 0.0
-                                   ? config_.general.trafficChangeIntervalSec
-                                   : 30.0;
-    trafficTimer_->start(static_cast<int>(intervalSec * 1000.0));
+    simTimer_ = new QTimer(this);
+    connect(simTimer_, &QTimer::timeout, this, &MainWindow::onSimTick);
 }
 
 void MainWindow::buildDocks() {
@@ -647,9 +662,8 @@ void MainWindow::onAdvanceStop() {
         return;
     }
     if (nodeIndex_ + 1 >= plan_.nodes.size()) {
-        appendLog(QStringLiteral("本次配送已完成：车辆已在仓库 %1")
-                      .arg(QString::fromStdString(currentNodeId_)));
-        return;   // 已结束，不再刷新
+        reportRouteFinishedOnce();   // 终点只播报一次（原先每个 tick 都刷一遍）
+        return;                      // 已结束，不再刷新
     }
 
     // 逐个节点前进。**状态转移只发生在这一处**：
@@ -707,6 +721,10 @@ void MainWindow::onAdvanceStop() {
                       .arg(minutesToClock(currentTimeMin_)));
     }
 
+    // 软件内时钟可能刚跨过一个事件刻：事件由"时间前进"驱动，与推进粒度无关。
+    // 必须放在 syncScene 之前 —— 事件可能触发重规划并改写 plan_。
+    settleEventsUpTo(state_.atTimeMin);
+
     // 推进后必须刷新画布：车辆位置标记要跟着移动
     syncScene();
     updatePanels();
@@ -719,71 +737,170 @@ void MainWindow::onReplan() {
     replan();
 }
 
-void MainWindow::onDebugToggled(bool on) {
-    debugOn_ = on;
-    appendLog(on ? QStringLiteral("Debug 模式开启：自动模拟路况 / 插单 / 推进")
-                 : QStringLiteral("Debug 模式关闭"));
+// ---- 两种模拟模式（互斥；同一 QActionGroup）-----------------------------------
+//
+// 事件**不**由"推进次数"或"真实秒数"触发，而由**软件内时钟跨过事件刻**触发。
+// 两种模式的差别只在推进粒度：按站模拟 = 一站；按时间模拟 = 一刻（下一个事件刻）。
+void MainWindow::onStationSimToggled(bool on) {
     if (on) {
-        // 固定 1 秒一步。原先给过「展示 2 秒 / 快速 1 秒」两档，用户要求
-        // 只留快的那一档并删掉选择卡片，以节约工具栏空间。
-        const int intervalMs = 1000;
-        debugTickMs_ = intervalMs;
-        debugTicks_ = 0;
-        debugTimer_->start(intervalMs);
-
-        const double tickSec = intervalMs / 1000.0;
-        appendLog(QStringLiteral("  紧急订单每 %1 秒最多插入一单，且同时最多 2 单待处理")
-                      .arg(config_.general.urgentOrderIntervalSec, 0, 'f', 0));
-    } else {
-        debugTimer_->stop();
-        appendLog(QStringLiteral("Debug 模式关闭：自动模拟已停止"));
+        simMode_ = 1;
+        appendLog(QStringLiteral("按站模拟开启：每 1 秒自动推进一站；"
+                                 "事件仍按软件内时间每 %1min 抽取")
+                      .arg(config_.general.eventIntervalMin));
+        simTimer_->start(simIntervalMs_);
+    } else if (simMode_ == 1) {
+        simMode_ = 0;
+        simTimer_->stop();
+        appendLog(QStringLiteral("按站模拟关闭：自动推进已停止"));
     }
 }
 
-// 实时路况：每 traffic_change_interval_sec 秒自动模拟一次（默认 30 秒）。
-// 与"点击模拟路况"走同一条逻辑，因此判定阈值/高亮更新/重规划触发完全一致。
-void MainWindow::onTrafficTick() {
-    if (trafficTimer_ == nullptr) {
+void MainWindow::onTimeSimToggled(bool on) {
+    if (on) {
+        simMode_ = 2;
+        appendLog(QStringLiteral("按时间模拟开启：每 1 秒自动推进一刻"
+                                 "（= 下一个事件刻，每 %1min 一个）")
+                      .arg(config_.general.eventIntervalMin));
+        simTimer_->start(simIntervalMs_);
+    } else if (simMode_ == 2) {
+        simMode_ = 0;
+        simTimer_->stop();
+        appendLog(QStringLiteral("按时间模拟关闭：自动推进已停止"));
+    }
+}
+
+void MainWindow::onSimTick() {
+    if (simMode_ == 0) {
+        return;   // 必须可随时关闭，且关闭后不再产生任何副作用
+    }
+    if (simMode_ == 1) {
+        onAdvanceStop();
+    } else {
+        onAdvanceMoment();
+    }
+    if (atRouteEnd()) {
+        stopSim(QStringLiteral("路线已走完"));
+    }
+}
+
+void MainWindow::onAdvanceMoment() {
+    if (plan_.status != logistics::PlanStatus::Ok || plan_.nodes.empty()) {
         return;
     }
-    onSimulateTraffic();
+    if (atRouteEnd()) {
+        reportRouteFinishedOnce();
+        return;
+    }
+
+    // 「推进一刻」= 推进到**下一个事件刻**。
+    const int target = nextEventMark_;
+
+    // **逐节点重放**，绝不跳节点：其间每个跨越的节点都必须走同一套状态转移
+    // （arriveAt / deliverAt / loadForCurrentTrip），否则送达/装卸/存货记账会与实际
+    // 脱节 —— 这正是 P25/P28 花好几轮才根除的那类缺陷。
+    // 循环条件**每轮重新读当前 plan_**：期间抽到的事件可能触发重规划并改写它。
+    while (!atRouteEnd() && nodeIndex_ + 1 < plan_.nodeArrivalMin.size()
+           && plan_.nodeArrivalMin[nodeIndex_ + 1] <= target) {
+        onAdvanceStop();
+    }
+
+    // 车卡在 i→i+1 途中：让时间走到 target，位置留在 i —— i 正是它所在路段的**起点**
+    // （用户要的"半路显示所在段的起点"就是这个语义，不需要额外换算）。
+    if (!atRouteEnd() && state_.atTimeMin < target) {
+        advanceClockTo(target);
+        settleEventsUpTo(target);
+    }
+
+    syncScene();
+    updatePanels();
 }
 
-void MainWindow::onDebugTick() {
-    if (!debugOn_) {
-        return;   // 定时器必须可随时关闭，且关闭后不再产生任何副作用
+bool MainWindow::atRouteEnd() const {
+    return plan_.status != logistics::PlanStatus::Ok || plan_.nodes.empty()
+           || nodeIndex_ + 1 >= plan_.nodes.size();
+}
+
+void MainWindow::reportRouteFinishedOnce() {
+    if (routeFinishedReported_) {
+        return;   // 终点只播报一次，消除原来"每个 tick 都刷一遍"的噪音
     }
-    ++debugTicks_;
-    onSimulateTraffic();
+    routeFinishedReported_ = true;
+    appendLog(QStringLiteral("本次配送已完成：车辆已在仓库 %1")
+                  .arg(QString::fromStdString(currentNodeId_)));
+}
 
-    // 紧急订单按配置的 urgent_order_interval_sec **节流**，而不是每个 tick 掷骰子。
-    // 早先用 1/4 概率逐 tick 触发：3 秒一个 tick 意味着平均十几秒就多一单紧急订单，
-    // 连续几单会把整体规划搅乱（人工测试第 15 关的反馈）。
-    const double tickSec = debugTickMs_ / 1000.0;
-    const double interval = config_.general.urgentOrderIntervalSec;
-    const int ticksPerUrgent = std::max(
-        1, static_cast<int>(interval / (tickSec > 0.0 ? tickSec : 1.0)));
+void MainWindow::stopSim(const QString& reason) {
+    if (simTimer_ != nullptr) {
+        simTimer_->stop();
+    }
+    simMode_ = 0;
+    // setChecked(false) 会再次触发 toggled —— 用信号屏蔽器挡住重复日志
+    if (stationSimAction_ != nullptr && stationSimAction_->isChecked()) {
+        const QSignalBlocker blocker(stationSimAction_);
+        stationSimAction_->setChecked(false);
+    }
+    if (timeSimAction_ != nullptr && timeSimAction_->isChecked()) {
+        const QSignalBlocker blocker(timeSimAction_);
+        timeSimAction_->setChecked(false);
+    }
+    appendLog(QStringLiteral("模拟结束（%1）").arg(reason));
+}
 
-    // 同时限制"当前待处理的紧急订单"数量，避免连续堆积干扰规划
-    std::size_t pendingUrgent = 0;
-    for (const Order& order : config_.orders) {
-        if (!order.served && order.urgent) {
-            ++pendingUrgent;
+// 时间流逝也是一次物理事件——但它**只动时刻、不动位置**：
+// 车留在最后一个已到达的节点上，那正是它此刻所在路段的起点。
+void MainWindow::advanceClockTo(int timeMin) {
+    if (timeMin <= state_.atTimeMin) {
+        return;   // 时间不倒退
+    }
+    state_.atTimeMin = timeMin;
+    currentTimeMin_ = timeMin;
+}
+
+// 结算所有 <= timeMin 的**事件刻**，每刻恰抽 1 个事件。
+//
+// 这一层刻意挂在"软件时间前进"上、而不是挂在某个按钮上：因此「按站模拟」（一站一步）
+// 与「推进一刻」（一刻一步）看到的是**同一串事件** —— 这也是等价性断言能成立的前提。
+void MainWindow::settleEventsUpTo(int timeMin) {
+    const int interval = config_.general.eventIntervalMin > 0
+                             ? config_.general.eventIntervalMin : 15;
+    while (nextEventMark_ <= timeMin) {
+        const int mark = nextEventMark_;
+        nextEventMark_ = logistics::nextEventTimeMin(mark, interval);
+
+        logistics::EventWeights w;
+        w.traffic  = config_.general.eventWeightTraffic;
+        w.urgent   = config_.general.eventWeightUrgent;
+        w.customer = config_.general.eventWeightCustomer;
+        w.closure  = config_.general.eventWeightClosure;
+
+        // 紧急订单已达"待处理上限"时**改抽其余事件**，保证不出现空刻。
+        std::size_t pendingUrgent = 0;
+        for (const Order& order : config_.orders) {
+            if (!order.served && order.urgent) {
+                ++pendingUrgent;
+            }
+        }
+        const std::size_t kMaxPendingUrgent = 2;
+        const bool urgentCapped = pendingUrgent >= kMaxPendingUrgent;
+        if (urgentCapped) {
+            w.urgent = 0;
+        }
+
+        const logistics::SimEventKind kind = logistics::pickEvent(w, rng_);
+        appendLog(QStringLiteral("[事件] %1 抽取：%2%3")
+                      .arg(minutesToClock(mark))
+                      .arg(QString::fromUtf8(logistics::simEventName(kind)))
+                      .arg(urgentCapped
+                               ? QStringLiteral("（紧急订单待处理已达上限，本次改抽其它事件）")
+                               : QString()));
+
+        switch (kind) {
+            case logistics::SimEventKind::Traffic:     onSimulateTraffic();       break;
+            case logistics::SimEventKind::UrgentOrder: insertUrgentOrderAction(); break;
+            case logistics::SimEventKind::NewCustomer: addRandomCustomerAction(); break;
+            case logistics::SimEventKind::RoadClosure: onCloseRandomRoad();       break;
         }
     }
-    const std::size_t kMaxPendingUrgent = 2;
-
-    if (debugTicks_ % ticksPerUrgent == 0 && pendingUrgent < kMaxPendingUrgent) {
-        insertUrgentOrderAction();
-    }
-
-    // 道路封闭也纳入自动模拟，但**概率压得很低**：它每次都会改动图结构，
-    // 连续发生会大幅破坏网络、让演示失去可读性。每 20 个 tick 最多一次。
-    if (++debugClosureCounter_ >= 20) {
-        debugClosureCounter_ = 0;
-        onCloseRandomRoad();
-    }
-    onAdvanceStop();
 }
 
 // 邻接表 / 邻接矩阵的**表格**展示（B3 修订）。
@@ -1330,6 +1447,148 @@ int MainWindow::runActionSelfCheck() {
             ++failures;
         }
     };
+
+    // 软件内时间的事件模型：「推进一刻」不得跳过节点（判据 #3）、
+    // 「半路显示所在路段起点」（判据 #4）。
+    //
+    // **必须放在最前面**：后面的检查会改动 config_（加新客户、把订单标记为已送达），
+    // 之后再新建窗口会得到"无货可送"的空计划，本守卫就退化成空跑——
+    // 那种"通过但什么都没测到"的守卫，比没有守卫更糟。
+    {
+        std::unique_ptr<MainWindow> m(new MainWindow(config_));
+        std::unique_ptr<MainWindow> s(new MainWindow(config_));
+        const int t0 = m->state_.atTimeMin;
+
+        // 被测路径：连续推进「一刻」（路线走完后它自己会变成空操作）
+        for (int i = 0; i < 40; ++i) {
+            m->onAdvanceMoment();
+        }
+
+        // 参照路径：**完全不使用** onAdvanceMoment —— 由检查器自己按"下一个事件刻"
+        // 逐节点调用 onAdvanceStop()，一直走到把 m 已结算的事件刻全部走完。
+        // 若 onAdvanceMoment 走捷径直接跳到下标、跳过沿途的送达/装卸/记账，
+        // 两条路径的已送达 / penalty / 车上货量 / 位置就会分叉（P25/P28 的缺陷类别）。
+        //
+        // 防呆：参照循环必须有**进展保证**与迭代上限 —— 否则一旦被测行为异常，
+        // 守卫会"挂住"而不是"报失败"，那比没有守卫更糟（ctest 会超时）。
+        int refGuard = 0;
+        while (!s->atRouteEnd() && s->nextEventMark_ <= m->state_.atTimeMin) {
+            if (++refGuard > 2000) {
+                expect(false, QStringLiteral("（守卫自身）参照推进超过 2000 步仍未结束，"
+                                             "疑似被测行为无进展"));
+                break;
+            }
+            const int markBefore = s->nextEventMark_;
+            const int T = markBefore;
+            while (!s->atRouteEnd() && s->nodeIndex_ + 1 < s->plan_.nodeArrivalMin.size()
+                   && s->plan_.nodeArrivalMin[s->nodeIndex_ + 1] <= T) {
+                s->onAdvanceStop();
+            }
+            if (!s->atRouteEnd() && s->state_.atTimeMin < T) {
+                s->advanceClockTo(T);
+                s->settleEventsUpTo(T);
+            }
+            if (s->nextEventMark_ == markBefore && s->state_.atTimeMin <= T) {
+                break;   // 没有任何进展：本不该发生，交给下面的断言去报告
+            }
+        }
+
+        // 前置断言：本守卫必须**真的测到了东西**，否则就是空跑。
+        expect(m->state_.atTimeMin > t0,
+               QStringLiteral("（前置）推进一刻必须真的推进了软件内时间：%1 -> %2min")
+                   .arg(t0)
+                   .arg(m->state_.atTimeMin));
+        expect(m->state_.servedStops > 0,
+               QStringLiteral("（前置）推进一刻后应已产生送达，否则测不到跳节点：已送达 %1 站")
+                   .arg(m->state_.servedStops));
+
+        expect(m->state_.servedStops == s->state_.servedStops,
+               QStringLiteral("推进一刻不得跳过送达：一刻 %1 站，逐个推进 %2 站")
+                   .arg(m->state_.servedStops)
+                   .arg(s->state_.servedStops));
+        expect(m->state_.incurredPenaltyMin == s->state_.incurredPenaltyMin,
+               QStringLiteral("推进一刻不得跳过 penalty 记账：一刻 %1min，逐个推进 %2min")
+                   .arg(m->state_.incurredPenaltyMin)
+                   .arg(s->state_.incurredPenaltyMin));
+        expect(std::fabs(m->state_.sumOnboard() - s->state_.sumOnboard()) < 1e-6,
+               QStringLiteral("推进一刻不得跳过装卸：一刻车上 %1kg，逐个推进 %2kg")
+                   .arg(m->state_.sumOnboard(), 0, 'f', 1)
+                   .arg(s->state_.sumOnboard(), 0, 'f', 1));
+        expect(m->currentNodeId_ == s->currentNodeId_,
+               QStringLiteral("推进一刻与逐个推进应停在同一地点：一刻 %1，逐个推进 %2")
+                   .arg(QString::fromStdString(m->currentNodeId_))
+                   .arg(QString::fromStdString(s->currentNodeId_)));
+
+        // 事件结算纪律（判据 #2 的"不空刻、不拖欠"面）：
+        // 推进之后，所有 <= 当前时刻的事件刻都必须已经结算完 —— 否则下一个事件刻
+        // 会 <= 当前时刻，意味着有事件被"拖欠"了。这条能抓住
+        // "把 settleEventsUpTo 从 onAdvanceStop 里摘掉"这类回退。
+        expect(m->nextEventMark_ > m->state_.atTimeMin,
+               QStringLiteral("推进后必须已结算所有 <= 当前时刻的事件刻："
+                              "下一事件刻 %1 应 > 当前 %2min（有事件被拖欠）")
+                   .arg(m->nextEventMark_)
+                   .arg(m->state_.atTimeMin));
+
+        // 判据 #4：车在半路时，位置必须是**所在路段的起点**
+        //（= "最后一个到达时刻 <= 当前时刻"的节点）。
+        const std::size_t idxM = logistics::nodeIndexAtTime(m->plan_, m->state_.atTimeMin);
+        expect(m->nodeIndex_ == idxM,
+               QStringLiteral("推进一刻后车辆停在「所在路段起点」：当前下标 %1，"
+                              "时刻 %2min 对应下标 %3")
+                   .arg(static_cast<qulonglong>(m->nodeIndex_))
+                   .arg(m->state_.atTimeMin)
+                   .arg(static_cast<qulonglong>(idxM)));
+        if (idxM < m->plan_.nodes.size() && m->scene_ != nullptr) {
+            expect(m->scene_->vehiclePosition() == m->plan_.nodes[idxM],
+                   QStringLiteral("画布车辆标记 == 所在路段起点 %1，实际标记在 %2")
+                       .arg(QString::fromStdString(m->plan_.nodes[idxM]))
+                       .arg(QString::fromStdString(m->scene_->vehiclePosition())));
+        }
+
+        // 判据 #4 的**定向用例**：必须构造出一个"车正处在 k → k+1 途中"的时刻。
+        // 用户给的例子：过去 15min 内车走完 A→B、B→C，现正驶向 D ⇒ 显示位置应是 C。
+        // 上面的通用断言在路线跑完后落在空计划上，偏弱；这里显式制造"半路"情形。
+        {
+            std::unique_ptr<MainWindow> w(new MainWindow(config_));
+            bool midSegmentChecked = false;
+            for (int i = 0; i < 40 && !w->atRouteEnd(); ++i) {
+                w->onAdvanceMoment();
+                const std::size_t k = w->nodeIndex_;
+                if (k + 1 >= w->plan_.nodeArrivalMin.size()
+                    || k + 1 >= w->plan_.nodes.size()) {
+                    continue;   // 已经走到序列末端，构造不出"半路"了
+                }
+                const int tArriveK = w->plan_.nodeArrivalMin[k];
+                const int tArriveNext = w->plan_.nodeArrivalMin[k + 1];
+                if (tArriveNext <= w->state_.atTimeMin) {
+                    continue;   // 还没卡在两节点之间
+                }
+                expect(tArriveK <= w->state_.atTimeMin && w->state_.atTimeMin < tArriveNext,
+                       QStringLiteral("（前置）当前时刻确实落在 %1(%2min) 与 %3(%4min) 之间")
+                           .arg(QString::fromStdString(w->plan_.nodes[k]))
+                           .arg(tArriveK)
+                           .arg(QString::fromStdString(w->plan_.nodes[k + 1]))
+                           .arg(tArriveNext));
+                expect(w->nodeIndex_ == logistics::nodeIndexAtTime(w->plan_, w->state_.atTimeMin),
+                       QStringLiteral("车在 %1→%2 途中时，下标必须是路段起点 %1")
+                           .arg(QString::fromStdString(w->plan_.nodes[k]))
+                           .arg(QString::fromStdString(w->plan_.nodes[k + 1])));
+                expect(w->scene_ != nullptr
+                           && w->scene_->vehiclePosition() == w->plan_.nodes[k],
+                       QStringLiteral("车在 %1→%2 途中时，画布应显示所在路段起点 %1，实际 %3")
+                           .arg(QString::fromStdString(w->plan_.nodes[k]))
+                           .arg(QString::fromStdString(w->plan_.nodes[k + 1]))
+                           .arg(QString::fromStdString(w->scene_ != nullptr
+                                                           ? w->scene_->vehiclePosition()
+                                                           : std::string())));
+                midSegmentChecked = true;
+                break;
+            }
+            expect(midSegmentChecked,
+                   QStringLiteral("（前置）应能构造出「车在两节点之间」的时刻，"
+                                  "否则判据 #4 没有被真正验证"));
+        }
+    }
 
     // ---- 重规划必须继承的两条"既定事实" ----
     //

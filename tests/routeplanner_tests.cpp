@@ -18,6 +18,7 @@ using logistics::PlanStatus;
 using logistics::RoutePlan;
 using logistics::Vehicle;
 using logistics::WeightType;
+using logistics::nodeIndexAtTime;
 using logistics::planRoute;
 using logistics::replan;
 using testutil::check;
@@ -754,6 +755,94 @@ void testIsEdgeOnRoute() {
     check(logistics::isEdgeOnRoute(loop, "D1", "W"), "重复经过的段落也在路径上");
 }
 
+// ---- nodeIndexAtTime：软件内时刻 -> "半路显示所在段的起点" ----
+//
+// 用切片 1 的手算路线：W(480) -> D1(540) -> W(550)，index 0/1/2。
+// 该函数的语义是**段起点**：车在 i -> i+1 途中时返回 i。
+void testNodeIndexAtTimeReturnsSegmentStart() {
+    const LogisticsGraph g = makeWtoD1Graph();
+    const Vehicle v = makeVehicle("W", 1000.0, 480);
+    const std::vector<Order> orders = {makeOrder("O1", "D1", 10.0, 540, 1080, false)};
+    const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
+
+    // 先固定前提：到达时刻就是手算的 480 / 540 / 550
+    check(plan.nodeArrivalMin == std::vector<int>({480, 540, 550}),
+          "前提：逐节点到达时刻为 480 / 540 / 550");
+    if (plan.nodes.size() != 3) {
+        return;
+    }
+
+    // 早于首节点 -> 0（车还在起点，尚未出发/刚到）
+    check(nodeIndexAtTime(plan, 400) == 0, "早于首节点 -> 下标 0");
+    check(nodeIndexAtTime(plan, 479) == 0, "首节点前 1 分钟 -> 下标 0");
+
+    // 恰等于某节点到达时刻 -> 返回该节点（"恰好已到达"算作到了）
+    check(nodeIndexAtTime(plan, 480) == 0, "恰等于节点 0 到达时刻 -> 下标 0");
+    check(nodeIndexAtTime(plan, 540) == 1, "恰等于节点 1 到达时刻 -> 下标 1");
+    check(nodeIndexAtTime(plan, 550) == 2, "恰等于节点 2 到达时刻 -> 下标 2");
+
+    // 落在两节点之间 -> 返回**前一个**节点（这就是段起点）
+    check(nodeIndexAtTime(plan, 500) == 0, "480 之后 540 之前 -> 段起点 0（W->D1 途中）");
+    check(nodeIndexAtTime(plan, 539) == 0, "紧临节点 1 之前 -> 段起点 0");
+    check(nodeIndexAtTime(plan, 545) == 1, "540 之后 550 之前 -> 段起点 1（D1->W 途中）");
+
+    // 超过末节点 -> 末节点下标（clamp，不越界）
+    check(nodeIndexAtTime(plan, 551) == 2, "超过末节点 -> 末节点下标 2");
+    check(nodeIndexAtTime(plan, 100000) == 2, "远超末节点 -> 仍为末节点下标 2");
+}
+
+// 边界：空 plan 返回 0；节点数 < 到达时刻数等非规范输入也不得越界。
+void testNodeIndexAtTimeOnEmptyPlanAndClamp() {
+    const RoutePlan empty;
+    check(empty.nodes.empty(), "前提：空 plan");
+    check(nodeIndexAtTime(empty, 0) == 0, "空 plan -> 0");
+    check(nodeIndexAtTime(empty, 99999) == 0, "空 plan（任意时刻）-> 0");
+
+    // 只有一个节点：任何时刻都只能是下标 0（clamp 到 [0, size-1]）
+    RoutePlan single;
+    single.nodes = {"W"};
+    single.nodeArrivalMin = {480};
+    check(nodeIndexAtTime(single, 100) == 0, "单节点且早于到达 -> 0");
+    check(nodeIndexAtTime(single, 480) == 0, "单节点恰在到达 -> 0");
+    check(nodeIndexAtTime(single, 1000) == 0, "单节点超过到达 -> 0（不越界）");
+
+    // nodeArrivalMin 比 nodes 短：只按到达时刻序列判定，且结果不得越界
+    RoutePlan ragged;
+    ragged.nodes = {"A", "B", "C"};
+    ragged.nodeArrivalMin = {480};
+    check(nodeIndexAtTime(ragged, 600) == 0, "到达时刻序列不完整时返回其有效下标");
+}
+
+// 单调性：timeMin 增大时返回值必须单调不减（抽查多个时刻）。
+void testNodeIndexAtTimeIsMonotonicInTime() {
+    const LogisticsGraph g = makeTransitClusterGraph();
+    const Vehicle v = makeVehicle("W", 20.0, 480);
+    const std::vector<Order> orders = {makeOrder("O1", "D1", 10.0, 0, 1440, false),
+                                       makeOrder("O2", "D2", 10.0, 0, 1440, false)};
+    const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
+    check(plan.status == PlanStatus::Ok, "前提：多趟路线规划成功");
+
+    std::size_t prev = nodeIndexAtTime(plan, 0);
+    bool monotonic = true;
+    bool outOfRange = false;
+    for (int t = 0; t <= 2000; t += 5) {
+        const std::size_t cur = nodeIndexAtTime(plan, t);
+        if (cur < prev) {
+            monotonic = false;
+        }
+        if (cur >= plan.nodes.size()) {
+            outOfRange = true;
+        }
+        prev = cur;
+    }
+    check(monotonic, "timeMin 增大时返回值单调不减（0..2000 每 5min 抽查）");
+    check(!outOfRange, "返回值始终落在 [0, nodes.size()-1] 内");
+
+    // 单调性必须是"内容"上的：时间足够大时应落回末节点（回到仓库）
+    check(nodeIndexAtTime(plan, 100000) == plan.nodes.size() - 1,
+          "足够大的时刻落在末节点（回到仓库）");
+}
+
 } // namespace
 
 // 增量重规划在全量回退时，必须把"站内存货"与"在途货"一并带走。
@@ -821,6 +910,9 @@ int main() {
     testPlanRouteEqualsReplanFromDepot();
     testIsEdgeOnRoute();
     testIncrementalReplanForwardsOnboard();
+    testNodeIndexAtTimeReturnsSegmentStart();
+    testNodeIndexAtTimeOnEmptyPlanAndClamp();
+    testNodeIndexAtTimeIsMonotonicInTime();
 
     return testutil::summarize("routeplanner_tests");
 }

@@ -180,6 +180,13 @@ void testLoadDefaultConfig() {
     // 均为 0 处），按用户要求删掉，到达时刻即离开时刻。
     check(cfg.general.trafficChangeRatio == 0.1, "traffic_change_ratio == 0.1");
     check(cfg.general.trafficTimeIncreaseMin == 0.2, "traffic_time_increase_min == 0.2");
+
+    // 软件内时间的事件模型键（sim-time-events §2/§3.2）：默认数据集中的取值
+    check(cfg.general.eventIntervalMin == 15, "event_interval_min == 15");
+    check(cfg.general.eventWeightTraffic == 10, "event_weight_traffic == 10");
+    check(cfg.general.eventWeightUrgent == 3, "event_weight_urgent == 3");
+    check(cfg.general.eventWeightCustomer == 1, "event_weight_customer == 1");
+    check(cfg.general.eventWeightClosure == 1, "event_weight_closure == 1");
 }
 
 void testDefaultConfigRoutingPreconditions() {
@@ -393,6 +400,65 @@ void testBoundaryCases() {
         check(ok, "无 [general] 节时使用默认值（错误: " + error + "）");
         check(ok && cfg.general.trafficChangeRatio == 0.1,
               "默认 traffic_change_ratio == 0.1");
+        check(ok && cfg.general.eventIntervalMin == 15,
+              "默认 event_interval_min == 15");
+        check(ok && cfg.general.eventWeightTraffic == 10,
+              "默认 event_weight_traffic == 10");
+        check(ok && cfg.general.eventWeightUrgent == 3,
+              "默认 event_weight_urgent == 3");
+        check(ok && cfg.general.eventWeightCustomer == 1,
+              "默认 event_weight_customer == 1");
+        check(ok && cfg.general.eventWeightClosure == 1,
+              "默认 event_weight_closure == 1");
+    }
+
+    // [general] 存在但缺事件模型键：逐键回落到各自默认值（与其他键同口径）
+    {
+        Config cfg;
+        std::string error;
+        const bool ok = ConfigLoader::parse(std::string("[general]\n")
+                                                + "traffic_change_ratio = 0.25\n"
+                                                + kMinimalConfig, cfg, error);
+        check(ok, "[general] 缺事件键时用默认值（错误: " + error + "）");
+        check(ok && cfg.general.trafficChangeRatio == 0.25, "已给键取文件值");
+        check(ok && cfg.general.eventIntervalMin == 15,
+              "缺口键 event_interval_min 回落到 15");
+        check(ok && cfg.general.eventWeightTraffic == 10,
+              "缺口键 event_weight_traffic 回落到 10");
+        check(ok && cfg.general.eventWeightUrgent == 3,
+              "缺口键 event_weight_urgent 回落到 3");
+        check(ok && cfg.general.eventWeightCustomer == 1,
+              "缺口键 event_weight_customer 回落到 1");
+        check(ok && cfg.general.eventWeightClosure == 1,
+              "缺口键 event_weight_closure 回落到 1");
+    }
+
+    // 事件模型键**确实被读取**——而不是"恰好永远等于默认值"。
+    //
+    // 为什么单列这一段：上面两个用例（默认值 / 缺口键回落）的期望值**都等于代码默认值**，
+    // 因此"解析绑定被删掉"与"解析正常"会产出**完全相同**的结果——守卫没有牙齿。
+    // 这里喂**非默认值**：删掉任意一条 IntBinder 绑定，对应断言立刻失败。
+    {
+        Config cfg;
+        std::string error;
+        const bool ok = ConfigLoader::parse(std::string("[general]\n")
+                                                + "event_interval_min = 7\n"
+                                                + "event_weight_traffic = 11\n"
+                                                + "event_weight_urgent = 5\n"
+                                                + "event_weight_customer = 2\n"
+                                                + "event_weight_closure = 3\n"
+                                                + kMinimalConfig, cfg, error);
+        check(ok, "非默认事件键可加载（错误: " + error + "）");
+        check(ok && cfg.general.eventIntervalMin == 7,
+              "已给键取文件值 event_interval_min == 7（非默认值）");
+        check(ok && cfg.general.eventWeightTraffic == 11,
+              "已给键取文件值 event_weight_traffic == 11（非默认值）");
+        check(ok && cfg.general.eventWeightUrgent == 5,
+              "已给键取文件值 event_weight_urgent == 5（非默认值）");
+        check(ok && cfg.general.eventWeightCustomer == 2,
+              "已给键取文件值 event_weight_customer == 2（非默认值）");
+        check(ok && cfg.general.eventWeightClosure == 3,
+              "已给键取文件值 event_weight_closure == 3（非默认值）");
     }
 }
 

@@ -130,10 +130,11 @@ private slots:
     void onAddRandomCustomer();
     void onCloseRandomRoad();
     void onAdvanceStop();
+    void onAdvanceMoment();
     void onReplan();
-    void onDebugToggled(bool on);
-    void onDebugTick();
-    void onTrafficTick();
+    void onStationSimToggled(bool on);
+    void onTimeSimToggled(bool on);
+    void onSimTick();
     void onManualEdit();
 
 private:
@@ -148,6 +149,16 @@ private:
     void syncScene();
     void updatePanels();
     void appendLog(const QString& text);
+
+    // ---- 软件内时间的事件模型（设计 §7 / D24）----
+    //
+    // 事件由**软件时间前进**驱动，而不是由"你按了哪个按钮"决定：因此
+    // 「推进一站」与「推进一刻」看到的是同一串事件（等价性断言的前提）。
+    void settleEventsUpTo(int timeMin);   // 结算所有 <= timeMin 的事件刻（每刻恰 1 个事件）
+    void advanceClockTo(int timeMin);     // 让"时间流逝"走到 timeMin（车留在所在段的起点）
+    bool atRouteEnd() const;              // 路线是否已走完
+    void stopSim(const QString& reason);  // 停止模拟：停表 + 取消勾选 + 记一次日志
+    void reportRouteFinishedOnce();       // 终点只播报一次（消除原来每 tick 重复刷的噪音）
 
     std::string        currentPositionId() const;
     QString            orderIdsAt(const std::string& nodeId) const;
@@ -181,8 +192,8 @@ private:
 
     QComboBox*     strategyBox_ = nullptr;
     QComboBox*     weightBox_ = nullptr;
-    // Debug 模拟间隔固定 1 秒（用户要求删掉速度选择卡片以节约工具栏空间）
-    int            debugIntervalMs_ = 1000;
+    // 模拟步进间隔固定 1 秒（两种模拟模式共用同一节奏）
+    int            simIntervalMs_ = 1000;
 
     // ---- 重规划必须继承的"既定事实" ----
     //
@@ -240,16 +251,19 @@ private:
     QTableWidget*  orderTable_ = nullptr;
     QTableWidget*  transitTable_ = nullptr;
     QTableWidget*  stopTable_ = nullptr;
-    int            debugClosureCounter_ = 0;
+    // 道路封闭不再用 tick 计数节流——它现在是加权事件的一种（权重最低）。
     QTableWidget*  lateTable_ = nullptr;
     QPlainTextEdit* logView_ = nullptr;
 
-    QTimer* debugTimer_ = nullptr;
-    // 实时路况定时器：按配置的 traffic_change_interval_sec 自动模拟路况变化。
-    // 需求 §5.4 实现提示 2 明确要求"每 30 秒修改 10% 路径的耗时权重"——
-    // 此前该配置只被读入、从未被使用（审计发现的 #16），路况只能靠按钮触发。
-    QTimer* trafficTimer_ = nullptr;
-    bool    debugOn_ = false;
-    int     debugTicks_ = 0;
-    int     debugTickMs_ = 3000;
+    QTimer* simTimer_ = nullptr;
+    // 模拟模式：0 = 关闭；1 = 按站模拟；2 = 按时间模拟。两者**互斥**（同一 QActionGroup）。
+    int     simMode_ = 0;
+    // 下一个待结算的**事件刻**（软件内时刻，绝对时刻对齐到 event_interval_min 的整数倍）。
+    // 事件由"软件时间前进"驱动、与推进粒度无关 —— 因此「按站模拟」与「推进一刻」
+    // 看到的是**同一串事件**（这是等价性断言成立的前提，见设计 D24/P34）。
+    int     nextEventMark_ = 0;
+    // 到终点只播报一次（原先每个 tick 都重复刷「本次配送已完成」）
+    bool    routeFinishedReported_ = false;
+    QAction* stationSimAction_ = nullptr;
+    QAction* timeSimAction_ = nullptr;
 };

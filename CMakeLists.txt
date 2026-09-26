@@ -13,6 +13,7 @@ add_library(core STATIC
     src/core/Dijkstra.cpp
     src/core/RoutePlanner.cpp
     src/core/Random.cpp
+    src/core/SimEvent.cpp
     src/core/GraphEdit.cpp
     src/core/Traffic.cpp
 )
@@ -38,6 +39,9 @@ target_compile_definitions(config_tests PRIVATE
 add_executable(minheap_tests tests/minheap_tests.cpp)
 target_link_libraries(minheap_tests PRIVATE core)
 
+add_executable(simevent_tests tests/simevent_tests.cpp)
+target_link_libraries(simevent_tests PRIVATE core)
+
 add_executable(dijkstra_tests tests/dijkstra_tests.cpp)
 target_link_libraries(dijkstra_tests PRIVATE core)
 
@@ -59,6 +63,7 @@ enable_testing()
 add_test(NAME core_tests COMMAND core_tests)
 add_test(NAME config_tests COMMAND config_tests)
 add_test(NAME minheap_tests COMMAND minheap_tests)
+add_test(NAME simevent_tests COMMAND simevent_tests)
 add_test(NAME dijkstra_tests COMMAND dijkstra_tests)
 add_test(NAME routeplanner_tests COMMAND routeplanner_tests)
 add_test(NAME integration_tests COMMAND integration_tests)

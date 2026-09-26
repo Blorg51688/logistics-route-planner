@@ -44,11 +44,17 @@ TRUNK_COST_FACTOR = 1.6    # 主干道 元/km
 BRANCH_TIME_FACTOR = 2.4
 BRANCH_COST_FACTOR = 1.2
 
-TRAFFIC_CHANGE_INTERVAL_SEC = 30
 TRAFFIC_CHANGE_RATIO = 0.1
 TRAFFIC_TIME_INCREASE_MIN = 0.2
 TRAFFIC_TIME_INCREASE_MAX = 0.5
-URGENT_ORDER_INTERVAL_SEC = 60
+# 软件内时间的事件模型（见 .omd/plans/sim-time-events.md §2/§3.2 与 docs/设计.md D24）：
+# 每 EVENT_INTERVAL_MIN 分钟软件内时间抽 1 个带权重的事件。
+# 注：原先的 traffic_change_interval_sec（真实秒级）与 urgent_order_interval_sec 已被本模型取代并移除。
+EVENT_INTERVAL_MIN = 15
+EVENT_WEIGHT_TRAFFIC = 10
+EVENT_WEIGHT_URGENT = 3
+EVENT_WEIGHT_CUSTOMER = 1
+EVENT_WEIGHT_CLOSURE = 1
 
 CAPACITY_KG = 200
 DEPART_TIME = "08:00"
@@ -57,7 +63,7 @@ DEFAULT_WINDOW = ("09:00", "18:00")
 TIGHT_WINDOWS = {"D05": ("09:00", "10:00"), "D12": ("09:00", "11:00")}
 # 初始数据集中**不放任何紧急订单**：E3 的语义是"配送过程中动态插入紧急订单"，
 # 预置紧急订单会让该功能看起来一开始就存在，混淆演示。
-# 需要演示紧急优先时用界面的「插入紧急订单」或 Debug 模式。
+# 需要演示紧急优先时用界面的「插入紧急订单」，或开启「按站模拟 / 按时间模拟」等事件刻自动抽取。
 URGENT_NODES = set()
 
 # ---------------------------------------------------------------- 拓扑定义
@@ -168,11 +174,14 @@ def build_text():
     links = build_links()
 
     out = ["[general]",
-           "traffic_change_interval_sec = %d" % TRAFFIC_CHANGE_INTERVAL_SEC,
            "traffic_change_ratio = %s" % TRAFFIC_CHANGE_RATIO,
            "traffic_time_increase_min = %s" % TRAFFIC_TIME_INCREASE_MIN,
            "traffic_time_increase_max = %s" % TRAFFIC_TIME_INCREASE_MAX,
-           "urgent_order_interval_sec = %d" % URGENT_ORDER_INTERVAL_SEC,
+           "event_interval_min = %d" % EVENT_INTERVAL_MIN,
+           "event_weight_traffic = %d" % EVENT_WEIGHT_TRAFFIC,
+           "event_weight_urgent = %d" % EVENT_WEIGHT_URGENT,
+           "event_weight_customer = %d" % EVENT_WEIGHT_CUSTOMER,
+           "event_weight_closure = %d" % EVENT_WEIGHT_CLOSURE,
            "", "[nodes]", "# ID, type, x, y, name, sub_network_id"]
     for n in nodes:
         out.append("%s, %s, %d, %d, %s, %d" % n)

@@ -33,6 +33,20 @@ def read_config():
     return nodes, edges, orders, vehicles
 
 
+def read_event_model():
+    """读 config/default.ini 的事件模型键（`[general]` 段的 event_* 键）。
+
+    向导的第 7 关现在写死「软件内每 15min 一个事件刻」与权重 10:3:1:1，
+    这两处同样会随配置漂移——这里对照配置，过期即报错。
+    """
+    g = {}
+    for line in open(CONFIG, encoding="utf-8"):
+        m = re.match(r"\s*(event_(?:interval_min|weight_[a-z]+))\s*=\s*(\S+)", line)
+        if m:
+            g[m.group(1)] = m.group(2)
+    return g
+
+
 def facts():
     nodes, edges, orders, vehicles = read_config()
     und = {(a, b) if a < b else (b, a) for a, b in edges}
@@ -131,6 +145,24 @@ def main():
     # 这条没有捕获组，单独判断：向导写死了「子网络 1/2/3」
     checks.append(("子网络 1/2/3" in text and len(f["subs"]) == 3,
                    "向导写死「子网络 1/2/3」，但数据里有 %d 个子网络" % len(f["subs"])))
+
+    # 事件模型新口径（2026-09-26）：按软件内时间每 event_interval_min 分钟一个事件刻，
+    # 权重 路况:紧急订单:新客户:封路 = event_weight_*。向导第 7 关写死了这两处事实。
+    ev = read_event_model()
+    claim_all(r"每 (\d+)min", ev.get("event_interval_min", ""), "事件刻间隔（分钟）")
+    wm = re.search(r"路况 (\d+) : 紧急订单 (\d+) : 新客户 (\d+) : 封路 (\d+)", text)
+    if not wm:
+        checks.append((False, "向导里没找到事件权重声明（形如「路况 10 : 紧急订单 3 : 新客户 1 : 封路 1」）"))
+    else:
+        for got, key, label in zip(
+                wm.groups(),
+                ("event_weight_traffic", "event_weight_urgent",
+                 "event_weight_customer", "event_weight_closure"),
+                ("路况", "紧急订单", "新客户", "封路")):
+            expected = ev.get(key)
+            checks.append((expected is not None and got == expected,
+                           "事件权重「%s」：向导写 %s，配置 %s=%s"
+                           % (label, got, key, expected)))
 
     # 载重必须同时满足：小于最小簇货量、大于最大单订单
     # 注：中转站已改为"有存货才考虑"（不再每簇必用），因此这条不再是

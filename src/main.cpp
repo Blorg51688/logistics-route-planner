@@ -78,7 +78,7 @@ void usage() {
         "  --render PATH.png          离屏渲染图形场景成 PNG 后退出\n"
         "  --render-window PATH.png   离屏渲染完整窗口（工具栏+侧栏）成 PNG 后退出\n"
         "                              （注意 --width/--height 对交互窗口无效——它总是最大化）\n"
-        "  --demo N                   渲染窗口前先自动触发 N 轮交互（验证交互后状态）\n"
+        "  --demo N                   渲染窗口前先自动执行 N 次「推进一站」（按站模拟；验证交互后状态）\n"
         "  --dump-graph [list|matrix|both]  输出邻接表 / 邻接矩阵后退出（B3）\n"
         "  --ui-probe                 检查工具栏与侧栏是否完整构造后退出\n"
         "  --self-check-actions       自动验证插单不丢单 / 新客户会被配送后退出\n"
