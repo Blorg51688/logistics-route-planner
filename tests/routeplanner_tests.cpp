@@ -1200,6 +1200,69 @@ void testUrgentBufferChoiceIsNeverWorse() {
     check(!anyDraw, "没选就地满足时不得记任何站内出库（账要跟方案一致）");
 }
 
+// ---- 「出仓必满载」：任何**从仓库装货出发**的趟都必须把车厢装满 ----
+//
+// 这条不变量在实现过程中真的被破坏过：`replanIncremental`（路况触发的增量重规划）
+// 逐趟重建时只复制 `loadKg`，把 `bufferKg`/`bankOps` 丢了 ⇒ 一次路况重规划之后，
+// 车回仓库只装订单货就出发，站里再也攒不到货（用户跑模拟时观察到的现象）。
+// 所以这里对**两条规划路径**都断言：常规 planRoute 与增量 replanIncremental。
+void testEveryDepotTripIsFullyLoaded() {
+    const LogisticsGraph g = makeBufferGraph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+    std::vector<Order> orders;
+    orders.push_back(makeOrder("O1", "D1", 60.0, 0, 1440));
+    orders.push_back(makeOrder("O2", "D2", 60.0, 0, 1440));
+    const std::string depot = v.startNodeId;
+
+    const auto everyDepotTripFull = [&](const RoutePlan& p, const char* tag) {
+        bool ok = true;
+        std::size_t depotTrips = 0;
+        for (const logistics::Trip& t : p.trips) {
+            if (t.nodes.empty() || t.nodes.front() != depot) {
+                continue;   // 不是出仓的趟（在途货续送 / 收尾）不适用
+            }
+            ++depotTrips;
+            const double spare = (v.capacityKg - t.loadKg > 0.0) ? (v.capacityKg - t.loadKg) : 0.0;
+            if (std::fabs(t.bufferKg - spare) > 1e-6) {
+                ok = false;
+            }
+        }
+        check(depotTrips > 0, std::string(tag) + "：应当存在至少一趟「从仓库装货出发」");
+        check(ok, std::string(tag) + "：每一趟从仓库出发的趟都必须满载出仓"
+                      "（buffer == 载重上限 − 本趟订单货量）");
+    };
+
+    const RoutePlan base = planRoute(g, v, orders, WeightType::Distance);
+    everyDepotTripFull(base, "planRoute");
+
+    // 造一份命中若干条边的路况报告，强制走增量路径
+    TrafficReport rep;
+    for (std::size_t i = 1; i < base.nodes.size() && rep.changes.size() < 6; ++i) {
+        TrafficChange c;
+        c.fromId = base.nodes[i - 1];
+        c.toId = base.nodes[i];
+        c.increaseRatio = 0.5;
+        c.congested = true;
+        rep.changes.push_back(c);
+    }
+    bool usedIncremental = false;
+    const RoutePlan inc = replanIncremental(
+        g, v, orders, base, v.departTimeMin, WeightType::Distance, rep, 0.2,
+        std::vector<logistics::OnboardItem>(), &usedIncremental,
+        std::map<std::string, double>());
+    check(usedIncremental, "（前置）本夹具应真的走增量路径，否则这条守卫测不到东西");
+    everyDepotTripFull(inc, "replanIncremental（增量重规划后）");
+
+    // 紧急单：车在仓库时插入，出仓那趟同样必须满载（常规与紧急一视同仁）
+    const Order urgent = makeOrder("U1", "D2", 10.0, 0, 1440, true);
+    std::vector<Order> all = orders;
+    all.push_back(urgent);
+    const RoutePlan withUrgent = replan(g, v, all, depot, 480, WeightType::Distance,
+                                        std::vector<logistics::OnboardItem>(),
+                                        std::map<std::string, double>());
+    everyDepotTripFull(withUrgent, "插入紧急单后");
+}
+
 int main() {
     testSingleOrderRouteIsFullyCorrect();
     testEmptyOrdersDegeneratesToNoMovement();
@@ -1226,6 +1289,7 @@ int main() {
     testTransitBufferProducer();
     testUrgentBufferInPlaceDelivery();
     testUrgentBufferChoiceIsNeverWorse();
+    testEveryDepotTripIsFullyLoaded();
 
     return testutil::summarize("routeplanner_tests");
 }

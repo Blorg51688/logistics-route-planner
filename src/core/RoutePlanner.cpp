@@ -1053,10 +1053,18 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
         || previous.nodes.size() < 2
         || previous.nodes.back() != vehicle.startNodeId) {
         return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
-                      weight, onboard);
+                      weight, onboard, initialStock);
     }
 
     const std::vector<Candidate> pool = buildCandidates(remainingOrders);
+
+    // 子网络 → 该簇中转站（与多趟规划同源），用于逐趟重新推导寄存
+    std::map<int, std::string> transitBySub;
+    for (const Node& n : graph.nodes()) {
+        if (n.type == NodeType::Transit && n.subNetworkId != 0) {
+            transitBySub[n.subNetworkId] = n.id;
+        }
+    }
 
     RoutePlan plan;
     double elapsed = static_cast<double>(currentTimeMin);
@@ -1066,15 +1074,41 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
         if (!replanOneTrip(graph, pool, prevTrip, report, thresholdRatio, weight,
                            static_cast<int>(std::lround(elapsed)), rebuilt, endTime)) {
             return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
-                          weight, onboard);
+                          weight, onboard, initialStock);
+        }
+        // **每一趟仍要"出仓满载"**。增量重规划逐趟重建时只复制 loadKg，会**丢掉缓冲货**
+        // （实测症状：一次路况重规划之后，车回仓库只装订单货就出发，站里再也攒不到货）。
+        // 这里**重新推导**而不是从 prevTrip 复制：受影响的 leg 可能已被重算，顺路关系
+        // 随之改变。规则与 multiTripPlanImpl 完全一致——只有"从仓库装货出发"的趟才计缓冲。
+        if (!rebuilt.nodes.empty() && rebuilt.nodes.front() == vehicle.startNodeId
+            && rebuilt.loadKg > 1e-9) {
+            fillBufferFromDepot(vehicle, rebuilt.loadKg, rebuilt);
+            TransitOp banked;
+            if (bankBufferEnRoute(graph, tripHub(graph, transitBySub, rebuilt),
+                                  vehicle.startNodeId, weight, rebuilt, &banked)) {
+                plan.transitOps.push_back(banked);
+            }
         }
         plan.trips.push_back(rebuilt);
         elapsed = endTime;
     }
 
+    // 库存快照必须跟着走，否则界面与后续规划看到的库存凭空归零。
+    // 期末值按"期初 + 本计划全部操作"重算，保证守恒（规格 I3）在这条路径上也成立。
+    plan.transitStock = previous.transitStock;
+    for (TransitStock& st : plan.transitStock) {
+        st.finalKg = st.initialKg;
+        for (const TransitOp& op : plan.transitOps) {
+            if (op.nodeId == st.nodeId) {
+                st.finalKg += op.kgDelta;
+            }
+        }
+    }
+
     if (usedIncremental != nullptr) {
         *usedIncremental = true;
     }
+    sortTransitOpsByTime(plan.transitOps);
     flatten(plan, currentTimeMin, elapsed);
     return plan;
 }
