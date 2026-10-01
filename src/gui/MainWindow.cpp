@@ -390,10 +390,10 @@ void MainWindow::loadForTrip(std::size_t tripIndex) {
                           .arg(tripIndex + 1)
                           .arg(QString::fromStdString(trip.nodes.empty() ? std::string("?")
                                                                          : trip.nodes.front()))
-                          .arg(trip.loadKg, 0, 'f', 1)
-                          .arg(trip.bufferKg, 0, 'f', 1)
-                          .arg(trip.loadKg, 0, 'f', 1)
-                          .arg(trip.bufferKg, 0, 'f', 1));
+                          .arg(trip.loadKg, 0, 'f', 0)
+                          .arg(trip.bufferKg, 0, 'f', 0)
+                          .arg(trip.loadKg, 0, 'f', 0)
+                          .arg(trip.bufferKg, 0, 'f', 0));
             state_.departed = false;
             return;
         }
@@ -403,18 +403,18 @@ void MainWindow::loadForTrip(std::size_t tripIndex) {
                           .arg(tripIndex + 1)
                           .arg(QString::fromStdString(trip.nodes.empty() ? std::string("?")
                                                                          : trip.nodes.front()))
-                          .arg(trip.loadKg, 0, 'f', 1)
-                          .arg(trip.bufferKg, 0, 'f', 1)
-                          .arg(trip.loadKg + trip.bufferKg, 0, 'f', 1));
+                          .arg(trip.loadKg, 0, 'f', 0)
+                          .arg(trip.bufferKg, 0, 'f', 0)
+                          .arg(trip.loadKg + trip.bufferKg, 0, 'f', 0));
             state_.departed = false;
             return;
         }
         recordRun(QStringLiteral("出仓装车（第 %1 趟）：订单货 %2 kg ＋ 缓冲货 %3 kg "
                                  "＝ 车上载重 %4 kg（载重上限 %5 kg，%6）")
                       .arg(tripIndex + 1)
-                      .arg(trip.loadKg, 0, 'f', 1)
-                      .arg(trip.bufferKg, 0, 'f', 1)
-                      .arg(trip.loadKg + trip.bufferKg, 0, 'f', 1)
+                      .arg(trip.loadKg, 0, 'f', 0)
+                      .arg(trip.bufferKg, 0, 'f', 0)
+                      .arg(trip.loadKg + trip.bufferKg, 0, 'f', 0)
                       .arg(cap, 0, 'f', 0)
                       .arg(trip.loadKg + trip.bufferKg >= cap - 1e-6
                                ? QStringLiteral("已满载") : QStringLiteral("未满载")));
@@ -702,7 +702,16 @@ std::string MainWindow::insertUrgentOrderAction() {
     Order urgent;
     urgent.id = nextFreeId("U");
     urgent.nodeId = base.nodeId;
-    urgent.demandKg = 3.0 + rng_.nextRange(0.0, 7.0);   // 3–10 kg
+    // 货量一律**整公斤**（本项目所有货量数据都是整数，见导出日志的"货量口径"守卫）。
+    // 原实现是 `3.0 + nextRange(0.0, 7.0)`，会产出 3.3kg 这类小数，并一路传播到
+    // 车上载重 / 缓冲货 / 站内库存，使导出证据里出现看不懂的小数。区间仍是 3–10kg。
+    //
+    // 为什么用「nextRange + floor」而不是 nextInt：两者都只消耗一次 nextU32()，
+    // 但 nextInt 用取模（`nextU32() % span`），会**改变后续随机序列**；而 self-check
+    // 里"连续两次插单不丢单""新客户被纳入配送"两条既有断言依赖该序列的具体走向，
+    // 换实现后它们会失败（实测 3 项红）。保持 nextRange 只加 floor，随机流形状不变，
+    // 只消除小数——不为此去改那两条无关断言。
+    urgent.demandKg = std::floor(3.0 + rng_.nextRange(0.0, 8.0));
     // 需求原文的举例就是「1 小时内送达」：窗口起 = 当前时刻，止 = 当前时刻 + 60 分钟。
     // （早先这里写的是 0–1440 全天，等于没有时间要求，是错的。）
     urgent.windowStartMin = currentTimeMin();
@@ -723,7 +732,7 @@ std::string MainWindow::insertUrgentOrderAction() {
     appendLog(QStringLiteral("插入紧急订单 %1 @ %2（货量 %3kg，要求 %4 前送达）")
                   .arg(QString::fromStdString(urgent.id))
                   .arg(QString::fromStdString(urgent.nodeId))
-                  .arg(urgent.demandKg, 0, 'f', 1)
+                  .arg(urgent.demandKg, 0, 'f', 0)
                   .arg(minutesToClock(urgent.windowEndMin)));
     if (!inserted.warning.empty()) {
         appendLog(QStringLiteral("  ⚠ %1").arg(QString::fromStdString(inserted.warning)));
@@ -738,8 +747,8 @@ std::string MainWindow::insertUrgentOrderAction() {
         }
         appendLog(QStringLiteral("  就地满足：从 %1 取货 %2kg（站内库存余 %3kg）")
                       .arg(QString::fromStdString(inserted.stationUsed))
-                      .arg(inserted.stationUsedKg, 0, 'f', 1)
-                      .arg(state_.stationStock[inserted.stationUsed], 0, 'f', 1));
+                      .arg(inserted.stationUsedKg, 0, 'f', 0)
+                      .arg(state_.stationStock[inserted.stationUsed], 0, 'f', 0));
     }
     if (inserted.carBufferUsedKg > 1e-9) {
         state_.bufferKg -= inserted.carBufferUsedKg;
@@ -747,7 +756,7 @@ std::string MainWindow::insertUrgentOrderAction() {
             state_.bufferKg = 0.0;
         }
         appendLog(QStringLiteral("  就地满足：用车上缓冲货 %1kg")
-                      .arg(inserted.carBufferUsedKg, 0, 'f', 1));
+                      .arg(inserted.carBufferUsedKg, 0, 'f', 0));
     }
     afterPlanReplaced();
     syncScene();
@@ -772,7 +781,8 @@ std::string MainWindow::addRandomCustomerAction() {
     Order order;
     order.id = nextFreeId("C");
     order.nodeId = nodeId;
-    order.demandKg = 3.0 + rng_.nextRange(0.0, 12.0);
+    // 同上：货量一律整公斤（nextRange + floor，理由见 insertUrgentOrderAction）；区间仍是 3–15kg。
+    order.demandKg = std::floor(3.0 + rng_.nextRange(0.0, 13.0));
     order.windowStartMin = currentTimeMin();
     order.windowEndMin = 24 * 60;
     order.urgent = false;
@@ -782,7 +792,7 @@ std::string MainWindow::addRandomCustomerAction() {
     appendLog(QStringLiteral("模拟新客户：新增配送点 %1 与订单 %2（货量 %3kg）")
                   .arg(QString::fromStdString(nodeId))
                   .arg(QString::fromStdString(order.id))
-                  .arg(order.demandKg, 0, 'f', 1));
+                  .arg(order.demandKg, 0, 'f', 0));
     replan();
     return nodeId;
 }
@@ -865,9 +875,9 @@ void MainWindow::onAdvanceStop() {
                 state_.bufferKg = 0.0;
             }
             appendLog(QStringLiteral("  顺路寄存缓冲货 %1kg 于 %2（站内库存 %3kg）")
-                          .arg(kg, 0, 'f', 1)
+                          .arg(kg, 0, 'f', 0)
                           .arg(QString::fromStdString(op.nodeId))
-                          .arg(state_.stationStock[op.nodeId], 0, 'f', 1));
+                          .arg(state_.stationStock[op.nodeId], 0, 'f', 0));
             break;
         }
     }
@@ -904,9 +914,9 @@ void MainWindow::onAdvanceStop() {
             recordRun(QStringLiteral("    └ 到达 %1 时车上载重：订单货 %2 kg ＋ 缓冲货 %3 kg "
                                      "＝ %4 kg（载重上限 %5 kg）")
                           .arg(QString::fromStdString(stop.nodeId))
-                          .arg(state_.loadKg, 0, 'f', 1)
-                          .arg(state_.bufferKg, 0, 'f', 1)
-                          .arg(state_.loadKg + state_.bufferKg, 0, 'f', 1)
+                          .arg(state_.loadKg, 0, 'f', 0)
+                          .arg(state_.bufferKg, 0, 'f', 0)
+                          .arg(state_.loadKg + state_.bufferKg, 0, 'f', 0)
                           .arg(cap, 0, 'f', 0));
         }
         deliverAt(stop);
@@ -1332,8 +1342,8 @@ void MainWindow::updatePanels() {
             stationStockTotal += kv.second;
         }
         route += QStringLiteral("缓冲库存：站内 %1 kg，车上 %2 kg\n")
-                     .arg(stationStockTotal, 0, 'f', 1)
-                     .arg(state_.bufferKg, 0, 'f', 1);
+                     .arg(stationStockTotal, 0, 'f', 0)
+                     .arg(state_.bufferKg, 0, 'f', 0);
         // 拆成三段写明，避免"共 K 趟"被误读成"整趟配送总共几趟"：
         //   已完成 = 真的跑完了几趟（事实）
         //   当前第 N 趟 = 绝对趟号（跨重规划连续，不重置）
@@ -1537,7 +1547,7 @@ void MainWindow::updatePanels() {
             transitTable_->setItem(i, 2,
                                    new QTableWidgetItem(QString::number(rows[i].serves)));
             transitTable_->setItem(i, 3,
-                                   new QTableWidgetItem(QString::number(rows[i].stockKg, 'f', 1)));
+                                   new QTableWidgetItem(QString::number(rows[i].stockKg, 'f', 0)));
         }
     }
 
@@ -1621,8 +1631,8 @@ QString MainWindow::runLogText() const {
                           "期末车上缓冲 %4 kg\n")
                .arg(runEventCount_)
                .arg(state_.servedStops)
-               .arg(stationTotal, 0, 'f', 1)
-               .arg(state_.bufferKg, 0, 'f', 1);
+               .arg(stationTotal, 0, 'f', 0)
+               .arg(state_.bufferKg, 0, 'f', 0);
     return out;
 }
 
@@ -1967,8 +1977,8 @@ int MainWindow::runActionSelfCheck() {
                    .arg(s->state_.incurredPenaltyMin));
         expect(std::fabs(m->state_.sumOnboard() - s->state_.sumOnboard()) < 1e-6,
                QStringLiteral("推进一刻不得跳过装卸：一刻车上 %1kg，逐个推进 %2kg")
-                   .arg(m->state_.sumOnboard(), 0, 'f', 1)
-                   .arg(s->state_.sumOnboard(), 0, 'f', 1));
+                   .arg(m->state_.sumOnboard(), 0, 'f', 0)
+                   .arg(s->state_.sumOnboard(), 0, 'f', 0));
         expect(m->currentNodeId_ == s->currentNodeId_,
                QStringLiteral("推进一刻与逐个推进应停在同一地点：一刻 %1，逐个推进 %2")
                    .arg(QString::fromStdString(m->currentNodeId_))
@@ -2360,7 +2370,7 @@ int MainWindow::runActionSelfCheck() {
         // 把"决策"和"事实"分开守，正是本轮结构改动的要点。
         expect(std::fabs(state_.tripLoadKg - snapshot.tripLoadKg) < 1e-6,
                QStringLiteral("重规划不得改变本趟出发时的装载量：%1 -> %2")
-                   .arg(snapshot.tripLoadKg, 0, 'f', 1).arg(state_.tripLoadKg, 0, 'f', 1));
+                   .arg(snapshot.tripLoadKg, 0, 'f', 0).arg(state_.tripLoadKg, 0, 'f', 0));
     }
 
     // ---- 轨迹必须正常：车要真的回仓库装货 ----
@@ -2529,7 +2539,7 @@ int MainWindow::runActionSelfCheck() {
         }
         expect(stockTotal > 1e-9,
                QStringLiteral("（前置）跑完全程后中转站应真的攒下缓冲货，实际合计 %1kg")
-                   .arg(stockTotal, 0, 'f', 1));
+                   .arg(stockTotal, 0, 'f', 0));
 
         const QString panel = transitPanelSummary();
         const QStringList panelRows = panel.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
@@ -2683,7 +2693,7 @@ int MainWindow::runActionSelfCheck() {
         }
         expect(seeded > 1e-9,
                QStringLiteral("（前置）默认数据上生产者应先攒到站内库存，实际 %1kg")
-                   .arg(seeded, 0, 'f', 1));
+                   .arg(seeded, 0, 'f', 0));
 
         // 车的位置取几个有代表性的点；目标取**图上全部配送点**——
         // 手写短名单会因前面步骤改动了世界状态（加了客户、插了单）而搜不到案例。
@@ -2751,6 +2761,113 @@ int MainWindow::runActionSelfCheck() {
             std::printf("[self-check] --  紧急单就地满足：%s\n", detail.toUtf8().constData());
         }
     }
+
+    // ⑨（货量口径）本项目**所有货量都是整公斤**。
+    //
+    // 缺陷背景（人工测试导出日志发现）：静态数据 config/default.ini 的货量列全是整数，
+    // 但两个**动态事件**按浮点随机生成货量——`3.0 + rng_.nextRange(0.0, 7.0)`
+    // （紧急单）与 `3.0 + rng_.nextRange(0.0, 12.0)`（新客户）。小数于是写进
+    // Order::demandKg 并一路传播到 loadKg/bufferKg/stationStock，
+    // 导出日志里出现「插入紧急订单 U001（货量 3.3kg）」与 135.2 / 141.9 kg 这类数字。
+    //
+    // 守卫读的是**动态事件真的生成出来的那个货量**（不是把公式重算一遍）：
+    // 反复触发两个生成入口，检查新落盘的订单货量是否为整数。
+    // 反复多次是因为这是随机路径——只跑一次可能恰好抽到整数而漏报。
+    //
+    // **必须用独立窗口副本**：这两个入口会往 config_.orders 里塞订单、还会各自
+    // replan 改 plan_。直接在本窗口上跑 200 轮会把状态彻底改脏，令其余检查失效
+    // （首次实现正是这样：本守卫插在中段，导致后面三条既有断言全红）。
+    {
+        std::unique_ptr<MainWindow> probe(new MainWindow(config_));
+        int checked = 0;
+        int fractional = 0;
+        QString firstBad;
+        // 固定次数上限，绝不无界循环（本项目纪律：守卫宁可失败，不可挂住）。
+        // 轮数取 40：这两个入口**每轮都会 replan**（全量规划），200 轮会让本测试
+        // 从 0.25s 涨到 99s，把 ctest 拖成分钟级。40 轮 ×2 入口 = 80 个样本，
+        // 已足够覆盖"浮点随机是否会产出小数"（原实现实测 80/80 全部带小数）。
+        for (int i = 0; i < 40; ++i) {
+            const std::size_t before = probe->config_.orders.size();
+            probe->insertUrgentOrderAction();
+            const std::size_t afterUrgent = probe->config_.orders.size();
+            probe->addRandomCustomerAction();
+            const std::size_t afterCustomer = probe->config_.orders.size();
+
+            for (std::size_t k = before;
+                 k < afterCustomer && k < probe->config_.orders.size(); ++k) {
+                const double kg = probe->config_.orders[k].demandKg;
+                ++checked;
+                if (std::fabs(kg - std::floor(kg + 0.5)) > 1e-9) {
+                    ++fractional;
+                    if (firstBad.isEmpty()) {
+                        const char* which = (k < afterUrgent) ? "紧急单" : "新客户";
+                        firstBad = QStringLiteral("%1 %2kg")
+                                       .arg(QString::fromUtf8(which))
+                                       .arg(kg, 0, 'f', 4);
+                    }
+                }
+            }
+        }
+        // 前置断言：必须真的生成了订单，否则下面那条断言是空跑
+        // （"0 个都合格"式的空跑通过，比没有守卫更糟——本项目反复踩过）。
+        expect(checked > 0,
+               QStringLiteral("（前置）应真的生成出动态订单货量用于检查，实际检查 %1 个")
+                   .arg(checked));
+        expect(fractional == 0,
+               QStringLiteral("动态事件（紧急单/新客户）生成的货量必须是整数公斤："
+                              "检查 %1 个，其中 %2 个带小数（首个：%3）")
+                   .arg(checked)
+                   .arg(fractional)
+                   .arg(firstBad.isEmpty() ? QStringLiteral("—") : firstBad));
+        // 货量区间不得因为"改整数"而漂移：紧急单 3–10kg、新客户 3–15kg。
+        // 这条防的是"顺手把 nextInt 的上下界写错"，那会让演示数据失去边界覆盖。
+        int urgentLo = 1000, urgentHi = -1, custLo = 1000, custHi = -1;
+        std::unique_ptr<MainWindow> rangeProbe(new MainWindow(config_));
+        for (int i = 0; i < 40; ++i) {
+            const std::size_t before = rangeProbe->config_.orders.size();
+            rangeProbe->insertUrgentOrderAction();
+            const std::size_t afterUrgent = rangeProbe->config_.orders.size();
+            rangeProbe->addRandomCustomerAction();
+            const std::size_t afterCustomer = rangeProbe->config_.orders.size();
+            for (std::size_t k = before;
+                 k < afterCustomer && k < rangeProbe->config_.orders.size(); ++k) {
+                const int kg = static_cast<int>(rangeProbe->config_.orders[k].demandKg);
+                if (k < afterUrgent) {
+                    urgentLo = (kg < urgentLo) ? kg : urgentLo;
+                    urgentHi = (kg > urgentHi) ? kg : urgentHi;
+                } else {
+                    custLo = (kg < custLo) ? kg : custLo;
+                    custHi = (kg > custHi) ? kg : custHi;
+                }
+            }
+        }
+        expect(urgentLo >= 3 && urgentHi <= 10 && urgentLo <= urgentHi,
+               QStringLiteral("紧急单货量应落在 3–10kg，实际 %1–%2kg")
+                   .arg(urgentLo).arg(urgentHi));
+        expect(custLo >= 3 && custHi <= 15 && custLo <= custHi,
+               QStringLiteral("新客户货量应落在 3–15kg，实际 %1–%2kg")
+                   .arg(custLo).arg(custHi));
+
+        // ⑨-b（显示口径）导出证据里**不得出现小数 kg**。
+        // 读的是将要交给别人的那份**文本本身**（runLogText），不重算公式。
+        // 只扫"数字紧跟 kg"的形态：距离/耗时/成本的小数（178.2km、378.3min、244.2 元）
+        // 是既有正确口径，必须原样保留——它们不带 kg 后缀，因此不会被这条误伤。
+        {
+            const QRegularExpression fractionalKg(
+                QStringLiteral("([0-9]+\\.[0-9]+)\\s*kg"));
+            const QString text = runLogText();
+            const QRegularExpressionMatch m = fractionalKg.match(text);
+            expect(!m.hasMatch(),
+                   QStringLiteral("导出运行日志里的货量必须是整数：出现了「%1」")
+                       .arg(m.hasMatch() ? m.captured(1) + QStringLiteral(" kg")
+                                         : QStringLiteral("—")));
+            // 前置断言：扫描对象必须真的含 kg 数字，否则上面那条是空跑
+            //（把 kg 全删掉也能"通过"，那正是"守卫没测到东西"的典型形态）。
+            expect(text.contains(QStringLiteral(" kg")),
+                   QStringLiteral("（前置）导出文本里应含以 kg 计的货量字段"));
+        }
+    }
+
 
     std::printf("[self-check] %s（失败 %d 项）\n",
                 failures == 0 ? "全部通过" : "存在失败", failures);
