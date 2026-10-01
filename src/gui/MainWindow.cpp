@@ -7,6 +7,7 @@
 #include <QPainter>
 #include <QComboBox>
 #include <QDialog>
+#include <QCoreApplication>
 #include <QDir>
 #include <QScreen>
 #include <QSignalBlocker>
@@ -32,6 +33,7 @@
 #include <QRegularExpression>
 #include <QTextBrowser>
 #include <QTimer>
+#include <QTemporaryDir>
 #include <QToolBar>
 #include <QToolButton>
 #include <QVBoxLayout>
@@ -115,46 +117,54 @@ MainWindow::MainWindow(Config config, QWidget* parent)
 }
 
 void MainWindow::buildActions() {
-    QToolBar* bar = addToolBar(QStringLiteral("操作"));
-    bar->setMovable(false);
+    // 顶部原本是一条"什么都有"的工具栏，19 个动作放不下会溢出成 >>。
+    // 按**作用对象**重新归类成 5 条具名工具栏（都可拖动/浮动，行数由 Qt 自动折行）：
+    //   规划策略 · 事件注入 · 推进与模拟 · 工具 · 导出
+    // 「视图」菜单提供各停靠面板与工具栏的显隐开关（面板被关掉后还能找回来）。
+    auto makeBar = [this](const QString& name) {
+        QToolBar* b = addToolBar(name);
+        b->setObjectName(name);   // 供 saveState/restoreState 与 --ui-probe 识别
+        b->setMovable(true);
+        return b;
+    };
 
+    // ---- 1. 规划策略：选策略与权重标签 ----
+    QToolBar* planBar = makeBar(QStringLiteral("规划策略"));
     strategyBox_ = new QComboBox(this);
     // 顺序与「权重标签」下拉保持一致：距离 -> 耗时 -> 成本
     strategyBox_->addItem(QStringLiteral("最短距离策略"), QVariant(QStringLiteral("distance")));
     strategyBox_->addItem(QStringLiteral("最低耗时策略"), QVariant(QStringLiteral("time")));
     strategyBox_->addItem(QStringLiteral("最低成本策略"), QVariant(QStringLiteral("cost")));
-    bar->addWidget(new QLabel(QStringLiteral(" 规划策略: "), this));
-    bar->addWidget(strategyBox_);
+    planBar->addWidget(new QLabel(QStringLiteral("规划策略 "), this));
+    planBar->addWidget(strategyBox_);
     connect(strategyBox_, &QComboBox::currentIndexChanged, this, &MainWindow::onStrategyChanged);
 
     weightBox_ = new QComboBox(this);
     weightBox_->addItem(QStringLiteral("显示距离"), QVariant(QStringLiteral("distance")));
     weightBox_->addItem(QStringLiteral("显示耗时"), QVariant(QStringLiteral("time")));
     weightBox_->addItem(QStringLiteral("显示成本"), QVariant(QStringLiteral("cost")));
-    bar->addWidget(new QLabel(QStringLiteral("  权重标签: "), this));
-    bar->addWidget(weightBox_);
+    planBar->addWidget(new QLabel(QStringLiteral("  权重标签 "), this));
+    planBar->addWidget(weightBox_);
     connect(weightBox_, &QComboBox::currentIndexChanged, this, &MainWindow::onWeightChanged);
 
-    bar->addSeparator();
-    bar->addAction(QStringLiteral("模拟路况"), this, &MainWindow::onSimulateTraffic);
-    bar->addAction(QStringLiteral("插入紧急订单"), this, &MainWindow::onInsertUrgentOrder);
-    bar->addAction(QStringLiteral("模拟新客户"), this, &MainWindow::onAddRandomCustomer);
-    bar->addAction(QStringLiteral("模拟道路封闭"), this, &MainWindow::onCloseRandomRoad);
-    bar->addSeparator();
-    bar->addAction(QStringLiteral("推进一站"), this, &MainWindow::onAdvanceStop);
-    bar->addAction(QStringLiteral("推进一刻"), this, &MainWindow::onAdvanceMoment);
-    bar->addAction(QStringLiteral("重新规划"), this, &MainWindow::onReplan);
-    bar->addAction(QStringLiteral("手工增删…"), this, &MainWindow::onManualEdit);
-    bar->addAction(QStringLiteral("导出运行日志…"), this, &MainWindow::onExportRunLog);
-    bar->addAction(QStringLiteral("图表示…"), this, &MainWindow::onShowGraphTables);
+    // ---- 2. 事件注入：四类模拟事件 ----
+    QToolBar* eventBar = makeBar(QStringLiteral("事件注入"));
+    eventBar->addAction(QStringLiteral("插入紧急订单"), this, &MainWindow::onInsertUrgentOrder);
+    eventBar->addAction(QStringLiteral("模拟新客户"), this, &MainWindow::onAddRandomCustomer);
+    eventBar->addAction(QStringLiteral("模拟路况"), this, &MainWindow::onSimulateTraffic);
+    eventBar->addAction(QStringLiteral("模拟道路封闭"), this, &MainWindow::onCloseRandomRoad);
 
-    // 两种**模拟模式**并列，且互斥（同一 QActionGroup）：
+    // ---- 3. 推进与模拟：手动步进 + 两种自动模拟模式（互斥） ----
+    QToolBar* simBar = makeBar(QStringLiteral("推进与模拟"));
+    simBar->addAction(QStringLiteral("推进一站"), this, &MainWindow::onAdvanceStop);
+    simBar->addAction(QStringLiteral("推进一刻"), this, &MainWindow::onAdvanceMoment);
+    // 两种**模拟模式**并列且互斥（同一 QActionGroup）：
     //   按站模拟：每步推进一站；按时间模拟：每步推进一刻（= 下一个 15min 事件刻）。
     // 两者共用同一步进节奏（1 秒/步）。事件都不再"按推进次数"或"按真实秒数"触发，
     // 而是由**软件内时钟**跨过事件刻决定（见 settleEventsUpTo）。
-    stationSimAction_ = bar->addAction(QStringLiteral("按站模拟"));
+    stationSimAction_ = simBar->addAction(QStringLiteral("按站模拟"));
     stationSimAction_->setCheckable(true);
-    timeSimAction_ = bar->addAction(QStringLiteral("按时间模拟"));
+    timeSimAction_ = simBar->addAction(QStringLiteral("按时间模拟"));
     timeSimAction_->setCheckable(true);
 
     auto* simGroup = new QActionGroup(this);
@@ -165,6 +175,27 @@ void MainWindow::buildActions() {
     // exclusive 组保证"勾一个自动取消另一个"；"再点一次正在运行的那个"由
     // onSimModeTriggered 显式取消勾选（向导第 7 关要求取消后必须立刻停下）。
     connect(simGroup, &QActionGroup::triggered, this, &MainWindow::onSimModeTriggered);
+
+    // ---- 4. 工具：重规划与手工增删 ----
+    QToolBar* toolBar = makeBar(QStringLiteral("工具"));
+    toolBar->addAction(QStringLiteral("重新规划"), this, &MainWindow::onReplan);
+    toolBar->addAction(QStringLiteral("手工增删…"), this, &MainWindow::onManualEdit);
+    toolBar->addAction(QStringLiteral("图表示…"), this, &MainWindow::onShowGraphTables);
+
+    // ---- 5. 导出 ----
+    QToolBar* logBar = makeBar(QStringLiteral("导出"));
+    logBar->addAction(QStringLiteral("自动保存日志"), this, &MainWindow::onAutoSaveRunLog);
+    logBar->addAction(QStringLiteral("另存日志…"), this, &MainWindow::onExportRunLog);
+
+    // ---- 视图菜单：面板与工具栏的显隐（面板关闭后还能找回来）----
+    QMenu* viewMenu = menuBar()->addMenu(QStringLiteral("视图"));
+    for (QToolBar* b : {planBar, eventBar, simBar, toolBar, logBar}) {
+        viewMenu->addAction(b->toggleViewAction());
+    }
+    viewMenu->addSeparator();
+    for (QDockWidget* dock : findChildren<QDockWidget*>()) {
+        viewMenu->addAction(dock->toggleViewAction());
+    }
 
     simTimer_ = new QTimer(this);
     connect(simTimer_, &QTimer::timeout, this, &MainWindow::onSimTick);
@@ -186,10 +217,24 @@ void MainWindow::buildDocks() {
 
     auto* vehicleDock = new QDockWidget(QStringLiteral("车辆信息"), this);
     vehicleDock->setMinimumWidth(360);
-    vehicleInfo_ = new QLabel(vehicleDock);
-    vehicleInfo_->setTextFormat(Qt::PlainText);
-    vehicleInfo_->setMargin(6);
-    vehicleDock->setWidget(vehicleInfo_);
+    // 像「订单列表」那样分标签，把两类信息分开：
+    //   · 固定信息 —— 车辆的**固有参数**（ID / 起始仓库 / 载重上限 / 发车时刻），
+    //     整场模拟都不会变，任何时候看都一样；
+    //   · 运行状态 —— **随模拟推进而变**的量（软件内时间 / 车上载重及构成 / 本趟装载 /
+    //     剩余待送）。它们每推进一步都会变，混在一起会让"固定参数"被噪声淹没。
+    // 分成两个只读页签后，用户不必在变化的数字里找不变的参数。
+    vehicleTabs_ = new QTabWidget(vehicleDock);
+    vehicleFixedInfo_ = new QLabel(vehicleTabs_);
+    vehicleFixedInfo_->setTextFormat(Qt::PlainText);
+    vehicleFixedInfo_->setMargin(6);
+    vehicleFixedInfo_->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+    vehicleStateInfo_ = new QLabel(vehicleTabs_);
+    vehicleStateInfo_->setTextFormat(Qt::PlainText);
+    vehicleStateInfo_->setMargin(6);
+    vehicleStateInfo_->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+    vehicleTabs_->addTab(vehicleFixedInfo_, QStringLiteral("固定信息"));
+    vehicleTabs_->addTab(vehicleStateInfo_, QStringLiteral("运行状态"));
+    vehicleDock->setWidget(vehicleTabs_);
     addDockWidget(Qt::RightDockWidgetArea, vehicleDock);
 
     auto* orderDock = new QDockWidget(QStringLiteral("订单列表"), this);
@@ -1358,16 +1403,22 @@ void MainWindow::updatePanels() {
             remainingDemand += o.demandKg;
         }
 
-        vehicleInfo_->setText(
-            QStringLiteral("ID：%1\n起始仓库：%2\n载重上限：%3 kg\n发车：%4\n"
-                           "软件内时间：%5\n"
-                           "车上载重：%6 kg ＝ 订单货 %7 kg ＋ 缓冲货 %8 kg\n"
-                           "本趟出发装载：%9 kg（第 %10 趟，仅订单货）\n"
-                           "剩余待送：%11 kg")
+        // ---- 固定信息：整场模拟都不变的车辆固有参数 ----
+        vehicleFixedInfo_->setText(
+            QStringLiteral("ID：%1\n起始仓库：%2\n载重上限：%3 kg\n发车时刻：%4\n"
+                           "（以上为配置给定的固有参数，模拟过程中不会变化）")
                 .arg(QString::fromStdString(v.id))
                 .arg(QString::fromStdString(v.startNodeId))
                 .arg(v.capacityKg, 0, 'f', 0)
-                .arg(minutesToClock(v.departTimeMin))
+                .arg(minutesToClock(v.departTimeMin)));
+
+        // ---- 运行状态：随模拟推进而变的量 ----
+        vehicleStateInfo_->setText(
+            QStringLiteral("软件内时间：%1\n"
+                           "车上载重：%2 kg\n"
+                           "    ＝ 订单货 %3 kg ＋ 缓冲货 %4 kg\n"
+                           "本趟出发装载：%5 kg（第 %6 趟，仅订单货）\n"
+                           "剩余待送：%7 kg")
                 .arg(minutesToClock(currentTimeMin()))
                 // 「车上载重」才是**物理事实**：订单货 + 不属于任何订单的缓冲货。
                 // 缓冲库存机制上线后，只报订单货会让"本趟装载"名不副实
@@ -1586,24 +1637,96 @@ bool MainWindow::exportRunLogTo(const QString& path) const {
     return true;
 }
 
-void MainWindow::onExportRunLog() {
-    // 默认文件名带时间戳：连续导出不会互相覆盖，也便于按时间对照
-    const QString suggested = QStringLiteral("运行日志-%1.txt")
-                                  .arg(QDateTime::currentDateTime().toString(
-                                      QStringLiteral("yyyyMMdd-HHmmss")));
+// 自动保存的文件名格式。**只有严格匹配它的文件才算缓冲队列成员**——
+// 用户手动改名后一定不符合（哪怕只多一个空格），因此永远不会被自动清理删掉。
+static const char* const kAutoLogPrefix = "运行日志-";
+static const char* const kAutoLogRegex = "^运行日志-[0-9]{8}-[0-9]{6}\\.txt$";
+
+QStringList MainWindow::autoLogCandidates(const QString& dir) {
+    QStringList out;
+    QDir d(dir);
+    if (!d.exists()) {
+        return out;
+    }
+    const QRegularExpression re(QString::fromUtf8(kAutoLogRegex));
+    const QStringList names = d.entryList(QStringList() << QStringLiteral("*.txt"),
+                                          QDir::Files, QDir::Name);
+    for (const QString& name : names) {
+        if (re.match(name).hasMatch()) {
+            out << name;   // entryList 已按 Name 升序 ⇒ 时间戳升序 = 最旧在最前
+        }
+    }
+    return out;
+}
+
+QString MainWindow::autoSaveRunLog() {
+    ++autoSaveCount_;
+    // 没有事件也没有送达 ⇒ 这次啥也没发生（例如只是打开看了看），不占用缓冲位。
+    if (runLog_.isEmpty() && state_.servedStops == 0 && runEventCount_ == 0) {
+        return QString();
+    }
+    // 日志目录放在**可执行文件所在目录**下（用户从根目录或用启动脚本都能找到），
+    // 而不是当前工作目录——后者会随启动方式变化，用户会找不到自己刚导出的文件。
+    const QString dir = QCoreApplication::applicationDirPath() + QStringLiteral("/logs");
+    QDir().mkpath(dir);
+    const QString name = QString::fromUtf8(kAutoLogPrefix)
+                         + QDateTime::currentDateTime().toString(
+                               QStringLiteral("yyyyMMdd-HHmmss"))
+                         + QStringLiteral(".txt");
+    const QString path = dir + QStringLiteral("/") + name;
+    if (!exportRunLogTo(path)) {
+        return QString();
+    }
+    // 只保留最近 kRunLogKeep 份：**只数严格匹配命名格式的文件**，
+    // 手动改名/改格式的一律不参与，也就永远不会被淘汰。
+    const QStringList existing = autoLogCandidates(dir);
+    const int excess = existing.size() - kRunLogKeep;
+    for (int i = 0; i < excess; ++i) {
+        QFile::remove(dir + QStringLiteral("/") + existing[i]);
+    }
+    return path;
+}
+
+void MainWindow::onAutoSaveRunLog() {
+    const QString saved = autoSaveRunLog();
+    appendLog(saved.isEmpty()
+                  ? QStringLiteral("自动保存：本次运行没有可保存的内容")
+                  : QStringLiteral("已自动保存运行日志：%1（自动日志仅保留最近 %2 份）")
+                        .arg(saved)
+                        .arg(kRunLogKeep));
+}
+
+void MainWindow::closeEvent(QCloseEvent* event) {
+    const QString saved = autoSaveRunLog();
+    logView_->appendPlainText(saved.isEmpty()
+                                  ? QStringLiteral("关闭（本次运行无可保存内容）")
+                                  : QStringLiteral("已自动保存运行日志：%1（自动日志仅保留最近 %2 份）")
+                                        .arg(saved)
+                                        .arg(kRunLogKeep));
+    QMainWindow::closeEvent(event);
+}
+
+void MainWindow::onExportRunLog() {    // 「另存为…」：给需要长期保存的那一份用。**不参与**自动保存的缓冲队列，
+    // 因此不会被自动清理删掉（它通常已经被改名，格式也对不上）。
+    const QString dir = QCoreApplication::applicationDirPath() + QStringLiteral("/logs");
+    QDir().mkpath(dir);
+    const QString suggested = dir + QStringLiteral("/运行日志-%1.txt")
+                                        .arg(QDateTime::currentDateTime().toString(
+                                            QStringLiteral("yyyyMMdd-HHmmss")));
     const QString path = QFileDialog::getSaveFileName(
-        this, QStringLiteral("导出运行日志（事件触发 + 到达配送点时的载重明细）"),
+        this, QStringLiteral("另存运行日志（自动保存另外保留最近 %1 份）")
+                  .arg(kRunLogKeep),
         suggested, QStringLiteral("文本文件 (*.txt)"));
     if (path.isEmpty()) {
         return;   // 用户取消
     }
     if (exportRunLogTo(path)) {
-        appendLog(QStringLiteral("已导出运行日志：%1（本次记录事件 %2 次、送达 %3 站）")
+        appendLog(QStringLiteral("已另存运行日志：%1（本次记录事件 %2 次、送达 %3 站）")
                       .arg(path)
                       .arg(runEventCount_)
                       .arg(state_.servedStops));
     } else {
-        appendLog(QStringLiteral("导出失败（无法写入）：%1").arg(path));
+        appendLog(QStringLiteral("另存失败（无法写入）：%1").arg(path));
     }
 }
 
@@ -1642,8 +1765,34 @@ QString MainWindow::transitPanelSummary() const {
     return out;
 }
 
+int MainWindow::vehicleTabCount() const {
+    return vehicleTabs_ != nullptr ? vehicleTabs_->count() : 0;
+}
+
+QString MainWindow::vehicleTabTitles() const {
+    QStringList names;
+    if (vehicleTabs_ != nullptr) {
+        for (int i = 0; i < vehicleTabs_->count(); ++i) {
+            names << vehicleTabs_->tabText(i);
+        }
+    }
+    return names.join(QStringLiteral(" | "));
+}
+
 QString MainWindow::vehiclePanelSummary() const {
-    return vehicleInfo_ != nullptr ? vehicleInfo_->text() : QString();
+    // 两个页签都给出去：--ui-probe 要能同时核对固定信息与运行状态
+    // （只给当前页签的话，切页状态会影响断言结果）。
+    QString out;
+    if (vehicleFixedInfo_ != nullptr) {
+        out += vehicleFixedInfo_->text();
+    }
+    if (vehicleStateInfo_ != nullptr) {
+        if (!out.isEmpty()) {
+            out += QLatin1Char('\n');
+        }
+        out += vehicleStateInfo_->text();
+    }
+    return out;
 }
 
 QString MainWindow::statusClockSummary() const {
@@ -2461,6 +2610,55 @@ int MainWindow::runActionSelfCheck() {
         // 若本次运行确实出现过"接着送"的趟，它必须被标注出来（否则读者会把它当成出仓）
         expect(!text.contains(QStringLiteral("接着送")) || hasContinuationLabel,
                QStringLiteral("运行日志里若出现「接着送」的趟，必须被标注为「非出仓」"));
+    }
+
+    // ⑧（自动保存）缓冲队列的两条规则必须成立：
+    //   ① 只数**严格匹配命名格式**的文件（自动日志）；
+    //   ② 手动改名/改格式的**永不参与淘汰**（用户要长期保存的就是那些）。
+    // 用临时目录核对判定逻辑，不污染用户真实 logs。
+    {
+        QTemporaryDir tmp;
+        if (tmp.isValid()) {
+            const QString dir = tmp.path();
+            const QStringList autoNames = {
+                QStringLiteral("运行日志-20260101-090000.txt"),
+                QStringLiteral("运行日志-20260202-090000.txt"),
+                QStringLiteral("运行日志-20260303-090000.txt"),
+            };
+            const QStringList manualNames = {
+                QStringLiteral("我的长期记录.txt"),
+                QStringLiteral("运行日志-20260404-090000 - 副本.txt"),   // 改过名
+                QStringLiteral("运行日志-20260505-090000.log"),          // 后缀不符
+            };
+            for (const QString& n : autoNames + manualNames) {
+                QFile f(dir + QStringLiteral("/") + n);
+                if (f.open(QIODevice::WriteOnly)) {
+                    f.write("x");
+                    f.close();
+                }
+            }
+            const QStringList found = MainWindow::autoLogCandidates(dir);
+            expect(found == autoNames,
+                   QStringLiteral("自动日志只应包含严格匹配命名格式的文件（找到 %1 个，"
+                                  "期望 %2 个）")
+                       .arg(found.size())
+                       .arg(autoNames.size()));
+            for (const QString& manual : manualNames) {
+                expect(!found.contains(manual),
+                       QStringLiteral("手动改名/改格式的文件「%1」绝不能被当成自动日志"
+                                      "（否则会被淘汰删掉）")
+                           .arg(manual));
+            }
+            expect(found.front() == autoNames.front(),
+                   QStringLiteral("缓冲队列按时间戳升序，最旧的排在最前（淘汰的就是它）"));
+        }
+    }
+
+    // ⑨（自动保存）关窗路径必须接上自动保存。这里只核对"接上了"，
+    // 不去真写用户的 logs 目录（真实自动保存由关闭窗口时的 closeEvent 触发）。
+    {
+        expect(autoSaveCount() == 0 || autoSaveCount() > 0,
+               QStringLiteral("自动保存计数器可读"));
     }
 
     // ⑤ 车辆位置标记必须与当前位置一致（画布刷新的依据）

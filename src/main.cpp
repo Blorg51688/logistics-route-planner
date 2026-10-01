@@ -397,6 +397,14 @@ int main(int argc, char** argv) {
         const QString vehiclePanel = window.vehiclePanelSummary();
         {
             const double cap = config.vehicles.empty() ? 0.0 : config.vehicles.front().capacityKg;
+            // 车辆信息必须分「固定信息」「运行状态」两页（否则变化的数字会把不变的参数淹没）
+            const int vehicleTabs = window.vehicleTabCount();
+            if (vehicleTabs != 2) {
+                std::fprintf(stderr, "[ui-probe] 车辆信息应有 2 个标签页，实际 %d\n", vehicleTabs);
+                return 1;
+            }
+            std::printf("[ui-probe] 车辆信息 %d 个标签页：%s\n", vehicleTabs,
+                        window.vehicleTabTitles().toUtf8().constData());
             // 「车上载重」是物理事实，必须 <= 载重上限
             const QRegularExpression totalRe(
                 QStringLiteral("车上载重：([0-9.]+) kg"));

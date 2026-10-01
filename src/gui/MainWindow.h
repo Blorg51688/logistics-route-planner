@@ -1,6 +1,10 @@
 #pragma once
 
 #include <QMainWindow>
+#include <QMenu>
+#include <QMenuBar>
+#include <QToolBar>
+#include <QTabWidget>
 
 #include <map>
 #include <set>
@@ -12,6 +16,7 @@
 #include "core/RoutePlanner.h"
 #include "core/WeightType.h"
 
+class QCloseEvent;
 class GraphScene;
 class QAction;
 class QComboBox;
@@ -101,6 +106,13 @@ public:
 public:
     explicit MainWindow(logistics::Config config, QWidget* parent = nullptr);
 
+    // 关窗即**自动保存**本次运行日志到 `logs/`（只保留最近 kRunLogKeep 份）。
+    // 放在关窗路径上：用户跑完模拟直接关窗是最常见的收尾动作，不必记得手动导出。
+    void closeEvent(QCloseEvent* event) override;
+    // 自动保存（含淘汰旧文件）的次数。仅用于 --self-check-actions 观察行为，
+    // 避免为了测一次淘汰就往用户真实 logs 目录里塞文件。
+    int autoSaveCount() const { return autoSaveCount_; }
+
     // 交互式显示：把窗口尺寸限制在可用屏幕之内，避免默认尺寸大于屏幕
     // 导致侧栏或工具栏被推到屏幕之外而"看不见"
     void showInteractive();
@@ -117,6 +129,16 @@ public:
     // 目的：把"确实会出现的问题"变成可以直接带出界面的证据，而不是要求对方复现。
     QString runLogText() const;
     bool exportRunLogTo(const QString& path) const;
+    // 自动保存到 `logs/运行日志-yyyyMMdd-HHmmss.txt`，并**只保留最近 kRunLogKeep 份**。
+    //
+    // **缓冲队列的成员判定**：文件名**严格**匹配上面这个格式的才算。
+    // 用户手动改名后一定不符合这个格式 ⇒ 自动排除、**永不删除**（那些是要长期保存的）。
+    // 返回实际写入的路径（失败返回空串）。
+    QString autoSaveRunLog();
+    static constexpr int kRunLogKeep = 2;
+    // 列出某目录下"算作自动日志"的文件（按名升序 = 时间戳升序）。静态、不写盘，
+    // 供 --self-check-actions 核对命名判定与淘汰规则。
+    static QStringList autoLogCandidates(const QString& dir);
     // 中转站面板的文本快照，供 --ui-probe 在无头环境下确定性核对
     QString transitPanelSummary() const;
     // 停靠明细面板的文本快照（供 --ui-probe）
@@ -136,6 +158,9 @@ public:
     double  currentTripLoadKg() const { return state_.tripLoadKg; }
     // 车辆信息面板的文本快照（供 --ui-probe）
     QString vehiclePanelSummary() const;
+    // 车辆信息的页签数与标题（供 --ui-probe 核对"固定信息 / 运行状态"确实分开了）
+    int     vehicleTabCount() const;
+    QString vehicleTabTitles() const;
     // 状态栏"软件内时间"的文本快照（供 --ui-probe 断言它确实常驻可见）
     QString statusClockSummary() const;
     // 供 --self-check-actions 使用：自动验证两个由人工测试发现的缺陷不再复现
@@ -165,6 +190,7 @@ private slots:
     // 「导出运行日志…」：把本次模拟的事件触发与每个配送点到达时的载重明细写成文件，
     // 好把"确实出现过的问题"作为证据交给别人（而不必要求对方复现）。
     void onExportRunLog();
+    void onAutoSaveRunLog();
 
 private:
     void buildActions();
@@ -185,6 +211,7 @@ private:
     void recordRun(const QString& text, int atMin = -1);
     QStringList runLog_;
     int         runEventCount_ = 0;   // 本次模拟抽到的事件次数（供汇总行）
+    int         autoSaveCount_ = 0;   // 自动保存次数（仅自检观察用）
 
     // ---- 软件内时间的事件模型（设计 §7 / D24）----
     //
@@ -287,7 +314,10 @@ private:
     // "它刚跑完的那一趟"（该趟终点就是仓库），用 curTrip 会少记一趟，
     // 于是趟号永远停在「第 1 趟」——这正是人工测试反馈的现象。
     QTextBrowser*  routeInfo_ = nullptr;
-    QLabel*        vehicleInfo_ = nullptr;
+    // 车辆信息分两页签：固定信息（固有参数）/ 运行状态（随模拟变化）
+    QTabWidget*    vehicleTabs_ = nullptr;
+    QLabel*        vehicleFixedInfo_ = nullptr;
+    QLabel*        vehicleStateInfo_ = nullptr;
     // 状态栏上的**软件内时间**：它是这套模拟的核心驱动量（事件刻、订单窗口、
     // penalty 全按它算），但此前只出现在日志里，一滚就看不见了。
     QLabel*        clockLabel_ = nullptr;
