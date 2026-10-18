@@ -6,7 +6,7 @@
 
 ## 1. 问题（已实测确认）
 
-工作区根目录当前只有：`要求源文件/ build/ CMakeLists.txt config/ docs/ scripts/ src/ tests/ tools/`。
+工作区根目录当前只有：`requirements/ build/ CMakeLists.txt config/ docs/ scripts/ src/ tests/ tools/`。
 **既无 README，也无任何启动脚本。** 一个不熟悉本项目的人站在根目录：
 
 - 不知道哪个是主程序（`build/app` 藏在被 gitignore 的构建目录里）；

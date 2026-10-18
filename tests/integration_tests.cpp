@@ -187,8 +187,8 @@ void checkDataQualityInvariants(const Config& cfg, const RoutePlan& byDistance,
 
     // 6) 缓冲库存的「弹药量」（守卫：生产者记账的量级不得漂移）。
     //    口径 = F1「读法 2」（仓库可发不属于任何订单的缓冲货）在默认数据上的静态规划总量。
-    //    期望值来源：docs/留档/决策/transit-stock-full-load.md 的 F1 实测（2026-09-26），
-    //    由 docs/留档/决策/probes/probeF 独立复现；实现 T2 后逐位对齐（T01=138 T02=158
+    //    期望值来源：docs/records/decisions/transit-stock-full-load.md 的 F1 实测（2026-09-26），
+    //    由 docs/records/decisions/probes/probeF 独立复现；实现 T2 后逐位对齐（T01=138 T02=158
     //    T03=138 → 434；成本策略 T03=142 → 438）。
     //    与上面的黄金值同类：是**捕获值**，用于检测非预期漂移，不用于证明最优性。
     //    （缓冲货不参与选路，所以黄金值不会因为本机制而变化——守卫必须落在“量”上。）

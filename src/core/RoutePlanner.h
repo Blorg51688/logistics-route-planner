@@ -127,7 +127,7 @@ RoutePlan planRoute(const LogisticsGraph& graph,
                     WeightType weight,
                     // 期初站内库存（缓冲库存机制）。默认空 = 无库存可用（黄金值口径）。
                     // 仓库可发出不属于任何订单的缓冲货——2026-09-26 用户裁定，见
-                    // docs/留档/实现规格/transit-urgent-buffer.md 的"建模前提"。
+                    // docs/records/specs/transit-urgent-buffer.md 的"建模前提"。
                     const std::map<std::string, double>& initialStock
                         = std::map<std::string, double>());
 

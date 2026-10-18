@@ -1,6 +1,6 @@
 # 实现规格：紧急单"缓冲库存"就地满足（transit-urgent-buffer）
 
-> 来源：`docs/留档/决策/transit-stock-full-load.md`（四轮商议记录）。
+> 来源：`docs/records/decisions/transit-stock-full-load.md`（四轮商议记录）。
 > 结论已由用户裁定为**做**（第四轮）：前置 A = **读法 2**（每次满载出仓强制带一部分
 > **不属于任何订单的缓冲货**，它是站内库存与车上盈余的唯一来源）；前置 B = 本规格强制的
 > **两版取优 + penalty 一票否决 + 四条守卫**。
@@ -178,7 +178,7 @@ pos = 车辆当前位置；T = 当前时刻
 
 | 路径 | 原因 |
 |---|---|
-| `要求源文件/` | 老师给的原始文件，只读 |
+| `requirements/` | 老师给的原始文件，只读 |
 | `docs/人工测试记录.md` | 陈旧记录，需真人在终端重跑向导才会刷新；不得手改 |
 | `config/default.ini` | 本规格不需要新配置；改它会影响黄金值口径 |
 | `CMakeLists.txt` | 不新增测试二进制（守卫并入既有 `routeplanner_tests`/`integration_tests`） |

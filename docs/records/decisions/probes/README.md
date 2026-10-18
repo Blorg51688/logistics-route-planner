@@ -6,10 +6,10 @@
 
 ```bash
 R="$PWD"
-g++ -std=c++17 -O1 -I "$R/src" docs/留档/决策/probes/probe.cpp  "$R"/src/core/*.cpp "$R"/src/io/*.cpp -o /tmp/probe_abc
-g++ -std=c++17 -O1 -I "$R/src" docs/留档/决策/probes/probeD.cpp "$R"/src/core/*.cpp "$R"/src/io/*.cpp -o /tmp/probe_d
-g++ -std=c++17 -O1 -I "$R/src" docs/留档/决策/probes/probeE.cpp "$R"/src/core/*.cpp "$R"/src/io/*.cpp -o /tmp/probe_e
-g++ -std=c++17 -O1 -I "$R/src" docs/留档/决策/probes/probeF.cpp "$R"/src/core/*.cpp "$R"/src/io/*.cpp -o /tmp/probe_f
+g++ -std=c++17 -O1 -I "$R/src" docs/records/decisions/probes/probe.cpp  "$R"/src/core/*.cpp "$R"/src/io/*.cpp -o /tmp/probe_abc
+g++ -std=c++17 -O1 -I "$R/src" docs/records/decisions/probes/probeD.cpp "$R"/src/core/*.cpp "$R"/src/io/*.cpp -o /tmp/probe_d
+g++ -std=c++17 -O1 -I "$R/src" docs/records/decisions/probes/probeE.cpp "$R"/src/core/*.cpp "$R"/src/io/*.cpp -o /tmp/probe_e
+g++ -std=c++17 -O1 -I "$R/src" docs/records/decisions/probes/probeF.cpp "$R"/src/core/*.cpp "$R"/src/io/*.cpp -o /tmp/probe_f
 ```
 
 运行（均以 `config/default.ini` 为输入）：
