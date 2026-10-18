@@ -1,0 +1,62 @@
+%%{init: {'theme':'base', 'flowchart': {'curve': 'basis'}}}%%
+%% F4 多趟分批配送 multiTripPlanImpl（总需求超过载重时进入）
+%% 依据 src/core/RoutePlanner.cpp multiTripPlanImpl · multiTripPlan · weave
+%%      src/core/RoutePlanner.cpp fillBufferFromDepot · bankBufferEnRoute · tripHub
+%%      src/core/RoutePlanner.cpp appendLeg · eraseCandidateByNode · totalDemand
+%%      src/core/RoutePlanner.cpp sortTransitOpsByTime · flatten
+%%      设计.md §5.6（多趟分批）§5.5（载重约束 D14/D21）§16 P25/P30（中转站不参与排线）
+%% 落点只写符号名不写行号：行号会漂，符号名不会。
+%% ----
+%% 注意两个入口都通向本函数：multiTripPlan（多趟）与 replan（总需求 > 载重时转来）。
+%% 单趟 replan 路径也有"出仓满载 + 顺路寄存 + 补库存快照"的生产者，
+%% 判据与这里完全一致（当前位置 == startNodeId 且 load > 0），见 F5 / RoutePlanner::replan。
+flowchart TD
+    A(["multiTripPlanImpl(candidates, startPos, ...)"]) --> B["建 transitBySub<br/>（sub_network_id → 中转站）"]
+    B --> C["拆分 candidates：<br/>urgentPool（紧急）/ normalPool（普通）"]
+    C --> D["current = startPos, elapsed = startTimeMin"]
+
+    %% ---- 紧急批次 ----
+    D --> E{"urgentPool 非空"}
+    E -->|是| F["贪心装箱 batchLoad ≤ capacity<br/>batch = 一批紧急订单"]
+    F --> F2{"某订单货量 > capacity"}
+    F2 -->|是| G(["返回 OrderExceedsCapacity<br/>（单订单超载才是真不可行；总需求超载走多趟）"])
+    F2 -->|否| H0["pickupNode = supply.pickup<br/>（D23 缓冲库存：默认 startNodeId，<br/>命中目标紧急单时被覆盖成车上/中转站）"]
+    H0 --> H["weave(batch, current,<br/>pickup=pickupNode, end=startNodeId)"]
+    H --> I{"weave 成功"}
+    I -->|否| J(["返回 Unreachable"])
+    I -->|是| K{"supplyUsed<br/>（取货点不是仓库）"}
+    K -->|是| K1["bufferKg = 0, supplyInPlace = true<br/>（就地满足：本趟不是出仓，不装缓冲）"]
+    K -->|否| K2["fillBufferFromDepot（满载出仓）<br/>+ bankBufferEnRoute（返程顺路寄存，<br/>至多一条 bankOps）"]
+    K1 --> L
+    K2 --> L["trips.push(trip)<br/>current = startNodeId<br/>从 urgentPool 移除 batch"] --> E
+
+    %% ---- 在途货 ----
+    E -->|否| M{"onboard 非空"}
+    M -->|是| N["carried = 与 onboard 匹配的候选<br/>（只从剩余池取；按节点去重）"]
+    N --> O["weave(carried, current,<br/>pickup=current, end=startNodeId)"]
+    O --> P{"weave 成功"}
+    P -->|是| P2{"current = startNodeId<br/>且 load > 0"}
+    P2 -->|是| P3["fillBufferFromDepot（确实是出仓）<br/>+ bankBufferEnRoute"] --> P4
+    P2 -->|否| P4["trips.push(trip)<br/>current = trip.endNodeId<br/>从两池移除 carried"] --> M
+    P -->|否| M
+
+    %% ---- 按簇分批 ----
+    M -->|否| Q["按 hub 分簇 clusters<br/>（sub_network_id 归属，0 归仓库簇）"]
+    Q --> R["簇按总货量降序排序<br/>（并列按 hub 名升序；手写选择排序）"]
+    R --> S{"有下一个簇"}
+    S -->|是| T["pool = 该簇候选"]
+    T --> U{"pool 非空"}
+    U -->|是| V["贪心装箱 batchLoad ≤ capacity"]
+    V --> V2{"某订单货量 > capacity"}
+    V2 -->|是| G
+    V2 -->|否| W["weave(batch, current,<br/>pickup=startNodeId, end=startNodeId)"]
+    W --> X{"weave 成功"}
+    X -->|否| J
+    X -->|是| Y["fillBufferFromDepot（簇批必从仓库出发）<br/>+ bankBufferEnRoute<br/>trips.push(trip)<br/>current = startNodeId<br/>从 pool 移除 batch"] --> U
+    U -->|否| S
+
+    %% ---- 收尾 ----
+    S -->|否| Z{"current ≠ startNodeId"}
+    Z -->|是| ZA["appendLeg(current → startNodeId)<br/>收尾趟，trips.push<br/>（收尾趟不出仓，不计缓冲）"] --> ZB
+    Z -->|否| ZB["汇总 transitStock（期初 + 寄存 = 期末）<br/>sortTransitOpsByTime（按时刻排序）<br/>flatten(plan)：trips → 扁平视图<br/>（唯一展平点）"]
+    ZB --> ZC(["返回 RoutePlan<br/>status = Ok"])

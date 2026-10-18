@@ -1,0 +1,33 @@
+%%{init: {'theme':'base', 'flowchart': {'curve': 'basis'}}}%%
+%% F2 Dijkstra 单源最短路（手写最小堆 + 松弛）
+%% 依据 src/core/Dijkstra.cpp shortestPath
+%%      src/core/MinHeap.cpp   push / popMin（惰性删除）
+%%      src/core/WeightType.h  pickWeight（按维度取距离/耗时/成本）
+flowchart TD
+    A(["shortestPath(graph, sourceId, targetId, weight)"]) --> B["source = indexOf(sourceId)<br/>target = indexOf(targetId)"]
+    B --> C{"source 和 target 都存在"}
+    C -->|否| D(["返回 found=false<br/>端点不存在"])
+    C -->|是| E["dist[] = ∞, previous[] = −1<br/>dist[source] = 0"]
+    E --> F["heap.push(0, source)"]
+    F --> G{"heap 非空"}
+
+    G -->|是| I["popMin → currentDist, current"]
+    I --> J{"currentDist > dist[current]"}
+    J -->|是 过期条目<br/>惰性删除| G
+    J -->|否| K["遍历 current 的出边<br/>adjacency[current]"]
+    K --> L{"有下一条 edge"}
+    L -->|是| M["next = indexOf(edge.toId)"]
+    M --> N{"next 存在"}
+    N -->|否| L
+    N -->|是| O["candidate = currentDist<br/>+ pickWeight(距离/耗时/成本)"]
+    O --> P{"candidate < dist[next]"}
+    P -->|否| L
+    P -->|是| Q["dist[next] = candidate<br/>previous[next] = current<br/>heap.push(candidate, next)"]
+    Q --> L
+    L -->|遍历完| G
+
+    G -->|否| H{"dist[target] < ∞"}
+    H -->|否| R(["返回 found=false<br/>目标不可达"])
+    H -->|是| S["由 previous[] 从 target<br/>回溯到 source"]
+    S --> T["反转为 source→target 顺序"]
+    T --> U(["返回 found=true<br/>nodes = 路径序列<br/>totalWeight = dist[target]"])

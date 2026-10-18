@@ -1,0 +1,174 @@
+%%{init: {'theme':'base'}}%%
+%% U2 类图：gui 层（Qt6）+ io 层（零 Qt）
+%% 依据 src/gui/MainWindow.h   class MainWindow（含 struct VehicleState：物理事实唯一权威来源）
+%%      src/gui/GraphScene.h   class GraphScene
+%%      src/gui/NodeItem.h     class NodeItem
+%%      src/gui/EdgeItem.h     class EdgeItem
+%%      src/io/ConfigLoader.h  class ConfigLoader
+%%      src/io/IniFile.h       class IniFile + struct IniSection / IniRecord
+%%      src/io/StringUtil.h    trim / 分割（辅助）
+%%      src/core/Config.h      struct Config（core，因 MainWindow 持有而在此引用）
+%%      src/core/RoutePlanner.h struct RoutePlan / OnboardItem（core，被界面消费）
+%% ----
+%% 重要读法：
+%%  · 依赖方向单向：core ← io ← gui。gui 只"只读查询 + 调业务方法 + 按结果重建图元"。
+%%  · VehicleState 是 MainWindow 的嵌套 struct（不是独立顶层类），
+%%    重规划只读它作为输入，绝不改写；plan_ 只描述"接下来怎么走"。
+%%  · MainWindow 的私有方法很多，这里只列与调度/界面同步直接相关的；
+%%    调试/探针入口（renderToFile / runDemoActions / *Summary / autoSave* 等）不画，见头文件。
+%%  · 行号不写：会漂，用符号名。
+classDiagram
+    direction LR
+
+    namespace Qt 基类 {
+        class QMainWindow {
+            <<external>>
+        }
+        class QGraphicsScene {
+            <<external>>
+        }
+        class QGraphicsItem {
+            <<external>>
+        }
+    }
+
+    namespace GUI 层 {
+        class MainWindow {
+            -Config config_
+            -RoutePlan plan_
+            -VehicleState state_
+            -GraphScene* scene_
+            -size_t nodeIndex_
+            -size_t stopCursor_
+            -int nextEventMark_
+            +MainWindow(config)
+            +closeEvent(event)
+            +showInteractive()
+            +replan()
+            +onSimulateTraffic()
+            +onInsertUrgentOrder()
+            +onAddRandomCustomer()
+            +onCloseRandomRoad()
+            +onAdvanceStop()
+            +onAdvanceMoment()
+            +onSimModeTriggered(action)
+            +afterPlanReplaced()
+            +syncScene()
+            +updatePanels()
+            +loadForCurrentTrip()
+            +loadForTrip(idx)
+            -settleEventsUpTo(timeMin)
+            -advanceClockTo(timeMin)
+            -currentPositionId() string
+            -currentLoadKg() double
+            -onboardGoods() vector~OnboardItem~
+            -remainingOrders() vector~Order~
+        }
+
+        class VehicleState {
+            +string atNodeId
+            +int atTimeMin
+            +double loadKg
+            +vector~OnboardItem~ onboard
+            +int tripNumber
+            +double tripLoadKg
+            +bool departed
+            +int completedTrips
+            +int servedStops
+            +int offloadedWithoutGoods
+            +int incurredPenaltyMin
+            +vector~LateStop~ deliveredLate
+            +double bufferKg
+            +map~string,double~ stationStock
+            +set~string~ creditedBanks
+            +sumOnboard() double
+        }
+
+        class GraphScene {
+            -vector~NodeItem*~ nodes_
+            -vector~EdgeItem*~ edges_
+            -WeightType weight_
+            -bool allLabelsVisible_
+            -string vehicleNodeId_
+            +build(graph, weight)
+            +setWeightType(weight)
+            +highlightRoute(routeNodes)
+            +clearHighlight()
+            +setVehiclePosition(nodeId)
+            +setAllLabelsVisible(on)
+            +vehiclePosition() string
+            -refreshLabelVisibility()
+        }
+
+        class NodeItem {
+            -Node node_
+            -vector~EdgeItem*~ edges_
+            -bool vehicleHere_
+            +kRadius = 18.0$
+            +addEdge(edge)
+            +setVehicleHere(on)
+            +nodeId() string
+            +itemChange(change, value)
+        }
+
+        class EdgeItem {
+            -NodeItem* source_
+            -NodeItem* target_
+            -Edge edge_
+            -WeightType weight_
+            -bool highlighted_
+            -bool labelVisible_
+            +adjust()
+            +setWeightType(weight)
+            +setHighlighted(on)
+            +setLabelVisible(on)
+            +highlighted() bool
+            +fromId() string
+            +toId() string
+        }
+    }
+
+    namespace IO 层 {
+        class ConfigLoader {
+            <<utility>>
+            +load(path, out, error) bool$
+            +parse(text, out, error) bool$
+        }
+        class IniFile {
+            -vector~IniSection~ sections_
+            +parse(text, out, error) bool$
+            +loadFromFile(path, out, error) bool$
+            +findSection(name) IniSection*
+        }
+        class IniSection {
+            +string name
+            +vector~IniRecord~ records
+            +findValue(key) IniRecord*
+        }
+        class IniRecord {
+            +int lineNo
+            +bool isKeyValue
+            +string key
+            +string value
+            +string text
+        }
+    }
+
+    QMainWindow <|-- MainWindow
+    QGraphicsScene <|-- GraphScene
+    QGraphicsItem <|-- NodeItem
+    QGraphicsItem <|-- EdgeItem
+    MainWindow *-- GraphScene : scene_（构造时 new）
+    MainWindow *-- VehicleState : state_（物理事实唯一权威来源，重规划只读不改）
+    GraphScene *-- NodeItem : nodes_（build 时 addItem，场景拥有）
+    GraphScene *-- EdgeItem : edges_（同上）
+    NodeItem "2" <-- "1" EdgeItem : source_ / target_（指针，不拥有）
+    ConfigLoader ..> IniFile : loadFromFile / parse
+    ConfigLoader ..> Config : 组装 + 校验
+    MainWindow o-- Config : config_（按值持有，构造时移入）
+    MainWindow ..> RoutePlan : plan_（每次重规划整体替换）
+    MainWindow ..> OnboardItem : onboardGoods() 交给规划器
+    MainWindow ..> NodeItem : setVehiclePosition / setVehicleHere
+    GraphScene ..> EdgeItem : highlightRoute → isEdgeOnRoute（与 core 同一判定）
+    IniFile "1" *-- "*" IniSection : sections_
+    IniSection "1" *-- "*" IniRecord : records（自带 lineNo）

@@ -1,0 +1,52 @@
+%%{init: {'theme':'base'}}%%
+%% U3 时序图：启动 → 加载配置 → 首次规划 → 画布渲染
+%% 依据 src/main.cpp              main / parseOptions / showInteractive / renderToFile
+%%      src/io/ConfigLoader.cpp    ConfigLoader::load
+%%      src/io/IniFile.cpp         IniFile::loadFromFile / parse
+%%      src/io/StringUtil.h        trim（去注释与首尾空白）
+%%      src/gui/MainWindow.cpp     MainWindow 构造函数 / buildActions / buildDocks
+%%      src/gui/MainWindow.cpp     syncScene / replan / afterPlanReplaced / loadForCurrentTrip
+%%      src/core/RoutePlanner.cpp  logistics::replan（首次规划入口）
+%%      src/core/RoutePlanner.cpp  buildCandidates / weave / multiTripPlan（内部）
+%%      src/gui/GraphScene.cpp     GraphScene::build / highlightRoute
+%% ----
+%% 注意：首次规划走 MainWindow::replan → logistics::replan（以当前位置/时刻为起点），
+%% 不是 planRoute —— planRoute 只被 CLI --plan-summary / 自检 / 测试直接调用
+%% （src/main.cpp、src/gui/MainWindow.cpp:runActionSelfCheck、tests/）。
+%% 参与者是模块/对象；函数名出现在消息上，不当作参与者。
+sequenceDiagram
+    participant main as main()
+    participant Loader as ConfigLoader
+    participant Ini as IniFile
+    participant MW as MainWindow
+    participant Core as logistics::replan
+    participant Scene as GraphScene
+
+    main->>Loader: load(configPath, config)
+    Loader->>Ini: loadFromFile(path)
+    Ini-->>Loader: IniSection 列表（每条 IniRecord 自带 lineNo）
+    Loader->>Loader: 解析节点/边/车辆/订单/参数<br/>校验：缺节 / 字段数 / 类型 / 端点不存在 / ID 重复
+    Loader-->>main: Config{graph, vehicles, orders, general}
+
+    Note over main: 构建 QApplication
+    main->>MW: new MainWindow(config)
+    Note right of MW: 初始化 state_（物理事实唯一权威来源）：<br/>atNodeId = 仓库, atTimeMin = 发车时刻<br/>loadKg = 0, tripNumber = 1<br/>nextEventMark_ = nextEventTimeMin(发车时刻, 15)
+
+    MW->>MW: buildActions()（5 条具名工具栏）/ buildDocks()
+    MW->>Scene: build(config_.graph, weight)
+    Note right of Scene: 按坐标摆放 NodeItem<br/>按有向边画 EdgeItem（箭头 + 权重标签）<br/>双向对同线，标签只让字典序小的一端显示
+    MW->>MW: replan()
+
+    MW->>Core: replan(graph, vehicle, remainingOrders(),<br/>currentPositionId(), currentTimeMin(),<br/>weight, onboardGoods(), state_.stationStock)
+    Note over Core: buildCandidates：同点多单合并成一个停靠点<br/>总需求 ≤ 载重 → weave 单趟贪心<br/>总需求 > 载重 → multiTripPlan 分批<br/>随后 fillBufferFromDepot / bankBufferEnRoute / flatten
+    Core-->>MW: RoutePlan（trips 是真源）
+
+    MW->>MW: afterPlanReplaced()
+    Note right of MW: nodeIndex_ = 0, stopCursor_ = 0<br/>补齐 plan_.transitStock 里新出现的站<br/>loadForCurrentTrip()（车在仓库 ⇒ 装第 0 趟）
+    MW->>MW: syncScene()
+    MW->>Scene: highlightRoute(plan_.nodes 从 nodeIndex_ 起)
+    Note right of Scene: 只高亮尚未走完的段<br/>setVehiclePosition(currentNodeId_)
+    MW->>MW: updatePanels()
+    MW-->>main: 窗口就绪
+
+    Note over main: 交互窗口 → showInteractive()<br/>离屏渲染 → renderToFile()<br/>无头探针 → --ui-probe / --self-check-actions

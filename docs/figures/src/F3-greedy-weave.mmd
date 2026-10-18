@@ -1,0 +1,49 @@
+%%{init: {'theme':'base', 'flowchart': {'curve':'basis'}}}%%
+%% F3 贪心串联 weave（单趟内逐轮选最近未服务点）
+%% 依据 src/core/RoutePlanner.cpp（匿名命名空间内） weave · appendLeg · beginTrip
+%%      src/core/RoutePlanner.cpp:buildCandidates（同文件，order → candidate 合并）
+%%      src/core/Dijkstra.cpp:shortestPath
+%%      设计.md §5.2（贪心规则）§4.3（时间推进）§4.4（停靠点合并）
+%% 落点只写符号名不写行号：行号会漂，符号名不会。
+flowchart TD
+    A(["weave(pool, startPos, pickupNode, endNode, loadKg)"]) --> B["trip.loadKg = loadKg<br/>current = startPos<br/>beginTrip(trip, current, elapsed)"]
+    B --> C{"pickupNode 非空<br/>且 current ≠ pickupNode"}
+    C -->|是| D["appendLeg(current → pickupNode)<br/>非停靠段"] --> D2{"appendLeg 成功"}
+    D2 -->|否 failReason 已置| FAIL1(["返回 false<br/>无法从 current 到达 pickupNode"])
+    D2 -->|是| D3["current = pickupNode"] --> E
+    C -->|否| E
+    E{"pool 非空"}
+
+    E -->|是| F["hasUrgent = pool 中存在<br/>紧急订单（逐轮判定，<br/>不得靠事后排序实现）"]
+    F --> G["bestIndex = −1<br/>遍历 pool 中每个候选 i"]
+    G --> H{"有下一个候选 i"}
+    H -->|是| I{"hasUrgent 且<br/>pool[i] 非紧急"}
+    I -->|是 跳过| H
+    I -->|否| J["path = shortestPath<br/>(current, pool[i].nodeId, weight)"]
+    J --> K{"path.found"}
+    K -->|否| L["记入 unreachable 列表"] --> H
+    K -->|是| M["比较 totalWeight 与 bestWeight<br/>并列时按 nodeId 字典序 tie-break"]
+    M --> N{"更优 或 并列更小 ID"}
+    N -->|是| O["bestIndex = i<br/>bestWeight = totalWeight"] --> H
+    N -->|否| H
+    H -->|遍历完| P{"bestIndex ≥ 0"}
+    P -->|否| Q(["返回 false<br/>无法到达: unreachable 列表"])
+    P -->|是| R["chosen = pool[bestIndex]"]
+    R --> S["appendLeg(current → chosen.nodeId)<br/>停靠段 endpointIsStop=true"] --> S2{"appendLeg 成功"}
+    S2 -->|否| FAIL2(["返回 false<br/>段内某条边缺失 / 最短路不可达"])
+    S2 -->|是| T["rawArrival = elapsed<br/>wait = max(0, 窗口起 − rawArrival)<br/>arrival = rawArrival + wait"]
+    T --> U{"arrival > 窗口止"}
+    U -->|是 超时| V["stop.late = true<br/>penalty = arrival − 窗口止<br/>D13: 超时不弃，只记 penalty"]
+    U -->|否| W["stop.late = false<br/>penalty = 0"]
+    V --> X
+    W --> X["trip.nodeArrivalMin[末] = arrival<br/>（送达时刻，不是原始到达时刻）<br/>elapsed = arrival"]
+    X --> Y["loadKg −= chosen.demandKg<br/>stop.remainingLoadKg = loadKg"]
+    Y --> Z["trip.stops.push(stop)<br/>current = chosen.nodeId<br/>pool.erase(bestIndex)"]
+    Z --> E
+
+    E -->|否 pool 空| AA{"current ≠ endNode"}
+    AA -->|是| AB["appendLeg(current → endNode)<br/>非停靠段"] --> AB2{"appendLeg 成功"}
+    AB2 -->|否| FAIL3(["返回 false<br/>无法返回 endNode"])
+    AB2 -->|是| AC
+    AA -->|否| AC["trip.endNodeId = endNode"]
+    AC --> AD(["返回 true<br/>调用方据此判 RoutePlan::Unreachable"])

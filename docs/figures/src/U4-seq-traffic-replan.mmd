@@ -1,0 +1,73 @@
+%%{init: {'theme':'base'}}%%
+%% U4 时序图：路况触发 → 增量式重规划 → 界面刷新
+%% 依据 src/gui/MainWindow.cpp    onSimulateTraffic / afterPlanReplaced / syncScene
+%%      src/core/Traffic.cpp       simulateTrafficChange / needsReplan
+%%      src/core/RoutePlanner.cpp  sliceRemainder / replanIncremental / replanOneTrip
+%%      src/core/RoutePlanner.cpp  replan（全量兜底）/ fillBufferFromDepot / bankBufferEnRoute
+%%      src/core/RoutePlanner.cpp  makeStop / findCandidate / sortTransitOpsByTime / flatten
+%%      src/core/Dijkstra.cpp      shortestPath
+%%      src/core/LogisticsGraph.cpp updateEdgeTime
+%% ----
+%% 参与者是模块/对象；函数名出现在消息上，不当作参与者。
+%% 事件本身由 settleEventsUpTo 按软件内时钟分派（设计 D24），本图画"抽中路况"那一刻。
+sequenceDiagram
+    actor User as 用户（工具栏）
+    participant MW as MainWindow
+    participant TrafficMod as logistics::Traffic
+    participant Core as logistics::replanIncremental
+    participant OneTrip as replanOneTrip（内部）
+    participant Dij as logistics::Dijkstra
+    participant Scene as GraphScene
+
+    User->>MW: onSimulateTraffic()
+    MW->>TrafficMod: simulateTrafficChange(graph, ratio, minR, maxR, seed, clearProb)
+    Note over TrafficMod: 选 round(ratio×E) 条边（部分 Fisher-Yates）<br/>畅通 → 耗时恢复 baseTimeMin<br/>拥堵 → 耗时 = baseTimeMin×(1+增幅)<br/>updateEdgeTime：只改 timeMin，baseTimeMin 不动
+    TrafficMod-->>MW: TrafficReport
+
+    MW->>TrafficMod: needsReplan(plan_.nodes, report, threshold)
+    Note over TrafficMod: 遍历 changes：<br/>增幅 ≥ 阈值 且 isEdgeOnRoute（与界面高亮同一判定）？
+    TrafficMod-->>MW: bool trigger
+
+    alt trigger = false（边不在当前路径或增幅不足）
+        MW->>MW: syncScene()（仅重绘拥堵标记）
+    else trigger = true（路径受影响）
+        MW->>Core: sliceRemainder(plan_, nodeIndex_)
+        Note over Core: 按 nodeTripIndex 保留趟结构<br/>切出"尚未走完"的剩余路线<br/>bufferKg / bankOps / transitStock 随趟带走
+
+        MW->>Core: replanIncremental(graph, vehicle, remaining, remainder, ...)
+
+        alt previous 不合法（status≠Ok / trips 空 / nodes<2 / 末节点≠仓库）
+            Core->>Core: replan()（全量重算）
+            Core-->>MW: RoutePlan, usedIncremental=false
+        else previous 合法
+            loop 每一趟 prevTrip
+                Core->>OneTrip: replanOneTrip(prevTrip, report, threshold, weight, ...)
+                Note over OneTrip: 先判序列完整（nodes≥2 且 nodeIsStop 等长）<br/>按停靠点切 leg：bounds = [起点, 各停靠点, 末点]
+                loop 每一段 leg
+                    alt 该段走过被命中的边 且 起终点不同
+                        OneTrip->>Dij: shortestPath(段起点, 段终点, weight)
+                        Dij-->>OneTrip: PathResult
+                        opt 不可达（found=false）
+                            OneTrip-->>Core: false ⇒ 该趟增量失败
+                        end
+                    else 该段未受影响
+                        Note over OneTrip: 复用上一版该段节点序列（增量不重排顺序）
+                    end
+                end
+                OneTrip-->>Core: rebuilt Trip + endTime（或 false）
+
+                opt replanOneTrip = false
+                    Core->>Core: replan()（全量重算兜底）
+                    Core-->>MW: RoutePlan, usedIncremental=false
+                end
+            end
+            Note over Core: 全部成功时：<br/>逐趟重新推导 fillBufferFromDepot + bankBufferEnRoute<br/>库存快照随 remainder 带走，期末 = 期初 + ΣkgDelta<br/>sortTransitOpsByTime · flatten（唯一展平点）
+            Core-->>MW: RoutePlan, usedIncremental=true
+        end
+
+        MW->>MW: afterPlanReplaced()
+        Note right of MW: nodeIndex_ = 0, stopCursor_ = 0<br/>补齐新出现的站<br/>loadForCurrentTrip()
+        MW->>Scene: syncScene() → highlightRoute(剩余段)
+        Note right of Scene: setVehiclePosition / 拥堵标记
+        MW->>MW: updatePanels()
+    end

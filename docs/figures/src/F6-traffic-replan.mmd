@@ -1,0 +1,67 @@
+%%{init: {'theme':'base', 'flowchart': {'curve': 'basis'}}}%%
+%% F6 路况变化 → 增量式重规划 → 退回全量
+%% 依据 src/gui/MainWindow.cpp    onSimulateTraffic（调用方；事件由 settleEventsUpTo 分派而来）
+%%      src/core/Traffic.cpp       simulateTrafficChange · needsReplan
+%%      src/core/RoutePlanner.cpp  sliceRemainder · replanIncremental · replanOneTrip
+%%      src/core/RoutePlanner.cpp  replan（全量兜底）· fillBufferFromDepot · bankBufferEnRoute
+%%      src/core/RoutePlanner.cpp  sortTransitOpsByTime · flatten · makeStop · findCandidate
+%%      src/core/Dijkstra.cpp      shortestPath
+%%      src/core/LogisticsGraph.cpp updateEdgeTime
+%%      设计.md §5.4（路况模拟与重规划）§5.7（增量式重规划 D22）§16 P31
+%% 落点只写符号名不写行号：行号会漂，符号名不会。
+%% ----
+%% 注意：触发判定与界面高亮共用 RoutePlanner.cpp:isEdgeOnRoute 同一条逻辑；
+%% 是否真的走了增量由核心通过 usedIncremental 回报，界面不自己从趟数猜。
+flowchart TD
+    A(["onSimulateTraffic（GUI 触发；<br/>事件由 settleEventsUpTo 按软件内时钟分派）"]) --> B["report = simulateTrafficChange<br/>(graph, ratio, minR, maxR, seed, clearProb)"]
+    B --> B2["选取 round(ratio × 边数) 条边（≥1，≤ 总边数）<br/>部分 Fisher-Yates：只打乱前 count 个位置"]
+    B2 --> C{"每条边"}
+    C -->|是| D["becomesClear = rng.nextUnit < clearProb"]
+    D --> E{"becomesClear"}
+    E -->|畅通| F["耗时恢复 = baseTimeMin<br/>congested = false<br/>（increaseRatio = 0，永不触发重规划）"]
+    E -->|拥堵| G["耗时 = baseTimeMin × (1 + 增幅)<br/>增幅 ∈ minR..maxR 随机<br/>congested = true<br/>（重设而非叠加，耗时不会失控增长）"]
+    F --> H["graph.updateEdgeTime(from, to, newTime)<br/>只改 timeMin；baseTimeMin 始终不变"]
+    G --> H
+    H --> C
+    C -->|遍历完| I(["返回 TrafficReport<br/>changes 按选定顺序"])
+
+    %% ---- 判定是否需要重规划 ----
+    I --> J["trigger = needsReplan<br/>(plan_.nodes, report, threshold)"]
+    J --> K{"受影响边在当前路径上<br/>（isEdgeOnRoute）且增幅 ≥ 阈值"}
+    K -->|否| L["syncScene()（重绘拥堵标记）"] --> L2(["不触发重规划，返回"])
+    K -->|是| M["sliceRemainder(plan_, nodeIndex)<br/>切出剩余路线，保留趟结构<br/>（bufferKg / bankOps / transitStock 随趟带走）"]
+
+    %% ---- 增量式重规划 ----
+    M --> N["replanIncremental<br/>(graph, vehicle, remaining, remainder, currentTime, ...)"]
+    N --> O{"previous 合法<br/>（status=Ok, trips 非空,<br/>nodes ≥ 2, 末节点=仓库）"}
+    O -->|否| FULL["退回全量重算：<br/>replan(graph, vehicle, remaining, ...)<br/>usedIncremental = false"] --> DONE
+
+    O -->|是| P{"有下一趟 prevTrip"}
+    P -->|是| Q["replanOneTrip(prevTrip, report, ...)"]
+    Q --> Q2["按停靠点切 leg：<br/>bounds = [起点, 各停靠点, 末点]<br/>legCount = 停靠点数 + 1"]
+    Q2 --> Q3{"nodes.size() ≥ 2 且<br/>nodeIsStop 与 nodes 等长"}
+    Q3 -->|否 序列不完整| FULL2
+    Q3 -->|是| R{"有下一段 leg"}
+    R -->|是| S["检查该段走过的每条边<br/>是否被路况命中（增幅 ≥ 阈值）"]
+    S --> T{"该段受影响"}
+    T -->|是 且起终点不同| U["path = shortestPath<br/>(段起点, 段终点, weight)"]
+    T -->|否| V["path = 复用上一版该段节点序列<br/>（增量不重排停靠顺序）"]
+    U --> W{"path.found"}
+    W -->|否 该段已不可达| X["该趟增量失败"] --> FULL2
+    W -->|是| Y["legPaths.push(path)"] --> R
+    V --> Y
+    R -->|遍历完| Z["沿各段重建这一趟<br/>（停靠顺序不变）<br/>逐段累加距离/耗时/成本"]
+    Z --> Z2{"该段终点是停靠点"}
+    Z2 -->|是| Z3["findCandidate(pool, 段终点) 取订单<br/>makeStop：时间推进、扣载重、记 penalty<br/>（取不到 ⇒ 该趟增量失败）"] --> Z4
+    Z2 -->|否| Z4["replanOneTrip 返回 true / endTime"]
+    Z3 --> Z4
+    Z4 --> AA{"replanOneTrip 成功"}
+    AA -->|否| FULL2["退回全量重算：<br/>replan(...)<br/>usedIncremental = false"] --> DONE
+    AA -->|是| AB["若该趟从仓库出发且 load > 0：<br/>fillBufferFromDepot + bankBufferEnRoute<br/>（重新推导，不从 prevTrip 复制）"]
+    AB --> AC["plan.trips.push(rebuilt)<br/>elapsed = endTime"] --> P
+
+    P -->|否| AD["usedIncremental = true<br/>库存快照随 remainder 带走<br/>期末 = 期初 + ΣkgDelta（守恒重算）<br/>sortTransitOpsByTime · flatten<br/>（唯一展平点）"]
+    AD --> DONE["afterPlanReplaced()：nodeIndex_/stopCursor_ 归零<br/>+ loadForCurrentTrip()（三处重规划共用）<br/>syncScene() · updatePanels()"]
+    FULL --> DONE
+    FULL2 --> DONE
+    DONE --> AE(["plan_ = 新 RoutePlan<br/>（日志按 usedIncremental 说清走了哪条路）"])

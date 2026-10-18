@@ -1,0 +1,301 @@
+%%{init: {'theme':'base'}}%%
+%% U1 类图：core 层（零 Qt，可单独编译）
+%% 依据 src/core/Node.h       struct Node · enum NodeType · toString/parseNodeType
+%%      src/core/Edge.h       struct Edge
+%%      src/core/WeightType.h enum WeightType · pickWeight
+%%      src/core/Order.h      struct Order
+%%      src/core/Vehicle.h    struct Vehicle
+%%      src/core/LogisticsGraph.h class LogisticsGraph
+%%      src/core/MinHeap.h    class MinHeap（Entry 在类内 private）
+%%      src/core/Dijkstra.h   struct PathResult + 自由函数 shortestPath
+%%      src/core/RoutePlanner.h  struct Stop/Trip/RoutePlan/OnboardItem/InsertResult
+%%                            + 自由函数 planRoute/replan/insertUrgentOrder
+%%                            + sliceRemainder/replanIncremental/isEdgeOnRoute
+%%                            + nodeIndexAtTime
+%%      src/core/Traffic.h    struct TrafficChange/TrafficReport + 自由函数
+%%                            simulateTrafficChange/needsReplan
+%%      src/core/SimEvent.h   enum SimEventKind · struct EventWeights + 自由函数
+%%                            pickEvent/nextEventTimeMin/simEventName
+%%      src/core/GraphEdit.h  自由函数 addRandomCustomer/closeRandomRoad/makeSyntheticEdge
+%%      src/core/Config.h     struct GeneralConfig / Config
+%%      src/core/Random.h     class Rng
+%%      src/io/IniFile.h      struct IniRecord/IniSection + class IniFile
+%%      src/io/ConfigLoader.h class ConfigLoader（io 层，因 Config 的关系画在此处）
+%% ----
+%% 重要读法：
+%%  · Dijkstra / RoutePlanner / Traffic / SimEvent / GraphEdit **不是类**，是
+%%    logistics 命名空间下的自由函数集合（<<utility>>）。源码里没有 class RoutePlanner。
+%%  · weave / multiTripPlanImpl / replanOneTrip / appendLeg / flatten / makeStop 等
+%%    在 RoutePlanner.cpp 的匿名命名空间里，无头文件声明，只在 F3/F4/F5/F6 出现。
+%%  · 行号不写：会漂，用符号名。
+classDiagram
+    direction LR
+
+    namespace 领域类型 {
+        class Node {
+            +string id
+            +NodeType type
+            +double x, y
+            +string name
+            +int subNetworkId
+        }
+        class Edge {
+            +string fromId, toId
+            +double distanceKm
+            +double timeMin
+            +double costYuan
+            +double baseTimeMin
+            +bool congested
+        }
+        class Order {
+            +string id, nodeId
+            +double demandKg
+            +int windowStartMin
+            +int windowEndMin
+            +bool urgent, served
+        }
+        class Vehicle {
+            +string id, startNodeId
+            +double capacityKg
+            +int departTimeMin
+        }
+    }
+
+    namespace 图与堆 {
+        class LogisticsGraph {
+            -vector~Node~ nodes_
+            -vector~vector~Edge~~ out_
+            +addNode(node) bool
+            +removeNode(id) bool
+            +addEdge(edge) bool
+            +removeEdge(from, to) bool
+            +updateEdgeTime(from, to, newTime) bool
+            +findNode(id) Node*
+            +findEdge(from, to) Edge*
+            +nodes() vector~Node~
+            +outEdges(id) vector~Edge~
+            +edges() vector~Edge~
+            +adjacency() vector
+            +indexOf(id) int
+            +nodeCount() size_t
+            +edgeCount() size_t
+            +toAdjacencyListString() string
+            +toAdjacencyMatrixString(w) string
+        }
+        class MinHeap {
+            -vector~Entry~ entries_
+            +push(key, value)
+            +popMin(key, value) bool
+            +empty() bool
+            +size() size_t
+            -siftUp(index)
+            -siftDown(index)
+            -swapEntries(a, b)$
+        }
+        class PathResult {
+            +bool found
+            +vector~string~ nodes
+            +double totalWeight
+        }
+    }
+
+    namespace 路径规划结果 {
+        class Stop {
+            +string nodeId
+            +int rawArrivalMin
+            +int waitMin
+            +int arrivalMin
+            +bool late
+            +int penaltyMin
+            +double remainingLoadKg
+        }
+        class TransitOp {
+            +string nodeId
+            +double kgDelta
+            +int atMin
+        }
+        class TransitStock {
+            +string nodeId
+            +double initialKg
+            +double finalKg
+        }
+        class Trip {
+            +vector~string~ nodes
+            +vector~int~ nodeArrivalMin
+            +vector~bool~ nodeIsStop
+            +vector~Stop~ stops
+            +double loadKg
+            +double bufferKg
+            +bool loadedFromDepot
+            +bool supplyInPlace
+            +vector~TransitOp~ bankOps
+            +double totalDistanceKm
+            +double totalCostYuan
+            +double totalTimeMin
+            +string endNodeId
+        }
+        class RoutePlan {
+            +PlanStatus status
+            +string reason
+            +vector~string~ nodes
+            +vector~int~ nodeArrivalMin
+            +vector~bool~ nodeIsStop
+            +vector~size_t~ nodeTripIndex
+            +vector~Stop~ stops
+            +double totalDistanceKm
+            +double totalTimeMin
+            +int returnArrivalMin
+            +double totalCostYuan
+            +int totalPenaltyMin
+            +vector~Trip~ trips
+            +vector~TransitStock~ transitStock
+            +vector~TransitOp~ transitOps
+        }
+        class OnboardItem {
+            +string nodeId
+            +double kg
+        }
+        class InsertResult {
+            +RoutePlan plan
+            +string warning
+            +double carBufferUsedKg
+            +string stationUsed
+            +double stationUsedKg
+        }
+    }
+
+    namespace 路况与事件 {
+        class TrafficChange {
+            +string fromId, toId
+            +double increaseRatio
+            +bool congested
+        }
+        class TrafficReport {
+            +vector~TrafficChange~ changes
+        }
+        class EventWeights {
+            +int traffic = 10
+            +int urgent = 3
+            +int customer = 1
+            +int closure = 1
+        }
+    }
+
+    namespace 配置与随机 {
+        class GeneralConfig {
+            +double trafficChangeRatio
+            +double trafficTimeIncreaseMin
+            +double trafficTimeIncreaseMax
+            +int eventIntervalMin
+            +int eventWeightTraffic
+            +int eventWeightUrgent
+            +int eventWeightCustomer
+            +int eventWeightClosure
+        }
+        class Config {
+            +LogisticsGraph graph
+            +vector~Vehicle~ vehicles
+            +vector~Order~ orders
+            +GeneralConfig general
+        }
+        class Rng {
+            -uint state_
+            +nextU32() uint
+            +nextUnit() double
+            +nextInt(lo, hi) int
+            +nextRange(low, high) double
+        }
+    }
+
+    namespace io 层 {
+        class IniRecord {
+            +int lineNo
+            +bool isKeyValue
+            +string key
+            +string value
+            +string text
+        }
+        class IniSection {
+            +string name
+            +vector~IniRecord~ records
+            +findValue(key) IniRecord*
+        }
+        class IniFile {
+            -vector~IniSection~ sections_
+            +parse(text, out, error) bool$
+            +loadFromFile(path, out, error) bool$
+            +findSection(name) IniSection*
+        }
+        class ConfigLoader {
+            +load(path, out, error) bool$
+            +parse(text, out, error) bool$
+        }
+    }
+
+    namespace core 自由函数 {
+        class Dijkstra {
+            <<utility>>
+            +shortestPath(graph, source, target, weight) PathResult$
+        }
+        class RoutePlanner {
+            <<utility>>
+            +planRoute(graph, vehicle, orders, weight, initialStock) RoutePlan$
+            +replan(graph, vehicle, orders, pos, time, weight, onboard, initialStock) RoutePlan$
+            +insertUrgentOrder(...) InsertResult$
+            +sliceRemainder(plan, fromNodeIndex) RoutePlan$
+            +replanIncremental(...) RoutePlan$
+            +isEdgeOnRoute(routeNodes, fromId, toId) bool$
+            +nodeIndexAtTime(plan, timeMin) size_t$
+            +flatten(plan, startTimeMin, elapsedMin)$
+        }
+        class Traffic {
+            <<utility>>
+            +simulateTrafficChange(graph, ratio, minR, maxR, seed, clearProb) TrafficReport$
+            +needsReplan(routeNodes, report, thresholdRatio) bool$
+        }
+        class SimEvent {
+            <<utility>>
+            +pickEvent(weights, rng) SimEventKind$
+            +nextEventTimeMin(nowMin, intervalMin) int$
+            +simEventName(kind) char*$
+        }
+        class GraphEdit {
+            <<utility>>
+            +addRandomCustomer(graph, rng) string$
+            +closeRandomRoad(graph, rng) string$
+            +makeSyntheticEdge(graph, from, to, out) bool$
+        }
+    }
+
+    LogisticsGraph "1" *-- "*" Node : nodes_ 顺序表
+    LogisticsGraph "1" *-- "*" Edge : out_ 邻接表（下标与 nodes_ 严格对齐）
+    MinHeap ..> Dijkstra : 供 shortestPath 使用（依赖箭头指向被依赖方）
+    Dijkstra ..> LogisticsGraph : adjacency() / indexOf() 只读
+    Dijkstra ..> MinHeap : push / popMin（惰性删除，无 decrease-key）
+    Dijkstra ..> PathResult : 返回
+    RoutePlanner ..> Dijkstra : 每步调最短路（appendLeg / weave / replanOneTrip）
+    RoutePlanner ..> LogisticsGraph : 读取
+    RoutePlanner ..> RoutePlan : 生成
+    RoutePlanner ..> Traffic : isEdgeOnRoute（needsReplan 复用同一判定）
+    Traffic ..> LogisticsGraph : updateEdgeTime（就地改 timeMin，baseTimeMin 不动）
+    Traffic ..> TrafficReport : 返回
+    TrafficReport "1" *-- "*" TrafficChange : changes
+    SimEvent ..> Rng : pickEvent 消耗一次随机数
+    GraphEdit ..> LogisticsGraph : 增删节点 / 边
+    GraphEdit ..> Rng : 随机位置 / 随机道路
+    Config "1" *-- "1" LogisticsGraph : graph
+    Config "1" *-- "*" Vehicle : vehicles
+    Config "1" *-- "*" Order : orders
+    Config "1" *-- "1" GeneralConfig : general
+    ConfigLoader ..> IniFile : loadFromFile / parse
+    ConfigLoader ..> Config : 组装 + 校验（缺节 / 字段数 / 类型 / 端点 / 重复 ID）
+    IniFile "1" *-- "*" IniSection : sections_
+    IniSection "1" *-- "*" IniRecord : records（自带 lineNo，报错能指到行）
+    RoutePlan "1" *-- "*" Trip : trips（真源）
+    RoutePlan ..> RoutePlan : flatten()：扁平字段由 trips 展平而来，唯一生成点
+    Trip "1" *-- "*" Stop : stops
+    Trip "1" o-- "*" TransitOp : bankOps（返程顺路寄存，至多一条）
+    RoutePlan "1" *-- "*" TransitStock : transitStock
+    RoutePlan "1" *-- "*" TransitOp : transitOps（按时刻排序）
+    InsertResult *-- RoutePlan : plan
+    Order ..> RoutePlanner : buildCandidates 折叠成停靠点候选

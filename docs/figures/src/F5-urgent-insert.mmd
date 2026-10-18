@@ -1,0 +1,63 @@
+%%{init: {'theme':'base', 'flowchart': {'curve': 'basis'}}}%%
+%% F5 紧急订单插入 insertUrgentOrder（A/B 两版取优）
+%% 依据 src/core/RoutePlanner.cpp insertUrgentOrder
+%%      src/core/RoutePlanner.cpp replan · multiTripPlan（同文件；A/B 分别走这两条）
+%%      src/core/RoutePlanner.cpp buildCandidates · candidateDemand · hubOfNode
+%%      src/core/RoutePlanner.cpp stockOf · recordStationDraw · sortTransitOpsByTime
+%%      src/core/Dijkstra.cpp   shortestPath（冲突判定按 Time 维度）
+%%      设计.md §5.3（动态订单插入）§4.4（停靠点合并）D13（超时不弃只记）
+%%      docs/records/specs/transit-urgent-buffer.md（D23 缓冲库存就地满足）
+%% 落点只写符号名不写行号：行号会漂，符号名不会。
+%% ----
+%% 取货点与 F4 的关系：本函数把 supply.pickup 传给 multiTripPlan，
+%% multiTripPlanImpl 用它覆盖紧急批的 pickupNode —— 所以「紧急批从仓库装货」
+%% 只在候选 A（supply.pickup 为空）时成立；候选 B 是就地满足，不新增节点。
+flowchart TD
+    A(["insertUrgentOrder(remaining, newOrder, pos, time, ...)"]) --> B["inserted = newOrder<br/>inserted.urgent = true（强制，调用方传入不作数）<br/>all = remaining + inserted"]
+    B --> C["冲突判定（耗时维度）：<br/>toNew = shortestPath(pos, inserted.nodeId, Time)"]
+    C --> D{"toNew.found"}
+    D -->|否| E["warning = 紧急订单目标不可达<br/>（仍继续规划，不在这里返回）"]
+    D -->|是| F{"窗口止 < 最早到达时刻"}
+    F -->|是| G["warning = 无法在窗口内送达<br/>D13: 仍纳入规划，只记 penalty"]
+    F -->|否| H
+    E --> H
+    G --> H
+
+    %% ---- 候选 A ----
+    H["候选 A：现状（supply.pickup 为空）<br/>planA = replan(all, ...)<br/>紧急批独立成趟、先回仓库装货"] --> I
+
+    %% ---- 候选 B ----
+    I["候选 B：就地满足<br/>d = 该停靠点合并需求（非单张订单！<br/>同点还有普通订单时它们已合并）"] --> J
+    J["hub = 该点所属中转站<br/>avail = 车上缓冲 carBufferKg<br/>stock = 站内库存"]
+    J --> K{"d > 0 且 avail ≥ d"}
+    K -->|是| K2["bUsable = true<br/>bPickup = 空串（车上已有，不新增节点）"]
+    K -->|否| L{"d > 0 且 hub 非空 且 stock > 0<br/>且 avail + stock ≥ d"}
+    L -->|是| L2["bUsable = true<br/>bPickup = hub<br/>bStation = hub<br/>bTakeKg = d − avail"]
+    L -->|否| L3["bUsable = false"]
+    K2 --> M
+    L2 --> M
+    L3 --> M{"bUsable 且<br/>总需求 > capacity"}
+    M -->|是| N["supply.nodeId = 该紧急单的配送点<br/>supply.pickup = bPickup<br/>planB = multiTripPlan(all, ..., supply)<br/>bUsable = (planB.status == Ok)"]
+    M -->|否| O["bUsable = false<br/>（总量不超载时单趟路径本就不回仓库，B 无意义）"]
+
+    %% ---- 取优 ----
+    N --> P
+    O --> P{"bUsable"}
+    P -->|否| ChooseA["选 A"]
+    P -->|是| Q{"planB.totalPenalty<br/>> planA.totalPenalty"}
+    Q -->|是 penalty 一票否决| ChooseA
+    Q -->|否| R{"planB 目标值<br/>< planA 目标值"}
+    R -->|是| ChooseB["选 B"]
+    R -->|否| S{"目标值相等<br/>且 planB 趟数 < planA 趟数"}
+    S -->|是| ChooseB
+    S -->|否 平局保守| ChooseA
+
+    ChooseA --> T["result.plan = planA<br/>carBufferUsedKg = 0<br/>stationUsed = 空"]
+    ChooseB --> T2["result.plan = planB"]
+    T2 --> U{"选 B 且<br/>bStation 非空"}
+    U -->|是| V["recordStationDraw：在服务该紧急单的趟里记账<br/>（读不到那一趟就不记，保证可追溯）<br/>stationUsed = bStation<br/>stationUsedKg = bTakeKg"]
+    U -->|否| W
+    V --> W["carBufferUsedKg = d − fromStation<br/>（把「车真的取了货」回报给调用方，<br/>界面据此落成物理事实，不自己猜）"]
+    W --> W2["sortTransitOpsByTime(result.plan.transitOps)"]
+    T --> W2
+    W2 --> X(["返回 InsertResult<br/>{plan, warning, carBufferUsedKg,<br/>stationUsed, stationUsedKg}"])

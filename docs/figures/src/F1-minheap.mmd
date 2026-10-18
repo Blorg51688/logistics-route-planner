@@ -1,0 +1,33 @@
+%%{init: {'theme':'base', 'flowchart': {'curve': 'basis'}}}%%
+%% F1 手写最小堆 MinHeap：入堆 / 出堆 / 上浮 / 下沉
+%% 依据 src/core/MinHeap.cpp  MinHeap::push / popMin / siftUp / siftDown / swapEntries
+%%      src/core/MinHeap.h     class MinHeap · Entry{key, value} · entries_
+%% 落点只写符号名不写行号：行号会漂，符号名不会。
+flowchart TD
+    Start([MinHeap 操作]) --> Op{调用哪个操作}
+
+    %% ---- push：追加后上浮 ----
+    Op -->|push key value| P1["在 entries_ 末尾追加 Entry<br/>MinHeap::push"]
+    P1 --> P2["i = size − 1"]
+    P2 --> P3["parent = (i−1) / 2"]
+    P3 --> P4{"parent.key ≤ i.key"}
+    P4 -->|是 已到位| P5(["入堆完成"])
+    P4 -->|否| P6["swapEntries(parent, i)<br/>i = parent<br/>MinHeap::siftUp"] --> P3
+
+    %% ---- popMin：取首尾交换后下沉 ----
+    Op -->|popMin| Q1{"entries_ 为空"}
+    Q1 -->|是| Q2(["返回 false<br/>不修改 key / value"])
+    Q1 -->|否| Q3["key ← front.key<br/>value ← front.value"]
+    Q3 --> Q4["front ← back<br/>pop_back()"]
+    Q4 --> Q5{"仍非空"}
+    Q5 -->|否| Q6(["返回 true"])
+    Q5 -->|是| Q7["i = 0<br/>left = 2i+1, right = left+1<br/>smallest = i<br/>MinHeap::siftDown"]
+    Q7 --> Q8{"left < size 且<br/>left.key < smallest.key"}
+    Q8 -->|是| Q9["smallest = left"]
+    Q8 -->|否| Q10{"right < size 且<br/>right.key < smallest.key"}
+    Q9 --> Q10
+    Q10 -->|是| Q11["smallest = right"]
+    Q10 -->|否| Q12{"smallest = i"}
+    Q11 --> Q12
+    Q12 -->|是 已到位| Q6
+    Q12 -->|否| Q13["swapEntries(smallest, i)<br/>i = smallest"] --> Q7
