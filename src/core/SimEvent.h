@@ -2,7 +2,7 @@
 
 #include "core/Random.h"
 
-// 软件内时间的**模拟事件模型**（设计见 .omd/plans/sim-time-events.md §3.2）。
+// 软件内时间的**模拟事件模型**（设计见 docs/留档/实现规格/sim-time-events.md §3.2）。
 //
 // 与"真实秒级定时器"和"每推进一次就抽一次"两种旧触发方式的区别：
 // 事件**只**由软件内时钟驱动——每过一个 `event_interval_min`（默认 15min）的整数倍时刻，

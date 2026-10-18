@@ -47,7 +47,7 @@ BRANCH_COST_FACTOR = 1.2
 TRAFFIC_CHANGE_RATIO = 0.1
 TRAFFIC_TIME_INCREASE_MIN = 0.2
 TRAFFIC_TIME_INCREASE_MAX = 0.5
-# 软件内时间的事件模型（见 .omd/plans/sim-time-events.md §2/§3.2 与 docs/设计.md D24）：
+# 软件内时间的事件模型（见 docs/留档/实现规格/sim-time-events.md §2/§3.2 与 docs/设计.md D24）：
 # 每 EVENT_INTERVAL_MIN 分钟软件内时间抽 1 个带权重的事件。
 # 注：原先的 traffic_change_interval_sec（真实秒级）与 urgent_order_interval_sec 已被本模型取代并移除。
 EVENT_INTERVAL_MIN = 15

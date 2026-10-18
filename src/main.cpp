@@ -321,7 +321,7 @@ int main(int argc, char** argv) {
         std::printf("[ui-probe] 动作: %s\n", actionTexts.toUtf8().constData());
         std::printf("[ui-probe] 面板: %s\n", window.dockTitles().toUtf8().constData());
         // 下限随模拟模式重做同步：原「Debug 模式」更名并新增「推进一刻」「按时间模拟」，
-        // 工具栏动作由 15 个增至 17 个（见 .omd/plans/sim-time-events.md §7.1）。
+        // 工具栏动作由 15 个增至 17 个（见 docs/留档/实现规格/sim-time-events.md §7.1）。
         if (actions < 17 || docks < 5) {
             std::fprintf(stderr,
                          "[ui-probe] UI 不完整：预期至少 17 个工具栏动作、5 个停靠面板\n");

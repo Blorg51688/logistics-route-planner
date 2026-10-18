@@ -68,16 +68,20 @@ bash 人工测试向导.sh              # 8 关人工测试向导（需要真实
 
 ## 6. 深背景按需拉取（不要往本文件里堆）
 
-需要项目历史与踩坑细节时，**主动去取**（不自动注入，所以得有人调）：
+需要项目历史与踩坑细节时，**主动去取**（不自动注入，所以得有人调）。原 `.omd` 编排层已迁进仓库、
+改为 `docs/留档/`（中文命名，受版本控制；不再藏在 gitignore 里）。实体文件：
 
-- `omd_memory_get({ projectPath, key })`，可用键：
-  `entry-points`（根目录入口结构）、`build-gotchas`（构建坑）、`test-targets`（目标数沿革与"以实测为准"口径）、
-  `sim-event-model`（模拟事件模型 D24：软件内时间事件刻 + 权重 + 结算纪律）、
-  `transit-buffer-model`（缓冲库存 D23 修订：满载出仓/顺路寄存/紧急单就地满足/两版取优）、
-  `commit-policy`（提交/推送授权与边界）。
-- `.omd/notepad.md` 的 **priority 区**（脚本安全教训：路径归属判定、`rm -rf` 穿透符号链接；
+- `docs/留档/工程经验教训.md` 的 **priority 区**（脚本安全教训：路径归属判定、`rm -rf` 穿透符号链接；
   守卫设计教训：必须证明"真的测到了东西"、且绝不能挂住而要失败）。
-- `docs/设计.md` §16（P0–P37 开发史，含每个真实缺陷的根因与修法）、`.omd/handoffs/`（历次阶段交接）。
+- `docs/留档/实现规格/root-entrypoints.md`（根目录入口结构 `entry-points`）。
+- `docs/留档/实现规格/sim-time-events.md`（模拟事件模型 D24：软件内时间事件刻 + 权重 + 结算纪律）。
+- `docs/留档/实现规格/transit-urgent-buffer.md` + `docs/留档/决策/transit-stock-full-load.md`（缓冲库存 D23 修订：
+  满载出仓/顺路寄存/紧急单就地满足/两版取优；含四轮商议与实测）。
+- `docs/留档/决策/probes/`（可复现探针 probe.cpp / probeD / probeE / probeF）。
+- `docs/留档/阶段交接/`（历次阶段交接 `team-*.md`）。
+- `docs/设计.md` §16（P0–P37 开发史，含每个真实缺陷的根因与修法）。
+- `build-gotchas`（构建坑）、`test-targets`（目标数沿革与"以实测为准"口径）、`commit-policy`
+  （提交/推送授权与边界）已分别写入本文件 §5 / §3 / §4，不另设文件。
 
 ## Agent skills
 
