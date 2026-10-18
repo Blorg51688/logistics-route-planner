@@ -2,7 +2,7 @@
 #
 # 共享的「确保已构建」逻辑 —— 供根目录的入口脚本 source，不要单独双击。
 #
-# 为什么单独抽出来：根目录的「启动软件.sh」与「人工测试向导.sh」都要先保证
+# 为什么单独抽出来：start-here/run/ 下的「启动软件.sh」与「人工测试向导.sh」都要先保证
 # 构建产物可用。这段逻辑必须只有一份，否则两处会各自漂移。
 #
 # 用法：
@@ -133,6 +133,6 @@ ensure_build() {
 # 本文件只定义函数；被直接执行（双击）时给一句人话，而不是静默退出 0。
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     printf '%s本文件只提供函数，请由入口脚本 source，不要直接运行。%s\n' "$_EB_YLW" "$_EB_RST" >&2
-    printf '请改用根目录的入口：  bash 启动软件.sh     或     bash 人工测试向导.sh\n' >&2
+    printf '请改用根目录的入口：  bash start-here/run/启动软件.sh     或     bash start-here/run/人工测试向导.sh\n' >&2
     exit 1
 fi

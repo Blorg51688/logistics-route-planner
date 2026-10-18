@@ -33,7 +33,7 @@ bash start-here/run/启动软件.sh
 bash start-here/run/人工测试向导.sh
 ```
 
-> 命令等价于直接在项目根运行 `bash 启动软件.sh` / `bash 人工测试向导.sh`——`start-here/run/` 只是薄封装，实现只有一份（由 `tools/check_wizard_terminal.sh` 的守卫指着根脚本，不必合并）。
+> 命令等价于直接在项目根运行根目录的 `启动软件.sh` / `start-here/run/` 下的 `人工测试向导.sh`——`start-here/run/` 是快捷入口，实现只有一份。
 
 ---
 
@@ -42,13 +42,12 @@ bash start-here/run/人工测试向导.sh
 ```
 .
 ├── 启动软件.sh              ← 入口：启动主软件（与 start-here/run/启动软件.sh 等价，实现一份）
-├── 人工测试向导.sh          ← 入口：人工测试向导（与 start-here/run/人工测试向导.sh 等价，实现一份）
-├── 文档导航.md              ← 入口：全部文档索引 + 待完成清单
+├── docs/文档导航.md        ← 入口：全部文档索引 + 待完成清单
 ├── README.md                ← 你正在读的这个
 ├── CMakeLists.txt           构建定义（找不到 Qt6 时自动跳过 GUI 目标）
 ├── config/default.ini       默认数据：30 节点 / 106 条有向边 / 25 订单
 ├── requirements/            老师给的原始题目与报告要求（.doc/.docx/.pptx，只读）
-├── scripts/                 人工测试向导本体、共享构建逻辑
+├── scripts/                 共享构建逻辑（ensure_build.sh）+ 人工测试向导本体（manual_test_wizard.sh）
 ├── src/
 │   ├── core/                图、手写堆、Dijkstra、路径规划（零 Qt；算法主体手写）
 │   ├── io/                  手写 INI 解析与配置加载
@@ -57,11 +56,11 @@ bash start-here/run/人工测试向导.sh
 ├── start-here/              用户入口：只放导览与薄封装脚本，原文件不动
 │   ├── README.md            三步走：看 / 跑 / 成果
 │   ├── read/                文档导览（只指路，不复制任何文档内容）
-│   ├── run/                 两个启动脚本的薄封装（实现仍在根目录的 .sh）
+│   ├── run/                 启动软件.sh（薄封装，指向根目录）+ 人工测试向导.sh（实现在此）
 │   └── deliverables/        报告/流程图/UML/测试用例表的成品出口（本阶段仅有说明）
 ├── tests/                   9 个测试程序，合计 829 项断言
 ├── tools/                   预言机对拍、数据生成器自检、向导文案检查器
-├── docs/                    设计文档、要求核对清单、测试记录……（见 文档导航.md）
+├── docs/                    设计文档、要求核对清单、测试记录……（见 docs/文档导航.md）
 └── build/                   构建产物（已 gitignore，首次运行自动生成）
 ```
 
@@ -92,8 +91,8 @@ QT_QPA_PLATFORM=offscreen \
 
 ---
 
-## 当前状态（不要只看代码，也看文档导航）
+## 当前状态（不要只看代码，也看 docs/文档导航.md）
 
 - **代码与自动化测试：完成**（`ctest` 20/20，829 项断言全通过，规划结果可复现）。
 - **课程设计报告：尚未编写**——占 30 分，且是参加验收的前置条件。
-- 完整的交付物清单与待完成项，见 [`文档导航.md`](文档导航.md)。
+- 完整的交付物清单与待完成项，见 [`文档导航.md`](docs/文档导航.md)。

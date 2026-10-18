@@ -12,7 +12,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LAUNCHER="$ROOT/人工测试向导.sh"
+LAUNCHER="$ROOT/start-here/run/人工测试向导.sh"
 fail=0
 
 work="$(mktemp -d)"

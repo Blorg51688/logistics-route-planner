@@ -85,7 +85,7 @@
   `tools/check_wizard_claims.py` 若引用被删的配置键需同步。
 - `docs/设计.md`：§7（GUI 语义）、§8（配置契约）、§16 追加一节记录本次口径变更（**30 秒 → 软件内 15min**）
   与新事件模型；`docs/功能实现清单.md` 的 H3（每 30 秒）与 A1（Debug 模式）两行。
-- `README.md` / `文档导航.md`：若含 Debug 字样则同步。
+- `README.md` / `docs/文档导航.md`：若含 Debug 字样则同步。
 
 ## 5. 验收判据（verifier 逐条对照）
 
@@ -214,7 +214,7 @@ while (nodeIndex_+1 < plan_.nodes.size()
 3. **断言总数口径同步**：9 个测试二进制自报断言数现为 **790**
    （core 101 / config **223** / minheap 28 / **simevent 27** / dijkstra 19 / **routeplanner 169** / integration 108 / traffic 83 / graphedit 32），
    旧文档里的 **718** 已过期。需要同步的地方：
-   `AGENTS.md` §3、`README.md`、`文档导航.md`、`docs/功能实现清单.md` 附录、`docs/设计.md` 相关小节。
+   `AGENTS.md` §3、`README.md`、`docs/文档导航.md`、`docs/功能实现清单.md` 附录、`docs/设计.md` 相关小节。
    **一律写明"以实测为准 + 目标数以 `ctest -N` 为准"**，并标明属于「已提交基线」还是「工作区修订」。
 4. **`ctest` 目标数**：注册 `simevent_tests` 后由 19 → **20**，同样要全量同步上述文档与 AGENTS.md。
    ⚠️ **当前工作区处于预期的中间态**：`wizard_ui_names_lint` 失败——向导已引导用户点
