@@ -37,7 +37,7 @@ footer { margin-top: 44px; padding-top: 14px; border-top: 1px solid #e2e8f0;
 </style></head><body>
 <h1>数据结构总览</h1>
 <p class="lead">系统的每一种结构画成一个方块，箭头写「传的是<strong>什么</strong>」。橙色 = 手写算法，蓝色 = 容器／结构本体，绿色 = 被算法承载的记录（Stop / Trip / RoutePlan / 各类记账），紫色 = Qt 视图层。虚线 = 非顺序的控制流（改图、回写计划）。</p>
-<p class="lead">读法：从左上 <code>config/default.ini</code> 顺着箭头往下，第三条带（事件与重规划）末尾会沿虚线回到 <code>RoutePlan</code> —— 这就是「重规划后计划换了一版」。表在下面，逐格与 <a href="数据结构地图.md">数据结构地图.md</a> 一致。</p>
+<p class="lead">读法：从左上 <code>config/default.ini</code> 顺着箭头往下，第三条带（事件与重规划）末尾会沿虚线回到 <code>RoutePlan</code> —— 这就是「重规划后计划换了一版」。表在下面，逐格与 <a href="../../docs/数据结构地图.md">数据结构地图.md</a> 一致。</p>
 <p class="meta">数字口径：n = 节点数 30、m = 有向边数 106、k = 停靠候选数 ≤ 25、s = 堆内条目数；config = 2 仓库 + 3 中转站 + 25 配送点、25 订单 740kg、车 200kg 08:00 发车。事实取自 <code>src/</code>（源码基线 = 提交 4a23236）。</p>
 <div class="legend"><span><i class="sw" style="background:#fff4e5;border:1.8px solid #e08a1e"></i>手写算法</span><span><i class="sw" style="background:#e9f2fd;border:1.8px solid #3a7bd5"></i>容器 / 结构本体</span><span><i class="sw" style="background:#eafaf0;border:1.8px solid #2f9e6b"></i>记录（被承载的数据）</span><span><i class="sw" style="background:#f3ecfd;border:1.8px solid #8a5cd6"></i>Qt 视图层</span><span><i class="dashline"></i>虚线 = 改图 / 回写计划</span></div>
 <div class="box"><svg viewBox="0 0 1200 1742" width="100%" xmlns="http://www.w3.org/2000/svg" font-family="Noto Sans CJK SC, Source Han Sans SC, Microsoft YaHei, sans-serif">
@@ -349,5 +349,5 @@ Dijkstra::shortestPath（dist[] + previous[]） ◄──► MinHeap{Entry{key,v
 <tr><td><code>EventWeights</code></td><td>路况/紧急/新客/封路 = 10/3/1/1</td><td>抽签的扫描顺序即枚举顺序，决定了并列时的确定性</td></tr>
 <tr><td><code>PlanStatus</code></td><td><code>Ok</code> / <code>OrderExceedsCapacity</code> / <code>Unreachable</code></td><td>只有「单个订单就超载」或「存在不可达点」才不可行；<strong>总需求超载走多趟</strong></td></tr>
 </tbody></table></div>
-<footer>本页的表由 <a href="数据结构地图.md">数据结构地图.md</a> 的表格机械转换而来，事实只有那一个真相源；改数字请改该 MD 并同步本页。索引：[docs/文档导航.md](../../docs/文档导航.md) · 导览：[项目速懂.md](项目速懂.md)</footer>
+<footer>本页的表由 <a href="../../docs/数据结构地图.md">数据结构地图.md</a> 的表格机械转换而来，事实只有那一个真相源；改数字请改该 MD 并同步本页。索引：[docs/文档导航.md](../../docs/文档导航.md) · 导览：[项目速懂.md](../../start-here/read/项目速懂.md)</footer>
 </body></html>
