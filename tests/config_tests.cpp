@@ -91,6 +91,33 @@ void expectParseFailure(const std::string& text, const std::string& what) {
     check(!error.empty(), "失败时应给出错误说明: " + what);
 }
 
+// 错误信息必须含「第 <lineNo> 行」，且 <lineNo> 与 expectLineNo 逐位相等。
+// 为什么不能只查"含'第'字"：那样即使 fail() 把行号拼成常量或拼错，
+// 断言依然通过——本条守卫要的是"行号与该错误在配置里实际所在行一致"。
+// 行号后用完整串比较，防止 "第 2 行" 误配 "第 12 行"。
+void expectParseFailureAtLine(const std::string& text, int expectLineNo,
+                              const std::string& what) {
+    Config cfg;
+    std::string error;
+    const bool ok = ConfigLoader::parse(text, cfg, error);
+    check(!ok, "应加载失败: " + what);
+    const std::string token = "第 " + std::to_string(expectLineNo) + " 行";
+    const std::size_t at = error.find(token);
+    check(at != std::string::npos,
+          "错误信息应带行号 " + std::to_string(expectLineNo) + "（实际 \"" + error + "\"）: " + what);
+    if (at == std::string::npos) {
+        return;
+    }
+    // 行号必须恰好结束在这里：后面紧跟的是冒号或空格+节名，不能再接数字
+    const std::size_t after = at + token.size();
+    const bool boundaryOk = after < error.size() && error[after] != '0' && error[after] != '1' &&
+                            error[after] != '2' && error[after] != '3' && error[after] != '4' &&
+                            error[after] != '5' && error[after] != '6' && error[after] != '7' &&
+                            error[after] != '8' && error[after] != '9';
+    check(boundaryOk, "行号 " + std::to_string(expectLineNo) + " 后不应再跟数字（实际 \"" + error +
+                          "\"）: " + what);
+}
+
 std::string nodeName(int index) {
     if (index == 0) {
         return "W01";
@@ -326,6 +353,20 @@ void testErrorCases() {
 
     // [section] 缺少右括号
     expectParseFailure("[nodes\nW01, warehouse, 0, 0, 仓, 0\n", "[section] 缺少右括号");
+    // 报错必须带行号，且行号 = 该错误在配置里实际所在行（IniFile 层，第 1 行）
+    expectParseFailureAtLine("[nodes\nW01, warehouse, 0, 0, 仓, 0\n", 1,
+                             "IniFile 层：节缺右括号，行号应为 1");
+
+    // 字段数不符（ConfigLoader 层，错误行在第 2 行）
+    expectParseFailureAtLine(
+        "[nodes]\nW01, warehouse, 0, 0\n[edges]\n[vehicles]\n[orders]\n", 2,
+        "ConfigLoader 层：[nodes] 字段数不符，行号应为 2");
+
+    // 错误行不在首行时也要带对行号（[edges] 节的数据行在第 5 行）
+    expectParseFailureAtLine(
+        "[nodes]\nW01, warehouse, 0, 0, 仓, 0\nD01, delivery, 1, 1, 客, 0\n"
+        "[edges]\nW01, NOPE, 1, 1, 1\n[vehicles]\n[orders]\n", 5,
+        "边端点不存在，行号应为 5");
 
     // 文件不存在
     Config cfg;
