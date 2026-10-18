@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>数据结构总览 —— 结构之间的流通</title>
+<style>
+:root { color-scheme: light; }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 28px 30px 60px; background: #ffffff; color: #1e293b;
+  font-family: "Noto Sans CJK SC", "Source Han Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+  line-height: 1.65; }
+h1 { font-size: 24px; margin: 0 0 6px; }
+h2 { font-size: 18px; margin: 40px 0 10px; padding-bottom: 6px; border-bottom: 2px solid #e2e8f0; }
+h3 { font-size: 15px; margin: 26px 0 8px; color: #334155; }
+p.lead { margin: 0 0 4px; color: #475569; }
+p.meta { margin: 6px 0 0; font-size: 12.5px; color: #64748b; }
+a { color: #1d4ed8; }
+code { background: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 4px;
+  padding: 0 4px; font-size: 12.5px; font-family: ui-monospace, "DejaVu Sans Mono", monospace; }
+.box { border: 1px solid #e2e8f0; border-radius: 10px; padding: 16px 18px; margin: 14px 0 0; background: #fff; }
+.legend { display: flex; flex-wrap: wrap; gap: 18px; margin: 10px 0 6px; font-size: 13px; }
+.legend span { display: inline-flex; align-items: center; gap: 7px; }
+.sw { width: 22px; height: 13px; border-radius: 3px; display: inline-block; }
+.dashline { display: inline-block; width: 26px; height: 0; border-top: 2px dashed #c2410c; }
+.tblwrap { overflow-x: auto; border: 1px solid #e2e8f0; border-radius: 10px; margin-top: 10px; }
+table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+th, td { border-bottom: 1px solid #eef2f7; border-right: 1px solid #f1f5f9;
+  padding: 8px 10px; text-align: left; vertical-align: top; }
+th { background: #f8fafc; position: sticky; top: 0; font-size: 12.5px; color: #0f172a; }
+td:first-child { white-space: nowrap; }
+tbody tr:nth-child(even) { background: #fcfdff; }
+details { margin-top: 14px; }
+summary { cursor: pointer; font-size: 13px; color: #475569; }
+pre { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px;
+  padding: 14px 16px; overflow-x: auto; font-size: 12px; line-height: 1.5; }
+footer { margin-top: 44px; padding-top: 14px; border-top: 1px solid #e2e8f0;
+  font-size: 12.5px; color: #64748b; }
+</style></head><body>
+<h1>数据结构总览</h1>
+<p class="lead">系统的每一种结构画成一个方块，箭头写「传的是<strong>什么</strong>」。橙色 = 手写算法，蓝色 = 容器／结构本体，绿色 = 被算法承载的记录（Stop / Trip / RoutePlan / 各类记账），紫色 = Qt 视图层。虚线 = 非顺序的控制流（改图、回写计划）。</p>
+<p class="lead">读法：从左上 <code>config/default.ini</code> 顺着箭头往下，第三条带（事件与重规划）末尾会沿虚线回到 <code>RoutePlan</code> —— 这就是「重规划后计划换了一版」。表在下面，逐格与 <a href="数据结构地图.md">数据结构地图.md</a> 一致。</p>
+<p class="meta">数字口径：n = 节点数 30、m = 有向边数 106、k = 停靠候选数 ≤ 25、s = 堆内条目数；config = 2 仓库 + 3 中转站 + 25 配送点、25 订单 740kg、车 200kg 08:00 发车。事实取自 <code>src/</code>（源码基线 = 提交 4a23236）。</p>
+<div class="legend"><span><i class="sw" style="background:#fff4e5;border:1.8px solid #e08a1e"></i>手写算法</span><span><i class="sw" style="background:#e9f2fd;border:1.8px solid #3a7bd5"></i>容器 / 结构本体</span><span><i class="sw" style="background:#eafaf0;border:1.8px solid #2f9e6b"></i>记录（被承载的数据）</span><span><i class="sw" style="background:#f3ecfd;border:1.8px solid #8a5cd6"></i>Qt 视图层</span><span><i class="dashline"></i>虚线 = 改图 / 回写计划</span></div>
+<div class="box"><svg viewBox="0 0 1200 1742" width="100%" xmlns="http://www.w3.org/2000/svg" font-family="Noto Sans CJK SC, Source Han Sans SC, Microsoft YaHei, sans-serif">
+<defs>
+<marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/></marker>
+<marker id="ahd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#c2410c"/></marker>
+</defs>
+<rect x="0" y="60" width="1200" height="496" fill="#fbfdff"/>
+<line x1="0" y1="60" x2="1200" y2="60" stroke="#e2e8f0" stroke-width="1.5"/>
+<text x="18" y="52" font-size="13" font-weight="700" fill="#94a3b8">① 配置 → 图（io + 图存储 · 蓝色 = 容器 / 结构本体）</text>
+<rect x="0" y="556" width="1200" height="620" fill="#fdfbf7"/>
+<line x1="0" y1="556" x2="1200" y2="556" stroke="#e2e8f0" stroke-width="1.5"/>
+<text x="18" y="548" font-size="13" font-weight="700" fill="#94a3b8">② 最短路 → 调度状态（core · 橙色 = 手写算法，绿色 = 被承载的记录）</text>
+<rect x="0" y="1176" width="1200" height="532" fill="#fbfaff"/>
+<line x1="0" y1="1176" x2="1200" y2="1176" stroke="#e2e8f0" stroke-width="1.5"/>
+<text x="18" y="1168" font-size="13" font-weight="700" fill="#94a3b8">③ 运行 · 事件 · 重规划 → 视图（紫色 = Qt 视图层，只读消费）</text>
+<line x1="0" y1="1708" x2="1200" y2="1708" stroke="#e2e8f0" stroke-width="1.5"/>
+<path d="M 610.0 184.0 L 610.0 204.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 400.0 256.0 L 320.0 256.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 308.0 L 610.0 328.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 432.0 L 610.0 452.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 400.0 380.0 L 330.0 380.0 L 330.0 628.0 L 320.0 628.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 556.0 L 610.0 576.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 820.0 504.0 L 890.0 504.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 820.0 628.0 L 890.0 628.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 680.0 L 610.0 700.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 30.0 628.0 L 360.0 628.0 L 360.0 752.0 L 820.0 752.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 820.0 752.0 L 890.0 752.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 804.0 L 610.0 824.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 320.0 876.0 L 400.0 876.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 928.0 L 610.0 948.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 820.0 1000.0 L 890.0 1000.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 1052.0 L 610.0 1072.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 820.0 1124.0 L 890.0 1124.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 1176.0 L 610.0 1196.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 820.0 1248.0 L 890.0 1248.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 1300.0 L 610.0 1320.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 400.0 1372.0 L 348.0 1372.0 L 348.0 1496.0 L 320.0 1496.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 1424.0 L 610.0 1444.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 820.0 1372.0 L 872.0 1372.0 L 872.0 1496.0 L 890.0 1496.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 1548.0 L 610.0 1568.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 400.0 1620.0 L 320.0 1620.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 400.0 1496.0 L 384.0 1496.0 L 384.0 504.0 L 400.0 504.0" fill="none" stroke="#c2410c" stroke-width="1.4" stroke-dasharray="6 4" marker-end="url(#ahd)"/>
+<path d="M 1170.0 1496.0 L 1195.0 1496.0 L 1195.0 44.0 L 880.0 44.0 L 880.0 530.0 L 820.0 530.0" fill="none" stroke="#c2410c" stroke-width="1.4" stroke-dasharray="6 4" marker-end="url(#ahd)"/>
+<path d="M 400.0 1620.0 L 396.0 1620.0 L 396.0 1000.0 L 400.0 1000.0" fill="none" stroke="#c2410c" stroke-width="1.4" stroke-dasharray="6 4" marker-end="url(#ahd)"/>
+<path d="M 30.0 1620.0 L 336.0 1620.0 L 336.0 1000.0 L 400.0 1000.0" fill="none" stroke="#c2410c" stroke-width="1.4" stroke-dasharray="6 4" marker-end="url(#ahd)"/>
+<text x="619" y="198" font-size="11.5" fill="#475569" text-anchor="start">文本</text>
+<text x="360" y="248" font-size="11.5" fill="#475569" text-anchor="middle">记录</text>
+<text x="619" y="322" font-size="11.5" fill="#475569" text-anchor="start">解析结果</text>
+<text x="619" y="446" font-size="11.5" fill="#475569" text-anchor="start">Config.graph</text>
+<text x="336" y="446" font-size="11.5" fill="#475569" text-anchor="start">Config.orders</text>
+<text x="619" y="570" font-size="11.5" fill="#475569" text-anchor="start">adjacency() 只读</text>
+<text x="855" y="496" font-size="11.5" fill="#475569" text-anchor="middle">node/edge</text>
+<text x="855" y="620" font-size="11.5" fill="#475569" text-anchor="middle">push/popMin</text>
+<text x="619" y="694" font-size="11.5" fill="#475569" text-anchor="start">PathResult{nodes, totalWeight}</text>
+<text x="366" y="694" font-size="11.5" fill="#475569" text-anchor="start">Candidate[] pool</text>
+<text x="855" y="744" font-size="11.5" fill="#475569" text-anchor="middle">Stop</text>
+<text x="619" y="818" font-size="11.5" fill="#475569" text-anchor="start">Trip[]（每批一趟）</text>
+<text x="360" y="868" font-size="11.5" fill="#475569" text-anchor="middle">在途货</text>
+<text x="619" y="942" font-size="11.5" fill="#475569" text-anchor="start">trips 攒齐</text>
+<text x="855" y="992" font-size="11.5" fill="#475569" text-anchor="middle">bankOps</text>
+<text x="619" y="1066" font-size="11.5" fill="#475569" text-anchor="start">trips（真源）</text>
+<text x="855" y="1116" font-size="11.5" fill="#475569" text-anchor="middle">展平字段</text>
+<text x="619" y="1190" font-size="11.5" fill="#475569" text-anchor="start">扁平视图</text>
+<text x="855" y="1240" font-size="11.5" fill="#475569" text-anchor="middle">syncScene()</text>
+<text x="619" y="1314" font-size="11.5" fill="#475569" text-anchor="start">settleEventsUpTo(now)</text>
+<text x="354" y="1438" font-size="11.5" fill="#475569" text-anchor="start">抽到紧急单 3/15</text>
+<text x="619" y="1438" font-size="11.5" fill="#475569" text-anchor="start">抽到路况 10/15</text>
+<text x="878" y="1438" font-size="11.5" fill="#475569" text-anchor="start">抽到新客/封路 2/15</text>
+<text x="619" y="1562" font-size="11.5" fill="#475569" text-anchor="start">needsReplan：增幅 ≥ 20% 且恰在相邻两站</text>
+<text x="360" y="1612" font-size="11.5" fill="#475569" text-anchor="middle">不可增量</text>
+<text x="390" y="942" font-size="11.5" fill="#475569" text-anchor="start">就地改 Edge::timeMin（baseTimeMin 不动）</text>
+<text x="1040" y="34" font-size="11.5" fill="#475569" text-anchor="middle">增删节点 / 边（GraphEdit）</text>
+<text x="402" y="1190" font-size="11.5" fill="#475569" text-anchor="start">回写 trips（新一版 RoutePlan）</text>
+<text x="342" y="1438" font-size="11.5" fill="#475569" text-anchor="start">回写（全量版）</text>
+<rect x="400" y="80" width="420" height="104" rx="9" fill="#e9f2fd" stroke="#3a7bd5" stroke-width="1.8"/>
+<text x="412" y="107" font-size="14" font-weight="700" fill="#123f6e">config/default.ini</text>
+<text x="412" y="130" font-size="12.5" fill="#334155">30 节点 / 106 有向边 / 25 订单</text>
+<text x="412" y="149" font-size="12.5" fill="#334155">车 200kg，08:00 发车</text>
+<rect x="400" y="204" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="412" y="231" font-size="14" font-weight="700" fill="#8a4500">IniFile::parse（手写解析）</text>
+<text x="412" y="254" font-size="12.5" fill="#334155"># 注释 / [section] / 空行；报错带行号</text>
+<text x="412" y="273" font-size="12.5" fill="#334155">记录自带 lineNo ⇒ 报错能指到具体行</text>
+<rect x="30" y="204" width="290" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
+<text x="42" y="231" font-size="13" font-weight="700" fill="#12563c">IniRecord / IniSection</text>
+<text x="42" y="254" font-size="12.5" fill="#334155">键值行或逗号记录行 + lineNo</text>
+<text x="42" y="273" font-size="12.5" fill="#334155">findValue 返回记录本体</text>
+<rect x="400" y="328" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="412" y="355" font-size="14" font-weight="700" fill="#8a4500">ConfigLoader::load → Config</text>
+<text x="412" y="378" font-size="12.5" fill="#334155">组装 + 校验：缺节 / 字段数 / 类型 / 端点 / 重复 ID</text>
+<text x="412" y="397" font-size="12.5" fill="#334155">输出 Config{graph, vehicles, orders, general}</text>
+<rect x="400" y="452" width="420" height="104" rx="9" fill="#e9f2fd" stroke="#3a7bd5" stroke-width="1.8"/>
+<text x="412" y="479" font-size="14" font-weight="700" fill="#123f6e">LogisticsGraph（邻接表）</text>
+<text x="412" y="502" font-size="12.5" fill="#334155">nodes_ 顺序表 + out_ 邻接表，下标对齐</text>
+<text x="412" y="521" font-size="12.5" fill="#334155">稀疏图：不用邻接矩阵（900 格几乎全空）</text>
+<text x="412" y="540" font-size="12.5" fill="#334155">indexOf O(n) / removeNode O(n+m)</text>
+<rect x="890" y="452" width="280" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
+<text x="902" y="479" font-size="13" font-weight="700" fill="#12563c">Node / Edge</text>
+<text x="902" y="502" font-size="12.5" fill="#334155">Edge 三权重 + baseTimeMin</text>
+<text x="902" y="521" font-size="12.5" fill="#334155">congested；baseTimeMin 永不改写</text>
+<rect x="400" y="576" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="412" y="603" font-size="14" font-weight="700" fill="#8a4500">Dijkstra::shortestPath</text>
+<text x="412" y="626" font-size="12.5" fill="#334155">dist[] + previous[] + 惰性删除</text>
+<text x="412" y="645" font-size="12.5" fill="#334155">三策略共用一份，只在 pickWeight 换维度</text>
+<text x="412" y="664" font-size="12.5" fill="#334155">时间 O(m·n + m·log m)，n 点 / m 边</text>
+<rect x="890" y="576" width="280" height="104" rx="9" fill="#e9f2fd" stroke="#3a7bd5" stroke-width="1.8"/>
+<text x="902" y="603" font-size="13" font-weight="700" fill="#123f6e">MinHeap（无 decrease-key）</text>
+<text x="902" y="626" font-size="12.5" fill="#334155">Entry{key, value}，底层 vector</text>
+<text x="902" y="645" font-size="12.5" fill="#334155">siftUp / siftDown / swapEntries</text>
+<text x="902" y="664" font-size="12.5" fill="#334155">push / popMin 各 O(log s)，自写</text>
+<rect x="30" y="576" width="290" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
+<text x="42" y="603" font-size="13" font-weight="700" fill="#12563c">Candidate{}</text>
+<text x="42" y="626" font-size="12.5" fill="#334155">同点订单合并：需求求和、窗口并集</text>
+<text x="42" y="645" font-size="12.5" fill="#334155">k ≤ 25 个停靠点候选</text>
+<rect x="400" y="700" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="412" y="727" font-size="14" font-weight="700" fill="#8a4500">weave 贪心串联 + appendLeg</text>
+<text x="412" y="750" font-size="12.5" fill="#334155">每轮选「当前位置到它权重最小」的候选</text>
+<text x="412" y="769" font-size="12.5" fill="#334155">紧急优先内嵌每轮；并列按节点 ID 字典序</text>
+<text x="412" y="788" font-size="12.5" fill="#334155">单趟 ≈ k(k+1)/2 次最短路（k=25 ⇒ 325）</text>
+<rect x="890" y="700" width="280" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
+<text x="902" y="727" font-size="13" font-weight="700" fill="#12563c">Stop</text>
+<text x="902" y="750" font-size="12.5" fill="#334155">rawArrival / wait / arrival</text>
+<text x="902" y="769" font-size="12.5" fill="#334155">penalty = max(0, arrival − 窗口止)</text>
+<text x="902" y="788" font-size="12.5" fill="#334155">remainingLoadKg = 离开该站剩余</text>
+<rect x="400" y="824" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="412" y="851" font-size="14" font-weight="700" fill="#8a4500">multiTripPlan（按载重分批）</text>
+<text x="412" y="874" font-size="12.5" fill="#334155">740kg &gt; 200kg ⇒ 多趟：紧急批 → 在途货批 → 按簇</text>
+<text x="412" y="893" font-size="12.5" fill="#334155">中转站不参与排线（实测经站 198.2km/13 趟）</text>
+<rect x="30" y="824" width="290" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
+<text x="42" y="851" font-size="13" font-weight="700" fill="#12563c">OnboardItem</text>
+<text x="42" y="874" font-size="12.5" fill="#334155">车此刻已装在车上的货（点 + kg）</text>
+<text x="42" y="893" font-size="12.5" fill="#334155">少了它，重规划会先跑回仓库</text>
+<rect x="400" y="948" width="420" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
+<text x="412" y="975" font-size="14" font-weight="700" fill="#12563c">RoutePlan（trips 是真源）</text>
+<text x="412" y="998" font-size="12.5" fill="#334155">trips[] + 展平视图 nodes/stops/nodeTripIndex</text>
+<text x="412" y="1017" font-size="12.5" fill="#334155">扁平字段只在一处生成 ⇒ 不会各自走样</text>
+<rect x="890" y="948" width="280" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
+<text x="902" y="975" font-size="13" font-weight="700" fill="#12563c">TransitOp / TransitStock</text>
+<text x="902" y="998" font-size="12.5" fill="#334155">站内装卸记账（kgDelta 带符号）</text>
+<text x="902" y="1017" font-size="12.5" fill="#334155">期末 = 期初 + ΣkgDelta（守恒）</text>
+<rect x="400" y="1072" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="412" y="1099" font-size="14" font-weight="700" fill="#8a4500">flatten（唯一展平点）</text>
+<text x="412" y="1122" font-size="12.5" fill="#334155">trips → 扁平视图并汇总；后趟跳过起点</text>
+<text x="412" y="1141" font-size="12.5" fill="#334155">三个规划出口各调一次</text>
+<rect x="890" y="1072" width="280" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
+<text x="902" y="1099" font-size="13" font-weight="700" fill="#12563c">扁平视图（界面消费）</text>
+<text x="902" y="1122" font-size="12.5" fill="#334155">nodes / nodeArrivalMin / nodeIsStop</text>
+<text x="902" y="1141" font-size="12.5" fill="#334155">nodeTripIndex（第几趟）/ stops</text>
+<rect x="400" y="1196" width="420" height="104" rx="9" fill="#f3ecfd" stroke="#8a5cd6" stroke-width="1.8"/>
+<text x="412" y="1223" font-size="14" font-weight="700" fill="#42257c">MainWindow 推进与结算</text>
+<text x="412" y="1246" font-size="12.5" fill="#334155">onAdvanceStop / onAdvanceMoment → settleEventsUpTo</text>
+<text x="412" y="1265" font-size="12.5" fill="#334155">nodeIndexAtTime：半路显示所在段的起点</text>
+<rect x="890" y="1196" width="280" height="104" rx="9" fill="#f3ecfd" stroke="#8a5cd6" stroke-width="1.8"/>
+<text x="902" y="1223" font-size="13" font-weight="700" fill="#42257c">GraphScene / NodeItem / EdgeItem</text>
+<text x="902" y="1246" font-size="12.5" fill="#334155">syncScene：高亮 isEdgeOnRoute</text>
+<text x="902" y="1265" font-size="12.5" fill="#334155">拥堵标记 / 车辆位置重绘</text>
+<text x="902" y="1284" font-size="12.5" fill="#334155">build O(m·n)，highlight O(m)</text>
+<rect x="400" y="1320" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="412" y="1347" font-size="14" font-weight="700" fill="#8a4500">SimEvent::nextEventTimeMin + pickEvent</text>
+<text x="412" y="1370" font-size="12.5" fill="#334155">每 15min 一个事件刻，严格前进</text>
+<text x="412" y="1389" font-size="12.5" fill="#334155">一次抽签 = 一次 O(4) 前缀扫描，权重 10:3:1:1</text>
+<text x="412" y="1408" font-size="12.5" fill="#334155">Rng 手写 xorshift32：为可复现，不是被禁 STL</text>
+<rect x="30" y="1444" width="290" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="42" y="1471" font-size="13" font-weight="700" fill="#8a4500">insertUrgentOrder</text>
+<text x="42" y="1494" font-size="12.5" fill="#334155">新单强制标紧急，以当前位置/时刻重算</text>
+<text x="42" y="1513" font-size="12.5" fill="#334155">两版取优：车上缓冲 / 站内库存就地满足</text>
+<rect x="400" y="1444" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="412" y="1471" font-size="14" font-weight="700" fill="#8a4500">Traffic::simulateTrafficChange → TrafficReport</text>
+<text x="412" y="1494" font-size="12.5" fill="#334155">部分 Fisher-Yates 选 round(0.1×106)=11 条边</text>
+<text x="412" y="1513" font-size="12.5" fill="#334155">改 Edge::timeMin；baseTimeMin 永不动</text>
+<rect x="890" y="1444" width="280" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="902" y="1471" font-size="13" font-weight="700" fill="#8a4500">GraphEdit</text>
+<text x="902" y="1494" font-size="12.5" fill="#334155">addRandomCustomer / closeRandomRoad</text>
+<text x="902" y="1513" font-size="12.5" fill="#334155">封路先 BFS 防封桥（不切孤岛）</text>
+<rect x="400" y="1568" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="412" y="1595" font-size="14" font-weight="700" fill="#8a4500">needsReplan → replanIncremental</text>
+<text x="412" y="1618" font-size="12.5" fill="#334155">增幅 ≥ 20% 且恰在路线相邻两站才触发</text>
+<text x="412" y="1637" font-size="12.5" fill="#334155">sliceRemainder → replanOneTrip：只重算受影响 leg</text>
+<text x="412" y="1656" font-size="12.5" fill="#334155">任一趟不可增量 ⇒ 整体退回全量 replan</text>
+<rect x="30" y="1568" width="290" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="42" y="1595" font-size="13" font-weight="700" fill="#8a4500">replan（全量兜底）</text>
+<text x="42" y="1618" font-size="12.5" fill="#334155">增量不可用时兜底：重跑 weave</text>
+<text x="42" y="1637" font-size="12.5" fill="#334155">起点 = 车当前位置，带上在途货</text>
+</svg></div>
+<details><summary>展开：同一张流通图的纯文本版（任何终端 / 编辑器可看，也是 <code>数据结构地图.md</code> 里的那一张）</summary>
+<pre>config/default.ini  （30 节点 / 106 有向边 / 25 订单 / 车 200kg·08:00）
+   │ 文本
+   ▼
+IniFile::parse ──────► IniSection / IniRecord（每条自带 lineNo，报错才能指到行）
+   │
+   ▼
+ConfigLoader::load ──► Config{ graph, vehicles, orders, general }
+   │                                    │
+   │ Config.graph                       │ Config.orders
+   ▼                                    ▼
+LogisticsGraph{ nodes_ 顺序表 + out_ 邻接表（下标严格对齐） }      Order[] ─► Candidate{}（同点订单合并）
+   │ adjacency() 只读                                    │                  │
+   ▼                                                     │                  │
+Dijkstra::shortestPath（dist[] + previous[]） ◄──► MinHeap{Entry{key,value}}  │
+   │ PathResult{nodes, totalWeight}                      │                  │
+   └──────────────────────────┬──────────────────────────┘                  │
+                              ▼                                             │
+   weave 贪心串联（每轮选“最短路权重最小”的候选；紧急优先内嵌在每轮里） ◄──────┘
+        │ 每选一站 ──► appendLeg 沿最短路走一段，并写 Stop（时刻/等待/罚时/剩余载重）
+        ▼
+   Trip{ nodes / nodeArrivalMin / nodeIsStop + stops + loadKg / bufferKg }（三条平行数组）
+        │ multiTripPlan：按载重上限分批，每批一趟（紧急批 → 在途货批 → 其余按簇）
+        ▼
+   RoutePlan{ trips[] = **真源** }  ◄── OnboardItem（车此刻在车上的货）
+        │      └──► TransitOp / TransitStock（缓冲库存记账：期初 + ΣkgDelta = 期末）
+        │ flatten（**唯一展平点**）
+        ▼
+   扁平视图 nodes / nodeArrivalMin / nodeIsStop / nodeTripIndex / stops
+        │
+        ▼
+   MainWindow 推进：onAdvanceStop / onAdvanceMoment ──► nodeIndexAtTime（半路显示段起点）
+        │ settleEventsUpTo(now) —— 事件结算挂在“软件时间前进”上
+        ▼
+   SimEvent::nextEventTimeMin（每 15min 一个刻，严格前进）+ pickEvent(Rng, 权重 10:3:1:1)
+        │ 抽中的那一类
+        ├─ Traffic::simulateTrafficChange ──► TrafficReport ──► needsReplan？
+        │        └── 就地改 Edge::timeMin（**baseTimeMin 永不动**）
+        ├─ RoutePlanner::insertUrgentOrder（强制紧急，以当前位置/时刻重算）
+        └─ GraphEdit::addRandomCustomer / closeRandomRoad（改图；封路前先 BFS，不封桥）
+        │
+        ▼
+   replanIncremental（sliceRemainder → replanOneTrip：按停靠点切 leg，只重算**受影响的** leg）
+        │ 任一趟不可增量 ──► 退回全量 replan（兜底）
+        └──► 回写 RoutePlan（新一版 trips）──► 回到上面的 flatten
+        │
+        ▼
+   GraphScene::syncScene（路径高亮 isEdgeOnRoute / 拥堵标记 / 车辆位置）</pre></details>
+<h3>2. 表 1 · 存储与配置层（结构本体 + 承载它的记录）</h3>
+<div class="tblwrap"><table><thead><tr>
+<th>结构</th>
+<th>是什么</th>
+<th>为什么是它（排除谁 / 依据）</th>
+<th>特点与复杂度（前提）</th>
+<th>没有它得自己写什么</th>
+<th>连接：谁喂它 → 它 → 谁消费</th>
+<th>代价与坑</th>
+</tr></thead><tbody>
+<tr><td><code>IniFile</code>·<code>IniSection</code>·<code>IniRecord</code></td><td>INI 文本 → 带行号的记录序列（节 → 记录）</td><td>解析错误必须报行号 ⇒ 记录自带 <code>lineNo</code>，而且 <code>findValue</code> 返回<strong>记录本体</strong>而非值（报错时才带得上行号）；节数与记录数都很小（<code>[general]</code> 8 行）⇒ 顺序 <code>vector</code> 足够，不必建键索引</td><td><code>parse</code> O(L)（L = 总行数）；<code>findSection</code> O(节数)；<code>findValue</code> O(r)（r = 该节记录数）</td><td>逐行扫描 + 手维护一张「值 → 行号」旁表</td><td><code>config/default.ini</code> → <code>IniFile::parse</code> → <code>IniSection</code>/<code>IniRecord</code> → <code>ConfigLoader::load</code></td><td>只认 <code>#</code> 注释；重复节名直接失败；不做语义校验（语义都在 <code>ConfigLoader</code>）</td></tr>
+<tr><td><code>Config</code></td><td>一次加载的完整结果：图 + 车辆 + 订单 + 全局参数</td><td>把「文件里的四类数据」收成一个值对象，规划器与界面只依赖它、不依赖 INI 形状；事件权重与间隔集中在 <code>GeneralConfig</code>，改配置不用改代码</td><td>O(n + m + 订单数) 空间；纯数据、无方法</td><td><code>ConfigLoader</code> 要回传 4 个出参，或每个调用点自己再解析一遍</td><td><code>ConfigLoader::load</code> → <code>Config</code> → <code>RoutePlanner::planRoute</code> / <code>MainWindow</code></td><td>事件参数只剩 <code>event_interval_min</code>（旧的真实秒级字段已删除）；<code>Config::graph</code> 是<strong>值</strong>，不是引用</td></tr>
+<tr><td><code>LogisticsGraph</code></td><td>有向带权图：<code>nodes_</code> 顺序表 + <code>out_</code> 邻接表，两者下标严格对齐</td><td>图是稀疏的（30 节点 / 106 有向边）⇒ 邻接矩阵 900 格绝大多数为空、而每格还要塞 3 个权重；下标对齐让「节点 i 的出边」是 O(1)，Dijkstra 不必每步筛边</td><td>n、m、deg：<code>indexOf</code> <strong>O(n)</strong>（线性扫，无 ID→索引映射）；<code>findEdge</code> O(deg)；<code>addNode</code> O(n)；<code>removeNode</code> <strong>O(n+m)</strong>（入边散落在别人的出边表里）；空间 O(n+m)</td><td>Dijkstra 每轮自己从边表里筛边（每次 O(m)），或另建一份邻接结构</td><td><code>ConfigLoader</code> 装配 → <code>Dijkstra</code> 只读 <code>adjacency()</code>、io 输出邻接表/邻接矩阵 → <code>Traffic</code>/<code>GraphEdit</code> 就地改 → GUI 只读遍历</td><td>没有反向邻接表 ⇒ 删点 O(n+m)；<code>indexOf</code> 是 O(n)（源码注明「节点数很小（30 量级），不为它引入索引结构」）；**不提供可写 <code>Edge*</code>**，防调用方改坏 <code>fromId</code> 等不变量</td></tr>
+<tr><td><code>Node</code>·<code>Edge</code>（记录）</td><td>图的两条记录类型；<code>Edge</code> 携带三权重（距离/耗时/成本）+ <code>baseTimeMin</code> + <code>congested</code></td><td>三权重并存才能「同一张图、三套策略」（<code>pickWeight</code> 只换维度）；<code>baseTimeMin</code> 单列出来，是因为路况判定要「相对基准的增幅」，而 <code>timeMin</code> 会被就地改写 ⇒ 没有基准就无法判断「畅通」</td><td>定长 O(1)；<code>findEdge(from,to)</code> O(deg)</td><td>想把耗时还原成「畅通」就得另存一张初始耗时表，并与图永远保持同步</td><td><code>ConfigLoader</code> 构造 → <code>LogisticsGraph::out_</code> → <code>Dijkstra</code> 松弛 / <code>Traffic::simulateTrafficChange</code> 改 <code>timeMin</code> / GUI 画箭头</td><td><code>updateEdgeTime</code> 只改 <code>timeMin</code>，<code>congested</code> 由「是否高于 <code>baseTimeMin</code>」自动维护；<code>Node::x/y</code> 只供 GUI 布局，不参与权重计算</td></tr>
+</tbody></table></div>
+<h3>3. 表 2 · 手写算法层（「手写算法、不手写轮子」的落点）</h3>
+<div class="tblwrap"><table><thead><tr>
+<th>结构</th>
+<th>是什么</th>
+<th>为什么是它（排除谁 / 依据）</th>
+<th>特点与复杂度（前提）</th>
+<th>没有它得自己写什么</th>
+<th>连接：谁喂它 → 它 → 谁消费</th>
+<th>代价与坑</th>
+</tr></thead><tbody>
+<tr><td><code>MinHeap</code></td><td>手写二叉最小堆，元素固定为 <code>Entry{key:double, value:int}</code>（底层 <code>std::vector</code>）</td><td>课程硬性要求堆自写（禁 <code>std::priority_queue</code>·<code>make_heap</code>）；<strong>不做成模板</strong>，是因为全项目只有 Dijkstra 一处用、元素类型固定为（权重, 节点下标），模板只会加噪音</td><td>s = 堆内条目数：<code>push</code>/<code>popMin</code> 各 O(log s)；<code>siftUp</code>/<code>siftDown</code>/<code>swapEntries</code> 全自写（不引 <code>&lt;algorithm&gt;</code>）；空堆 <code>popMin</code> 返回 false 且不改出参</td><td>Dijkstra 每轮取最小扫一遍 <code>dist[]</code>（O(n)）——n=30 时同阶，所以这里的收益是<strong>考点</strong>，不是运行时提速</td><td><code>Dijkstra::shortestPath</code> → <code>push</code>（松弛成功）/ <code>popMin</code>（取当前最近）</td><td><strong>没有 decrease-key</strong> ⇒ 同一节点会留下过期条目（堆条目 ≤ m），靠弹出时 <code>currentDist &gt; dist[current]</code> 惰性删除（源码注明：去掉该守卫结果不变，属性能优化）</td></tr>
+<tr><td><code>Dijkstra::shortestPath</code> + <code>dist[]</code>·<code>previous[]</code></td><td>单源单目标最短路：距离数组 + 前驱数组 + 惰性删除堆</td><td>三种策略<strong>共用这一份实现</strong>，只在 <code>pickWeight(Distance/Time/Cost)</code> 换权重来源 ⇒ 不是三套算法；用前驱数组复原路径，而不是让堆条目携带整条路径</td><td>n、m、s：<code>dist</code>/<code>previous</code> 各 O(n)；时间 <strong>O(m·n + m·log m)</strong>（每条边一次松弛，松弛内层的 <code>graph.indexOf</code> 是 O(n)）；路径复原 O(路径节点数)；起点=终点返回单元素路径、权重 0</td><td>把前驱数组换成「堆里带路径」会让每次松弛多 O(n)；三套策略要写三遍</td><td><code>LogisticsGraph::adjacency()</code> → <code>shortestPath</code> → <code>PathResult{nodes, totalWeight}</code> → 三个调用点：<code>appendLeg</code>（沿路走一段）、<code>weave</code>（选下一站）、<code>replanOneTrip</code>（重算受影响 leg）</td><td>不可达时 <code>found=false</code> 且 <code>nodes</code> 为空；<code>kInfinity=1e100</code> 只是哨兵；<strong>无 decrease-key 是设计，不是缺陷</strong></td></tr>
+<tr><td><code>weave</code>（贪心串联）+ <code>appendLeg</code></td><td>每轮在未服务候选里选「当前位置到它最短路权重最小」者，选完沿最短路走一段并记账</td><td>§5.2 贪心串联；<strong>紧急优先必须内嵌在每轮选择内部</strong>（每轮重扫 pool 判断 <code>hasUrgent</code>），不能靠事后排序——否则多趟与插单下会丢掉「紧急先送」；并列时按节点 ID 字典序取，保证同一输入必得同一条路线</td><td>k = 候选数：一轮对 pool 里每个候选各调一次最短路 ⇒ 单趟约 k(k+1)/2 = <strong>O(k²) 次最短路调用</strong>（k=25 时约 <strong>325 次</strong>），是整个规划的主开销；<code>appendLeg</code> 把<strong>全部途经节点</strong>写进 <code>Trip::nodes</code></td><td>自己写「每步选最近」的比较、时间窗推进、紧急优先与 tie-break</td><td><code>Candidate[]</code> + 图 → <code>weave</code> → <code>Stop</code>/<code>Trip</code>；被 <code>multiTripPlanImpl</code> / <code>replan</code> / <code>replanOneTrip</code> 复用</td><td>贪心不保证最优（报告必须照写）；时间推进恒用<strong>耗时</strong>维度 <code>edge-&gt;timeMin</code>，与本次策略无关；停靠点的到达时刻要用「等过窗口」的 <code>arrivalMin</code> 覆盖 <code>appendLeg</code> 记下的原始到达时刻</td></tr>
+<tr><td><code>multiTripPlan</code>（多趟分批）</td><td>总需求 &gt; 载重时进入：紧急候选先独立成趟 → 在途货一趟 → 其余按簇分批，每批一趟从仓库直达后返回</td><td>D21 把「载重不足」从不可行改成多趟往返；分簇用数据里的 <code>sub_network_id</code>（行政归属，可核对），不每次重算最近枢纽；簇按总货量降序、平局按 hub 名升序 ⇒ 输出确定。中转站<strong>不参与排线</strong>（实测经站 198.2km/13 趟 vs 直达 178.2km/6 趟）</td><td>批内「能装就装」线性装箱 O(簇内候选数)；簇序用<strong>手写选择排序</strong> O(簇数²)（禁 <code>std::sort</code>）；整体 ≈ Σ 各趟的 O(k_t²) 次最短路</td><td>超载场景直接判不可行（旧 D14 行为），或自己写分簇 + 分批 + 趟序列</td><td><code>Candidate[]</code> + <code>OnboardItem</code> + <code>initialStock</code> → <code>multiTripPlan</code> → <code>Trip[]</code> → <code>flatten</code></td><td>批的起点必须是车的<strong>真实位置</strong> <code>current</code> 而不是最初的 <code>startPos</code>（否则排出的趟首尾不接）；只有「从仓库装货出发」的趟才计缓冲货，别的趟凭空计会重复计数</td></tr>
+<tr><td><code>GraphEdit</code>（<code>addRandomCustomer</code>·<code>closeRandomRoad</code>·<code>makeSyntheticEdge</code>）</td><td>动态增删：随机位置插新客户、随机封一条路（双向删边）、手工加边的权重估算</td><td>坐标 → 权重的换算<strong>从图自身既有边推算</strong>平均比值（<code>estimateScale</code>），不硬编码「坐标单位 → 公里」⇒ 不与数据集尺度脱钩；封路前用 BFS 检查「封了以后还连不通」，<strong>不封桥</strong> ⇒ 不会把一片区域变成孤岛</td><td><code>estimateScale</code> O(m)；<code>reachesSkipping</code> 手写 BFS，队列用 <code>vector</code> + 游标、<code>seen</code> 线性查找 ⇒ O(n·(n+m)) 量级；<code>addRandomCustomer</code> 找最近既有节点 O(n)</td><td>自己写「最近点 + 双向连边 + 权重估算 + 连通性检查」</td><td>事件分派 → <code>GraphEdit</code> → <code>LogisticsGraph::addNode</code>/<code>addEdge</code>/<code>removeEdge</code> → 图变了，后续规划在新图上跑</td><td><code>seen</code> 是线性查找而不是 <code>set</code>（节点量小）；封路是<strong>双向</strong>删边，在含单向边的图里反向边本就可能不存在；<code>makeSyntheticEdge</code> 在坐标重合时返回 false；<code>addRandomCustomer</code> 建边失败会回滚删点</td></tr>
+<tr><td><code>SimEvent</code>（<code>nextEventTimeMin</code>·<code>pickEvent</code>·<code>EventWeights</code>）+ <code>Rng</code></td><td>软件内时间的事件模型：每 <code>intervalMin</code> 一个事件刻、每刻恰抽 1 个事件，四类权重 10:3:1:1</td><td><strong>两个独立理由，别混</strong>：①用软件内时钟而不是真实定时器／推进计数，是为了「推进粒度不影响事件串」（D24）；②手写 <code>xorshift32</code> 而不是 <code>&lt;random&gt;</code>，是<strong>可复现性</strong>选择（同种子必得同序列，测试能逐值断言不 flaky），<strong>不是</strong>因为 STL 被禁</td><td><code>pickEvent</code> 单次 O(4) 前缀扫描（不预先算总和再赌一次）；<code>nextEventTimeMin</code> O(1) 且严格大于 now；<code>Rng</code> 每步 3 次移位异或 O(1)</td><td>自己写加权抽签、全零权重的兜底、事件刻对齐</td><td><code>GeneralConfig</code>（权重 + 间隔）→ <code>nextEventTimeMin</code> + <code>pickEvent</code> → GUI 事件分派 → <code>Traffic</code> / <code>insertUrgentOrder</code> / <code>GraphEdit</code></td><td>权重 ≤ 0 的种类<strong>永不被抽中</strong>（写 0 再问「为什么不出现」是误用）；全零时保底 <code>Traffic</code> 且<strong>仍消耗一次随机数</strong>（契约：一次抽签 = 一次 rng 消耗，否则两条路径的事件串会错位）；<code>intervalMin &lt;= 0</code> 返回 <code>nowMin + 1</code></td></tr>
+<tr><td><code>simulateTrafficChange</code>·<code>TrafficChange</code>·<code>TrafficReport</code>·<code>needsReplan</code></td><td>一次路况变化中被改动的边清单（增幅 + 畅通/拥堵），以及「要不要重算」的判定</td><td>把「这次改了什么」落成<strong>可审的数据</strong>——因为触发判定要问「受影响的边是否恰在当前路线的相邻两站之间」；增幅每次<strong>重设</strong>为 <code>baseTimeMin×(1+ratio)</code> 而不是在原值上叠加 ⇒ 耗时不会逐次失控增长，<code>baseTimeMin</code> 永远是基准</td><td>count = 改动边数（默认 <code>round(0.1×106)</code> = <strong>11</strong>）：选边用<strong>部分 Fisher-Yates</strong> O(count)（只需前 count 个位置被打乱，全排列是浪费）；<code>needsReplan</code> O(count × 路线长度)</td><td>分不清「改了但不在我路上」和「改在我必经段上」，只能每次事件都全量重算</td><td><code>simulateTrafficChange</code> → <code>LogisticsGraph::updateEdgeTime</code>（就地改 <code>timeMin</code>）→ <code>TrafficReport</code> → <code>needsReplan</code> / <code>replanIncremental(report)</code></td><td>只有「增幅 ≥ 阈值 <strong>且</strong>恰在路线相邻两站」才触发（畅通变更 <code>increaseRatio=0</code>，永不触发）；<code>needsReplan</code> 与 GUI 高亮共用 <code>isEdgeOnRoute</code> 同一条逻辑</td></tr>
+</tbody></table></div>
+<h3>4. 表 3 · 调度状态层（被算法承载、被界面消费的记录）</h3>
+<div class="tblwrap"><table><thead><tr>
+<th>结构</th>
+<th>是什么</th>
+<th>为什么是它（排除谁 / 依据）</th>
+<th>特点与复杂度（前提）</th>
+<th>没有它得自己写什么</th>
+<th>连接：谁喂它 → 它 → 谁消费</th>
+<th>代价与坑</th>
+</tr></thead><tbody>
+<tr><td><code>Candidate</code>（<code>RoutePlanner.cpp</code> 内部）</td><td>把 <code>Order</code> 折叠成「停靠点候选」：同点订单合并（需求求和、窗口取并集、任一紧急则该点紧急）</td><td>§4.4 停靠点合并规则：一个节点只应停一次——否则同点多单会被贪心反复选中、来回奔波</td><td><code>buildCandidates</code> O(k × 订单数)（对每个订单线性扫已有候选，无映射表）；k ≤ 25</td><td><code>weave</code> 会把订单当候选 ⇒ 停靠次数与订单数同阶，而不是与配送点数同阶</td><td><code>Order[]</code> → <code>buildCandidates</code> → <code>Candidate[]</code> → <code>weave</code> 的 pool / <code>replanOneTrip</code> 的 <code>findCandidate</code></td><td>合并靠线性扫（订单量大才需要映射表）；<code>weave</code> 的 pool 按<strong>值</strong>传递，每次调用复制一份（25 项，换来「调用方保留自己副本」的清晰语义）</td></tr>
+<tr><td><code>Stop</code></td><td>一次停靠的时间-载重结算：<code>rawArrivalMin</code>/<code>waitMin</code>/<code>arrivalMin</code>/<code>late</code>/<code>penaltyMin</code>/<code>remainingLoadKg</code></td><td>§4.3 推进递归要求 raw → wait → arrival → penalty <strong>成组落地</strong>；否则界面与测试各自重算，口径必然漂（D13：规划、重规划、插单必须同一口径）</td><td>定长 O(1)；一次停靠一个</td><td>每个消费者（界面、汇总、测试）都要重算等待与罚时</td><td><code>weave</code> / <code>makeStop</code> 生成 → <code>Trip::stops</code> → <code>flatten</code> 汇总到 <code>RoutePlan::stops</code> 与 <code>totalPenaltyMin</code> → GUI 停靠明细</td><td><code>remainingLoadKg</code> 是「<strong>离开该站时</strong>本趟剩余」，只统计订单货；缓冲货走 <code>Trip::bufferKg</code>，两者绝不混用</td></tr>
+<tr><td><code>Trip</code></td><td>一趟行程：<code>nodes</code>/<code>nodeArrivalMin</code>/<code>nodeIsStop</code> 三条平行数组 + <code>stops</code> + <code>loadKg</code>/<code>bufferKg</code> + 汇总</td><td>多趟（D20/D21）的单位是「趟」：界面要显示第 N 趟、增量重规划要逐趟重建、缓冲库存要按趟记账；用平行数组是因为下游推进是<strong>按下标</strong>的（<code>nodeIndexAtTime</code> 的语义就建立在下标对齐上）</td><td>O(本趟节点数)；三条数组必须等长；不变量 <code>loadKg + bufferKg ≤ capacityKg</code> 且 <code>bufferKg ≥ 0</code></td><td>得自己从扁平序列里反推「趟边界」</td><td><code>weave</code> 填充 → <code>RoutePlan::trips</code>（<strong>真源</strong>）→ <code>flatten</code> 展平 / <code>sliceRemainder</code> 切剩余 / <code>replanOneTrip</code> 重建</td><td><code>replanOneTrip</code> 先用「<code>nodes.size() &lt; 2</code> 或 <code>nodeIsStop</code> 与 <code>nodes</code> 不等长」判不可增量；<code>loadedFromDepot</code> 与 <code>supplyInPlace</code> 两个标记专门区分「出仓趟／就地满足趟／接着送趟」，否则导出证据会把合法的 <code>bufferKg=0</code> 误报成缺陷</td></tr>
+<tr><td><code>RoutePlan</code>（+ <code>PlanStatus</code>）</td><td>一次规划的完整结果：<code>trips</code>（<strong>真源</strong>）+ 由它展平的 <code>nodes</code>/<code>nodeArrivalMin</code>/<code>nodeIsStop</code>/<code>nodeTripIndex</code>/<code>stops</code> + 汇总 + 库存字段</td><td><code>trips</code> 是真源、扁平字段是「兼容视图」，且<strong>只在一处（<code>flatten</code>）生成</strong> ⇒ 两套数据不会各自维护走样；界面按下标推进，扁平序列比「在 trips 里找第几个节点」直接</td><td>空间 O(总节点数 + 停靠数)；<code>flatten</code> O(总节点数 + 停靠数)；失败用 <code>PlanStatus{Ok, OrderExceedsCapacity, Unreachable}</code> + <code>reason</code> 返回</td><td>调用方自己维护「趟列表」与「整条序列」两份数据并保持同步</td><td><code>multiTripPlan</code>/<code>replan</code>/<code>replanIncremental</code> 产出 → GUI 推进与 <code>isEdgeOnRoute</code> 高亮 / <code>sliceRemainder</code> 切剩余 → 再喂 <code>replanIncremental(previous)</code></td><td><code>plan.nodes</code> 为空时 <code>nodeIndexAtTime</code> 返回 0（<strong>调用方需自行判空</strong>）；<code>totalTimeMin</code> 用<strong>未取整</strong>的 elapsed 算（改用 <code>returnArrivalMin</code> 反推会引入 0.1min 级精度回归）</td></tr>
+<tr><td><code>flatten</code>（展平点，core 里产出视图消费的字段）</td><td>把 <code>trips</code> 展平成 <code>nodes</code>/<code>nodeArrivalMin</code>/<code>nodeIsStop</code>/<code>nodeTripIndex</code>/<code>stops</code> 并汇总总量</td><td><strong>唯一生成点</strong>；后续趟要跳过起点（否则展平后出现「原地一步」）</td><td>O(总节点数 + 停靠数)；在三个规划出口各调一次（<code>multiTripPlanImpl</code> / <code>replan</code> / <code>replanIncremental</code>）</td><td>每个消费者各自展平一遍，视图立刻与趟结构走样</td><td><code>RoutePlan::trips</code> → <code>flatten</code> → 扁平字段 → GUI 推进 / <code>isEdgeOnRoute</code> / <code>sliceRemainder</code></td><td>三个出口都要调，忘一个就拿不到新视图；<code>sliceRemainder</code> 切出的 <code>remainder</code> 只填了 <code>trips</code>/<code>nodes</code>/<code>nodeIsStop</code> 与库存快照，<strong>没有</strong> <code>nodeArrivalMin</code>/<code>nodeTripIndex</code>（它只喂 <code>replanIncremental(previous)</code>，那边只读 <code>trips</code>/<code>nodes</code>/<code>status</code>）</td></tr>
+<tr><td><code>OnboardItem</code></td><td>车辆<strong>此刻已在车上</strong>的货（<code>nodeId</code>, <code>kg</code>）</td><td>重规划时若不知道「车非空」，规划器会假设货都在仓库 ⇒ 每次重算都先跑回仓库（P17 实测「车在仓库与客户间反复跳跃」）；只留两个字段，因为规划只需要「哪一点、多少货」</td><td>O(在途点数)；<code>multiTripPlanImpl</code> 里按节点线性去重（同点多单只插一次）</td><td>重规划出来的每一段都可能先回仓库，与车的物理事实脱节</td><td>GUI 从当前 <code>RoutePlan</code> 推出在途货 → <code>replan</code> / <code>insertUrgentOrder</code> / <code>replanIncremental</code> → <code>multiTripPlanImpl</code> 的「在途货批」（排在紧急批之后）</td><td>必须从<strong>剩余池</strong>取候选（从全量取会把已送过的点再送一遍）；批的起点用 <code>current</code>（车的真实位置），不是 <code>startPos</code></td></tr>
+<tr><td><code>TransitOp</code>·<code>TransitStock</code></td><td>站内一次装卸的记账单元（<code>nodeId</code>/<code>kgDelta</code>/<code>atMin</code>）与站库存快照（期初/期末）</td><td>缓冲库存（D23，<strong>仅服务紧急单</strong>）要能核对守恒 ⇒ 用「操作序列 + 期初/期末」表达：期末 = 期初 + Σ<code>kgDelta</code>；<code>kgDelta</code> 带符号（&gt;0 入库、&lt;0 出库）比两套字段少一个状态</td><td><code>transitOps</code> O(操作数)、<code>transitStock</code> O(站点数)；按时刻排序用<strong>手写插入排序</strong> <code>sortTransitOpsByTime</code>（禁 <code>std::sort</code>）；期末重算 O(操作数 × 站点数)</td><td>库存变成隐式状态，守恒守恒断言无从落笔</td><td><code>Trip::bankOps</code>（返程顺路寄存，至多一条）→ <code>RoutePlan::transitOps</code> → 界面显示 + 守恒断言；<code>initialStock</code>（<strong>当前时刻</strong>快照）→ 规划器</td><td><code>initialStock</code> 的语义是「当前时刻快照」而不是「规划期初」，且<strong>不回传</strong>（期末只从 <code>RoutePlan::transitStock</code> 读）；<code>replanIncremental</code> 必须把库存快照<strong>带走</strong>，否则路况重规划后库存凭空归零；「顺路」意味着该站本来就在最短路的节点序列里 ⇒ 寄存<strong>不新增节点、不改时刻、不改里程</strong></td></tr>
+</tbody></table></div>
+<h3>5. 表 4 · 视图层（消费方，不是真源）</h3>
+<div class="tblwrap"><table><thead><tr>
+<th>结构</th>
+<th>是什么</th>
+<th>为什么是它（排除谁 / 依据）</th>
+<th>特点与复杂度（前提）</th>
+<th>没有它得自己写什么</th>
+<th>连接：谁喂它 → 它 → 谁消费</th>
+<th>代价与坑</th>
+</tr></thead><tbody>
+<tr><td><code>MainWindow</code>（推进 / 结算 / 事件分派）</td><td>GUI 的时间推进与事件分派器：<code>onAdvanceStop</code>/<code>onAdvanceMoment</code> → <code>settleEventsUpTo(now)</code> → 分派事件 → <code>syncScene()</code></td><td><code>core</code>/<code>io</code> 不许 include Qt ⇒ 视图只能「只读查询 + 调业务方法 + 按结果重建」；事件结算挂在「软件时间前进」上，因此推进粒度（一站／一刻）不影响事件串</td><td>每次推进 O(路线长度)（<code>nodeIndexAtTime</code> 全表扫）+ 事件结算 O(1)（<code>nextEventTimeMin</code>）</td><td>没有可视结果，验收无法演示</td><td><code>RoutePlan</code> 扁平字段 + <code>LogisticsGraph</code> → <code>MainWindow</code> → <code>GraphScene</code>（<code>syncScene</code>）</td><td>界面是消费方、<strong>不是真源</strong>：不许在界面里改写物理事实（本项目为这类缺陷返工过多次）</td></tr>
+<tr><td><code>GraphScene</code>·<code>NodeItem</code>·<code>EdgeItem</code></td><td>画布与图元：节点、带箭头的边、权重标签、路径高亮、车辆位置</td><td>高亮判定直接用 core 的 <code>isEdgeOnRoute</code>（<strong>同一条逻辑</strong>，避免界面再实现一遍而漂）；双向边标签只在「两端都可见」时让字典序小的一端保留，避免两张标签完全重叠</td><td><code>build</code> O(m·n)（每条边内层扫全部节点找端点）；<code>highlightRoute</code> 每次 O(m)</td><td>报告与演示没有可视结果</td><td><code>LogisticsGraph</code> + <code>RoutePlan</code> → <code>GraphScene::build</code>/<code>highlightRoute</code>/<code>setVehiclePosition</code></td><td>图元是视图对象，<strong>不是</strong>数据结构真源；<code>docs/screenshots/</code> 的截图已过期，别当证据</td></tr>
+</tbody></table></div>
+<h3>6. 基础记录速查（没有算法、只有字段，故不占上面七栏）</h3>
+<div class="tblwrap"><table><thead><tr>
+<th>类型</th>
+<th>字段要点</th>
+<th>一句话</th>
+</tr></thead><tbody>
+<tr><td><code>Node</code></td><td><code>id</code> / <code>type</code> / <code>x,y</code> / <code>subNetworkId</code></td><td>当前数据：2 仓库 + 3 中转站 + 25 配送点；<code>subNetworkId</code> 是分簇依据（行政归属，不是算出来的最近枢纽）</td></tr>
+<tr><td><code>Edge</code></td><td><code>fromId</code>/<code>toId</code> / 三权重 / <code>baseTimeMin</code> / <code>congested</code></td><td>有向；同一对 <code>(from,to)</code> 至多一条；<code>baseTimeMin</code> 由 <code>addEdge</code> 在未指定时固化为当前 <code>timeMin</code></td></tr>
+<tr><td><code>Order</code></td><td><code>nodeId</code> / <code>demandKg</code> / <code>windowStartMin</code> / <code>windowEndMin</code> / <code>urgent</code> / <code>served</code></td><td>窗口统一是「相对当日 00:00 的分钟数」；被 <code>buildCandidates</code> 折叠成 <code>Candidate</code></td></tr>
+<tr><td><code>Vehicle</code></td><td><code>startNodeId</code> / <code>capacityKg</code> / <code>departTimeMin</code></td><td>当前单车辆（200kg、08:00）；约束的是<strong>单趟在车货量</strong>，不是总需求</td></tr>
+<tr><td><code>PathResult</code></td><td><code>found</code> / <code>nodes</code> / <code>totalWeight</code></td><td><code>Dijkstra</code> 的唯一出口；<code>found=false</code> 时 <code>nodes</code> 为空</td></tr>
+<tr><td><code>TrafficChange</code></td><td><code>fromId</code>/<code>toId</code> / <code>increaseRatio</code> / <code>congested</code></td><td>一次改动的账目；<code>increaseRatio</code> 就是本次施加的增幅（<strong>不叠加</strong>）</td></tr>
+<tr><td><code>EventWeights</code></td><td>路况/紧急/新客/封路 = 10/3/1/1</td><td>抽签的扫描顺序即枚举顺序，决定了并列时的确定性</td></tr>
+<tr><td><code>PlanStatus</code></td><td><code>Ok</code> / <code>OrderExceedsCapacity</code> / <code>Unreachable</code></td><td>只有「单个订单就超载」或「存在不可达点」才不可行；<strong>总需求超载走多趟</strong></td></tr>
+</tbody></table></div>
+<footer>本页的表由 <a href="数据结构地图.md">数据结构地图.md</a> 的表格机械转换而来，事实只有那一个真相源；改数字请改该 MD 并同步本页。索引：[docs/文档导航.md](../../docs/文档导航.md) · 导览：[项目速懂.md](项目速懂.md)</footer>
+</body></html>
