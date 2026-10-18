@@ -78,3 +78,17 @@ bash 人工测试向导.sh              # 8 关人工测试向导（需要真实
 - `.omd/notepad.md` 的 **priority 区**（脚本安全教训：路径归属判定、`rm -rf` 穿透符号链接；
   守卫设计教训：必须证明"真的测到了东西"、且绝不能挂住而要失败）。
 - `docs/设计.md` §16（P0–P37 开发史，含每个真实缺陷的根因与修法）、`.omd/handoffs/`（历次阶段交接）。
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked in GitHub Issues via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default five-role triage vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+single-context: one root `GLOSSARY.md` + `docs/adr/`. See `docs/agents/domain.md`.
