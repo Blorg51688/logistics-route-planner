@@ -20,9 +20,9 @@
 
 ## 三个子文件夹
 
-### `read/` —— 需要你读的文档（全部指向原文，不复制内容）
+### `read/` —— 需要你读的文档
 
-- [`read/README.md`](read/README.md) —— 四份必读文档的导览：读什么、按什么顺序、读的时候注意什么。
+全部指向原文，**不复制内容**。阅读清单（按什么顺序、读什么、读的时候注意什么）见 [`read/README.md`](read/README.md)。
 
 ### `run/` —— 需要你亲手跑的脚本
 
@@ -48,16 +48,4 @@
 
 ---
 
-## 不需要图形界面的命令（写脚本或快速自查用）
-
-在**项目根目录**执行：
-
-```bash
-(cd build && ctest)                      # 全部自动化测试
-./build/app --help                       # 主程序全部命令行选项
-./build/app --plan-summary distance      # 三策略汇总（distance / time / cost）
-./build/app --dump-graph list            # 邻接表（matrix 是邻接矩阵）
-./build/app --self-check-actions         # 插单不丢单等交互性自检
-```
-
-> 口径提醒：`ctest` 的**目标数**与测试二进制**自报的检查项数**是两个数，不许混——以 `ctest -N` 为准。
+> 不需要图形界面的命令（`ctest` / `--plan-summary` / `--dump-graph` 等）见根目录 [`README.md`](../README.md)。
