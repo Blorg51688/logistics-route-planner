@@ -43,8 +43,8 @@
 
 1. **`docs/人工测试记录.md` 是陈旧记录**（出自修复前的向导，只有 1 行）。它**只能**由真人在终端跑
    `bash 人工测试向导.sh` 刷新，**不许手改**，也不可当作有效测试证据。
-2. **`docs/screenshots/` 的截图已过期**（其后界面改过状态栏时间、工具栏拆成 5 条、车辆信息分页签）。
-   需要重截：`QT_QPA_PLATFORM=offscreen ./build/app --render-window docs/screenshots/gui-window.png`。
+2. **`docs/截图/` 的截图已过期**（其后界面改过状态栏时间、工具栏拆成 5 条、车辆信息分页签）。
+   需要重截：`QT_QPA_PLATFORM=offscreen ./build/app --render-window docs/截图/gui-window.png`。
 
 ---
 
