@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>原型 · 紧急取送单降载行程与载重记账</title>
+<style>
+  :root { --accent:#2563eb; --ok:#15803d; --bad:#b91c1c; --ink:#1f2937; --muted:#6b7280; --line:#e5e7eb; --bg:#f8fafc; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; color:var(--ink); background:var(--bg); line-height:1.55; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 28px 22px 80px; }
+  h1 { font-size: 22px; margin: 0 0 6px; }
+  .question { background:#fff; border:1px solid var(--line); border-left:4px solid var(--accent); padding:14px 16px; border-radius:8px; margin:14px 0 22px; }
+  .question b { color:var(--accent); }
+  .proto-tag { display:inline-block; font-size:12px; color:#92400e; background:#fef3c7; border:1px solid #fcd34d; padding:1px 8px; border-radius:999px; margin-left:8px; vertical-align:middle; }
+  .grid { display:grid; grid-template-columns: 1.35fr 1fr; gap:20px; }
+  @media (max-width: 860px){ .grid { grid-template-columns: 1fr; } }
+  .card { background:#fff; border:1px solid var(--line); border-radius:10px; padding:16px 16px; margin-bottom:18px; }
+  .card h2 { font-size:15px; margin:0 0 12px; text-transform:none; letter-spacing:.02em; }
+  .muted { color:var(--muted); font-size:13px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; }
+  .kv { display:flex; gap:18px; flex-wrap:wrap; font-size:14px; margin-bottom:10px; }
+  .kv div b { color:var(--ink); }
+  .bar { height:16px; background:#eef2ff; border-radius:8px; overflow:hidden; border:1px solid var(--line); margin:4px 0 2px; }
+  .bar > span { display:block; height:100%; background:var(--accent); }
+  .bar.over > span { background:var(--bad); }
+  .pill { display:inline-block; font-size:12px; padding:1px 8px; border-radius:999px; background:#eff6ff; color:#1e40af; margin-right:4px; }
+  .pill.urgent { background:#fef2f2; color:#991b1b; }
+  .pill.done { background:#f0fdf4; color:#166534; }
+  .pill.blocked { background:#fef2f2; color:#991b1b; }
+  .inv { display:flex; align-items:flex-start; gap:8px; padding:6px 0; border-bottom:1px dashed var(--line); font-size:13px; }
+  .inv .dot { width:10px; height:10px; border-radius:50%; margin-top:5px; flex:0 0 auto; background:#cbd5e1; }
+  .inv.ok .dot { background: var(--ok); }
+  .inv.bad .dot { background: var(--bad); }
+  .inv .lbl { font-weight:600; }
+  .log { font-size:12.5px; max-height:230px; overflow:auto; }
+  .log div { padding:4px 0; border-bottom:1px dashed var(--line); }
+  .log .t { color:var(--muted); font-variant-numeric: tabular-nums; margin-right:6px; }
+  button { font:inherit; border:1px solid var(--line); background:#fff; color:var(--ink); padding:7px 12px; border-radius:7px; cursor:pointer; }
+  button:hover { border-color:#c7d2fe; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.primary:hover { filter:brightness(1.05); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .btnrow { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .field { display:flex; flex-direction:column; font-size:12.5px; color:var(--muted); gap:3px; }
+  .field select, .field input { font:inherit; color:var(--ink); padding:6px 8px; border:1px solid var(--line); border-radius:7px; }
+  .tabs { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:14px; }
+  .tab { padding:7px 12px; border:1px solid var(--line); border-radius:7px; background:#fff; cursor:pointer; font-size:13px; }
+  .tab.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .step { display:flex; align-items:center; gap:10px; padding:7px 10px; border:1px solid var(--line); border-radius:8px; margin-bottom:7px; font-size:13px; background:#fff; }
+  .step .num { width:22px; height:22px; border-radius:50%; background:#eef2ff; color:#3730a3; display:flex; align-items:center; justify-content:center; font-size:12px; flex:0 0 auto; }
+  .step.done { opacity:.6; }
+  .step.done .num { background:var(--ok); color:#fff; }
+  .step.current { border-color:var(--accent); box-shadow:0 0 0 2px #dbeafe; }
+  .step .txt { flex:1; }
+  svg.map { width:100%; height:auto; background:#fff; border:1px solid var(--line); border-radius:8px; }
+  .err { color:var(--bad); font-size:13px; margin-top:6px; }
+  .note { font-size:12.5px; color:var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>原型：紧急取送单的降载行程与载重记账 <span class="proto-tag">PROTOTYPE · 用完即弃</span></h1>
+  <div class="question">
+    <b>要回答的问题：</b>把紧急订单改成「客户 A 取 → 客户 B 送」后，当车装不下包裹需要先降载时，
+    这条行程 <code>当前 → S(卸整单) → A(装包裹/顺路交货) → B(卸) → S(取回暂存) → 继续普通 → 仓库</code>
+    在<strong>载重不超限、暂存守恒（卸下多少 = 取回多少）、同一时刻只有一堆暂存货</strong>这三条上是否自洽？
+    车多、路近不影响结论——这里用一张示意小图代替真实路网。
+  </div>
+
+  <div class="grid">
+    <div>
+      <!-- 状态面板 -->
+      <div class="card">
+        <h2>当前状态（每次操作后刷新）</h2>
+        <div id="statePanel"></div>
+      </div>
+
+      <!-- 不变量 -->
+      <div class="card">
+        <h2>关键不变量</h2>
+        <div id="invPanel"></div>
+      </div>
+
+      <!-- 地图 -->
+      <div class="card">
+        <h2>示意小图</h2>
+        <div id="mapWrap"></div>
+        <p class="note">圆点=车辆当前位置；方块=中转站；圆形=客户。仅示意位置，不是比例尺。</p>
+      </div>
+    </div>
+
+    <div>
+      <!-- 自由点按 -->
+      <div class="card">
+        <h2>自由点按</h2>
+        <p class="muted" style="margin-top:0">初始：载重上限 100kg，车上已装普通货 C1:30、C2:30、C3:30（已接近满载）。随意插入紧急单、逐步推进。</p>
+        <div class="btnrow" style="margin-bottom:10px">
+          <label class="field">取货点 A
+            <select id="fpA"></select>
+          </label>
+          <label class="field">送达点 B
+            <select id="fpB"></select>
+          </label>
+          <label class="field">送货量(kg)
+            <input id="fpDemand" type="number" min="1" max="100" value="15" style="width:90px">
+          </label>
+        </div>
+        <div class="btnrow">
+          <button class="primary" id="fpInsert">插入紧急取送单</button>
+          <button id="fpNext">下一步</button>
+          <button id="fpRun">一键跑完</button>
+          <button id="fpReset">重置</button>
+        </div>
+        <div class="err" id="fpErr"></div>
+        <div class="log card" style="margin:12px 0 0; padding:10px 12px" id="fpLog"></div>
+      </div>
+
+      <!-- 引导场景 -->
+      <div class="card">
+        <h2>引导场景（点标签切换，按顺序点每一步）</h2>
+        <div class="tabs" id="scTabs"></div>
+        <div id="scDesc" class="muted" style="margin-bottom:12px"></div>
+        <div id="scSteps"></div>
+        <div class="btnrow" style="margin-top:10px">
+          <button id="scReset">重置本场景</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ============================================================
+   纯逻辑模块（可整段搬走，不碰 DOM）
+   形状：一组纯函数 over 一个普通数据对象 state
+   ============================================================ */
+const OffloadModel = (function () {
+  const NODES = {
+    W:  { x: 0,  y: 0,  name: '仓库 W',   type: 'depot' },
+    S1: { x: 2,  y: 6,  name: '中转站甲',  type: 'station' },
+    S2: { x: 12, y: 2,  name: '中转站乙',  type: 'station' },
+    C1: { x: 3,  y: 2,  name: '客户1',    type: 'customer' },
+    C2: { x: 5,  y: 5,  name: '客户2',    type: 'customer' },
+    C3: { x: 7,  y: 1,  name: '客户3',    type: 'customer' },
+    C4: { x: 9,  y: 6,  name: '客户4',    type: 'customer' },
+    C5: { x: 11, y: 3,  name: '客户5',    type: 'customer' }
+  };
+  const CUSTOMERS = ['C1', 'C2', 'C3', 'C4', 'C5'];
+  const STATIONS = ['S1', 'S2'];
+
+  function dist(a, b) { const A = NODES[a], B = NODES[b]; return Math.hypot(A.x - B.x, A.y - B.y); }
+  function clone(o) { return JSON.parse(JSON.stringify(o)); }
+  function sumKg(list) { return list.reduce((s, i) => s + i.kg, 0); }
+  function pendingKg(s) { return s.stash ? sumKg(s.stash.items) : 0; }
+  let uid = 0;
+  function resetIds() { uid = 0; }
+
+  function stationMinDetour(pos, A) {
+    let best = null, bestInc = Infinity;
+    for (const st of STATIONS) {
+      const inc = dist(pos, st) + dist(st, A) - dist(pos, A);
+      if (inc < bestInc) { bestInc = inc; best = st; }
+    }
+    return best;
+  }
+
+  function makeState(cfg) {
+    return {
+      capacity: cfg.capacity,
+      pos: 'W', time: 0,
+      onboard: cfg.onboard.map(o => ({ id: o.id, node: o.node, kg: o.kg, kind: 'normal' })),
+      urgentQueue: [], activeUrgentId: null, stash: null, phase: 'normal',
+      completedUrgents: [], servedNormal: [],
+      counters: { offloadedKg: 0, reclaimedKg: 0, maxPiles: 0 },
+      log: [], violations: [], done: false, blocked: false
+    };
+  }
+
+  function pushLog(s, text) { s.log.unshift({ t: s.time, text: text }); }
+
+  function refresh(s) {
+    s.violations = [];
+    const load = sumKg(s.onboard);
+    if (load > s.capacity + 1e-9) s.violations.push('超载：' + load.toFixed(1) + ' > ' + s.capacity);
+    if (s.counters.maxPiles > 1) s.violations.push('出现多堆暂存');
+    const pending = pendingKg(s);
+    if (Math.abs(s.counters.offloadedKg - (s.counters.reclaimedKg + pending)) > 1e-9) s.violations.push('暂存不守恒');
+    if (s.done && s.stash) s.violations.push('结束时仍有暂存货');
+    const order = s.urgentQueue.map(u => u.id);
+    for (let i = 0; i < s.completedUrgents.length; i++) {
+      if (s.completedUrgents[i] !== order[i]) { s.violations.push('紧急单未按插入顺序完成'); break; }
+    }
+  }
+
+  function insertUrgent(s0, u) {
+    const s = clone(s0);
+    if (s.phase === 'done') return { error: '本趟配送已结束，请先重置', state: s0 };
+    if (!NODES[u.A] || !NODES[u.B]) return { error: '取货点/送达点无效', state: s0 };
+    if (NODES[u.A].type !== 'customer' || NODES[u.B].type !== 'customer') return { error: 'A、B 必须是用户（客户）节点', state: s0 };
+    if (u.A === u.B) return { error: '起点 A 与终点 B 不能相同（已拒绝）', state: s0 };
+    if (!(u.demand > 0)) return { error: '送货量必须大于 0', state: s0 };
+    if (u.demand > s.capacity + 1e-9) return { error: '送货量 ' + u.demand + 'kg 超过载重上限 ' + s.capacity + 'kg，无法取送（已拒绝）', state: s0 };
+    uid += 1;
+    const id = 'U' + uid;
+    s.urgentQueue.push({ id: id, A: u.A, B: u.B, demand: u.demand, status: 'queued', picked: false });
+    if (s.phase !== 'serve') s.phase = 'serve';
+    pushLog(s, '插入紧急取送单 ' + id + '：' + u.A + ' 取 → ' + u.B + ' 送，' + u.demand + 'kg');
+    refresh(s);
+    return { state: s };
+  }
+
+  function nextStep(s0) {
+    const s = clone(s0);
+    if (s.done) return { state: s, desc: '本趟已结束', noop: true };
+    if (s.blocked) return { state: s, desc: '已卡住：无法腾出足够空间', noop: true };
+
+    const active = s.urgentQueue.find(u => u.status === 'active');
+    if (active) {
+      const pkg = s.onboard.find(i => i.kind === 'urgent' && i.urgentId === active.id);
+      if (!pkg) {
+        const free = s.capacity - sumKg(s.onboard);
+        if (active.demand > free + 1e-9) return stepOffload(s, active, free);
+        return stepPickup(s, active);
+      }
+      return stepDeliver(s, active);
+    }
+
+    if (s.phase === 'serve') {
+      const q = s.urgentQueue.find(u => u.status === 'queued');
+      if (q) { q.status = 'active'; s.activeUrgentId = q.id; pushLog(s, '激活紧急取送单 ' + q.id + '（按插入顺序）'); refresh(s); return { state: s, desc: '激活 ' + q.id }; }
+      s.phase = s.stash ? 'reclaim' : 'normal';
+    }
+    if (s.phase === 'reclaim' && s.stash) return stepReclaim(s);
+    if (s.phase === 'reclaim' && !s.stash) s.phase = 'normal';
+    if (s.phase === 'normal') return stepNormal(s);
+    return { state: s, desc: '无动作', noop: true };
+  }
+
+  function stepOffload(s, active, free) {
+    const need = active.demand - free;
+    const station = s.stash ? s.stash.station : stationMinDetour(s.pos, active.A);
+    let cands = s.onboard.filter(i => i.kind === 'normal' && i.node !== active.A && i.node !== active.B);
+    cands.sort((a, b) => dist(b.node, 'W') - dist(a.node, 'W')); // 回程最长优先
+    let freed = 0; const chosen = [];
+    for (const c of cands) { if (freed >= need - 1e-9) break; chosen.push(c); freed += c.kg; }
+    if (freed < need - 1e-9) {
+      s.blocked = true;
+      pushLog(s, '无法降载：可卸的普通货仅 ' + freed.toFixed(1) + 'kg，仍需 ' + need.toFixed(1) + 'kg，装不下 ' + active.id);
+      refresh(s);
+      return { state: s, desc: '降载不足，卡住' };
+    }
+    const travel = dist(s.pos, station); s.time += travel; s.pos = station;
+    if (!s.stash) s.stash = { station: station, items: [] };
+    for (const c of chosen) {
+      s.onboard = s.onboard.filter(x => !(x.kind === 'normal' && x.id === c.id));
+      s.stash.items.push({ id: c.id, node: c.node, kg: c.kg });
+      s.counters.offloadedKg += c.kg;
+    }
+    s.counters.maxPiles = Math.max(s.counters.maxPiles, 1);
+    pushLog(s, '到 ' + NODES[station].name + ' 卸下整单普通货：' + chosen.map(c => c.id + '(' + c.kg + 'kg→' + c.node + ')').join('、') + '；现载 ' + sumKg(s.onboard).toFixed(1) + 'kg，空位 ' + (s.capacity - sumKg(s.onboard)).toFixed(1) + 'kg');
+    refresh(s);
+    return { state: s, desc: '到 ' + station + ' 卸整单普通货' };
+  }
+
+  function stepPickup(s, active) {
+    const travel = dist(s.pos, active.A); s.time += travel; s.pos = active.A;
+    let incTxt = '';
+    const inc = s.onboard.find(i => i.kind === 'normal' && i.node === active.A);
+    if (inc) { s.onboard = s.onboard.filter(x => x !== inc); s.servedNormal.push(inc.id); incTxt = '，顺路交付 ' + inc.id + '(' + inc.kg + 'kg)'; }
+    s.onboard.push({ id: active.id, urgentId: active.id, node: active.B, kg: active.demand, kind: 'urgent' });
+    active.picked = true;
+    pushLog(s, '到 ' + NODES[active.A].name + ' 装紧急包裹 ' + active.id + '(' + active.demand + 'kg)' + incTxt + '；现载 ' + sumKg(s.onboard).toFixed(1) + 'kg');
+    refresh(s);
+    return { state: s, desc: '到 ' + active.A + ' 装包裹' + (inc ? ' + 顺路交货' : '') };
+  }
+
+  function stepDeliver(s, active) {
+    const travel = dist(s.pos, active.B); s.time += travel; s.pos = active.B;
+    s.onboard = s.onboard.filter(i => !(i.kind === 'urgent' && i.urgentId === active.id));
+    let incTxt = '';
+    const inc = s.onboard.find(i => i.kind === 'normal' && i.node === active.B);
+    if (inc) { s.onboard = s.onboard.filter(x => x !== inc); s.servedNormal.push(inc.id); incTxt = '，顺路交付 ' + inc.id + '(' + inc.kg + 'kg)'; }
+    active.status = 'done';
+    s.completedUrgents.push(active.id);
+    s.activeUrgentId = null;
+    pushLog(s, '到 ' + NODES[active.B].name + ' 卸紧急包裹 ' + active.id + ' 完成' + incTxt + '；现载 ' + sumKg(s.onboard).toFixed(1) + 'kg');
+    const nq = s.urgentQueue.find(u => u.status === 'queued');
+    if (nq) s.phase = 'serve';
+    else if (s.stash) s.phase = 'reclaim';
+    else s.phase = 'normal';
+    refresh(s);
+    return { state: s, desc: '到 ' + active.B + ' 完成 ' + active.id + (inc ? ' + 顺路交货' : '') };
+  }
+
+  function stepReclaim(s) {
+    const station = s.stash.station;
+    const travel = dist(s.pos, station); s.time += travel; s.pos = station;
+    const items = s.stash.items;
+    for (const it of items) { s.onboard.push({ id: it.id, node: it.node, kg: it.kg, kind: 'normal' }); s.counters.reclaimedKg += it.kg; }
+    pushLog(s, '到 ' + NODES[station].name + ' 取回暂存货 ' + items.map(i => i.id).join('、') + '（' + sumKg(items).toFixed(1) + 'kg）；现载 ' + sumKg(s.onboard).toFixed(1) + 'kg');
+    s.stash = null; s.phase = 'normal';
+    refresh(s);
+    return { state: s, desc: '回 ' + station + ' 取回暂存货' };
+  }
+
+  function stepNormal(s) {
+    const normals = s.onboard.filter(i => i.kind === 'normal');
+    if (normals.length > 0) {
+      let best = normals[0];
+      for (const n of normals) if (dist(s.pos, n.node) < dist(s.pos, best.node)) best = n;
+      const travel = dist(s.pos, best.node); s.time += travel; s.pos = best.node;
+      s.onboard = s.onboard.filter(x => x !== best); s.servedNormal.push(best.id);
+      pushLog(s, '继续普通配送：到 ' + NODES[best.node].name + ' 送达 ' + best.id + '(' + best.kg + 'kg)；现载 ' + sumKg(s.onboard).toFixed(1) + 'kg');
+      refresh(s);
+      return { state: s, desc: '送达普通货 ' + best.id + '@' + best.node };
+    }
+    const travel = dist(s.pos, 'W'); s.time += travel; s.pos = 'W'; s.done = true; s.phase = 'done';
+    pushLog(s, '返回仓库 W，本趟结束；总耗时 ' + s.time.toFixed(1) + ' min');
+    refresh(s);
+    return { state: s, desc: '返回仓库，结束' };
+  }
+
+  function invariants(s) {
+    const load = sumKg(s.onboard);
+    const pending = pendingKg(s);
+    const order = s.urgentQueue.map(u => u.id);
+    let fifo = true;
+    for (let i = 0; i < s.completedUrgents.length; i++) { if (s.completedUrgents[i] !== order[i]) { fifo = false; break; } }
+    return [
+      { label: '载重不超限', ok: load <= s.capacity + 1e-9, detail: '车上 ' + load.toFixed(1) + 'kg / 上限 ' + s.capacity + 'kg' },
+      { label: '单堆暂存（≤1 堆）', ok: s.counters.maxPiles <= 1, detail: '历史最多 ' + s.counters.maxPiles + ' 堆；当前 ' + (s.stash ? 1 : 0) + ' 堆' },
+      { label: '暂存守恒', ok: Math.abs(s.counters.offloadedKg - (s.counters.reclaimedKg + pending)) < 1e-9, detail: '已卸 ' + s.counters.offloadedKg.toFixed(1) + ' = 已取回 ' + s.counters.reclaimedKg.toFixed(1) + ' + 在站 ' + pending.toFixed(1) },
+      { label: '紧急单按插入顺序完成（FIFO）', ok: fifo, detail: '完成 ' + (s.completedUrgents.join(' → ') || '无') }
+    ];
+  }
+
+  return {
+    NODES: NODES, CUSTOMERS: CUSTOMERS, STATIONS: STATIONS,
+    dist: dist, makeState: makeState, insertUrgent: insertUrgent, nextStep: nextStep,
+    invariants: invariants, sumKg: sumKg, pendingKg: pendingKg, resetIds: resetIds
+  };
+})();
+
+/* ============================================================
+   页面外壳（throwaway）：只调用上面的纯模块，不反向依赖
+   ============================================================ */
+(function () {
+  const M = OffloadModel;
+
+  /* ---------- 渲染：状态 ---------- */
+  function loadBar(load, cap) {
+    const pct = Math.min(100, Math.round((load / cap) * 100));
+    return '<div class="bar ' + (load > cap + 1e-9 ? 'over' : '') + '"><span style="width:' + pct + '%"></span></div>';
+  }
+  function onboardRows(s) {
+    if (s.onboard.length === 0) return '<tr><td colspan="4" class="muted">（空车）</td></tr>';
+    return s.onboard.map(i =>
+      '<tr><td>' + i.id + '</td><td>' + (M.NODES[i.node] ? M.NODES[i.node].name : i.node) + '</td><td>' + i.kg + 'kg</td><td>' +
+      (i.kind === 'urgent' ? '<span class="pill urgent">紧急包裹</span>' : '<span class="pill">普通货</span>') + '</td></tr>').join('');
+  }
+  function stashBlock(s) {
+    if (!s.stash) return '<div class="muted">当前无暂存货（0 堆）</div>';
+    const rows = s.stash.items.map(it => it.id + '(' + it.kg + 'kg→' + it.node + ')').join('、');
+    return '<div class="pill urgent">1 堆</div> 于 ' + M.NODES[s.stash.station].name + '：' + rows + '，合计 ' + M.sumKg(s.stash.items).toFixed(1) + 'kg';
+  }
+  function queueBlock(s) {
+    if (s.urgentQueue.length === 0) return '<div class="muted">无紧急单</div>';
+    return s.urgentQueue.map(u => {
+      const cls = u.status === 'done' ? 'pill done' : (u.status === 'active' ? 'pill urgent' : 'pill');
+      const label = u.status === 'done' ? '已完成' : (u.status === 'active' ? '执行中' : '排队');
+      return '<div style="margin:3px 0"><span class="' + cls + '">' + label + '</span> ' + u.id + '：' + u.A + ' 取 → ' + u.B + ' 送，' + u.demand + 'kg</div>';
+    }).join('');
+  }
+  function renderState(s) {
+    const load = M.sumKg(s.onboard);
+    const phaseText = { normal: '继续普通配送', serve: '执行紧急取送', reclaim: '回站取回暂存货', done: '已完成' }[s.phase] || s.phase;
+    return '' +
+      '<div class="kv">' +
+        '<div>车辆位置：<b>' + (M.NODES[s.pos] ? M.NODES[s.pos].name : s.pos) + '</b></div>' +
+        '<div>已用时间：<b>' + s.time.toFixed(1) + ' min</b></div>' +
+        '<div>阶段：<b>' + phaseText + '</b></div>' +
+        (s.blocked ? '<div style="color:#b91c1c"><b>已卡住</b></div>' : '') +
+      '</div>' +
+      '<div>车上载重 <b>' + load.toFixed(1) + 'kg</b> / 上限 ' + s.capacity + 'kg' + loadBar(load, s.capacity) + '</div>' +
+      '<table style="margin-top:10px"><thead><tr><th>订单</th><th>目的地</th><th>重量</th><th>类型</th></tr></thead><tbody>' + onboardRows(s) + '</tbody></table>' +
+      '<div style="margin-top:12px"><div class="muted" style="margin-bottom:3px">中转站暂存</div>' + stashBlock(s) + '</div>' +
+      '<div style="margin-top:12px"><div class="muted" style="margin-bottom:3px">紧急取送单队列</div>' + queueBlock(s) + '</div>';
+  }
+  function renderInvariants(s) {
+    return M.invariants(s).map(iv =>
+      '<div class="inv ' + (iv.ok ? 'ok' : 'bad') + '"><span class="dot"></span><div><span class="lbl">' +
+      (iv.ok ? '✓ ' : '✗ ') + iv.label + '</span><div class="muted">' + iv.detail + '</div></div></div>').join('');
+  }
+  function renderMap(s) {
+    const sc = 35, ox = 50, oy = 55;
+    function px(n) { const N = M.NODES[n]; return [ox + N.x * sc, oy + N.y * 40]; }
+    let parts = ['<svg class="map" viewBox="0 0 520 340" xmlns="http://www.w3.org/2000/svg">'];
+    // node shapes
+    for (const key of Object.keys(M.NODES)) {
+      const N = M.NODES[key], p = px(key);
+      if (N.type === 'station') {
+        parts.push('<rect x="' + (p[0] - 9) + '" y="' + (p[1] - 9) + '" width="18" height="18" fill="#fde68a" stroke="#b45309" rx="3"/>');
+      } else if (N.type === 'depot') {
+        parts.push('<rect x="' + (p[0] - 12) + '" y="' + (p[1] - 9) + '" width="24" height="18" fill="#c7d2fe" stroke="#3730a3" rx="3"/>');
+      } else {
+        parts.push('<circle cx="' + p[0] + '" cy="' + p[1] + '" r="9" fill="#e0e7ff" stroke="#4f46e5"/>');
+      }
+      parts.push('<text x="' + p[0] + '" y="' + (p[1] - 14) + '" font-size="11" fill="#374151" text-anchor="middle">' + N.name + '</text>');
+    }
+    // stash highlight
+    if (s.stash) { const p = px(s.stash.station); parts.push('<text x="' + p[0] + '" y="' + (p[1] + 22) + '" font-size="11" fill="#b45309" text-anchor="middle">暂存货</text>'); }
+    // vehicle
+    const vp = px(s.pos);
+    parts.push('<circle cx="' + vp[0] + '" cy="' + vp[1] + '" r="11" fill="#2563eb" opacity="0.9"/>');
+    parts.push('<text x="' + vp[0] + '" y="' + (vp[1] + 4) + '" font-size="12" fill="#fff" text-anchor="middle">车</text>');
+    parts.push('</svg>');
+    return parts.join('');
+  }
+  function renderLog(s) {
+    if (!s.log.length) return '<div class="muted">（暂无操作）</div>';
+    return s.log.map(e => '<div><span class="t">' + e.t.toFixed(1) + 'min</span>' + e.text + '</div>').join('');
+  }
+  function renderAll(s, ids) {
+    document.getElementById(ids.state).innerHTML = renderState(s);
+    document.getElementById(ids.inv).innerHTML = renderInvariants(s);
+    document.getElementById(ids.map).innerHTML = renderMap(s);
+  }
+  function renderActive() {
+    const s = (active === 'fp') ? fp : scLive;
+    if (!s) return;
+    renderAll(s, PANELS);
+    document.getElementById('fpLog').innerHTML = renderLog(fp || s);
+  }
+
+  /* ---------- 自由点按 ---------- */
+  function fillSelects(aId, bId) {
+    const opts = M.CUSTOMERS.map(c => '<option value="' + c + '">' + M.NODES[c].name + ' (' + c + ')</option>').join('');
+    document.getElementById(aId).innerHTML = opts;
+    document.getElementById(bId).innerHTML = opts;
+    document.getElementById(bId).value = 'C5';
+  }
+  const PANELS = { state: 'statePanel', inv: 'invPanel', map: 'mapWrap' };
+  let fp = null;
+  let active = 'fp';
+  function fpReset() {
+    M.resetIds();
+    fp = M.makeState({ capacity: 100, onboard: [{ id: 'N1', node: 'C1', kg: 30 }, { id: 'N2', node: 'C2', kg: 30 }, { id: 'N3', node: 'C3', kg: 30 }] });
+    document.getElementById('fpErr').textContent = '';
+    active = 'fp';
+    renderActive();
+  }
+  function fpDo(fn) {
+    const before = fp;
+    const r = fn(before);
+    if (r && r.error) { document.getElementById('fpErr').textContent = r.error; return; }
+    fp = r.state;
+    document.getElementById('fpErr').textContent = (fp.violations && fp.violations.length) ? ('⚠ ' + fp.violations.join('；')) : '';
+    active = 'fp';
+    renderActive();
+  }
+  document.getElementById('fpInsert').addEventListener('click', function () {
+    const A = document.getElementById('fpA').value;
+    const B = document.getElementById('fpB').value;
+    const demand = Number(document.getElementById('fpDemand').value);
+    fpDo(function (st) { return M.insertUrgent(st, { A: A, B: B, demand: demand }); });
+  });
+  document.getElementById('fpNext').addEventListener('click', function () {
+    fpDo(function (st) { return M.nextStep(st); });
+  });
+  document.getElementById('fpRun').addEventListener('click', function () {
+    let guard = 0;
+    while (!fp.done && !fp.blocked && guard < 80) {
+      const r = M.nextStep(fp); fp = r.state; guard += 1;
+      if (r.noop) break;
+    }
+    active = 'fp';
+    renderActive();
+  });
+  document.getElementById('fpReset').addEventListener('click', fpReset);
+
+  /* ---------- 引导场景 ---------- */
+  const SCENARIOS = [
+    {
+      key: 'fits', title: '① 装得下：直接取送',
+      desc: '车上只有 40kg 普通货（空位 60kg），插入一张 15kg 的紧急取送单。看点：不需要降载，直接从 A 取、B 送，全程不超载。',
+      setup: function () { return M.makeState({ capacity: 100, onboard: [{ id: 'N1', node: 'C1', kg: 20 }, { id: 'N2', node: 'C2', kg: 20 }] }); },
+      preInsert: [{ A: 'C4', B: 'C5', demand: 15 }]
+    },
+    {
+      key: 'offload', title: '② 装不下：整单降载',
+      desc: '车上已装 90kg 普通货（空位仅 10kg），插入 15kg 紧急单。看点：先卸一张整单普通货到中转站腾出空间，再 A 取、B 送，完成后回站取回——重点看「暂存守恒」与「单堆」。',
+      setup: function () { return M.makeState({ capacity: 100, onboard: [{ id: 'N1', node: 'C1', kg: 30 }, { id: 'N2', node: 'C2', kg: 30 }, { id: 'N3', node: 'C3', kg: 30 }] }); },
+      preInsert: [{ A: 'C4', B: 'C5', demand: 15 }]
+    },
+    {
+      key: 'incidental', title: '③ 顺路交货',
+      desc: 'A、B 本身就是车上普通货的目的地（A=C4 有 25kg、B=C5 有 25kg）。看点：在 A 取包裹时顺路交付 A 的普通货、在 B 送达时顺路交付 B 的普通货，不额外绕路也不超载。',
+      setup: function () { return M.makeState({ capacity: 100, onboard: [{ id: 'N1', node: 'C4', kg: 25 }, { id: 'N2', node: 'C5', kg: 25 }, { id: 'N3', node: 'C1', kg: 20 }] }); },
+      preInsert: [{ A: 'C4', B: 'C5', demand: 15 }]
+    },
+    {
+      key: 'fifo', title: '④ 两张紧急单（FIFO）',
+      desc: '一次排了两张紧急单。看点：严格按插入顺序先做完第一张再做第二张，新单不插队；两张都完成且队列清空后才回站取回暂存货。',
+      setup: function () { return M.makeState({ capacity: 100, onboard: [{ id: 'N1', node: 'C1', kg: 30 }, { id: 'N2', node: 'C2', kg: 30 }, { id: 'N3', node: 'C3', kg: 30 }] }); },
+      preInsert: [{ A: 'C4', B: 'C5', demand: 15 }, { A: 'C4', B: 'C5', demand: 10 }]
+    },
+    {
+      key: 'invalid', title: '⑤ 非法输入被拒',
+      desc: '试插一张 150kg（超过载重上限 100kg）和一张 A==B 的紧急单。看点：都应被当场拒绝、不进入队列。',
+      setup: function () { return M.makeState({ capacity: 100, onboard: [{ id: 'N1', node: 'C1', kg: 30 }] }); },
+      special: 'invalid'
+    }
+  ];
+
+  let scKey = SCENARIOS[0].key;
+  let scLive = null, scPlan = [], scIdx = 0;
+
+  function buildPlan(sc) {
+    const steps = [];
+    M.resetIds();
+    let s = sc.setup();
+    const startState = s;
+    if (sc.special === 'invalid') {
+      const r1 = M.insertUrgent(s, { A: 'C4', B: 'C5', demand: 150 });
+      steps.push({ type: 'invalid', desc: '试插 150kg（超载）→ 应拒绝', error: r1.error || '（未拒绝！）', stateAfter: s });
+      const r2 = M.insertUrgent(s, { A: 'C4', B: 'C4', demand: 10 });
+      steps.push({ type: 'invalid', desc: '试插 A==B → 应拒绝', error: r2.error || '（未拒绝！）', stateAfter: s });
+      return { steps: steps, startState: startState };
+    }
+    for (const u of sc.preInsert) {
+      const r = M.insertUrgent(s, u);
+      if (r.error) { steps.push({ type: 'insert', desc: '插入失败：' + r.error, error: r.error, stateAfter: s }); continue; }
+      s = r.state;
+      steps.push({ type: 'insert', urgent: u, desc: '插入紧急单：' + u.A + ' 取 → ' + u.B + ' 送 ' + u.demand + 'kg', stateAfter: s });
+    }
+    let guard = 0;
+    while (!s.done && !s.blocked && guard < 80) {
+      const r = M.nextStep(s); guard += 1;
+      if (r.noop) break;
+      s = r.state;
+      steps.push({ type: 'next', desc: r.desc, stateAfter: s });
+    }
+    return { steps: steps, startState: startState };
+  }
+
+  function selectScenario(key) {
+    scKey = key;
+    const sc = SCENARIOS.find(x => x.key === key);
+    const built = buildPlan(sc);
+    scPlan = built.steps;
+    scLive = built.startState;
+    scIdx = 0;
+    active = 'guided';
+    renderScenarioTabs();
+    document.getElementById('scDesc').textContent = sc.desc;
+    renderScenarioSteps();
+    renderActive();
+  }
+  function renderScenarioTabs() {
+    document.getElementById('scTabs').innerHTML = SCENARIOS.map(sc =>
+      '<div class="tab ' + (sc.key === scKey ? 'active' : '') + '" data-k="' + sc.key + '">' + sc.title + '</div>').join('');
+    document.querySelectorAll('#scTabs .tab').forEach(el => el.addEventListener('click', () => selectScenario(el.getAttribute('data-k'))));
+  }
+  function renderScenarioSteps() {
+    const sc = SCENARIOS.find(x => x.key === scKey);
+    if (sc.special === 'invalid') {
+      document.getElementById('scSteps').innerHTML = scPlan.map((st, i) =>
+        '<div class="step ' + (i < scIdx ? 'done' : (i === scIdx ? 'current' : '')) + '">' +
+        '<span class="num">' + (i + 1) + '</span><span class="txt">' + st.desc + (st.error ? ' —— <b style="color:#b91c1c">' + st.error + '</b>' : '') + '</span>' +
+        (i === scIdx ? '<button class="primary" data-i="' + i + '">执行</button>' : '') + '</div>').join('');
+      document.querySelectorAll('#scSteps button').forEach(b => b.addEventListener('click', () => scInvalidStep(Number(b.getAttribute('data-i')))));
+      return;
+    }
+    document.getElementById('scSteps').innerHTML = scPlan.map((st, i) =>
+      '<div class="step ' + (i < scIdx ? 'done' : (i === scIdx ? 'current' : '')) + '">' +
+      '<span class="num">' + (i + 1) + '</span><span class="txt">' + st.desc + '</span>' +
+      (i === scIdx ? '<button class="primary" data-i="' + i + '">执行这一步</button>' : '') + '</div>').join('');
+    document.querySelectorAll('#scSteps button').forEach(b => b.addEventListener('click', () => scApplyStep(Number(b.getAttribute('data-i')))));
+  }
+  function scApplyStep(i) {
+    if (i !== scIdx) return;
+    scLive = scPlan[i].stateAfter;
+    scIdx += 1;
+    active = 'guided';
+    renderScenarioSteps();
+    renderActive();
+  }
+  function scInvalidStep(i) {
+    scIdx = i + 1;
+    active = 'guided';
+    renderScenarioSteps();
+    renderActive();
+  }
+  document.getElementById('scReset').addEventListener('click', function () { selectScenario(scKey); });
+
+  /* ---------- 启动 ---------- */
+  fillSelects('fpA', 'fpB');
+  fpReset();
+  selectScenario(SCENARIOS[0].key);
+})();
+</script>
+</body>
+</html>
