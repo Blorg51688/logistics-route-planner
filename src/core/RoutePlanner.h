@@ -44,6 +44,14 @@ struct PickupOp {
     double      kg = 0.0;
 };
 
+// 一次降载（issue #4）：紧急包裹装不下时，把车上一条普通货整单卸到中转站暂存。
+// 只记录"卸了什么、卸在哪、多少 kg"；同一趟内回程会按 reclaimStation/reclaimKg 取回。
+struct OffloadOp {
+    std::string station;         // 暂存中转站 S
+    std::string nodeId;          // 被卸下的货所属的配送点
+    double      kg = 0.0;
+};
+
 // 一趟行程：车辆的一段连续行程。
 // 起点 = 上一趟的终点（首趟为规划起点），终点 = 起始仓库。
 // （注 2026-09-26：中转站不参与排线，故每趟终点都是起始仓库，见 docs/设计.md §16 P25/P30。）
@@ -57,6 +65,13 @@ struct Trip {
     double loadKg = 0.0;
     // 本趟的取货记录（紧急取送单在 A 装货）。普通趟为空。
     std::vector<PickupOp> pickups;
+    // 本趟的降载记录（issue #4：装不下时把整条普通货卸到中转站 S 暂存）。
+    // 全部发生在本趟的取货点 A 之前；普通趟为空。
+    std::vector<OffloadOp> offloads;
+    // 暂存货的取回：本趟在送完全部紧急包裹后回到 reclaimStation 取回 reclaimKg
+    // （= offloads 各项 kg 之和，守恒）。空串表示本趟没有降载/取回。
+    std::string reclaimStation;
+    double      reclaimKg = 0.0;
     double totalDistanceKm = 0.0;
     double totalCostYuan   = 0.0;
     double totalTimeMin    = 0.0;

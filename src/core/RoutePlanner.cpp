@@ -4,6 +4,7 @@
 #include <sstream>
 #include <cstddef>
 #include <map>
+#include <utility>
 
 namespace logistics {
 
@@ -333,7 +334,9 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
     std::string current = startPos;
 
     // 紧急取送单：每张独立成趟、最先执行，按插入顺序（FIFO）。
-    // 行程：当前位置 → A(取货) → B(送达) → 仓库；只有 B 是配送停靠点（有窗口/penalty）。
+    // 装得下：当前位置 → A(取货) → B(送达) → 仓库；只有 B 是配送停靠点（有窗口/penalty）。
+    // 装不下（issue #4）：先到中转站 S 把**整条**普通货卸下暂存腾出空间，再
+    // S → A → B → S（同一趟内取回暂存货）→ 仓库；S 一趟出现两次，靠顺序区分。
     while (!urgentPool.empty()) {
         const Candidate c = urgentPool.front();
         if (c.demandKg > vehicle.capacityKg + 1e-9) {
@@ -345,11 +348,164 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
             plan.reason = os.str();
             return plan;
         }
+        const std::string pickup = c.pickupNodeId.empty() ? vehicle.startNodeId : c.pickupNodeId;
+
+        double onboardLoad = 0.0;
+        for (const OnboardItem& it : onboard) {
+            onboardLoad += it.kg;
+        }
+        const double freeKg = vehicle.capacityKg - onboardLoad;
+
+        if (c.demandKg > freeKg + 1e-9) {
+            // ---- 装不下：整单降载 + 完成后取回（issue #4）----
+            const double need = c.demandKg - freeKg;
+
+            // 挑整条普通货（跳过 A/B 本身的货——它们正是这一趟要去服务的点），
+            // 按"离仓库最远优先"（回程最长）累加，直到腾出 need。选择排序手写，
+            // 与全文件的"算法手写"口径一致。
+            std::vector<OnboardItem> pool = onboard;
+            std::vector<double> distDepot(pool.size(), 0.0);
+            for (std::size_t i = 0; i < pool.size(); ++i) {
+                const PathResult r =
+                    shortestPath(graph, pool[i].nodeId, vehicle.startNodeId, weight);
+                distDepot[i] = r.found ? r.totalWeight : -1.0;   // 不可达排最后
+            }
+            for (std::size_t i = 0; i + 1 < pool.size(); ++i) {
+                std::size_t best = i;
+                for (std::size_t j = i + 1; j < pool.size(); ++j) {
+                    const bool farther = distDepot[j] > distDepot[best] + 1e-9;
+                    const bool tieFartherId =
+                        !farther && distDepot[j] > distDepot[best] - 1e-9
+                        && pool[j].nodeId < pool[best].nodeId;
+                    if (farther || tieFartherId) {
+                        best = j;
+                    }
+                }
+                if (best != i) {
+                    std::swap(pool[i], pool[best]);
+                    std::swap(distDepot[i], distDepot[best]);
+                }
+            }
+
+            double freed = 0.0;
+            std::vector<OnboardItem> freedItems;
+            for (const OnboardItem& it : pool) {
+                if (it.nodeId == c.pickupNodeId || it.nodeId == c.nodeId) {
+                    continue;
+                }
+                if (freed >= need - 1e-9) {
+                    break;
+                }
+                freedItems.push_back(it);
+                freed += it.kg;
+            }
+            if (freed < need - 1e-9) {
+                plan.status = PlanStatus::OrderExceedsCapacity;
+                std::ostringstream os;
+                os << "紧急订单货量 "
+                   << static_cast<long long>(std::lround(c.demandKg))
+                   << "kg 装不下（剩余空间 "
+                   << static_cast<long long>(std::lround(freeKg))
+                   << "kg），且卸下全部在途货仍缺 "
+                   << static_cast<long long>(std::lround(need - freed)) << "kg";
+                plan.reason = os.str();
+                return plan;
+            }
+
+            // 选中转站 S：使绕行增量 dist(current,S)+dist(S,A)−dist(current,A) 最小；
+            // 并列时按节点 ID 字典序取，保证输出确定。
+            std::string bestStation;
+            double bestDelta = 0.0;
+            for (const Node& n : graph.nodes()) {
+                if (n.type != NodeType::Transit) {
+                    continue;
+                }
+                const PathResult cs = shortestPath(graph, current, n.id, weight);
+                const PathResult sa = shortestPath(graph, n.id, pickup, weight);
+                const PathResult ca = shortestPath(graph, current, pickup, weight);
+                if (!cs.found || !sa.found || !ca.found) {
+                    continue;
+                }
+                const double delta = cs.totalWeight + sa.totalWeight - ca.totalWeight;
+                const bool better = bestStation.empty()
+                                    || delta < bestDelta - 1e-9
+                                    || (delta < bestDelta + 1e-9 && n.id < bestStation);
+                if (better) {
+                    bestStation = n.id;
+                    bestDelta = delta;
+                }
+            }
+            if (bestStation.empty()) {
+                plan.status = PlanStatus::OrderExceedsCapacity;
+                plan.reason = "紧急订单货量装不下，且图中没有可达的中转站可供暂存";
+                return plan;
+            }
+
+            // 构造这一趟：current → S(降载) → A(取) → B(送) → S(取回) → 仓库。
+            // 子趟用 weave（single={c}，起点与终点都是 S），其节点/到达/停靠
+            // 追加进本趟（跳过子趟首节点 S，避免重复）。
+            Trip trip;
+            std::string fail;
+            beginTrip(trip, current, elapsed);
+            if (!appendLeg(graph, trip, elapsed, current, bestStation, weight, false, fail)) {
+                plan.status = PlanStatus::Unreachable;
+                plan.reason = fail;
+                return plan;
+            }
+            for (const OnboardItem& it : freedItems) {
+                OffloadOp op;
+                op.station = bestStation;
+                op.nodeId = it.nodeId;
+                op.kg = it.kg;
+                trip.offloads.push_back(op);
+            }
+            Trip sub;
+            std::vector<Candidate> single;
+            single.push_back(c);
+            if (!weave(graph, single, bestStation, elapsed, weight, pickup,
+                       bestStation, c.demandKg, sub, fail)) {
+                plan.status = PlanStatus::Unreachable;
+                plan.reason = fail;
+                return plan;
+            }
+            for (std::size_t i = 1; i < sub.nodes.size(); ++i) {
+                trip.nodes.push_back(sub.nodes[i]);
+                trip.nodeArrivalMin.push_back(
+                    i < sub.nodeArrivalMin.size() ? sub.nodeArrivalMin[i] : 0);
+                trip.nodeIsStop.push_back(
+                    i < sub.nodeIsStop.size() ? sub.nodeIsStop[i] : false);
+            }
+            for (const Stop& s : sub.stops) {
+                trip.stops.push_back(s);
+            }
+            trip.totalDistanceKm += sub.totalDistanceKm;
+            trip.totalCostYuan += sub.totalCostYuan;
+            PickupOp op;
+            op.orderId = c.orderId;
+            op.pickupNodeId = c.pickupNodeId;
+            op.deliverNodeId = c.nodeId;
+            op.kg = c.demandKg;
+            trip.pickups.push_back(op);
+            trip.reclaimStation = bestStation;
+            trip.reclaimKg = freed;
+            if (!appendLeg(graph, trip, elapsed, bestStation, vehicle.startNodeId,
+                           weight, false, fail)) {
+                plan.status = PlanStatus::Unreachable;
+                plan.reason = fail;
+                return plan;
+            }
+            trip.endNodeId = vehicle.startNodeId;
+            trip.loadKg = c.demandKg;
+            plan.trips.push_back(trip);
+            current = vehicle.startNodeId;
+            urgentPool.erase(urgentPool.begin());
+            continue;
+        }
+
         Trip trip;
         std::string fail;
         std::vector<Candidate> single;
         single.push_back(c);
-        const std::string pickup = c.pickupNodeId.empty() ? vehicle.startNodeId : c.pickupNodeId;
         if (!weave(graph, single, current, elapsed, weight, pickup,
                    vehicle.startNodeId, c.demandKg, trip, fail)) {
             plan.status = PlanStatus::Unreachable;

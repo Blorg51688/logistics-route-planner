@@ -965,6 +965,166 @@ void testTripContinuityAfterUrgentInsertWhileEnRoute() {
     check(chainOk, "各趟必须首尾相接（车不能凭空移动）：" + bad + "；实际 " + seq);
 }
 
+// ---- issue #4：装不下 → 整单降载到中转站 + 完成后取回 ----
+//
+// 图：W -- S(中转站, sub=1) -- {D1..D4(客户, sub=1)}，另有 D3--D4 直连。
+LogisticsGraph makeOffloadGraph() {
+    LogisticsGraph g;
+    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
+    Node s = makeNode("S", NodeType::Transit, "中转站");
+    s.subNetworkId = 1;
+    g.addNode(s);
+    for (int i = 1; i <= 4; ++i) {
+        Node d = makeNode("D" + std::to_string(i), NodeType::Delivery,
+                          "客户" + std::to_string(i));
+        d.subNetworkId = 1;
+        g.addNode(d);
+    }
+    addTwoWay(g, "W", "S", 5.0, 10.0, 4.0);
+    addTwoWay(g, "S", "D1", 2.0, 4.0, 2.0);
+    addTwoWay(g, "S", "D2", 3.0, 6.0, 3.0);
+    addTwoWay(g, "S", "D3", 4.0, 8.0, 4.0);
+    addTwoWay(g, "S", "D4", 5.0, 10.0, 5.0);
+    addTwoWay(g, "D3", "D4", 2.0, 4.0, 2.0);
+    return g;
+}
+
+// 车上已载普通货 D1 60kg + D2 30kg（free = 10），紧急单 D3→D4 要 50kg：
+// 必须先整单降载。按"离仓库最远优先"挑整条货（D2 距 8 > D1 距 7）：
+// D2 30kg 仍缺（need 40）→ 再挑 D1，共 freed 90 ≥ need。全图中转站只有 S。
+void testUrgentOffloadToTransitWhenNotFitting() {
+    const LogisticsGraph g = makeOffloadGraph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+
+    std::vector<Order> pending;
+    pending.push_back(makeOrder("O1", "D1", 60.0, 0, 1440));
+    pending.push_back(makeOrder("O2", "D2", 30.0, 0, 1440));
+    const std::vector<logistics::OnboardItem> onboard{{"D1", 60.0}, {"D2", 30.0}};
+
+    Order urgent;
+    urgent.id = "U1";
+    urgent.pickupNodeId = "D3";
+    urgent.nodeId = "D4";
+    urgent.demandKg = 50.0;
+    urgent.windowStartMin = 0;
+    urgent.windowEndMin = 1440;
+    urgent.urgent = true;
+
+    const InsertResult res = insertUrgentOrder(g, v, pending, urgent, "W", 480,
+                                               WeightType::Distance, onboard);
+    const RoutePlan& p = res.plan;
+
+    check(p.status == PlanStatus::Ok, "降载场景规划可行");
+    std::size_t offTrip = p.trips.size();
+    for (std::size_t i = 0; i < p.trips.size(); ++i) {
+        if (!p.trips[i].offloads.empty()) {
+            offTrip = i;
+            break;
+        }
+    }
+    check(offTrip < p.trips.size(), "存在降载趟");
+    if (offTrip >= p.trips.size()) {
+        return;
+    }
+    // 紧急单最先执行（FIFO），降载趟应是第一趟
+    check(offTrip == 0, "降载趟应最先执行（紧急单优先）");
+
+    const logistics::Trip& t = p.trips[offTrip];
+    check(t.nodes == std::vector<std::string>({"W", "S", "D3", "D4", "S", "W"}),
+          "降载趟序列 W->S(卸)->D3(取)->D4(送)->S(取回)->W，实际 " + join(t.nodes));
+
+    // 降载发生在取货之前；取回发生在送达之后
+    std::size_t s1 = t.nodes.size();
+    std::size_t s2 = 0;
+    std::size_t ia = t.nodes.size();
+    std::size_t ib = t.nodes.size();
+    for (std::size_t i = 0; i < t.nodes.size(); ++i) {
+        if (t.nodes[i] == "S" && s1 == t.nodes.size()) {
+            s1 = i;
+        }
+        if (t.nodes[i] == "S") {
+            s2 = i;
+        }
+        if (t.nodes[i] == "D3") {
+            ia = i;
+        }
+        if (t.nodes[i] == "D4") {
+            ib = i;
+        }
+    }
+    check(s1 < ia, "降载站 S 必须出现在取货点 A 之前");
+    check(t.reclaimStation == "S" && s2 > ib, "取回站 S 必须出现在送达点 B 之后");
+
+    // 暂存守恒：Σoffloads.kg == reclaimKg，且两条普通货都被整单卸下
+    double sum = 0.0;
+    bool hasD1 = false;
+    bool hasD2 = false;
+    for (const logistics::OffloadOp& op : t.offloads) {
+        sum += op.kg;
+        if (op.nodeId == "D1") {
+            hasD1 = fixtures::nearlyEqual(op.kg, 60.0);
+        }
+        if (op.nodeId == "D2") {
+            hasD2 = fixtures::nearlyEqual(op.kg, 30.0);
+        }
+        check(op.station == "S", "降载只发生在中转站 S");
+    }
+    check(fixtures::nearlyEqual(sum, t.reclaimKg), "Σoffloads.kg == reclaimKg（暂存守恒）");
+    check(fixtures::nearlyEqual(t.reclaimKg, 90.0),
+          "need 40 按「离仓库最远优先」累积应卸下两条共 90kg，实际 "
+              + std::to_string(t.reclaimKg));
+    check(hasD1 && hasD2, "D1/D2 的整条货都被降载");
+
+    // 本趟载重不超过上限
+    check(t.loadKg <= v.capacityKg + 1e-9, "降载趟 loadKg 不超过载重上限");
+    check(fixtures::nearlyEqual(t.loadKg, 50.0), "降载趟 loadKg = 紧急单货量 50");
+    check(!t.pickups.empty() && t.pickups[0].orderId == "U1",
+          "取货记录属于紧急单 U1");
+
+    // 手算距离：W-S 5 + S-D3 4 + D3-D4 2 + D4-S 5 + S-W 5 = 21
+    check(fixtures::nearlyEqual(t.totalDistanceKm, 21.0),
+          "降载趟距离 21.0，实际 " + std::to_string(t.totalDistanceKm));
+
+    checkRouteIsWalkable(g, p, "W");
+}
+
+// 对照：装得下（demand ≤ free）时保持 #3 行为，不产生任何降载/取回
+void testUrgentFitsLeavesOffloadsEmpty() {
+    const LogisticsGraph g = makeOffloadGraph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+
+    std::vector<Order> pending;
+    pending.push_back(makeOrder("O1", "D1", 60.0, 0, 1440));
+    pending.push_back(makeOrder("O2", "D2", 30.0, 0, 1440));
+    const std::vector<logistics::OnboardItem> onboard{{"D1", 60.0}, {"D2", 30.0}};
+
+    Order urgent;
+    urgent.id = "U1";
+    urgent.pickupNodeId = "D3";
+    urgent.nodeId = "D4";
+    urgent.demandKg = 8.0;   // ≤ free 10
+    urgent.windowStartMin = 0;
+    urgent.windowEndMin = 1440;
+    urgent.urgent = true;
+
+    const InsertResult res = insertUrgentOrder(g, v, pending, urgent, "W", 480,
+                                               WeightType::Distance, onboard);
+    const RoutePlan& p = res.plan;
+
+    check(p.status == PlanStatus::Ok, "装得下场景规划可行");
+    check(!p.trips.empty(), "至少一趟");
+    if (p.trips.empty()) {
+        return;
+    }
+    const logistics::Trip& t = p.trips[0];
+    check(t.offloads.empty(), "装得下时不降载（offloads 为空）");
+    check(t.reclaimStation.empty() && t.reclaimKg == 0.0, "装得下时无取回记录");
+    check(t.nodes == std::vector<std::string>({"W", "S", "D3", "D4", "S", "W"}),
+          "装得下时仍为 #3 的取送趟（途经 S 只是路径），实际 " + join(t.nodes));
+    check(!t.pickups.empty() && t.pickups[0].orderId == "U1", "取货记录正确");
+    checkRouteIsWalkable(g, p, "W");
+}
+
 int main() {
     testSingleOrderRouteIsFullyCorrect();
     testEmptyOrdersDegeneratesToNoMovement();
@@ -989,6 +1149,8 @@ int main() {
     testNodeIndexAtTimeOnEmptyPlanAndClamp();
     testNodeIndexAtTimeIsMonotonicInTime();
     testTripContinuityAfterUrgentInsertWhileEnRoute();
+    testUrgentOffloadToTransitWhenNotFitting();
+    testUrgentFitsLeavesOffloadsEmpty();
 
     return testutil::summarize("routeplanner_tests");
 }
