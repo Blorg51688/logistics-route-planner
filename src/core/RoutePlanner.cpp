@@ -29,7 +29,7 @@ std::vector<Candidate> buildCandidates(const std::vector<Order>& orders) {
     for (const Order& o : orders) {
         // 取送式紧急单（有取货点 A）：各自独立成候选，**不**并入普通停靠点，
         // 因为它不是"仓库→客户"的普通配送，而是"A 取 → B 送"的一段独立行程。
-        if (!o.pickupNodeId.empty()) {
+        if (!o.pickupNodeId.empty() && !o.picked) {
             Candidate c;
             c.nodeId = o.nodeId;
             c.pickupNodeId = o.pickupNodeId;
@@ -56,7 +56,7 @@ std::vector<Candidate> buildCandidates(const std::vector<Order>& orders) {
             if (o.windowEndMin > c.windowEndMin) {
                 c.windowEndMin = o.windowEndMin;
             }
-            c.urgent = c.urgent || o.urgent;
+            c.urgent = c.urgent || (o.urgent && !o.picked);
             merged = true;
             break;
         }
@@ -68,7 +68,7 @@ std::vector<Candidate> buildCandidates(const std::vector<Order>& orders) {
         c.demandKg = o.demandKg;
         c.windowStartMin = o.windowStartMin;
         c.windowEndMin = o.windowEndMin;
-        c.urgent = o.urgent;
+        c.urgent = o.urgent && !o.picked;
         candidates.push_back(c);
     }
     return candidates;
@@ -454,7 +454,8 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
                             const std::string& startPos,
                             int startTimeMin,
                             WeightType weight,
-                            const std::vector<OnboardItem>& onboard) {
+                            const std::vector<OnboardItem>& onboard,
+                            const StashState& stash) {
     RoutePlan plan;
 
     // 子网络编号 → 该子网络的中转站。配送点按 sub_network_id 归属，
@@ -724,6 +725,48 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
         urgentPool.erase(urgentPool.begin());
     }
 
+    // ---- 中转站暂存货：回站取回并继续配送（跨重规划保住）----
+    // 暂存货不属于任何在车货；重规划时由调用方传入，规划器在计划里保留取回与配送。
+    if (!stash.station.empty() && !stash.items.empty()) {
+        std::vector<Candidate> stashCands;
+        for (const OnboardItem& it : stash.items) {
+            for (const Candidate& c : normalPool) {
+                if (c.nodeId != it.nodeId) {
+                    continue;
+                }
+                bool seen = false;
+                for (const Candidate& sc : stashCands) {
+                    if (sc.nodeId == c.nodeId) {
+                        seen = true;
+                    }
+                }
+                if (!seen) {
+                    stashCands.push_back(c);
+                }
+                break;
+            }
+        }
+        Trip trip;
+        std::string fail;
+        const double load = totalDemand(stashCands);
+        if (!weave(graph, stashCands, current, elapsed, weight, stash.station,
+                   vehicle.startNodeId, load, trip, fail)) {
+            plan.status = PlanStatus::Unreachable;
+            plan.reason = fail;
+            return plan;
+        }
+        trip.reclaimStation = stash.station;
+        trip.reclaimKg = 0.0;
+        for (const OnboardItem& it : stash.items) {
+            trip.reclaimKg += it.kg;
+        }
+        plan.trips.push_back(trip);
+        current = trip.endNodeId;
+        for (const Candidate& b : stashCands) {
+            eraseCandidateByNode(normalPool, b.nodeId);
+        }
+    }
+
     // ---- 车上已经载着的货，接着把它们送掉（在**紧急订单之后**）----
     //
     // 顺序：紧急订单 -> 在途货 -> 其余按簇分批。
@@ -906,9 +949,10 @@ RoutePlan multiTripPlan(const LogisticsGraph& graph,
                         const std::string& startPos,
                         int startTimeMin,
                         WeightType weight,
-                        const std::vector<OnboardItem>& onboard) {
+                        const std::vector<OnboardItem>& onboard,
+                        const StashState& stash) {
     return multiTripPlanImpl(graph, vehicle, candidates, startPos, startTimeMin,
-                             weight, onboard);
+                             weight, onboard, stash);
 }
 
 } // namespace
@@ -919,7 +963,8 @@ RoutePlan replan(const LogisticsGraph& graph,
                  const std::string& currentPositionId,
                  int currentTimeMin,
                  WeightType weight,
-                 const std::vector<OnboardItem>& onboard) {
+                 const std::vector<OnboardItem>& onboard,
+                 const StashState& stash) {
     RoutePlan plan;
 
     if (graph.findNode(currentPositionId) == nullptr) {
@@ -933,16 +978,16 @@ RoutePlan replan(const LogisticsGraph& graph,
 
     // 只要存在取送式紧急单（有取货点 A），就必须走多趟入口：单趟 weave 无法表达"A 取 → B 送"。
     for (const Order& o : remainingOrders) {
-        if (!o.pickupNodeId.empty()) {
+        if (!o.pickupNodeId.empty() || !stash.station.empty()) {
             return multiTripPlan(graph, vehicle, remaining, currentPositionId, currentTimeMin,
-                                 weight, onboard);
+                                 weight, onboard, stash);
         }
     }
 
-    if (total > vehicle.capacityKg + 1e-9) {
-        // 总需求超过载重：改走多趟分批（D21），不再判为不可行
+    if (!stash.station.empty() || total > vehicle.capacityKg + 1e-9) {
+        // 有暂存货，或总需求超过载重：改走多趟分批（D21）
         return multiTripPlan(graph, vehicle, remaining, currentPositionId, currentTimeMin,
-                             weight, onboard);
+                             weight, onboard, stash);
     }
 
     // 单趟：车辆在起点已装载全部货物，直接贪心串联后回仓库（与历史行为一致）
@@ -1153,7 +1198,8 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
                             const TrafficReport& report,
                             double thresholdRatio,
                             const std::vector<OnboardItem>& onboard,
-                            bool* usedIncremental) {
+                            bool* usedIncremental,
+                            const StashState& stash) {
     if (usedIncremental != nullptr) {
         *usedIncremental = false;
     }
@@ -1162,9 +1208,9 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
 
     // 含取送式紧急单时，增量重算无法保证 A→B 取送链完整，直接退回全量重规划。
     for (const Order& o : remainingOrders) {
-        if (!o.pickupNodeId.empty()) {
+        if (!o.pickupNodeId.empty() || !stash.station.empty()) {
             return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
-                          weight, onboard);
+                          weight, onboard, stash);
         }
     }
 
@@ -1177,7 +1223,7 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
         || previous.nodes.size() < 2
         || previous.nodes.back() != vehicle.startNodeId) {
         return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
-                      weight, onboard);
+                      weight, onboard, stash);
     }
 
     const std::vector<Candidate> pool = buildCandidates(remainingOrders);
@@ -1259,7 +1305,8 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
                                const std::string& currentPositionId,
                                int currentTimeMin,
                                WeightType weight,
-                               const std::vector<OnboardItem>& onboard) {
+                               const std::vector<OnboardItem>& onboard,
+                               const StashState& stash) {
     InsertResult result;
 
     // 插入的订单一律按紧急处理，调用方传入的 urgent 不作数
@@ -1295,7 +1342,7 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
     // 并入订单集合后，从车辆当前位置与当前时刻整条重算：
     // 取送式紧急单会独立成趟，按 当前位置 → A 取 → B 送 → 仓库。
     result.plan = replan(graph, vehicle, all, currentPositionId, currentTimeMin,
-                         weight, onboard);
+                         weight, onboard, stash);
     return result;
 }
 

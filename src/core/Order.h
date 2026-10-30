@@ -13,6 +13,7 @@ struct Order {
     int         windowStartMin = 0;  // 窗口起
     int         windowEndMin = 0;    // 窗口止
     bool        urgent = false;      // 是否紧急订单
+    bool        picked = false;      // 紧急取送单是否已从 A 取到包裹（执行中：已取未送）
     bool        served = false;      // 是否已配送
 };
 

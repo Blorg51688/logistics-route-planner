@@ -356,6 +356,14 @@ void MainWindow::loadForTrip(std::size_t tripIndex) {
     // 在途货会凭空消失，随后的"降载/取回"也会因为货不在车上而失去物理意义。
     // 车上普通货保持不动；本趟装载量 = 出发时的实际载重。
     if (!trip.pickups.empty()) {
+        // 只有"从当前位置续跑"的取送趟才保留车上货；若该趟起点就是仓库，
+        // 说明它是新的一趟，必须清掉上一趟的残留，否则多趟货会越积越多而超载。
+        const bool startsAtDepot =
+            trip.nodes.empty() || trip.nodes.front() == config_.vehicles.front().startNodeId;
+        if (startsAtDepot) {
+            state_.onboard.clear();
+            state_.loadKg = 0.0;
+        }
         state_.tripLoadKg = state_.loadKg;
         state_.departed = false;
         return;
@@ -556,8 +564,11 @@ void MainWindow::replan() {
     const int now = currentTimeMin();
     const std::vector<Order> remaining = remainingOrders();
 
+    logistics::StashState stash;
+    stash.station = state_.stashStation;
+    stash.items = state_.stashItems;
     plan_ = logistics::replan(config_.graph, config_.vehicles.front(), remaining, here, now,
-                              planWeight_, onboardGoods());
+                              planWeight_, onboardGoods(), stash);
     afterPlanReplaced();
 
     if (plan_.status == logistics::PlanStatus::Ok) {
@@ -637,11 +648,14 @@ void MainWindow::onSimulateTraffic() {
     bool usedIncremental = false;
     // 换计划之前，把"当前计划里已经走过的停靠点"并入记账（三条重规划路径都要做，
     // 否则界面上的「已送达 N 站」会归 0、「停靠 N 站」会缩水成剩余数）
+    logistics::StashState stashInc;
+    stashInc.station = state_.stashStation;
+    stashInc.items = state_.stashItems;
     plan_ = logistics::replanIncremental(config_.graph, config_.vehicles.front(),
                                          remainingOrders(), remainder, currentTimeMin(),
                                          planWeight_,
                                          report, config_.general.trafficTimeIncreaseMin,
-                                         onboardGoods(), &usedIncremental);
+                                         onboardGoods(), &usedIncremental, stashInc);
     afterPlanReplaced();
     appendLog(usedIncremental
                   ? QStringLiteral("  → 增量式重规划：仅重算受影响的路段，其余原样保留")
@@ -711,9 +725,12 @@ std::string MainWindow::insertUrgentOrderAt(const std::string& a, const std::str
     urgent.served = false;
 
     const std::vector<Order> pending = remainingOrders();
+    logistics::StashState stashIns;
+    stashIns.station = state_.stashStation;
+    stashIns.items = state_.stashItems;
     const logistics::InsertResult inserted = logistics::insertUrgentOrder(
         config_.graph, config_.vehicles.front(), pending, urgent, currentPositionId(),
-        currentTimeMin(), planWeight_, onboardGoods());
+        currentTimeMin(), planWeight_, onboardGoods(), stashIns);
 
     // 必须并入 config_.orders，否则连续插单会丢单、订单表也看不见。
     config_.orders.push_back(urgent);
@@ -897,12 +914,14 @@ void MainWindow::onAdvanceStop() {
                 bool removed = false;
                 for (std::size_t i = 0; i < state_.onboard.size(); ++i) {
                     if (state_.onboard[i].nodeId == op.nodeId) {
+                        state_.stashItems.push_back(state_.onboard[i]);
                         state_.onboard.erase(state_.onboard.begin()
                                                  + static_cast<std::ptrdiff_t>(i));
                         removed = true;
                         break;
                     }
                 }
+                state_.stashStation = op.station;
                 state_.loadKg = state_.sumOnboard();
                 appendLog(QStringLiteral("降载：在 %1 卸下 %2 的货 %3kg（暂存，送完紧急包裹后取回）%4")
                               .arg(QString::fromStdString(op.station))
@@ -911,43 +930,27 @@ void MainWindow::onAdvanceStop() {
                               .arg(removed ? QString()
                                            : QStringLiteral("（车上无此货，仅记账）")));
             }
-            // ② 取回：再次经过 S（包裹已在车上）且尚未取回
-            if (!trip.offloads.empty() && trip.reclaimStation == node) {
-                bool allOffloaded = true;
-                bool allPicked = true;
-                for (const logistics::OffloadOp& op : trip.offloads) {
-                    const std::string key = op.station + "@" + op.nodeId + "@"
-                                            + std::to_string(std::lround(op.kg));
-                    if (state_.appliedOffloads.count(key) == 0) {
-                        allOffloaded = false;
-                    }
+            // ② 取回：再次经过 S，且站里确有暂存货（跨重规划也成立）。
+            // 闸：本趟的紧急包裹必须都已取到（否则第一次经过 S 卸完就立刻取回，
+            // 会让普通货与包裹叠加而超载）。无 pickups 的「纯取回趟」直接放行。
+            bool allPickedHere = true;
+            for (const logistics::PickupOp& pk : trip.pickups) {
+                if (state_.pickedOrderIds.count(pk.orderId) == 0) {
+                    allPickedHere = false;
                 }
-                for (const logistics::PickupOp& pk : trip.pickups) {
-                    if (state_.pickedOrderIds.count(pk.orderId) == 0) {
-                        allPicked = false;
-                    }
+            }
+            if (trip.reclaimStation == node && allPickedHere && !state_.stashItems.empty()) {
+                double reclaimed = 0.0;
+                for (const logistics::OnboardItem& it : state_.stashItems) {
+                    state_.onboard.push_back(it);
+                    reclaimed += it.kg;
                 }
-                if (allOffloaded && allPicked) {
-                    bool anyReclaimed = false;
-                    for (const logistics::OffloadOp& op : trip.offloads) {
-                        const std::string key = "R@" + op.station + "@" + op.nodeId + "@"
-                                                + std::to_string(std::lround(op.kg));
-                        if (!state_.appliedOffloads.insert(key).second) {
-                            continue;
-                        }
-                        logistics::OnboardItem item;
-                        item.nodeId = op.nodeId;
-                        item.kg = op.kg;
-                        state_.onboard.push_back(item);
-                        anyReclaimed = true;
-                    }
-                    if (anyReclaimed) {
-                        state_.loadKg = state_.sumOnboard();
-                        appendLog(QStringLiteral("取回暂存货：在 %1 取回 %2kg，返回仓库")
-                                      .arg(QString::fromStdString(trip.reclaimStation))
-                                      .arg(trip.reclaimKg, 0, 'f', 0));
-                    }
-                }
+                state_.stashItems.clear();
+                state_.stashStation.clear();
+                state_.loadKg = state_.sumOnboard();
+                appendLog(QStringLiteral("取回暂存货：在 %1 取回 %2kg，继续配送")
+                              .arg(QString::fromStdString(trip.reclaimStation))
+                              .arg(reclaimed, 0, 'f', 0));
             }
         }
     }
@@ -962,6 +965,11 @@ void MainWindow::onAdvanceStop() {
                     continue;
                 }
                 if (state_.pickedOrderIds.insert(pk.orderId).second) {
+                    for (Order& o : config_.orders) {
+                        if (o.id == pk.orderId) {
+                            o.picked = true;
+                        }
+                    }
                     logistics::OnboardItem item;
                     item.nodeId = pk.deliverNodeId;
                     item.kg = pk.kg;
@@ -2083,6 +2091,16 @@ int MainWindow::runActionSelfCheck() {
         expect(unserved > 0 && inPlan == unserved,
                QStringLiteral("全部未完成紧急单都必须出现在计划停靠点里（%1/%2）")
                    .arg(inPlan).arg(unserved));
+        // 事件随机参数：A≠B、3–10kg 整数、窗口 60min
+        auto paramOk = [](const Order& o) {
+            return o.urgent && o.pickupNodeId != o.nodeId
+                   && o.demandKg >= 3.0 - 1e-9 && o.demandKg <= 10.0 + 1e-9
+                   && std::fabs(o.demandKg - std::floor(o.demandKg)) < 1e-9
+                   && (o.windowEndMin - o.windowStartMin) == 60;
+        };
+        const std::size_t n = config_.orders.size();
+        expect(n >= 2 && paramOk(config_.orders[n - 2]) && paramOk(config_.orders[n - 1]),
+               QStringLiteral("事件随机紧急单参数：A≠B、3–10kg 整数、窗口 60min"));
     }
 
     // ---- 3. 非法输入被拒（A==B / 超载），且不得并入订单集合 ----
@@ -2139,7 +2157,8 @@ int MainWindow::runActionSelfCheck() {
     if (cust.size() >= 2 && !config_.vehicles.empty()) {
         const double cap = config_.vehicles.front().capacityKg;
         const double freeKg = cap - state_.loadKg;
-        const bool shouldOffload = !state_.onboard.empty() && std::floor(cap) > freeKg + 1e-9;
+        const double offloadDemand = std::floor(cap * 0.6);
+        const bool shouldOffload = !state_.onboard.empty() && offloadDemand > freeKg + 1e-9;
         // 选 A/B：避开车上已有货的节点——在途货是"整条普通货"的释放候选，
         // 规划器不会卸掉 A/B 本身的货，撞上它们会让降载凑不齐而判不可行。
         std::string A;
@@ -2178,7 +2197,7 @@ int MainWindow::runActionSelfCheck() {
             A = cust.front();
             B = cust[cust.size() > 1 ? 1 : 0];
         }
-        const std::string id = insertUrgentOrderAt(A, B, std::floor(cap));
+        const std::string id = insertUrgentOrderAt(A, B, offloadDemand);
         expect(!id.empty(), QStringLiteral("接近满载的紧急取送单应插入成功"));
         if (!id.empty()) {
             // 计划层（确定性）：降载趟的暂存守恒与载重不变量
@@ -2210,13 +2229,30 @@ int MainWindow::runActionSelfCheck() {
             }
             // 推进到结束：全程载重不超限
             bool traceOk = true;
+            double maxLoad = 0.0;
+            std::string maxNode;
+            std::string maxBreak;
             for (int i = 0; i < 600 && !atRouteEnd(); ++i) {
                 onAdvanceStop();
+                if (state_.loadKg > maxLoad) {
+                    maxLoad = state_.loadKg;
+                    maxNode = state_.atNodeId;
+                    QStringList parts;
+                    for (const logistics::OnboardItem& it : state_.onboard) {
+                        parts << (QString::fromStdString(it.nodeId) + ":"
+                                  + QString::number(it.kg, 'f', 0));
+                    }
+                    maxBreak = parts.join(QStringLiteral(" | ")).toStdString();
+                }
                 if (state_.loadKg > cap + 1e-6) {
                     traceOk = false;
                 }
             }
-            expect(traceOk, QStringLiteral("全程车辆载重不超过上限"));
+            expect(traceOk, QStringLiteral("全程车辆载重不超过上限（峰值 %1kg @ %2 / 上限 %3，车上明细 %4）")
+                               .arg(maxLoad, 0, 'f', 0)
+                               .arg(QString::fromStdString(maxNode))
+                               .arg(cap, 0, 'f', 0)
+                               .arg(QString::fromStdString(maxBreak)));
             // 若降载真的执行了（未被中途重规划改道），日志里应能看到「降载」
             if (!state_.appliedOffloads.empty()) {
                 expect(runLogText().contains(QStringLiteral("降载")),

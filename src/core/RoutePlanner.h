@@ -126,6 +126,14 @@ struct OnboardItem {
     double      kg = 0.0;
 };
 
+// 中转站上的暂存货（降载后仍留在站里、待取回的普通货）。
+// station 为空 = 无暂存。跨重规划时由调用方（GUI）传入，规划器据此在计划里
+// 保留「回站取回并继续配送」，避免暂存货在重规划后凭空消失。
+struct StashState {
+    std::string              station;
+    std::vector<OnboardItem> items;
+};
+
 // 中转站不参与排线（实测参与更差，见设计 §16 P17/P25）。
 RoutePlan replan(const LogisticsGraph& graph,
                  const Vehicle& vehicle,
@@ -133,7 +141,8 @@ RoutePlan replan(const LogisticsGraph& graph,
                  const std::string& currentPositionId,
                  int currentTimeMin,
                  WeightType weight,
-                 const std::vector<OnboardItem>& onboard = std::vector<OnboardItem>());
+                 const std::vector<OnboardItem>& onboard = std::vector<OnboardItem>(),
+                 const StashState& stash = StashState());
 
 struct InsertResult {
     RoutePlan   plan;
@@ -154,7 +163,8 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
                                int currentTimeMin,
                                WeightType weight,
                                const std::vector<OnboardItem>& onboard
-                                   = std::vector<OnboardItem>());
+                                   = std::vector<OnboardItem>(),
+                               const StashState& stash = StashState());
 
 // 从已规划好的 plan 中切出"尚未走完的部分"，**保留趟结构**。
 // 供增量式重规划使用：若把整条剩余路线压成一趟，增量重规划之后
@@ -180,7 +190,9 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
                             const std::vector<OnboardItem>& onboard
                                 = std::vector<OnboardItem>(),
                             // 回报本函数是否真的走了增量路径（false = 退回了全量）
-                            bool* usedIncremental = nullptr);
+                            bool* usedIncremental = nullptr,
+                            // 与 replan 一致：跨重规划保住中转站暂存货
+                            const StashState& stash = StashState());
 
 // 判断某条有向边是否落在给定路线序列的**相邻两站**之间。
 // GUI 的路径高亮与路况重规划的触发判定共用这一条逻辑。

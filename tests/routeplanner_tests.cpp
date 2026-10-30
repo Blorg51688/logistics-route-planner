@@ -1306,6 +1306,67 @@ void testUrgentOffloadKeepsAAndBDeliversBoth() {
     checkRouteIsWalkable(g, p, "W");
 }
 
+// ---- issue #6：多紧急单严格 FIFO ----
+// 先插入 U1(D1→D2) 再插入 U2(D3→D4)；先插入者的送达点必须更早完成。
+void testUrgentFifoOrder() {
+    const LogisticsGraph g = makeOffloadGraph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+
+    Order u1;
+    u1.id = "U1"; u1.pickupNodeId = "D1"; u1.nodeId = "D2"; u1.demandKg = 5.0;
+    u1.windowStartMin = 0; u1.windowEndMin = 1440; u1.urgent = true;
+    Order u2;
+    u2.id = "U2"; u2.pickupNodeId = "D3"; u2.nodeId = "D4"; u2.demandKg = 5.0;
+    u2.windowStartMin = 0; u2.windowEndMin = 1440; u2.urgent = true;
+
+    const RoutePlan p = planRoute(g, v, {u1, u2}, WeightType::Distance);
+    check(p.status == PlanStatus::Ok, "两张紧急单规划可行");
+    std::size_t i2 = p.stops.size();
+    std::size_t i4 = p.stops.size();
+    for (std::size_t i = 0; i < p.stops.size(); ++i) {
+        if (p.stops[i].nodeId == "D2" && i2 == p.stops.size()) i2 = i;
+        if (p.stops[i].nodeId == "D4" && i4 == p.stops.size()) i4 = i;
+    }
+    check(i2 < i4, "FIFO：先插入的紧急单必须先完成（D2 早于 D4）");
+    checkRouteIsWalkable(g, p, "W");
+}
+
+// ---- issue #6：带暂存货的重规划必须保住「回站取回」 ----
+void testReplanKeepsStash() {
+    const LogisticsGraph g = makeOffloadGraph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+
+    std::vector<Order> pending;
+    pending.push_back(makeOrder("O1", "D1", 60.0, 0, 1440));
+    pending.push_back(makeOrder("O2", "D2", 30.0, 0, 1440));
+
+    logistics::StashState stash;
+    stash.station = "S";
+    stash.items.push_back(logistics::OnboardItem{"D1", 60.0});
+    stash.items.push_back(logistics::OnboardItem{"D2", 30.0});
+
+    const RoutePlan p = replan(g, v, pending, "W", 480, WeightType::Distance,
+                               std::vector<logistics::OnboardItem>(), stash);
+    check(p.status == PlanStatus::Ok, "带暂存货重规划可行");
+    bool hasReclaim = false;
+    double reclaimKg = 0.0;
+    for (const logistics::Trip& t : p.trips) {
+        if (t.reclaimStation == "S") {
+            hasReclaim = true;
+            reclaimKg = t.reclaimKg;
+        }
+    }
+    check(hasReclaim, "重规划后必须仍包含回 S 取回暂存货");
+    check(std::fabs(reclaimKg - 90.0) < 1e-6, "取回量与暂存守恒（90kg）");
+    std::size_t d1 = 0, d2 = 0;
+    for (const logistics::Stop& st : p.stops) {
+        if (st.nodeId == "D1") ++d1;
+        if (st.nodeId == "D2") ++d2;
+    }
+    check(d1 == 1 && d2 == 1, "暂存货各只配送一次（不重复、不丢失）");
+    checkRouteIsWalkable(g, p, "W");
+}
+
 int main() {
     testSingleOrderRouteIsFullyCorrect();
     testEmptyOrdersDegeneratesToNoMovement();
@@ -1334,6 +1395,8 @@ int main() {
     testUrgentFitsLeavesOffloadsEmpty();
     testUrgentPassingDeliversAAndBGoods();
     testUrgentOffloadKeepsAAndBDeliversBoth();
+    testUrgentFifoOrder();
+    testReplanKeepsStash();
 
     return testutil::summarize("routeplanner_tests");
 }

@@ -88,6 +88,10 @@ public:
         // 同样是**物理事实**，跨重规划保留。
         std::set<std::string> appliedOffloads;
 
+        // 中转站暂存货（降载后未取回）：跨重规划保留，传给规划器以保住取回。
+        std::vector<logistics::OnboardItem> stashItems;
+        std::string stashStation;
+
         // 车辆现有货量之和（单一算法，避免两处各算一遍）
         double sumOnboard() const {
             double t = 0.0;
