@@ -251,14 +251,12 @@ void MainWindow::buildDocks() {
     orderDock->setWidget(orderTable_);
     addDockWidget(Qt::RightDockWidgetArea, orderDock);
 
-    // 中转站 / 集散面板：既承担 P3 的"子网络分组标识"，
-    // 也承担 P4 的"中转站暂存货量显示"
+    // 中转站 / 集散面板：承担 P3 的"子网络分组标识"与下属配送点归属
     auto* transitDock = new QDockWidget(QStringLiteral("中转站 / 集散"), this);
     transitDock->setMinimumWidth(360);
-    transitTable_ = new QTableWidget(0, 4, transitDock);
+    transitTable_ = new QTableWidget(0, 3, transitDock);
     transitTable_->setHorizontalHeaderLabels(
-        {QStringLiteral("中转站"), QStringLiteral("子网络"), QStringLiteral("下属配送点"),
-         QStringLiteral("当前库存")});
+        {QStringLiteral("中转站"), QStringLiteral("子网络"), QStringLiteral("下属配送点")});
     transitTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     transitTable_->horizontalHeader()->setStretchLastSection(true);
     transitTable_->verticalHeader()->setVisible(false);
@@ -275,8 +273,7 @@ void MainWindow::buildDocks() {
     stopDock->setMinimumWidth(360);
     // 列里必须有「趟」：停靠明细是**跨趟拉平**的，不加这一列的话
     // "送后余货"会从 0 跳回几十公斤，看起来像数据错了，其实是新的一趟开始装货。
-    // 列名用"**余货**"而不是"余载"：该值只统计**订单货**（`Stop::remainingLoadKg`），
-    // 而车上还可能有不属于任何订单的缓冲货——叫"余载"会与"车上真实载重"混淆。
+    // 列名用"**余货**"而不是"余载"：该值只统计**订单货**（`Stop::remainingLoadKg`）。
     stopTable_ = new QTableWidget(0, 6, stopDock);
     stopTable_->setHorizontalHeaderLabels(
         {QStringLiteral("趟"), QStringLiteral("配送点"), QStringLiteral("原始到达"),
@@ -369,55 +366,30 @@ void MainWindow::loadForTrip(std::size_t tripIndex) {
     }
     state_.loadKg = state_.sumOnboard();
     state_.tripLoadKg = state_.loadKg;
-    // 缓冲货：出仓时按计划装满，**不属于任何订单**（因此不进 loadKg/onboard）。
-    // 装载读计划是合法的（与 onboard 同源）；装载之后的**后果**才由 state_ 记账。
-    state_.bufferKg = trip.bufferKg;
-    // 导出用的装车台帐：这一趟出发时车上装了什么（订单货 / 缓冲货 / 合计）。
+    // 导出用的装车台帐：这一趟出发时车上装了什么（订单货 / 合计）。
     //
     // **必须区分"出仓"与"接着送"**：只有 `nodes.front()` 是起始仓库的趟才是出仓。
-    // 早先把每一次装载都写成「出仓装车…未满载」——那些趟的起点其实是 D01 / T03
-    // （在途货续送），于是导出文件里凭空多出三条"出仓未满载"，会把读证据的人
+    // 早先把每一次装载都写成「出仓装车」——那些趟的起点其实是 D01 / T03
+    // （在途货续送），于是导出文件里凭空多出几条"出仓"记录，会把读证据的人
     // 引去追一个**根本不存在**的 bug。误报比没有证据更糟，所以这里分开写。
     {
         const double cap = config_.vehicles.empty() ? 0.0 : config_.vehicles.front().capacityKg;
-        // 用 core 明确打上的标记，而不是"起点是不是仓库"来猜：
-        // 用车上/站内存货就地满足的紧急趟也可能从仓库出发，但它**没在仓库装货**，
-        // bufferKg 本就该是 0——猜的话会把它误报成"出仓却未满载"。
-        const bool fromDepot = trip.loadedFromDepot;
-        if (trip.supplyInPlace) {
-            recordRun(QStringLiteral("就地满足紧急单（第 %1 趟，起点 %2，**非出仓装货**，"
-                                     "用的是车上缓冲/站内库存）：订单货 %3 kg ＋ 缓冲货 %4 kg")
-                          .arg(tripIndex + 1)
-                          .arg(QString::fromStdString(trip.nodes.empty() ? std::string("?")
-                                                                         : trip.nodes.front()))
-                          .arg(trip.loadKg, 0, 'f', 0)
-                          .arg(trip.bufferKg, 0, 'f', 0)
-                          .arg(trip.loadKg, 0, 'f', 0)
-                          .arg(trip.bufferKg, 0, 'f', 0));
-            state_.departed = false;
-            return;
-        }
+        const bool fromDepot =
+            trip.nodes.empty() || trip.nodes.front() == config_.vehicles.front().startNodeId;
         if (!fromDepot) {
-            recordRun(QStringLiteral("接着送车上已有的货（第 %1 趟，起点 %2，**非出仓**，"
-                                     "不计缓冲）：订单货 %3 kg ＋ 缓冲货 %4 kg ＝ %5 kg")
+            recordRun(QStringLiteral("接着送车上已有的货（第 %1 趟，起点 %2，**非出仓**）："
+                                     "订单货 %3 kg（载重上限 %4 kg）")
                           .arg(tripIndex + 1)
-                          .arg(QString::fromStdString(trip.nodes.empty() ? std::string("?")
-                                                                         : trip.nodes.front()))
+                          .arg(QString::fromStdString(trip.nodes.front()))
                           .arg(trip.loadKg, 0, 'f', 0)
-                          .arg(trip.bufferKg, 0, 'f', 0)
-                          .arg(trip.loadKg + trip.bufferKg, 0, 'f', 0));
+                          .arg(cap, 0, 'f', 0));
             state_.departed = false;
             return;
         }
-        recordRun(QStringLiteral("出仓装车（第 %1 趟）：订单货 %2 kg ＋ 缓冲货 %3 kg "
-                                 "＝ 车上载重 %4 kg（载重上限 %5 kg，%6）")
+        recordRun(QStringLiteral("出仓装车（第 %1 趟）：订单货 %2 kg（载重上限 %3 kg）")
                       .arg(tripIndex + 1)
                       .arg(trip.loadKg, 0, 'f', 0)
-                      .arg(trip.bufferKg, 0, 'f', 0)
-                      .arg(trip.loadKg + trip.bufferKg, 0, 'f', 0)
-                      .arg(cap, 0, 'f', 0)
-                      .arg(trip.loadKg + trip.bufferKg >= cap - 1e-6
-                               ? QStringLiteral("已满载") : QStringLiteral("未满载")));
+                      .arg(cap, 0, 'f', 0));
     }
     state_.departed = false;
 }
@@ -554,13 +526,6 @@ void MainWindow::afterPlanReplaced() {
     if (!atRouteEnd()) {
         routeFinishedReported_ = false;
     }
-    // 站内库存是**权威物理量**（P25）：这里只"补齐计划里新出现的站"，**不**把计划
-    // 预测的期末库存整份写回去——那会和"车到达站点时逐笔记账"重复计数。
-    for (const logistics::TransitStock& st : plan_.transitStock) {
-        if (state_.stationStock.find(st.nodeId) == state_.stationStock.end()) {
-            state_.stationStock[st.nodeId] = st.initialKg;
-        }
-    }
     // 车若正在仓库，就把计划的当前趟装上车——装载必须在每次（重新）规划之后发生，
     // 否则新计划第一趟的货永远上不了车。
     loadForCurrentTrip();
@@ -576,7 +541,7 @@ void MainWindow::replan() {
     const std::vector<Order> remaining = remainingOrders();
 
     plan_ = logistics::replan(config_.graph, config_.vehicles.front(), remaining, here, now,
-                              planWeight_, onboardGoods(), state_.stationStock);
+                              planWeight_, onboardGoods());
     afterPlanReplaced();
 
     if (plan_.status == logistics::PlanStatus::Ok) {
@@ -660,7 +625,7 @@ void MainWindow::onSimulateTraffic() {
                                          remainingOrders(), remainder, currentTimeMin(),
                                          planWeight_,
                                          report, config_.general.trafficTimeIncreaseMin,
-                                         onboardGoods(), &usedIncremental, state_.stationStock);
+                                         onboardGoods(), &usedIncremental);
     afterPlanReplaced();
     appendLog(usedIncremental
                   ? QStringLiteral("  → 增量式重规划：仅重算受影响的路段，其余原样保留")
@@ -704,7 +669,7 @@ std::string MainWindow::insertUrgentOrderAction() {
     urgent.nodeId = base.nodeId;
     // 货量一律**整公斤**（本项目所有货量数据都是整数，见导出日志的"货量口径"守卫）。
     // 原实现是 `3.0 + nextRange(0.0, 7.0)`，会产出 3.3kg 这类小数，并一路传播到
-    // 车上载重 / 缓冲货 / 站内库存，使导出证据里出现看不懂的小数。区间仍是 3–10kg。
+    // 车上载重，使导出证据里出现看不懂的小数。区间仍是 3–10kg。
     //
     // 为什么用「nextRange + floor」而不是 nextInt：两者都只消耗一次 nextU32()，
     // 但 nextInt 用取模（`nextU32() % span`），会**改变后续随机序列**；而 self-check
@@ -721,7 +686,7 @@ std::string MainWindow::insertUrgentOrderAction() {
 
     const logistics::InsertResult inserted = logistics::insertUrgentOrder(
         config_.graph, config_.vehicles.front(), pending, urgent, currentPositionId(),
-        currentTimeMin(), planWeight_, onboardGoods(), state_.bufferKg, state_.stationStock);
+        currentTimeMin(), planWeight_, onboardGoods());
 
     // 关键：必须并入 config_.orders。
     // 否则订单表看不到这一单，且下一次 replan 用 remainingOrders() 重建候选集时
@@ -738,26 +703,6 @@ std::string MainWindow::insertUrgentOrderAction() {
         appendLog(QStringLiteral("  ⚠ %1").arg(QString::fromStdString(inserted.warning)));
     }
     plan_ = inserted.plan;
-    // 就地满足把"计划的投影"落成**物理事实**：站内取用与车上缓冲消耗都要记账，
-    // 否则界面上的库存与车上的货会各说各话。取用明细由核心回报，界面不自己猜。
-    if (inserted.stationUsedKg > 1e-9) {
-        state_.stationStock[inserted.stationUsed] -= inserted.stationUsedKg;
-        if (state_.stationStock[inserted.stationUsed] < 1e-9) {
-            state_.stationStock[inserted.stationUsed] = 0.0;
-        }
-        appendLog(QStringLiteral("  就地满足：从 %1 取货 %2kg（站内库存余 %3kg）")
-                      .arg(QString::fromStdString(inserted.stationUsed))
-                      .arg(inserted.stationUsedKg, 0, 'f', 0)
-                      .arg(state_.stationStock[inserted.stationUsed], 0, 'f', 0));
-    }
-    if (inserted.carBufferUsedKg > 1e-9) {
-        state_.bufferKg -= inserted.carBufferUsedKg;
-        if (state_.bufferKg < 1e-9) {
-            state_.bufferKg = 0.0;
-        }
-        appendLog(QStringLiteral("  就地满足：用车上缓冲货 %1kg")
-                      .arg(inserted.carBufferUsedKg, 0, 'f', 0));
-    }
     afterPlanReplaced();
     syncScene();
     updatePanels();
@@ -836,53 +781,6 @@ void MainWindow::onAdvanceStop() {
     currentNodeId_ = state_.atNodeId;
     currentTimeMin_ = state_.atTimeMin;
 
-    // 顺路寄存落账（纯记账）：车**最后一次**经过计划要卸货的那个站时，把缓冲卸下。
-    // 为什么不用"到达时刻恰好等于计划时刻"或"趟下标"：一趟去程回程都经过同一个站，
-    // 而重规划会重建趟结构与下标（实测那两种判定在真实推进中几乎不命中，跑完全程
-    // 站内库存仍是 0）。"本计划里此后不再经过该站"这个条件不依赖任何索引与时刻，
-    // 语义上正是"返程顺路经过"，且去程那次必然不满足。
-    if (state_.bufferKg > 1e-9) {
-        for (const logistics::TransitOp& op : plan_.transitOps) {
-            if (op.kgDelta <= 1e-9 || op.nodeId != node) {
-                continue;
-            }
-            // "本趟内最后一次经过该站"——**必须限定在本趟**：
-            // 同一个站在后续趟里还会再出现（去取货/送货），若按"整份计划里最后
-            // 一次"判定就永远不成立（实测：站内库存始终为 0）。
-            const std::size_t hereTrip = (nodeIndex_ < plan_.nodeTripIndex.size())
-                                             ? plan_.nodeTripIndex[nodeIndex_] : 0;
-            bool lastPass = true;
-            for (std::size_t k = nodeIndex_ + 1; k < plan_.nodes.size(); ++k) {
-                if (k < plan_.nodeTripIndex.size() && plan_.nodeTripIndex[k] != hereTrip) {
-                    break;   // 已进入下一趟
-                }
-                if (plan_.nodes[k] == node) {
-                    lastPass = false;
-                    break;
-                }
-            }
-            if (!lastPass) {
-                continue;
-            }
-            const std::string key = op.nodeId + "@" + std::to_string(op.atMin);
-            if (!state_.creditedBanks.insert(key).second) {
-                continue;   // 同一次卸货已经记过账
-            }
-            const double kg = (op.kgDelta < state_.bufferKg) ? op.kgDelta : state_.bufferKg;
-            state_.stationStock[op.nodeId] += kg;
-            state_.bufferKg -= kg;
-            if (state_.bufferKg < 1e-9) {
-                state_.bufferKg = 0.0;
-            }
-            appendLog(QStringLiteral("  顺路寄存缓冲货 %1kg 于 %2（站内库存 %3kg）")
-                          .arg(kg, 0, 'f', 0)
-                          .arg(QString::fromStdString(op.nodeId))
-                          .arg(state_.stationStock[op.nodeId], 0, 'f', 0));
-            break;
-        }
-    }
-
-
     // 刚到仓库：上一趟跑完，装载**下一趟**（"回仓库装货再出发"这一物理事件）。
     // 必须在 arriveAt 之后调用（它会更新 tripNumber / departed）。
     if (!wasAtDepot && !config_.vehicles.empty()
@@ -907,16 +805,13 @@ void MainWindow::onAdvanceStop() {
                       .arg(stop.late ? QStringLiteral("，超时 penalty %1min").arg(stop.penaltyMin)
                                      : QString()));
         // 导出用的**到达时载重明细**（在卸货之前记，反映"到达这一刻车上载着什么"）。
-        // 这是用户要向缺陷修复对话出示的核心证据，所以细到 订单货/缓冲货/合计 三项
-        // ——只报一个合计数的话，正是"看不出问题"的老路。
+        // 这是用户要向缺陷修复对话出示的核心证据。
         {
             const double cap = config_.vehicles.empty() ? 0.0 : config_.vehicles.front().capacityKg;
-            recordRun(QStringLiteral("    └ 到达 %1 时车上载重：订单货 %2 kg ＋ 缓冲货 %3 kg "
-                                     "＝ %4 kg（载重上限 %5 kg）")
+            recordRun(QStringLiteral("    └ 到达 %1 时车上载重：订单货 %2 kg"
+                                     "（载重上限 %3 kg）")
                           .arg(QString::fromStdString(stop.nodeId))
                           .arg(state_.loadKg, 0, 'f', 0)
-                          .arg(state_.bufferKg, 0, 'f', 0)
-                          .arg(state_.loadKg + state_.bufferKg, 0, 'f', 0)
                           .arg(cap, 0, 'f', 0));
         }
         deliverAt(stop);
@@ -1335,15 +1230,6 @@ void MainWindow::updatePanels() {
         route += QStringLiteral("停靠 %1 站，已送达 %2 站\n")
                      .arg(state_.servedStops + static_cast<int>(remainingStops))
                      .arg(state_.servedStops);
-        // 缓冲库存合计（新机制的可见面）：站内 + 车上。二者都是**权威物理量**，
-        // 分别由"车真的卸了/取了"改动；不作为规划依据显示预测值。
-        double stationStockTotal = 0.0;
-        for (const std::map<std::string, double>::value_type& kv : state_.stationStock) {
-            stationStockTotal += kv.second;
-        }
-        route += QStringLiteral("缓冲库存：站内 %1 kg，车上 %2 kg\n")
-                     .arg(stationStockTotal, 0, 'f', 0)
-                     .arg(state_.bufferKg, 0, 'f', 0);
         // 拆成三段写明，避免"共 K 趟"被误读成"整趟配送总共几趟"：
         //   已完成 = 真的跑完了几趟（事实）
         //   当前第 N 趟 = 绝对趟号（跨重规划连续，不重置）
@@ -1426,16 +1312,11 @@ void MainWindow::updatePanels() {
         vehicleStateInfo_->setText(
             QStringLiteral("软件内时间：%1\n"
                            "车上载重：%2 kg\n"
-                           "    ＝ 订单货 %3 kg ＋ 缓冲货 %4 kg\n"
-                           "本趟出发装载：%5 kg（第 %6 趟，仅订单货）\n"
-                           "剩余待送：%7 kg")
+                           "本趟出发装载：%3 kg（第 %4 趟）\n"
+                           "剩余待送：%5 kg")
                 .arg(minutesToClock(currentTimeMin()))
-                // 「车上载重」才是**物理事实**：订单货 + 不属于任何订单的缓冲货。
-                // 缓冲库存机制上线后，只报订单货会让"本趟装载"名不副实
-                // （车上明明还有 40kg 缓冲，面板却只写 160）。
-                .arg(currentLoadKg() + state_.bufferKg, 0, 'f', 0)
+                // 「车上载重」是**物理事实**：车上此刻实际载着的订单货量。
                 .arg(currentLoadKg(), 0, 'f', 0)
-                .arg(state_.bufferKg, 0, 'f', 0)
                 .arg(tripLoad, 0, 'f', 0)
                 .arg(tripNo)
                 .arg(remainingDemand, 0, 'f', 0));
@@ -1509,13 +1390,12 @@ void MainWindow::updatePanels() {
         stopTable_->setItem(i, 5, new QTableWidgetItem(QString::number(s.remainingLoadKg, 'f', 0)));
     }
 
-    // 中转站 / 集散：子网络标识 + 下属配送点数 + 暂存货量
+    // 中转站 / 集散：子网络标识 + 下属配送点数
     {
         struct TransitRow {
             QString name;
             int     sub = 0;
             int     serves = 0;
-            double  stockKg = 0.0;   // 当前库存（权威值，来自 VehicleState）
         };
         std::vector<TransitRow> rows;
         for (const logistics::Node& n : config_.graph.nodes()) {
@@ -1532,11 +1412,6 @@ void MainWindow::updatePanels() {
                     ++row.serves;
                 }
             }
-            // 「当前库存」读的是 VehicleState 里的**权威值**（只由车真的卸/取改动），
-            // 不是计划里的预测值——计划一重算就会变，那样显示的就不是事实了。
-            const std::map<std::string, double>::const_iterator st =
-                state_.stationStock.find(n.id);
-            row.stockKg = (st != state_.stationStock.end()) ? st->second : 0.0;
             rows.push_back(row);
         }
         transitTable_->setRowCount(static_cast<int>(rows.size()));
@@ -1546,8 +1421,6 @@ void MainWindow::updatePanels() {
                                    new QTableWidgetItem(QString::number(rows[i].sub)));
             transitTable_->setItem(i, 2,
                                    new QTableWidgetItem(QString::number(rows[i].serves)));
-            transitTable_->setItem(i, 3,
-                                   new QTableWidgetItem(QString::number(rows[i].stockKg, 'f', 0)));
         }
     }
 
@@ -1613,7 +1486,7 @@ QString MainWindow::runLogText() const {
     out += QStringLiteral("电商物流配送路径规划系统 —— 运行日志导出\n");
     out += QStringLiteral("用途：把「确实出现过的问题」作为证据带出界面。\n");
     out += QStringLiteral("内容：每次事件触发、每次到达配送点时的车辆载重明细、"
-                          "每次出仓装车与顺路寄存、以及紧急单的处置方式。\n");
+                          "每次出仓装车、以及紧急单的处置方式。\n");
     out += QStringLiteral("策略：%1    载重上限：%2 kg    事件间隔：每 %3 min（软件内时间）\n")
                .arg(strategyBox_ != nullptr ? strategyBox_->currentText() : QString())
                .arg(config_.vehicles.empty() ? 0.0 : config_.vehicles.front().capacityKg, 0, 'f', 0)
@@ -1623,16 +1496,10 @@ QString MainWindow::runLogText() const {
         out += line + QStringLiteral("\n");
     }
     out += QString(72, QLatin1Char('=')) + QStringLiteral("\n");
-    double stationTotal = 0.0;
-    for (const std::map<std::string, double>::value_type& kv : state_.stationStock) {
-        stationTotal += kv.second;
-    }
-    out += QStringLiteral("汇总：事件 %1 次 ｜ 已送达 %2 站 ｜ 期末站内库存 %3 kg ｜ "
-                          "期末车上缓冲 %4 kg\n")
+    out += QStringLiteral("汇总：事件 %1 次 ｜ 已送达 %2 站 ｜ 期末车上载重 %3 kg\n")
                .arg(runEventCount_)
                .arg(state_.servedStops)
-               .arg(stationTotal, 0, 'f', 0)
-               .arg(state_.bufferKg, 0, 'f', 0);
+               .arg(state_.loadKg, 0, 'f', 0);
     return out;
 }
 
@@ -2178,14 +2045,12 @@ int MainWindow::runActionSelfCheck() {
                QStringLiteral("停靠总数应等于「已送 + 剩余」"));
     }
 
-    // ---- 库存不得因反复重规划而单调膨胀（审计发现的 F5）----
+    // ---- 反复重规划下的压力推进（审计发现的 F5）----
     //
-    // 顺路寄存是**一次性的物理事件**：同一批在途货只该入库一次。
-    // 曾经因为 onboardGoods() 仍把这批货算作在途，每重规划一次就再寄存一次，
-    // 实测 40 -> 80 -> 120 -> 201kg，还会被喂回规划器当 initialStock 污染路由。
+    // 这段是**后续守卫的前置状态**：让车在推进 + 路况重规划 + 紧急插单 + 封路的
+    // 反复扰动下跑若干轮，后面的不变量（趟号、本趟装载、导出证据…）才有东西可查。
+    // 只推进 + 路况的话紧急路径压根触发不了，断言会"通过"却什么也没测到。
     {
-        // 跑足够多轮，并且**要插单**：寄存只在"紧急订单把车逼回仓库"时才发生，
-        // 只推进+路况的话压根触发不了，断言会"通过"却什么也没测到。
         for (int i = 0; i < 20; ++i) {
             onAdvanceStop();
             onSimulateTraffic();
@@ -2196,8 +2061,6 @@ int MainWindow::runActionSelfCheck() {
                 onCloseRandomRoad();
             }
         }
-        // 寄存机制已随"中转站退出路由"一并移除（见设计 §16 P25）：
-        // 站内不再有存货，因此这里只保留"存货不得增长"这一条。
     }
 
     // ---- 趟号：已完成趟数只该在换计划时合并，不能与计划内趟号重复相加 ----
@@ -2511,8 +2374,7 @@ int MainWindow::runActionSelfCheck() {
                                                        : config_.vehicles.front().startNodeId;
     // 每一步前进一个**节点**（含仓库与中转站）。
     // 步数**不能**预取固定值：推进过程中事件可能触发重规划（新计划从当前位置重新起算、
-    // nodeIndex_ 归零），事先算好的步数就此失效——T4 让 GUI 真的把缓冲/站内库存喂给
-    // 紧急单路径之后，插单还可能选中"就地满足"从而改用另一条路线，这个坑立刻显形。
+    // nodeIndex_ 归零），事先算好的步数就此失效——插单会改用另一条路线，这个坑立刻显形。
     // 所以以"路线是否走完"为推进条件，并保留一个显式上界防挂住。
     const std::size_t stepBound = plan_.nodes.size() + 400;
     for (std::size_t i = 0; i < stepBound && !atRouteEnd(); ++i) {
@@ -2529,80 +2391,30 @@ int MainWindow::runActionSelfCheck() {
                .arg(plan_.stops.size())
                .arg(stopCursor_));
 
-    // ⑤（T4）缓冲库存的**端到端闭环**：车跑完全程后站内库存必须真的攒下来了，
-    // 并且**界面看得到**（中转站面板第 4 列 = VehicleState 的权威值）。
-    // 判据读用户看得到的东西（面板文本），不重算公式。
-    {
-        double stockTotal = 0.0;
-        for (const std::map<std::string, double>::value_type& kv : state_.stationStock) {
-            stockTotal += kv.second;
-        }
-        expect(stockTotal > 1e-9,
-               QStringLiteral("（前置）跑完全程后中转站应真的攒下缓冲货，实际合计 %1kg")
-                   .arg(stockTotal, 0, 'f', 0));
-
-        const QString panel = transitPanelSummary();
-        const QStringList panelRows = panel.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
-        int checked = 0;
-        bool matched = true;
-        for (const QString& row : panelRows) {
-            const QStringList cells = row.split(QStringLiteral(" | "));
-            if (cells.size() < 4) {
-                matched = false;
-                continue;
-            }
-            // 面板里站名写作「T01（中央中转站A）」，取括号前的 ID
-            const std::string id = cells[0].split(QStringLiteral("（")).first().toStdString();
-            const std::map<std::string, double>::const_iterator it =
-                state_.stationStock.find(id);
-            const double shown = cells[3].trimmed().toDouble();
-            const double actual = (it != state_.stationStock.end()) ? it->second : 0.0;
-            if (std::fabs(shown - actual) > 0.05) {
-                matched = false;
-            }
-            ++checked;
-        }
-        expect(checked > 0 && matched,
-               QStringLiteral("中转站面板「当前库存」必须等于 VehicleState 的权威库存"
-                              "（检查了 %1 行）")
-                   .arg(checked));
-    }
-
     // ⑦（导出证据）运行日志必须真的记下「事件触发 + 到达配送点时的载重明细」。
     // 这条守卫读的是**导出文件的文本本身**——那正是要交给别人的那份证据，
     // 所以必须证明它含够信息，而不是"生成了一个文件"。
     {
         const QString text = runLogText();
-        expect(text.contains(QStringLiteral("出仓装车")) && text.contains(QStringLiteral("已满载")),
-               QStringLiteral("运行日志应含出仓装车记录、并标出是否满载（证明「出仓必满载」）"));
+        expect(text.contains(QStringLiteral("出仓装车")),
+               QStringLiteral("运行日志应含出仓装车记录"));
         // 用**只在该明细行出现**的特征串，别用"到达"这种到处都有的词
         // （否则把明细行删掉守卫照样通过——这是本项目"守卫必须真的测到东西"的老坑）。
         expect(text.contains(QStringLiteral("时车上载重：订单货")),
-               QStringLiteral("运行日志应含「到达某配送点**时**的载重明细」"
-                              "（订单货 / 缓冲货 / 合计）"));
+               QStringLiteral("运行日志应含「到达某配送点**时**的载重明细」（订单货）"));
         expect(text.contains(QStringLiteral("抽取：")),
                QStringLiteral("运行日志应含每一次事件触发"));
         expect(text.contains(QStringLiteral("汇总：")),
-               QStringLiteral("运行日志应有汇总行（事件次数/已送达/期末库存）"));
-        // 「出仓必满载」在**导出证据**上也要成立：不得出现「出仓装车…未满载」。
-        // 同时"接着送"的趟必须被单独标注（起点不是仓库），不许冒充出仓——
-        // 早先正是这一点让导出文件凭空多出三条"出仓未满载"，会把人引去追不存在的 bug。
-        bool anyUnderloaded = false;
+               QStringLiteral("运行日志应有汇总行（事件次数/已送达）"));
+        // "接着送"的趟必须被单独标注（起点不是仓库），不许冒充出仓——
+        // 早先正是这一点让导出文件凭空多出几条"出仓"，会把人引去追不存在的 bug。
         bool hasContinuationLabel = false;
         for (const QString& line : text.split(QLatin1Char('\n'))) {
-            if (line.contains(QStringLiteral("出仓装车"))
-                && line.contains(QStringLiteral("未满载"))) {
-                anyUnderloaded = true;
-            }
             if (line.contains(QStringLiteral("非出仓"))) {
                 hasContinuationLabel = true;
             }
         }
-        expect(!anyUnderloaded,
-               QStringLiteral("导出证据里不得出现「出仓装车…未满载」（出仓必须满载）"));
         // **非循环**判据：凡标为"接着送"的趟，其**起点绝不能是起始仓库**。
-        // （只查"出仓行是否满载"是不够的——那个标签来自"是否装过货"这个同一个标记，
-        //   一旦某条路径不再装货，它就会改标成"接着送"从而绕过守卫。已实测踩到。）
         bool mislabeled = false;
         const std::string depotId = config_.vehicles.empty()
                                         ? std::string()
@@ -2615,7 +2427,7 @@ int MainWindow::runActionSelfCheck() {
         }
         expect(!mislabeled,
                QStringLiteral("「接着送」的趟起点不得是仓库 %1——从仓库出发就是出仓，"
-                              "必须满载并标为「出仓装车」")
+                              "必须标为「出仓装车」")
                    .arg(QString::fromStdString(depotId)));
         // 若本次运行确实出现过"接着送"的趟，它必须被标注出来（否则读者会把它当成出仓）
         expect(!text.contains(QStringLiteral("接着送")) || hasContinuationLabel,
@@ -2678,96 +2490,12 @@ int MainWindow::runActionSelfCheck() {
                                                              : std::string()))
                .arg(QString::fromStdString(currentNodeId_)));
 
-    // ⑥（规格 §1 C7）紧急单"就地满足"必须**真的**发生，并打印省下的 km。
-    // 判据读的是规划产物本身（transitOps 里有没有出库、两版距离差多少），
-    // 不是自己把公式重算一遍。
-    {
-        const logistics::RoutePlan base =
-            logistics::planRoute(config_.graph, config_.vehicles.front(), config_.orders,
-                                 logistics::WeightType::Distance);
-        std::map<std::string, double> stock;
-        double seeded = 0.0;
-        for (const logistics::TransitStock& st : base.transitStock) {
-            stock[st.nodeId] = st.finalKg;
-            seeded += st.finalKg;
-        }
-        expect(seeded > 1e-9,
-               QStringLiteral("（前置）默认数据上生产者应先攒到站内库存，实际 %1kg")
-                   .arg(seeded, 0, 'f', 0));
-
-        // 车的位置取几个有代表性的点；目标取**图上全部配送点**——
-        // 手写短名单会因前面步骤改动了世界状态（加了客户、插了单）而搜不到案例。
-        const char* positions[] = {"W01", "W02", "T01", "T02", "T03"};
-        std::vector<std::string> targets;
-        for (const logistics::Node& n : config_.graph.nodes()) {
-            if (n.type == logistics::NodeType::Delivery) {
-                targets.push_back(n.id);
-            }
-        }
-        bool happened = false;
-        QString detail;
-        for (const char* pos : positions) {
-            if (happened) {
-                break;
-            }
-            for (const std::string& tgt : targets) {
-                if (pos == tgt) {
-                    continue;
-                }
-                logistics::Order urgent;
-                urgent.id = "UCHECK";
-                urgent.nodeId = tgt;
-                urgent.demandKg = 6.0;
-                urgent.windowStartMin = 0;
-                urgent.windowEndMin = 1440;
-                urgent.urgent = true;
-
-                const logistics::InsertResult r = logistics::insertUrgentOrder(
-                    config_.graph, config_.vehicles.front(), config_.orders, urgent, pos, 600,
-                    logistics::WeightType::Distance,
-                    std::vector<logistics::OnboardItem>(), 0.0, stock);
-
-                std::vector<logistics::Order> all = config_.orders;
-                all.push_back(urgent);
-                const logistics::RoutePlan variantA = logistics::replan(
-                    config_.graph, config_.vehicles.front(), all, pos, 600,
-                    logistics::WeightType::Distance,
-                    std::vector<logistics::OnboardItem>(), stock);
-
-                bool drew = false;
-                for (const logistics::TransitOp& op : r.plan.transitOps) {
-                    if (op.kgDelta < -1e-9) {
-                        drew = true;
-                    }
-                }
-                const double saved = variantA.totalDistanceKm - r.plan.totalDistanceKm;
-                if (drew && saved > 1e-9) {
-                    detail = QStringLiteral("车在 %1 -> 紧急单 %2：现状 %3km，就地满足 %4km，"
-                                            "省 %5km（并记 1 次站内出库）")
-                                 .arg(pos)
-                                 .arg(tgt)
-                                 .arg(variantA.totalDistanceKm, 0, 'f', 1)
-                                 .arg(r.plan.totalDistanceKm, 0, 'f', 1)
-                                 .arg(saved, 0, 'f', 1);
-                    happened = true;
-                    break;
-                }
-            }
-        }
-        expect(happened,
-               QStringLiteral("至少发生 1 次紧急单就地满足（车上缓冲 + 站内库存）并省下里程"));
-        if (happened) {
-            // 单独打一行，便于肉眼与 grep 核对（C7 要求"打印省下的 km"）
-            std::printf("[self-check] --  紧急单就地满足：%s\n", detail.toUtf8().constData());
-        }
-    }
-
     // ⑨（货量口径）本项目**所有货量都是整公斤**。
     //
     // 缺陷背景（人工测试导出日志发现）：静态数据 config/default.ini 的货量列全是整数，
     // 但两个**动态事件**按浮点随机生成货量——`3.0 + rng_.nextRange(0.0, 7.0)`
     // （紧急单）与 `3.0 + rng_.nextRange(0.0, 12.0)`（新客户）。小数于是写进
-    // Order::demandKg 并一路传播到 loadKg/bufferKg/stationStock，
+    // Order::demandKg 并一路传播到 loadKg 与界面上的载重显示，
     // 导出日志里出现「插入紧急订单 U001（货量 3.3kg）」与 135.2 / 141.9 kg 这类数字。
     //
     // 守卫读的是**动态事件真的生成出来的那个货量**（不是把公式重算一遍）：

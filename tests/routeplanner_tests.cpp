@@ -1,7 +1,6 @@
 // RoutePlanner 的行为测试。
 // 期望值全部来自手工推导的字面量，不复用实现中的任何计算。
 #include <cmath>
-#include <map>
 #include <string>
 #include <vector>
 
@@ -25,8 +24,6 @@ using logistics::planRoute;
 using logistics::replan;
 using logistics::insertUrgentOrder;
 using logistics::InsertResult;
-using logistics::TransitOp;
-using logistics::TransitStock;
 using testutil::check;
 
 namespace {
@@ -853,8 +850,8 @@ void testNodeIndexAtTimeIsMonotonicInTime() {
 
 } // namespace
 
-// 增量重规划在全量回退时，必须把"站内存货"与"在途货"一并带走。
-// 否则这条路径上寄存与"积少成多"会静默断掉（审计时发现的缺口）。
+// 增量重规划在全量回退时，必须把"在途货"一并带走。
+// 否则这条路径上会静默断掉（审计时发现的缺口）。
 static void testIncrementalReplanForwardsOnboard() {
     const logistics::LogisticsGraph g = makeTransitClusterGraph();
     logistics::Vehicle v;
@@ -898,386 +895,16 @@ static void testIncrementalReplanForwardsOnboard() {
     check(carriesD2, "在途货所属的 D2 仍应被服务");
 }
 
-// ---- 中转站缓冲库存：生产者（满载出仓 + 返程顺路寄存）----
-//
-// 夹具：W(仓库) —T(中转站,子网络1)— D1(客户,子网络1)，另加 W —D2(客户,子网络1)。
-//   · D1 的最短路是 W-T-D1 ⇒ 回程 D1-T-W **真的经过 T**（顺路 ⇒ 应当寄存）；
-//   · D2 直连仓库 ⇒ 回程不经过 T（不顺路 ⇒ 缓冲**跟车回仓库**，不寄存）。
-// 载重 100、D1/D2 各 60kg ⇒ 总需求 120 > 100 ⇒ 两趟，每趟订单货量 60、空位 40。
-LogisticsGraph makeBufferGraph() {
-    LogisticsGraph g;
-    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
-    Node t = makeNode("T", NodeType::Transit, "中转站");
-    t.subNetworkId = 1;
-    g.addNode(t);
-    Node d1 = makeNode("D1", NodeType::Delivery, "客户1");
-    d1.subNetworkId = 1;
-    g.addNode(d1);
-    Node d2 = makeNode("D2", NodeType::Delivery, "客户2");
-    d2.subNetworkId = 1;
-    g.addNode(d2);
-    addTwoWay(g, "W", "T", 5.0, 10.0, 4.0);
-    addTwoWay(g, "T", "D1", 5.0, 10.0, 4.0);
-    addTwoWay(g, "W", "D2", 3.0, 6.0, 2.0);
-    return g;
-}
-
-void testTransitBufferProducer() {
-    const LogisticsGraph g = makeBufferGraph();
-    const Vehicle v = makeVehicle("W", 100.0, 480);
-    std::vector<Order> orders;
-    orders.push_back(makeOrder("O1", "D1", 60.0, 0, 1440));
-    orders.push_back(makeOrder("O2", "D2", 60.0, 0, 1440));
-
-    const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
-
-    check(plan.status == PlanStatus::Ok, "缓冲夹具应当可规划");
-    check(plan.trips.size() == 2, "两个 60kg 订单 + 载重 100 ⇒ 两趟，实际 "
-                                      + std::to_string(plan.trips.size()) + " 趟");
-
-    // G4：缓冲不得超载、不得为负；I5：缓冲 == 载重上限 − 本趟订单货量
-    bool capOk = true, nonNeg = true, fullOk = true;
-    for (const logistics::Trip& t : plan.trips) {
-        if (t.loadKg + t.bufferKg > v.capacityKg + 1e-9) { capOk = false; }
-        if (t.bufferKg < -1e-9) { nonNeg = false; }
-        if (t.bufferKg > 1e-9
-            && std::fabs(t.bufferKg - (v.capacityKg - t.loadKg)) > 1e-9) {
-            fullOk = false;
-        }
-    }
-    check(capOk, "本趟订单货量 + 缓冲货 不得超过载重上限");
-    check(nonNeg, "缓冲货不得为负");
-    check(fullOk, "缓冲货 = 载重上限 − 本趟订单货量（「装满」的确切含义）");
-
-    // G1①：常规规划（无紧急单）不得出现任何站内**出库**
-    bool noOutbound = true;
-    for (const logistics::TransitOp& op : plan.transitOps) {
-        if (op.kgDelta < -1e-9) { noOutbound = false; }
-    }
-    check(noOutbound, "无紧急单时不得有任何站内出库（中转站只服务紧急单）");
-
-    // G1②：寄存在的站必须**真的出现在该趟自己的节点序列里**，且时刻对得上。
-    // 这条是"零成本"的实质检查：只有站本来就在序列里，才谈得上"不新增节点"。
-    bool bankTraceable = true;
-    std::size_t bankCount = 0;
-    for (const logistics::Trip& t : plan.trips) {
-        for (const logistics::TransitOp& op : t.bankOps) {
-            ++bankCount;
-            bool hit = false;
-            for (std::size_t k = 0; k < t.nodes.size() && k < t.nodeArrivalMin.size(); ++k) {
-                if (t.nodes[k] == op.nodeId && t.nodeArrivalMin[k] == op.atMin) { hit = true; }
-            }
-            if (!hit) { bankTraceable = false; }
-        }
-    }
-    check(bankCount == 1, "夹具里应恰好 1 次寄存（第 1 趟回程顺路经过 T），实际 "
-                              + std::to_string(bankCount) + " 次");
-    check(bankTraceable, "寄存在的站必须在该趟自己的节点序列里，且 atMin == 该处到达时刻");
-
-    double stock = 0.0;
-    for (const logistics::TransitStock& st : plan.transitStock) { stock += st.finalKg; }
-    check(std::fabs(stock - 40.0) < 1e-6,
-          "顺路的那趟应寄存 40kg 进站，实际站内合计 " + std::to_string(stock) + "kg");
-
-    // 守恒（规格 I3 的生产者部分）：所有寄存之和 == 站内库存增量
-    double opsSum = 0.0;
-    for (const logistics::TransitOp& op : plan.transitOps) { opsSum += op.kgDelta; }
-    check(std::fabs(opsSum - stock) < 1e-6, "所有寄存之和 == 站内库存增量");
-
-    // G2：**库存不得影响选路** —— 同一输入、空库存 vs 有 123kg 存货，路线逐位相同
-    std::map<std::string, double> seeded;
-    seeded["T"] = 123.0;
-    const RoutePlan seededPlan = planRoute(g, v, orders, WeightType::Distance, seeded);
-    const bool routeUnchanged =
-        std::fabs(seededPlan.totalDistanceKm - plan.totalDistanceKm) < 1e-9
-        && std::fabs(seededPlan.totalTimeMin - plan.totalTimeMin) < 1e-9
-        && std::fabs(seededPlan.totalCostYuan - plan.totalCostYuan) < 1e-9
-        && seededPlan.totalPenaltyMin == plan.totalPenaltyMin
-        && seededPlan.trips.size() == plan.trips.size();
-    check(routeUnchanged, "期初库存不得改变路径/耗时/成本/penalty/趟数（寄存是纯记账）");
-
-    double seededStock = 0.0;
-    for (const logistics::TransitStock& st : seededPlan.transitStock) {
-        seededStock += st.finalKg;
-    }
-    check(std::fabs(seededStock - (stock + 123.0)) < 1e-6,
-          "期末库存 = 期初库存 + 本次寄存量");
-}
-
-// ---- 中转站缓冲库存：消费者（紧急单三链 + 两版取优）----
-//
-// 夹具：W(仓库) —T(中转站,子网络1)— D1、D3；W —D2（直连，不经 T）。
-// 载重 100、三个 60kg 订单 ⇒ 三趟；第 1、3 趟回程都顺路经过 T ⇒ T 攒下 80kg。
-// 车停在 D1（**远离仓库**）时插入一张到 D3 的紧急单：现状必须"回仓库装货"（绕远），
-// 而站内库存就在去 D3 的路上 ⇒ 就地满足应当更省。
-LogisticsGraph makeUrgentBufferGraph() {
-    LogisticsGraph g;
-    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
-    Node t = makeNode("T", NodeType::Transit, "中转站");
-    t.subNetworkId = 1;
-    g.addNode(t);
-    for (const char* id : {"D1", "D2", "D3"}) {
-        Node d = makeNode(id, NodeType::Delivery, std::string("客户") + id);
-        d.subNetworkId = 1;
-        g.addNode(d);
-    }
-    addTwoWay(g, "W", "T", 5.0, 10.0, 4.0);
-    addTwoWay(g, "T", "D1", 5.0, 10.0, 4.0);
-    addTwoWay(g, "W", "D2", 3.0, 6.0, 2.0);
-    addTwoWay(g, "T", "D3", 5.0, 10.0, 4.0);
-    return g;
-}
-
-void testUrgentBufferInPlaceDelivery() {
-    const LogisticsGraph g = makeUrgentBufferGraph();
-    const Vehicle v = makeVehicle("W", 100.0, 480);
-    std::vector<Order> orders;
-    orders.push_back(makeOrder("O1", "D1", 60.0, 0, 1440));
-    orders.push_back(makeOrder("O2", "D2", 60.0, 0, 1440));
-    orders.push_back(makeOrder("O3", "D3", 60.0, 0, 1440));
-
-    const RoutePlan base = planRoute(g, v, orders, WeightType::Distance);
-    std::map<std::string, double> initialStock;
-    double seeded = 0.0;
-    for (const logistics::TransitStock& st : base.transitStock) {
-        initialStock[st.nodeId] = st.finalKg;
-        seeded += st.finalKg;
-    }
-    check(std::fabs(seeded - 80.0) < 1e-6,
-          "基线应给 T 攒下 80kg（第 1、3 趟各顺路寄存 40），实际 "
-              + std::to_string(seeded) + "kg");
-
-    const Order urgent = makeOrder("U1", "D3", 10.0, 0, 1440, true);
-    const InsertResult inserted = insertUrgentOrder(
-        g, v, orders, urgent, "D1", 500, WeightType::Distance,
-        std::vector<logistics::OnboardItem>(), 0.0, initialStock);
-    check(inserted.plan.status == PlanStatus::Ok, "插入紧急单后应当可规划");
-    const RoutePlan& chosen = inserted.plan;
-
-    // 对照：候选 A（现状——独立紧急趟**先回仓库装货**）
-    std::vector<Order> all = orders;
-    all.push_back(urgent);
-    const RoutePlan variantA = replan(g, v, all, "D1", 500, WeightType::Distance,
-                                      std::vector<logistics::OnboardItem>(), initialStock);
-
-    // G6：绝不更差（penalty 一票否决 -> 目标值 -> 趟数）
-    check(chosen.totalPenaltyMin <= variantA.totalPenaltyMin,
-          "取优不得让 penalty 变差：选中 " + std::to_string(chosen.totalPenaltyMin)
-              + "min vs 现状 " + std::to_string(variantA.totalPenaltyMin) + "min");
-    check(chosen.totalDistanceKm < variantA.totalDistanceKm - 1e-9,
-          "本夹具里就地满足应当真的更省：现状 " + std::to_string(variantA.totalDistanceKm)
-              + "km，选中 " + std::to_string(chosen.totalDistanceKm) + "km");
-
-    // G5：E3 优先性不得被取优牺牲——紧急单所在停靠点必须早于**所有**其他停靠点
-    int urgentArrival = -1;
-    int firstOtherArrival = 1 << 30;
-    for (const logistics::Trip& t : chosen.trips) {
-        for (const logistics::Stop& s : t.stops) {
-            if (s.nodeId == "D3") {
-                urgentArrival = s.arrivalMin;
-            } else if (s.arrivalMin < firstOtherArrival) {
-                firstOtherArrival = s.arrivalMin;
-            }
-        }
-    }
-    check(urgentArrival >= 0, "紧急单所在停靠点必须被服务");
-    check(urgentArrival <= firstOtherArrival,
-          "紧急单必须早于所有普通停靠点：紧急 " + std::to_string(urgentArrival)
-              + "min vs 最早普通 " + std::to_string(firstOtherArrival) + "min");
-
-    // G3：守恒 + 可追溯
-    double opsSum = 0.0;
-    bool stockNonNeg = true;
-    for (const logistics::TransitOp& op : chosen.transitOps) { opsSum += op.kgDelta; }
-    double stockDelta = 0.0;
-    for (const logistics::TransitStock& st : chosen.transitStock) {
-        stockDelta += st.finalKg - st.initialKg;
-        if (st.finalKg < -1e-9) { stockNonNeg = false; }
-    }
-    check(std::fabs(opsSum - stockDelta) < 1e-6,
-          "所有站内装卸之和 == 期末 − 期初（守恒）");
-    check(stockNonNeg, "任何时刻站内库存不得为负");
-
-    bool traceable = true;
-    for (const logistics::TransitOp& op : chosen.transitOps) {
-        bool hit = false;
-        for (const logistics::Trip& t : chosen.trips) {
-            for (std::size_t k = 0; k < t.nodes.size() && k < t.nodeArrivalMin.size(); ++k) {
-                if (t.nodes[k] == op.nodeId && t.nodeArrivalMin[k] == op.atMin) { hit = true; }
-            }
-        }
-        if (!hit) { traceable = false; }
-    }
-    check(traceable, "每一次站内装卸的 atMin 都必须能追溯到某趟的到达时刻");
-
-    // 就地满足必须**真的**发生：紧急趟在紧急停靠点之前到过 T ⇒ 必须有一条对应该站的出库
-    bool tookFromStation = false;
-    for (const logistics::TransitOp& op : chosen.transitOps) {
-        if (op.kgDelta < -1e-9 && op.nodeId == "T") { tookFromStation = true; }
-    }
-    check(tookFromStation, "本夹具里车上无缓冲 ⇒ 必须从 T 出库才能就地满足");
-
-    // 车上缓冲足够时**不得**再动站内库存（先车上、后站内的顺序）
-    const InsertResult withCar = insertUrgentOrder(
-        g, v, orders, urgent, "D1", 500, WeightType::Distance,
-        std::vector<logistics::OnboardItem>(), 100.0, initialStock);
-    bool anyDraw = false;
-    for (const logistics::TransitOp& op : withCar.plan.transitOps) {
-        if (op.kgDelta < -1e-9) { anyDraw = true; }
-    }
-    check(!anyDraw, "车上缓冲已够时不得再动用站内库存");
-}
-
-// 反例夹具：**站不在路上**。W —D6 直连；W —T 与 T —D6 各 5km（绕路）。
-// 另有一个只能经 T 到达的 D5，用来让生产者把库存攒在 T 上。
-// 这样"就地满足"反而绕远 ⇒ 取优必须**退回现状 A**。
-LogisticsGraph makeOffRouteStationGraph() {
-    LogisticsGraph g;
-    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
-    Node t = makeNode("T", NodeType::Transit, "中转站");
-    t.subNetworkId = 1;
-    g.addNode(t);
-    Node d4 = makeNode("D4", NodeType::Delivery, "客户4");
-    d4.subNetworkId = 1;
-    g.addNode(d4);
-    Node d5 = makeNode("D5", NodeType::Delivery, "客户5");
-    d5.subNetworkId = 1;
-    g.addNode(d5);
-    Node d6 = makeNode("D6", NodeType::Delivery, "客户6");
-    d6.subNetworkId = 1;
-    g.addNode(d6);
-    addTwoWay(g, "W", "D4", 5.0, 10.0, 4.0);
-    addTwoWay(g, "W", "D6", 5.0, 10.0, 4.0);   // D6 **直连仓库** ⇒ T 不在去 D6 的路上
-    addTwoWay(g, "W", "T", 5.0, 10.0, 4.0);
-    addTwoWay(g, "T", "D5", 5.0, 10.0, 4.0);
-    addTwoWay(g, "T", "D6", 5.0, 10.0, 4.0);
-    return g;
-}
-
-void testUrgentBufferChoiceIsNeverWorse() {
-    const LogisticsGraph g = makeOffRouteStationGraph();
-    const Vehicle v = makeVehicle("W", 100.0, 480);
-    std::vector<Order> orders;
-    orders.push_back(makeOrder("O4", "D4", 60.0, 0, 1440));
-    orders.push_back(makeOrder("O5", "D5", 60.0, 0, 1440));
-
-    const RoutePlan base = planRoute(g, v, orders, WeightType::Distance);
-    std::map<std::string, double> initialStock;
-    double seeded = 0.0;
-    for (const logistics::TransitStock& st : base.transitStock) {
-        initialStock[st.nodeId] = st.finalKg;
-        seeded += st.finalKg;
-    }
-    check(seeded > 1e-9, "反例夹具也应先在 T 上攒到库存，实际 "
-                             + std::to_string(seeded) + "kg");
-
-    // 紧急单打在直连客户 D6 上（车在仓库）：现状 = W->D6->W = 10km；
-    // 经站 = W->T->D6->W = 20km ⇒ 取优必须选现状。
-    const Order urgent = makeOrder("U2", "D6", 10.0, 0, 1440, true);
-    const InsertResult inserted = insertUrgentOrder(
-        g, v, orders, urgent, "W", 480, WeightType::Distance,
-        std::vector<logistics::OnboardItem>(), 0.0, initialStock);
-    const RoutePlan& chosen = inserted.plan;
-    check(chosen.status == PlanStatus::Ok, "反例夹具应当可规划");
-
-    std::vector<Order> all = orders;
-    all.push_back(urgent);
-    const RoutePlan variantA = replan(g, v, all, "W", 480, WeightType::Distance,
-                                      std::vector<logistics::OnboardItem>(), initialStock);
-
-    check(std::fabs(chosen.totalDistanceKm - variantA.totalDistanceKm) < 1e-9,
-          "站不在路上时取优必须退回现状（不得\"有货就用\"）：选中 "
-              + std::to_string(chosen.totalDistanceKm) + "km vs 现状 "
-              + std::to_string(variantA.totalDistanceKm) + "km");
-    check(chosen.totalPenaltyMin <= variantA.totalPenaltyMin,
-          "退回现状后 penalty 也不得变差");
-
-    // 而且**不得**因为"选了现状"却还去扣站内库存
-    bool anyDraw = false;
-    for (const logistics::TransitOp& op : chosen.transitOps) {
-        if (op.kgDelta < -1e-9) { anyDraw = true; }
-    }
-    check(!anyDraw, "没选就地满足时不得记任何站内出库（账要跟方案一致）");
-}
-
-// ---- 「出仓必满载」：任何**从仓库装货出发**的趟都必须把车厢装满 ----
-//
-// 这条不变量在实现过程中真的被破坏过：`replanIncremental`（路况触发的增量重规划）
-// 逐趟重建时只复制 `loadKg`，把 `bufferKg`/`bankOps` 丢了 ⇒ 一次路况重规划之后，
-// 车回仓库只装订单货就出发，站里再也攒不到货（用户跑模拟时观察到的现象）。
-// 所以这里对**两条规划路径**都断言：常规 planRoute 与增量 replanIncremental。
-void testEveryDepotTripIsFullyLoaded() {
-    const LogisticsGraph g = makeBufferGraph();
-    const Vehicle v = makeVehicle("W", 100.0, 480);
-    std::vector<Order> orders;
-    orders.push_back(makeOrder("O1", "D1", 60.0, 0, 1440));
-    orders.push_back(makeOrder("O2", "D2", 60.0, 0, 1440));
-    const std::string depot = v.startNodeId;
-
-    const auto everyDepotTripFull = [&](const RoutePlan& p, const char* tag) {
-        bool ok = true;
-        std::size_t depotTrips = 0;
-        for (const logistics::Trip& t : p.trips) {
-            if (t.nodes.empty() || t.nodes.front() != depot) {
-                continue;   // 不是出仓的趟（在途货续送 / 收尾）不适用
-            }
-            ++depotTrips;
-            const double spare = (v.capacityKg - t.loadKg > 0.0) ? (v.capacityKg - t.loadKg) : 0.0;
-            if (std::fabs(t.bufferKg - spare) > 1e-6) {
-                ok = false;
-            }
-        }
-        check(depotTrips > 0, std::string(tag) + "：应当存在至少一趟「从仓库装货出发」");
-        check(ok, std::string(tag) + "：每一趟从仓库出发的趟都必须满载出仓"
-                      "（buffer == 载重上限 − 本趟订单货量）");
-    };
-
-    const RoutePlan base = planRoute(g, v, orders, WeightType::Distance);
-    everyDepotTripFull(base, "planRoute");
-
-    // 造一份命中若干条边的路况报告，强制走增量路径
-    TrafficReport rep;
-    for (std::size_t i = 1; i < base.nodes.size() && rep.changes.size() < 6; ++i) {
-        TrafficChange c;
-        c.fromId = base.nodes[i - 1];
-        c.toId = base.nodes[i];
-        c.increaseRatio = 0.5;
-        c.congested = true;
-        rep.changes.push_back(c);
-    }
-    bool usedIncremental = false;
-    const RoutePlan inc = replanIncremental(
-        g, v, orders, base, v.departTimeMin, WeightType::Distance, rep, 0.2,
-        std::vector<logistics::OnboardItem>(), &usedIncremental,
-        std::map<std::string, double>());
-    check(usedIncremental, "（前置）本夹具应真的走增量路径，否则这条守卫测不到东西");
-    everyDepotTripFull(inc, "replanIncremental（增量重规划后）");
-
-    // 紧急单：车在仓库时插入，出仓那趟同样必须满载（常规与紧急一视同仁）
-    const Order urgent = makeOrder("U1", "D2", 10.0, 0, 1440, true);
-    std::vector<Order> all = orders;
-    all.push_back(urgent);
-    const RoutePlan withUrgent = replan(g, v, all, depot, 480, WeightType::Distance,
-                                        std::vector<logistics::OnboardItem>(),
-                                        std::map<std::string, double>());
-    everyDepotTripFull(withUrgent, "插入紧急单后");
-}
-
-// ---- 用车在途中插紧急单后，计划各趟必须首尾相接（「出仓必满载」的上游不变量）----
+// ---- 用车在途中插紧急单后，计划各趟必须首尾相接 ----
 //
 // 缺陷背景（人工测试导出日志发现）：车在途中（位置 T）、车上还载着在途货，
 // 此时插入一张紧急单。紧急批**先执行**且以仓库收尾（`current = 仓库`），
 // 但"接着送车上已有的货"那一趟却从 `startPos`（车出发时的客户点）起算，
 // 排出一趟"起点是车早已离开的客户点"的趟。后果：
 //   · 计划各趟首尾不接（车凭空从仓库跳回客户点再开出去）；
-//   · 该趟起点非仓库 ⇒ `bufferKg=0`、`loadedFromDepot=false`；
 //   · 界面在车**到达仓库**时装载它 ⇒ 车只带着在途那点订单货离开仓库
-//     （导出日志实测「接着送…20.0kg」，与"每次出仓必满载"冲突）。
-// 本守卫直接断言**首尾相接**（车不能凭空移动）——这是"出仓必满载"的上游前提：
-// 一旦某趟起点不是车的真实位置，"哪一趟该满载"就无从谈起。
-//
-// 为什么既有 `testEveryDepotTripIsFullyLoaded` 没抓到：它按 `nodes.front()==仓库`
-// 筛"出仓趟"，而这趟的 front 是客户点、被直接跳过。本守卫补上这个盲区。
+//     （导出日志实测「接着送…20.0kg」）。
+// 本守卫直接断言**首尾相接**（车不能凭空移动）。
 void testTripContinuityAfterUrgentInsertWhileEnRoute() {
     LogisticsGraph g;
     g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
@@ -1312,8 +939,7 @@ void testTripContinuityAfterUrgentInsertWhileEnRoute() {
 
     const Order urgent = makeOrder("U1", "D1", 10.0, 0, 1440, true);
     const InsertResult res = insertUrgentOrder(g, v, pending, urgent, "T", 500,
-                                               WeightType::Distance, onboard, 0.0,
-                                               std::map<std::string, double>());
+                                               WeightType::Distance, onboard);
     const RoutePlan& p = res.plan;
 
     std::string seq;
@@ -1337,25 +963,6 @@ void testTripContinuityAfterUrgentInsertWhileEnRoute() {
         }
     }
     check(chainOk, "各趟必须首尾相接（车不能凭空移动）：" + bad + "；实际 " + seq);
-
-    // 任何"从仓库出发"的趟都必须满载（判据用起点，不依赖 loadedFromDepot 标记——
-    // 标记本身也是被检查对象：从仓库出发却声称"没在仓库装货"就是缺陷）
-    bool fullOk = true;
-    std::string fullBad;
-    for (const logistics::Trip& tr : p.trips) {
-        if (tr.nodes.empty() || tr.nodes.front() != v.startNodeId) {
-            continue;
-        }
-        const bool marked = tr.loadedFromDepot;
-        const bool full = std::fabs(tr.bufferKg - (v.capacityKg - tr.loadKg)) <= 1e-6;
-        if (!marked || !full) {
-            fullOk = false;
-            fullBad = "起点 " + tr.nodes.front() + " 订单货 " + std::to_string(tr.loadKg)
-                      + " 缓冲 " + std::to_string(tr.bufferKg)
-                      + (marked ? "" : "（未标成出仓装货）");
-        }
-    }
-    check(fullOk, "从仓库出发的趟必须满载：" + fullBad);
 }
 
 int main() {
@@ -1381,10 +988,6 @@ int main() {
     testNodeIndexAtTimeReturnsSegmentStart();
     testNodeIndexAtTimeOnEmptyPlanAndClamp();
     testNodeIndexAtTimeIsMonotonicInTime();
-    testTransitBufferProducer();
-    testUrgentBufferInPlaceDelivery();
-    testUrgentBufferChoiceIsNeverWorse();
-    testEveryDepotTripIsFullyLoaded();
     testTripContinuityAfterUrgentInsertWhileEnRoute();
 
     return testutil::summarize("routeplanner_tests");

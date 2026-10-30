@@ -13,7 +13,6 @@
 
 #include <cstdio>
 #include <cstdlib>
-#include <map>
 #include <string>
 
 #include "core/Config.h"
@@ -191,12 +190,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "配置中没有车辆\n");
             return 1;
         }
-        // 命令行首次规划：站里还没有任何缓冲库存（仓库发缓冲货要跑完一趟才可能寄存），
-        // 故显式传空库存 —— 与 planRoute 的默认值等价，只为让调用形状与其余四个入口一致。
-        const std::map<std::string, double> initialStock;
         const logistics::RoutePlan plan =
             logistics::planRoute(config.graph, config.vehicles.front(), config.orders,
-                                 planWeight, initialStock);
+                                 planWeight);
         if (plan.status != logistics::PlanStatus::Ok) {
             std::printf("不可行：%s\n", plan.reason.c_str());
             return 0;
@@ -262,11 +258,9 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "配置中没有车辆，无法规划\n");
                 return 1;
             }
-            // 同上：首次规划时站内无库存，显式传空以统一调用形状。
-            const std::map<std::string, double> initialStock;
             const logistics::RoutePlan plan =
                 logistics::planRoute(config.graph, config.vehicles.front(), config.orders,
-                                     planWeight, initialStock);
+                                     planWeight);
             if (plan.status == logistics::PlanStatus::Ok) {
                 scene.highlightRoute(plan.nodes);
                 std::printf("规划（%s）：距离 %.1fkm  耗时 %.1fmin  成本 %.1f元  "
@@ -364,36 +358,27 @@ int main(int argc, char** argv) {
 
         // 中转站面板的内容快照：无头环境下据此确定性核对（不必靠肉眼裁图）
         //
-        // G7（缓冲库存 T4）：第 4 列「当前库存」必须存在且为数字——
-        // 它把"中转站真的攒下货了"这件事变成用户能看到的东西。
+        // 面板为 3 列：中转站 / 子网络 / 下属配送点（「当前库存」列已随
+        // 中转缓冲机制退役而删除，见 issue #2）。
         for (const QString& row : panelRows) {
             const QStringList cells = row.split(QStringLiteral(" | "));
-            if (cells.size() < 4) {
+            if (cells.size() < 3) {
                 const QByteArray bad = row.toUtf8();
                 std::fprintf(stderr,
-                             "[ui-probe] 中转站面板应有 4 列（含「当前库存」），实际不足：%s\n",
-                             bad.constData());
-                return 1;
-            }
-            bool numberOk = false;
-            cells[3].trimmed().toDouble(&numberOk);
-            if (!numberOk) {
-                const QByteArray bad = row.toUtf8();
-                std::fprintf(stderr, "[ui-probe] 中转站「当前库存」列不是数字：%s\n",
+                             "[ui-probe] 中转站面板应有 3 列（中转站/子网络/下属配送点），"
+                             "实际不足：%s\n",
                              bad.constData());
                 return 1;
             }
         }
         const QByteArray transit = panel.toUtf8();
-        std::printf("[ui-probe] 中转站面板（%s）:\n%s", "中转站|子网络|下属配送点|当前库存",
+        std::printf("[ui-probe] 中转站面板（%s）:\n%s", "中转站|子网络|下属配送点",
                     transit.constData());
-        // 车辆面板：断言**界面上显示的载重**不超过载重上限，且**分解式自洽**。
+        // 车辆面板：断言**界面上显示的载重**不超过载重上限。
         //
-        // 两段历史：① 用户手工测试发现面板把"剩余待送总量 740kg"当成"当前载重"显示，
-        // 而载重上限只有 200kg —— 数据层没错，是显示口径错了，所以必须查显示值本身；
-        // ② 缓冲库存机制上线后，"只报订单货"的旧口径又变得**名不副实**（车上明明还有
-        // 不属于任何订单的缓冲货）。故改为：**车上载重 = 订单货 + 缓冲货**，
-        // 三者都印在面板上，这里逐项校验（读用户看得到的文本，不重算公式）。
+        // 历史：用户手工测试发现面板把"剩余待送总量 740kg"当成"当前载重"显示，
+        // 而载重上限只有 200kg —— 数据层没错，是显示口径错了，所以必须查显示值本身
+        //（读用户看得到的文本，不重算公式）。
         const QString vehiclePanel = window.vehiclePanelSummary();
         {
             const double cap = config.vehicles.empty() ? 0.0 : config.vehicles.front().capacityKg;
@@ -408,33 +393,21 @@ int main(int argc, char** argv) {
             // 「车上载重」是物理事实，必须 <= 载重上限
             const QRegularExpression totalRe(
                 QStringLiteral("车上载重：([0-9.]+) kg"));
-            const QRegularExpression breakdownRe(
-                QStringLiteral("订单货 ([0-9.]+) kg ＋ 缓冲货 ([0-9.]+) kg"));
             const QRegularExpression tripRe(
                 QStringLiteral("本趟出发装载：([0-9.]+) kg"));
 
             const QRegularExpressionMatch total = totalRe.match(vehiclePanel);
-            const QRegularExpressionMatch parts = breakdownRe.match(vehiclePanel);
             const QRegularExpressionMatch trip = tripRe.match(vehiclePanel);
-            if (!total.hasMatch() || !parts.hasMatch() || !trip.hasMatch()) {
+            if (!total.hasMatch() || !trip.hasMatch()) {
                 std::fprintf(stderr,
-                             "[ui-probe] 车辆面板缺少「车上载重 / 订单货+缓冲货 / 本趟出发装载」"
-                             "三处口径之一：\n%s\n",
+                             "[ui-probe] 车辆面板缺少「车上载重 / 本趟出发装载」"
+                             "两处口径之一：\n%s\n",
                              vehiclePanel.toUtf8().constData());
                 return 1;
             }
             const double shownTotal = total.captured(1).toDouble();
-            const double orders = parts.captured(1).toDouble();
-            const double buffer = parts.captured(2).toDouble();
             const double shownTrip = trip.captured(1).toDouble();
 
-            if (std::fabs((orders + buffer) - shownTotal) > 0.05) {
-                std::fprintf(stderr,
-                             "[ui-probe] 车辆面板分解式不自洽：订单货 %.1f + 缓冲货 %.1f "
-                             "!= 车上载重 %.1f\n",
-                             orders, buffer, shownTotal);
-                return 1;
-            }
             if (shownTotal > cap + 1e-6 || shownTrip > cap + 1e-6) {
                 std::fprintf(stderr,
                              "[ui-probe] 面板显示的载重超过上限 %.1fkg：车上载重 %.1f、"
@@ -442,9 +415,9 @@ int main(int argc, char** argv) {
                              cap, shownTotal, shownTrip);
                 return 1;
             }
-            std::printf("[ui-probe] 车辆面板 车上载重 %.1fkg（= 订单货 %.1f + 缓冲货 %.1f）"
-                        " <= 载重上限 %.1fkg；本趟出发装载 %.1fkg\n",
-                        shownTotal, orders, buffer, cap, shownTrip);
+            std::printf("[ui-probe] 车辆面板 车上载重 %.1fkg <= 载重上限 %.1fkg；"
+                        "本趟出发装载 %.1fkg\n",
+                        shownTotal, cap, shownTrip);
 
             // 时间必须常驻可见：软件内时间是事件刻/窗口/penalty 的共同基准，
             // 只在日志里出现等于"一滚就没了"。这里查状态栏确实带着它。

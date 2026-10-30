@@ -6,8 +6,6 @@
 #include <QToolBar>
 #include <QTabWidget>
 
-#include <map>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -88,16 +86,6 @@ public:
             }
             return t;
         }
-
-        // ---- 缓冲库存（2026-09-26 用户裁定恢复；只服务紧急单）----
-        // 车上剩余的缓冲货（不属于任何订单）。出仓时按计划装满，到站卸货/紧急单取用时递减。
-        double bufferKg = 0.0;
-        // 各中转站的**当前**库存——这是**权威物理量**：只由"车真的卸了/取了"来改动，
-        // 绝不从计划反推（P25）。计划里的 transitStock 只是投影，用于显示预测值。
-        std::map<std::string, double> stationStock;
-        // 已落账的寄存键（"站@时刻"）：重规划可能重新推导出同一条寄存，
-        // 用它去重，保证同一次物理卸货只记一次账。
-        std::set<std::string> creditedBanks;
     };
 
     // 供 --self-check-actions 核对
@@ -124,8 +112,8 @@ public:
     int toolbarActionCount() const;
     int dockCount() const;
     // ---- 运行日志导出（「导出运行日志…」按钮与 --export-log 共用同一条代码路径）----
-    // 记录：每次**事件触发**、每次**到达配送点时的车辆载重明细**（订单货 / 缓冲货 /
-    // 车上载重）、每次**出仓装车**与**顺路寄存**、以及紧急单的处置方式。
+    // 记录：每次**事件触发**、每次**到达配送点时的车辆载重明细**（订单货 / 车上载重）、
+    // 每次**出仓装车**、以及紧急单的处置方式。
     // 目的：把"确实会出现的问题"变成可以直接带出界面的证据，而不是要求对方复现。
     QString runLogText() const;
     bool exportRunLogTo(const QString& path) const;
