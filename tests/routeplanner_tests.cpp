@@ -1,6 +1,7 @@
 // RoutePlanner 的行为测试。
 // 期望值全部来自手工推导的字面量，不复用实现中的任何计算。
 #include <cmath>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -1125,6 +1126,186 @@ void testUrgentFitsLeavesOffloadsEmpty() {
     checkRouteIsWalkable(g, p, "W");
 }
 
+// ---- issue #5：A/B 顺路交货（装得下分支）----
+//
+// 图：W--A 5、W--B 3、W--X 4、A--B 2（均双向，距离/时间/成本取同一量纲便于手算）。
+// 车上已载 A 的普通货 20kg、B 的普通货 15kg；插紧急单 A→B 10kg（装得下）。
+// 期望：紧急趟 W→A(取货 + 顺路交付 A 货)→B(送紧急包裹 + 顺路交付 B 货)→W；
+// A、B 都只作为停靠点出现一次（不二次配送），B 的到达不晚于其它普通停靠点 X。
+LogisticsGraph makePassingGraph() {
+    LogisticsGraph g;
+    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
+    g.addNode(makeNode("A", NodeType::Delivery, "客户A"));
+    g.addNode(makeNode("B", NodeType::Delivery, "客户B"));
+    g.addNode(makeNode("X", NodeType::Delivery, "客户X"));
+    addTwoWay(g, "W", "A", 5.0, 10.0, 4.0);
+    addTwoWay(g, "W", "B", 3.0, 6.0, 2.0);
+    addTwoWay(g, "W", "X", 4.0, 8.0, 3.0);
+    addTwoWay(g, "A", "B", 2.0, 4.0, 2.0);
+    return g;
+}
+
+void testUrgentPassingDeliversAAndBGoods() {
+    const LogisticsGraph g = makePassingGraph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+
+    std::vector<Order> pending;
+    pending.push_back(makeOrder("O1", "A", 20.0, 0, 1440));
+    pending.push_back(makeOrder("O2", "B", 15.0, 0, 1440));
+    pending.push_back(makeOrder("O3", "X", 10.0, 0, 1440));
+    const std::vector<logistics::OnboardItem> onboard{{"A", 20.0}, {"B", 15.0}};
+
+    Order urgent;
+    urgent.id = "U1";
+    urgent.pickupNodeId = "A";
+    urgent.nodeId = "B";
+    urgent.demandKg = 10.0;
+    urgent.windowStartMin = 0;
+    urgent.windowEndMin = 1440;
+    urgent.urgent = true;
+
+    const InsertResult res = insertUrgentOrder(g, v, pending, urgent, "W", 480,
+                                               WeightType::Distance, onboard);
+    const RoutePlan& p = res.plan;
+
+    check(p.status == PlanStatus::Ok, "顺路交货（装得下）规划可行");
+    check(!p.trips.empty(), "至少一趟");
+    if (p.trips.empty()) {
+        return;
+    }
+    const logistics::Trip& t0 = p.trips[0];
+    check(t0.offloads.empty(), "装得下时无降载");
+    check(t0.stops.size() == 2, "紧急趟应有 A、B 两个停靠点，实际 "
+                                   + std::to_string(t0.stops.size()));
+    if (t0.stops.size() == 2) {
+        check(t0.stops[0].nodeId == "A" && t0.stops[1].nodeId == "B",
+              "A、B 顺序不变（A 前 B 后），实际 " + t0.stops[0].nodeId + "," + t0.stops[1].nodeId);
+    }
+    check(t0.nodes.front() == "W" && t0.nodes.back() == "W"
+              && std::find(t0.nodes.begin(), t0.nodes.end(), "A") != t0.nodes.end()
+              && std::find(t0.nodes.begin(), t0.nodes.end(), "B") != t0.nodes.end(),
+          "紧急趟从仓库出发、回到仓库，且经过 A、B，实际 " + join(t0.nodes));
+    check(fixtures::nearlyEqual(t0.totalDistanceKm, 10.0),
+          "顺路交付不额外绕路：W-A 5 + A-B 2 + B-W 3 = 10，实际 "
+              + std::to_string(t0.totalDistanceKm));
+    check(!t0.pickups.empty() && t0.pickups[0].orderId == "U1", "取货记录属于紧急单 U1");
+
+    // A、B 在整个计划里各只作为停靠点出现一次（普通候选已从 normalPool 移除，无二次配送）
+    int countA = 0;
+    int countB = 0;
+    bool hasX = false;
+    int arrivalB = -1;
+    for (const logistics::Stop& s : p.stops) {
+        if (s.nodeId == "A") {
+            ++countA;
+        }
+        if (s.nodeId == "B") {
+            ++countB;
+            arrivalB = s.arrivalMin;
+        }
+        if (s.nodeId == "X") {
+            hasX = true;
+        }
+    }
+    check(countA == 1, "A 只被配送一次（停靠出现 " + std::to_string(countA) + " 次）");
+    check(countB == 1, "B 只被配送一次（停靠出现 " + std::to_string(countB) + " 次）");
+    check(hasX, "未在车上的普通货 X 仍需单独配送");
+
+    // 紧急优先守卫（放宽后）：B 的到达 ≤ 其余普通停靠点（A/B 同点顺路交付除外）
+    bool bFirst = true;
+    for (const logistics::Stop& s : p.stops) {
+        if (s.nodeId == "A" || s.nodeId == "B") {
+            continue;
+        }
+        if (arrivalB > s.arrivalMin) {
+            bFirst = false;
+        }
+    }
+    check(bFirst, "紧急送达点 B 的到达不晚于其它普通停靠点");
+
+    checkRouteIsWalkable(g, p, "W");
+}
+
+// ---- issue #5：降载分支也支持顺路交货，且绝不卸 A/B 的货 ----
+//
+// 图同 issue #4。车上载 D1 40 + D2 30 + D3(A) 10 + D4(B) 10 = 90kg（上限 100），
+// 紧急单 D3→D4 要 50kg：free 10 → 需降载 40。降载只从 D1/D2 里挑（按离仓库最远：
+// D2 30 仍缺 → 再 D1 40，共 70），A/B 的货一个都不卸；送完后同一趟取回。
+void testUrgentOffloadKeepsAAndBDeliversBoth() {
+    const LogisticsGraph g = makeOffloadGraph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+
+    std::vector<Order> pending;
+    pending.push_back(makeOrder("O1", "D1", 40.0, 0, 1440));
+    pending.push_back(makeOrder("O2", "D2", 30.0, 0, 1440));
+    pending.push_back(makeOrder("O3", "D3", 10.0, 0, 1440));
+    pending.push_back(makeOrder("O4", "D4", 10.0, 0, 1440));
+    const std::vector<logistics::OnboardItem> onboard{
+        {"D1", 40.0}, {"D2", 30.0}, {"D3", 10.0}, {"D4", 10.0}};
+
+    Order urgent;
+    urgent.id = "U1";
+    urgent.pickupNodeId = "D3";
+    urgent.nodeId = "D4";
+    urgent.demandKg = 50.0;
+    urgent.windowStartMin = 0;
+    urgent.windowEndMin = 1440;
+    urgent.urgent = true;
+
+    const InsertResult res = insertUrgentOrder(g, v, pending, urgent, "W", 480,
+                                               WeightType::Distance, onboard);
+    const RoutePlan& p = res.plan;
+
+    check(p.status == PlanStatus::Ok, "顺路交货 + 降载规划可行");
+    check(!p.trips.empty(), "至少一趟");
+    if (p.trips.empty()) {
+        return;
+    }
+    const logistics::Trip& t0 = p.trips[0];
+    check(!t0.offloads.empty(), "装不下时应降载");
+
+    // 降载绝不卸 A(D3)/B(D4) 的货
+    bool keepsA = true;
+    bool keepsB = true;
+    double freed = 0.0;
+    for (const logistics::OffloadOp& op : t0.offloads) {
+        freed += op.kg;
+        if (op.nodeId == "D3") {
+            keepsA = false;
+        }
+        if (op.nodeId == "D4") {
+            keepsB = false;
+        }
+        check(op.station == "S", "降载只发生在中转站 S");
+    }
+    check(keepsA && keepsB, "降载绝不卸 A/B 目的地的货");
+    check(fixtures::nearlyEqual(freed, t0.reclaimKg), "暂存守恒：Σoffloads.kg == reclaimKg");
+
+    // 序列 W->S(卸)->D3(取+交付)->D4(送+交付)->S(取回)->W
+    check(t0.nodes == std::vector<std::string>({"W", "S", "D3", "D4", "S", "W"}),
+          "降载 + 顺路交货趟序列，实际 " + join(t0.nodes));
+    check(t0.stops.size() == 2 && t0.stops[0].nodeId == "D3" && t0.stops[1].nodeId == "D4",
+          "D3(A)、D4(B) 均作为停靠点且顺序不变");
+    check(t0.loadKg <= v.capacityKg + 1e-9, "降载趟载重不超过上限");
+    check(fixtures::nearlyEqual(t0.loadKg, 70.0),
+          "降载趟峰值载重 = 剩余在途 20 + 紧急 50 = 70，实际 " + std::to_string(t0.loadKg));
+
+    // D3/D4 全计划各只配送一次
+    int countD3 = 0;
+    int countD4 = 0;
+    for (const logistics::Stop& s : p.stops) {
+        if (s.nodeId == "D3") {
+            ++countD3;
+        }
+        if (s.nodeId == "D4") {
+            ++countD4;
+        }
+    }
+    check(countD3 == 1 && countD4 == 1, "A/B 只被配送一次（无二次配送）");
+
+    checkRouteIsWalkable(g, p, "W");
+}
+
 int main() {
     testSingleOrderRouteIsFullyCorrect();
     testEmptyOrdersDegeneratesToNoMovement();
@@ -1151,6 +1332,8 @@ int main() {
     testTripContinuityAfterUrgentInsertWhileEnRoute();
     testUrgentOffloadToTransitWhenNotFitting();
     testUrgentFitsLeavesOffloadsEmpty();
+    testUrgentPassingDeliversAAndBGoods();
+    testUrgentOffloadKeepsAAndBDeliversBoth();
 
     return testutil::summarize("routeplanner_tests");
 }

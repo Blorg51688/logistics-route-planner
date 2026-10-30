@@ -242,6 +242,157 @@ void eraseCandidateByNode(std::vector<Candidate>& pool, const std::string& nodeI
     }
 }
 
+// issue #5：从 onboard + normalPool 里挑出"目的地恰为 nodeId、且此刻已在车上"的普通候选。
+// 只有真的在车上的货才顺路交付——仅存在于 normalPool 的普通单仍按原计划单独配送。
+void collectPassingCandidates(const std::vector<OnboardItem>& onboard,
+                              const std::string& nodeId,
+                              const std::vector<Candidate>& normalPool,
+                              std::vector<Candidate>& out) {
+    if (nodeId.empty()) {
+        return;
+    }
+    bool onboardHere = false;
+    for (const OnboardItem& it : onboard) {
+        if (it.nodeId == nodeId) {
+            onboardHere = true;
+            break;
+        }
+    }
+    if (!onboardHere) {
+        return;
+    }
+    for (const Candidate& c : normalPool) {
+        if (c.nodeId == nodeId) {
+            out.push_back(c);
+            return;
+        }
+    }
+}
+
+// issue #5：紧急取送趟顺路交付 A/B 的普通货。
+//
+// 车上已有目的地恰为 A 或 B 的普通货时，去 A 取紧急包裹的同时把 A 的普通货交付掉，
+// 到 B 送紧急包裹时与 B 的普通货**同点合并**交付。停靠点就是 A/B 本身，**不额外绕路**。
+// passingA/passingB 必须是调用方已确认要并入本趟的普通候选；本趟生成后调用方负责
+// 把它们从 normalPool 移除，避免二次配送（双重送达）。
+//
+// 无 passing 时不走这里（保持 #3/#4 的单紧急趟逐位不变）。loadAtStart 为出发时
+// 车上载重（降载分支为卸货后的剩余量）；trip.loadKg 记取货后的峰值载重。
+bool weaveUrgentWithPassing(const LogisticsGraph& graph,
+                            const Candidate& urgent,
+                            const std::vector<Candidate>& passingA,
+                            const std::vector<Candidate>& passingB,
+                            const std::string& startPos,
+                            const std::string& pickupNode,
+                            double loadAtStart,
+                            double& elapsedMin,
+                            WeightType weight,
+                            const std::string& endNode,
+                            Trip& trip,
+                            std::string& failReason) {
+    const std::string B = urgent.nodeId;
+    trip.loadKg = loadAtStart + urgent.demandKg;
+
+    std::string current = startPos;
+    beginTrip(trip, current, elapsedMin);
+    double load = loadAtStart;
+
+    // 到取货点 A；车上若有 A 的普通货，A 同时是一次顺路交付停靠。
+    const bool stopAtA = !passingA.empty();
+    if (current != pickupNode) {
+        if (!appendLeg(graph, trip, elapsedMin, current, pickupNode, weight,
+                       stopAtA, failReason)) {
+            return false;
+        }
+        current = pickupNode;
+    }
+    if (stopAtA) {
+        Candidate merged = passingA.front();
+        merged.nodeId = pickupNode;
+        merged.pickupNodeId.clear();
+        merged.orderId.clear();
+        merged.urgent = false;
+        for (std::size_t i = 1; i < passingA.size(); ++i) {
+            merged.demandKg += passingA[i].demandKg;
+            if (passingA[i].windowStartMin < merged.windowStartMin) {
+                merged.windowStartMin = passingA[i].windowStartMin;
+            }
+            if (passingA[i].windowEndMin > merged.windowEndMin) {
+                merged.windowEndMin = passingA[i].windowEndMin;
+            }
+        }
+        Stop stop;
+        stop.nodeId = pickupNode;
+        const double rawArrival = elapsedMin;
+        const double wait = (static_cast<double>(merged.windowStartMin) > rawArrival)
+                                ? (static_cast<double>(merged.windowStartMin) - rawArrival) : 0.0;
+        const double arrival = rawArrival + wait;
+        stop.rawArrivalMin = static_cast<int>(std::lround(rawArrival));
+        stop.waitMin = static_cast<int>(std::lround(wait));
+        stop.arrivalMin = static_cast<int>(std::lround(arrival));
+        stop.late = arrival > static_cast<double>(merged.windowEndMin);
+        stop.penaltyMin = stop.late
+            ? static_cast<int>(std::lround(arrival - static_cast<double>(merged.windowEndMin))) : 0;
+        // 该停靠节点就是刚走到的 A（appendLeg 已在此下标置 nodeIsStop=true）；
+        // 到达时刻记为等窗口后的实际送达时刻。
+        trip.nodeArrivalMin.back() = stop.arrivalMin;
+        trip.nodeIsStop.back() = true;
+        elapsedMin = arrival;
+        // 同一停靠先装上紧急包裹、再交付 A 的普通货。
+        load += urgent.demandKg;
+        load -= merged.demandKg;
+        stop.remainingLoadKg = load;
+        trip.stops.push_back(stop);
+    }
+
+    // 到 B：紧急送达；与 B 的普通货同点合并为一个停靠。
+    if (current != B) {
+        if (!appendLeg(graph, trip, elapsedMin, current, B, weight, true, failReason)) {
+            return false;
+        }
+        current = B;
+    }
+    {
+        Candidate merged = urgent;   // 窗口以紧急单为准，再并入普通货的窗口并集
+        merged.pickupNodeId.clear();
+        for (const Candidate& p : passingB) {
+            merged.demandKg += p.demandKg;
+            if (p.windowStartMin < merged.windowStartMin) {
+                merged.windowStartMin = p.windowStartMin;
+            }
+            if (p.windowEndMin > merged.windowEndMin) {
+                merged.windowEndMin = p.windowEndMin;
+            }
+        }
+        Stop stop;
+        stop.nodeId = B;
+        const double rawArrival = elapsedMin;
+        const double wait = (static_cast<double>(merged.windowStartMin) > rawArrival)
+                                ? (static_cast<double>(merged.windowStartMin) - rawArrival) : 0.0;
+        const double arrival = rawArrival + wait;
+        stop.rawArrivalMin = static_cast<int>(std::lround(rawArrival));
+        stop.waitMin = static_cast<int>(std::lround(wait));
+        stop.arrivalMin = static_cast<int>(std::lround(arrival));
+        stop.late = arrival > static_cast<double>(merged.windowEndMin);
+        stop.penaltyMin = stop.late
+            ? static_cast<int>(std::lround(arrival - static_cast<double>(merged.windowEndMin))) : 0;
+        trip.nodeArrivalMin.back() = stop.arrivalMin;
+        trip.nodeIsStop.back() = true;
+        elapsedMin = arrival;
+        load -= merged.demandKg;   // 紧急包裹 + B 的普通货一次卸下
+        stop.remainingLoadKg = load;
+        trip.stops.push_back(stop);
+    }
+
+    if (current != endNode) {
+        if (!appendLeg(graph, trip, elapsedMin, current, endNode, weight, false, failReason)) {
+            return false;
+        }
+    }
+    trip.endNodeId = endNode;
+    return true;
+}
+
 double totalDemand(const std::vector<Candidate>& pool) {
     double sum = 0.0;
     for (const Candidate& c : pool) {
@@ -356,6 +507,16 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
         }
         const double freeKg = vehicle.capacityKg - onboardLoad;
 
+        // issue #5：A/B 本身常也是普通订单的配送点。车上若已有目的地恰为 A 或 B
+        // 的普通货，就把它们并入这一趟顺路交付（停靠点仍是 A/B，不额外绕路）。
+        // 这些普通候选会在本趟生成后从 normalPool 移除，避免二次配送。
+        std::vector<Candidate> passingA;
+        std::vector<Candidate> passingB;
+        if (!c.pickupNodeId.empty()) {
+            collectPassingCandidates(onboard, c.pickupNodeId, normalPool, passingA);
+            collectPassingCandidates(onboard, c.nodeId, normalPool, passingB);
+        }
+
         if (c.demandKg > freeKg + 1e-9) {
             // ---- 装不下：整单降载 + 完成后取回（issue #4）----
             const double need = c.demandKg - freeKg;
@@ -460,13 +621,25 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
                 trip.offloads.push_back(op);
             }
             Trip sub;
-            std::vector<Candidate> single;
-            single.push_back(c);
-            if (!weave(graph, single, bestStation, elapsed, weight, pickup,
-                       bestStation, c.demandKg, sub, fail)) {
-                plan.status = PlanStatus::Unreachable;
-                plan.reason = fail;
-                return plan;
+            if (passingA.empty() && passingB.empty()) {
+                std::vector<Candidate> single;
+                single.push_back(c);
+                if (!weave(graph, single, bestStation, elapsed, weight, pickup,
+                           bestStation, c.demandKg, sub, fail)) {
+                    plan.status = PlanStatus::Unreachable;
+                    plan.reason = fail;
+                    return plan;
+                }
+            } else {
+                // 顺路交付 A/B 的普通货（issue #5）。降载后剩余在途货 = onboardLoad - freed，
+                // 其中 A/B 的货保证不会被卸（见上），仍在车上，故可顺路交付。
+                if (!weaveUrgentWithPassing(graph, c, passingA, passingB, bestStation, pickup,
+                                            onboardLoad - freed, elapsed, weight, bestStation,
+                                            sub, fail)) {
+                    plan.status = PlanStatus::Unreachable;
+                    plan.reason = fail;
+                    return plan;
+                }
             }
             for (std::size_t i = 1; i < sub.nodes.size(); ++i) {
                 trip.nodes.push_back(sub.nodes[i]);
@@ -495,8 +668,16 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
                 return plan;
             }
             trip.endNodeId = vehicle.startNodeId;
-            trip.loadKg = c.demandKg;
+            // 剩余在途货 + 紧急包裹 = 本趟峰值载重（≤ 上限，因已按需降载）
+            trip.loadKg = (onboardLoad - freed) + c.demandKg;
             plan.trips.push_back(trip);
+            // 顺路交付的普通候选已并入本趟，从 normalPool 移除，避免二次配送
+            for (const Candidate& p : passingA) {
+                eraseCandidateByNode(normalPool, p.nodeId);
+            }
+            for (const Candidate& p : passingB) {
+                eraseCandidateByNode(normalPool, p.nodeId);
+            }
             current = vehicle.startNodeId;
             urgentPool.erase(urgentPool.begin());
             continue;
@@ -504,13 +685,31 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
 
         Trip trip;
         std::string fail;
-        std::vector<Candidate> single;
-        single.push_back(c);
-        if (!weave(graph, single, current, elapsed, weight, pickup,
-                   vehicle.startNodeId, c.demandKg, trip, fail)) {
-            plan.status = PlanStatus::Unreachable;
-            plan.reason = fail;
-            return plan;
+        if (passingA.empty() && passingB.empty()) {
+            std::vector<Candidate> single;
+            single.push_back(c);
+            if (!weave(graph, single, current, elapsed, weight, pickup,
+                       vehicle.startNodeId, c.demandKg, trip, fail)) {
+                plan.status = PlanStatus::Unreachable;
+                plan.reason = fail;
+                return plan;
+            }
+        } else {
+            // 顺路交付 A/B 的普通货（issue #5）：装得下的分支。
+            if (!weaveUrgentWithPassing(graph, c, passingA, passingB, current, pickup,
+                                        onboardLoad, elapsed, weight, vehicle.startNodeId,
+                                        trip, fail)) {
+                plan.status = PlanStatus::Unreachable;
+                plan.reason = fail;
+                return plan;
+            }
+        }
+        // 顺路交付的普通候选已并入本趟，从 normalPool 移除，避免二次配送
+        for (const Candidate& p : passingA) {
+            eraseCandidateByNode(normalPool, p.nodeId);
+        }
+        for (const Candidate& p : passingB) {
+            eraseCandidateByNode(normalPool, p.nodeId);
         }
         if (!c.pickupNodeId.empty()) {
             PickupOp op;

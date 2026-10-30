@@ -438,12 +438,17 @@ void MainWindow::arriveAt(const std::string& nodeId, int timeMin) {
 
 void MainWindow::deliverAt(const logistics::Stop& stop) {
     // 卸货 + 记账。这两件事都是"已经发生的事实"，重规划不得改写。
+    //
+    // issue #5：一次停靠可能载着**同一节点上的多条货**（例如 B 点既有紧急包裹、
+    // 又有 B 的普通货，或同一节点合并的多张普通单）。必须把该节点上的货**全部**
+    // 卸下并累加 kg，而不是只移除一条——否则会残留一条已送过的货，被后续
+    // 重规划当成在途货再送一遍。
     bool offloaded = false;
-    for (std::size_t i = 0; i < state_.onboard.size(); ++i) {
-        if (state_.onboard[i].nodeId == stop.nodeId) {
-            state_.onboard.erase(state_.onboard.begin() + static_cast<std::ptrdiff_t>(i));
+    for (std::size_t i = state_.onboard.size(); i > 0; --i) {
+        const std::size_t k = i - 1;
+        if (state_.onboard[k].nodeId == stop.nodeId) {
+            state_.onboard.erase(state_.onboard.begin() + static_cast<std::ptrdiff_t>(k));
             offloaded = true;
-            break;
         }
     }
     if (!offloaded) {
@@ -983,11 +988,33 @@ void MainWindow::onAdvanceStop() {
     if (cursorMatches) {
         const Stop& stop = plan_.stops[stopCursor_];
         ++stopCursor_;
-        appendLog(QStringLiteral("送达 %1（到达 %2%3）")
-                      .arg(QString::fromStdString(stop.nodeId))
-                      .arg(minutesToClock(stop.arrivalMin))
-                      .arg(stop.late ? QStringLiteral("，超时 penalty %1min").arg(stop.penaltyMin)
-                                     : QString()));
+        // issue #5：该停靠点若同时也是本趟的取货点 A，说明这里是「顺路交付」——
+        // 到 A 取紧急包裹的同时，把车上本就要送到 A 的普通货一并交付。
+        bool passingDelivery = false;
+        if (nodeIndex_ < plan_.nodeTripIndex.size()) {
+            const std::size_t ti = plan_.nodeTripIndex[nodeIndex_];
+            if (ti < plan_.trips.size()) {
+                for (const logistics::PickupOp& pk : plan_.trips[ti].pickups) {
+                    if (!pk.pickupNodeId.empty() && pk.pickupNodeId == stop.nodeId) {
+                        passingDelivery = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (passingDelivery) {
+            appendLog(QStringLiteral("顺路交付 %1（取货点同点，到达 %2%3）")
+                          .arg(QString::fromStdString(stop.nodeId))
+                          .arg(minutesToClock(stop.arrivalMin))
+                          .arg(stop.late ? QStringLiteral("，超时 penalty %1min").arg(stop.penaltyMin)
+                                         : QString()));
+        } else {
+            appendLog(QStringLiteral("送达 %1（到达 %2%3）")
+                          .arg(QString::fromStdString(stop.nodeId))
+                          .arg(minutesToClock(stop.arrivalMin))
+                          .arg(stop.late ? QStringLiteral("，超时 penalty %1min").arg(stop.penaltyMin)
+                                         : QString()));
+        }
         // 导出用的**到达时载重明细**（在卸货之前记，反映"到达这一刻车上载着什么"）。
         // 这是用户要向缺陷修复对话出示的核心证据。
         {
@@ -1990,8 +2017,28 @@ int MainWindow::runActionSelfCheck() {
             }
         }
         expect(ia < ib, QStringLiteral("取送顺序：A 必须早于 B（A@%1, B@%2）").arg(ia).arg(ib));
-        expect(!plan_.stops.empty() && plan_.stops.front().nodeId == B,
-               QStringLiteral("紧急送达点 B 应是第一个停靠点"));
+        // 紧急优先守卫（issue #5 放宽）：B 的到达 ≤ 其余普通停靠点；A/B 同点顺路交付
+        // 时 A 可能排在 B 之前（到 A 取货的同时交付 A 的普通货），这是允许的例外。
+        bool bServed = false;
+        int bArrival = -1;
+        for (const logistics::Stop& s : plan_.stops) {
+            if (s.nodeId == B) {
+                bServed = true;
+                bArrival = s.arrivalMin;
+                break;
+            }
+        }
+        bool bFirst = bServed;
+        for (const logistics::Stop& s : plan_.stops) {
+            if (s.nodeId == A || s.nodeId == B) {
+                continue;
+            }
+            if (bArrival >= 0 && bArrival > s.arrivalMin) {
+                bFirst = false;
+            }
+        }
+        expect(bServed, QStringLiteral("紧急送达点 B 必须出现在计划停靠点里"));
+        expect(bFirst, QStringLiteral("紧急送达点 B 的到达不晚于其它普通停靠点（A/B 顺路交付除外）"));
         // 推进到取货点 A：应进入「执行中（已取未送）」；到达 B：应完成。
         bool picked = false;
         for (int i = 0; i < 60 && !picked; ++i) {
