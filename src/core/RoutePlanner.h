@@ -34,6 +34,16 @@ struct Stop {
     double remainingLoadKg = 0.0;  // 离开该站时的剩余载重
 };
 
+// 一次取货（紧急取送单在取货点 A 装上包裹）。
+// 只用于把"在 A 装了哪张单的包裹、送往哪里、多少 kg"传给界面与测试；
+// 送达仍走 Trip::stops（只有送达点 B 是停靠点、才有窗口与 penalty）。
+struct PickupOp {
+    std::string orderId;
+    std::string pickupNodeId;    // 取货点 A
+    std::string deliverNodeId;   // 送达点 B
+    double      kg = 0.0;
+};
+
 // 一趟行程：车辆的一段连续行程。
 // 起点 = 上一趟的终点（首趟为规划起点），终点 = 起始仓库。
 // （注 2026-09-26：中转站不参与排线，故每趟终点都是起始仓库，见 docs/设计.md §16 P25/P30。）
@@ -45,6 +55,8 @@ struct Trip {
     // 本趟车上装载的货量（不变量：任一趟都不得超过载重上限）。
     // 与"剩余待送总量"是两回事——多趟模式下车辆不会一次装完全部货物。
     double loadKg = 0.0;
+    // 本趟的取货记录（紧急取送单在 A 装货）。普通趟为空。
+    std::vector<PickupOp> pickups;
     double totalDistanceKm = 0.0;
     double totalCostYuan   = 0.0;
     double totalTimeMin    = 0.0;

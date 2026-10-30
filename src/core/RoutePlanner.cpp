@@ -12,6 +12,8 @@ namespace {
 // 一个待服务的停靠点候选
 struct Candidate {
     std::string nodeId;
+    std::string pickupNodeId;   // 取送式紧急单的取货点 A（普通单为空）
+    std::string orderId;        // 取送式紧急单的订单号（供取货记录回报）
     double      demandKg = 0.0;
     int         windowStartMin = 0;
     int         windowEndMin = 0;
@@ -24,8 +26,25 @@ struct Candidate {
 std::vector<Candidate> buildCandidates(const std::vector<Order>& orders) {
     std::vector<Candidate> candidates;
     for (const Order& o : orders) {
+        // 取送式紧急单（有取货点 A）：各自独立成候选，**不**并入普通停靠点，
+        // 因为它不是"仓库→客户"的普通配送，而是"A 取 → B 送"的一段独立行程。
+        if (!o.pickupNodeId.empty()) {
+            Candidate c;
+            c.nodeId = o.nodeId;
+            c.pickupNodeId = o.pickupNodeId;
+            c.orderId = o.id;
+            c.demandKg = o.demandKg;
+            c.windowStartMin = o.windowStartMin;
+            c.windowEndMin = o.windowEndMin;
+            c.urgent = o.urgent;
+            candidates.push_back(c);
+            continue;
+        }
         bool merged = false;
         for (Candidate& c : candidates) {
+            if (!c.pickupNodeId.empty()) {
+                continue;   // 不把普通单并进取送候选
+            }
             if (c.nodeId != o.nodeId) {
                 continue;
             }
@@ -313,41 +332,41 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
     double elapsed = static_cast<double>(startTimeMin);
     std::string current = startPos;
 
+    // 紧急取送单：每张独立成趟、最先执行，按插入顺序（FIFO）。
+    // 行程：当前位置 → A(取货) → B(送达) → 仓库；只有 B 是配送停靠点（有窗口/penalty）。
     while (!urgentPool.empty()) {
-        double batchLoad = 0.0;
-        std::vector<Candidate> batch;
-        for (const Candidate& c : urgentPool) {
-            if (c.demandKg > vehicle.capacityKg + 1e-9) {
-                plan.status = PlanStatus::OrderExceedsCapacity;
-                std::ostringstream os;
-                os << "订单货量 " << static_cast<long long>(std::lround(c.demandKg))
-                   << "kg 超过载重上限 "
-                   << static_cast<long long>(std::lround(vehicle.capacityKg)) << "kg";
-                plan.reason = os.str();
-                return plan;
-            }
-            if (batchLoad + c.demandKg <= vehicle.capacityKg + 1e-9) {
-                batch.push_back(c);
-                batchLoad += c.demandKg;
-            }
-        }
-        if (batch.empty()) {
-            break;   // 兜底
+        const Candidate c = urgentPool.front();
+        if (c.demandKg > vehicle.capacityKg + 1e-9) {
+            plan.status = PlanStatus::OrderExceedsCapacity;
+            std::ostringstream os;
+            os << "订单货量 " << static_cast<long long>(std::lround(c.demandKg))
+               << "kg 超过载重上限 "
+               << static_cast<long long>(std::lround(vehicle.capacityKg)) << "kg";
+            plan.reason = os.str();
+            return plan;
         }
         Trip trip;
         std::string fail;
-        // 紧急批独立成趟：先从车辆当前位置回仓库取货，再依次送达，最后回仓库。
-        if (!weave(graph, batch, current, elapsed, weight,
-                   vehicle.startNodeId, vehicle.startNodeId, batchLoad, trip, fail)) {
+        std::vector<Candidate> single;
+        single.push_back(c);
+        const std::string pickup = c.pickupNodeId.empty() ? vehicle.startNodeId : c.pickupNodeId;
+        if (!weave(graph, single, current, elapsed, weight, pickup,
+                   vehicle.startNodeId, c.demandKg, trip, fail)) {
             plan.status = PlanStatus::Unreachable;
             plan.reason = fail;
             return plan;
         }
+        if (!c.pickupNodeId.empty()) {
+            PickupOp op;
+            op.orderId = c.orderId;
+            op.pickupNodeId = c.pickupNodeId;
+            op.deliverNodeId = c.nodeId;
+            op.kg = c.demandKg;
+            trip.pickups.push_back(op);
+        }
         plan.trips.push_back(trip);
         current = vehicle.startNodeId;
-        for (const Candidate& b : batch) {
-            eraseCandidateByNode(urgentPool, b.nodeId);
-        }
+        urgentPool.erase(urgentPool.begin());
     }
 
     // ---- 车上已经载着的货，接着把它们送掉（在**紧急订单之后**）----
@@ -556,6 +575,14 @@ RoutePlan replan(const LogisticsGraph& graph,
 
     const std::vector<Candidate> remaining = buildCandidates(remainingOrders);
     const double total = totalDemand(remaining);
+
+    // 只要存在取送式紧急单（有取货点 A），就必须走多趟入口：单趟 weave 无法表达"A 取 → B 送"。
+    for (const Order& o : remainingOrders) {
+        if (!o.pickupNodeId.empty()) {
+            return multiTripPlan(graph, vehicle, remaining, currentPositionId, currentTimeMin,
+                                 weight, onboard);
+        }
+    }
 
     if (total > vehicle.capacityKg + 1e-9) {
         // 总需求超过载重：改走多趟分批（D21），不再判为不可行
@@ -778,6 +805,14 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
     const std::string startPos =
         previous.nodes.empty() ? vehicle.startNodeId : previous.nodes.front();
 
+    // 含取送式紧急单时，增量重算无法保证 A→B 取送链完整，直接退回全量重规划。
+    for (const Order& o : remainingOrders) {
+        if (!o.pickupNodeId.empty()) {
+            return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
+                          weight, onboard);
+        }
+    }
+
     // 适用范围：序列完整的多趟（或单趟）剩余路线。
     // **逐趟增量**：每一趟各自只重算受影响的 leg，互不影响；
     // 任何一趟增量失败（不可达/序列不全）就整体退回全量重算。
@@ -879,23 +914,31 @@ InsertResult insertUrgentOrder(const LogisticsGraph& graph,
     std::vector<Order> all = remainingOrders;
     all.push_back(inserted);
 
-    // 冲突判定：最早到达时刻始终按耗时维度衡量，与本次规划所选策略无关
-    const PathResult toNew =
-        shortestPath(graph, currentPositionId, inserted.nodeId, WeightType::Time);
-    if (!toNew.found) {
-        result.warning = "紧急订单目标不可达: " + inserted.nodeId;
+    // 可达性与窗口：按 current→A(取货) → B(送达) 的耗时估计（耗时维度，与策略无关）。
+    if (inserted.pickupNodeId.empty()) {
+        result.warning = "紧急取送单缺少取货点 A";
     } else {
-        const int earliestArrival =
-            currentTimeMin + static_cast<int>(std::lround(toNew.totalWeight));
-        if (inserted.windowEndMin < earliestArrival) {
-            result.warning = "紧急订单 " + inserted.id + " 无法在窗口内送达（窗口止 "
-                             + std::to_string(inserted.windowEndMin) + "，最早到达 "
-                             + std::to_string(earliestArrival) + "）";
+        const PathResult toA =
+            shortestPath(graph, currentPositionId, inserted.pickupNodeId, WeightType::Time);
+        const PathResult ab =
+            shortestPath(graph, inserted.pickupNodeId, inserted.nodeId, WeightType::Time);
+        if (!toA.found) {
+            result.warning = "紧急取货点 A 不可达: " + inserted.pickupNodeId;
+        } else if (!ab.found) {
+            result.warning = "紧急送达点 B 不可达: " + inserted.nodeId;
+        } else {
+            const int earliestArrival =
+                currentTimeMin + static_cast<int>(std::lround(toA.totalWeight + ab.totalWeight));
+            if (inserted.windowEndMin < earliestArrival) {
+                result.warning = "紧急订单 " + inserted.id + " 无法在窗口内送达（窗口止 "
+                                 + std::to_string(inserted.windowEndMin) + "，最早到达 "
+                                 + std::to_string(earliestArrival) + "）";
+            }
         }
     }
 
     // 并入订单集合后，从车辆当前位置与当前时刻整条重算：
-    // 紧急订单会独立成趟、先从仓库取货，行为与历史一致。
+    // 取送式紧急单会独立成趟，按 当前位置 → A 取 → B 送 → 仓库。
     result.plan = replan(graph, vehicle, all, currentPositionId, currentTimeMin,
                          weight, onboard);
     return result;

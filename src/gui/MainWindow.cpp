@@ -18,6 +18,8 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QGuiApplication>
+#include <QInputDialog>
 #include <QLabel>
 #include <QStatusBar>
 #include <QFile>
@@ -652,50 +654,59 @@ std::string MainWindow::nextFreeId(const char* prefix) const {
     return std::string(prefix) + "999";
 }
 
-std::string MainWindow::insertUrgentOrderAction() {
-    if (config_.orders.empty() || config_.vehicles.empty()) {
-        appendLog(QStringLiteral("配置中没有可插入的配送点"));
+std::string MainWindow::insertUrgentOrderAt(const std::string& a, const std::string& b,
+                                            double demand) {
+    if (config_.vehicles.empty()) {
+        appendLog(QStringLiteral("配置中没有车辆"));
         return std::string();
     }
-    const std::vector<Order> pending = remainingOrders();
-    if (pending.empty()) {
-        appendLog(QStringLiteral("没有未服务的配送点，无法插入紧急订单"));
+    const logistics::Node* na = config_.graph.findNode(a);
+    const logistics::Node* nb = config_.graph.findNode(b);
+    if (na == nullptr || nb == nullptr
+        || na->type != logistics::NodeType::Delivery
+        || nb->type != logistics::NodeType::Delivery) {
+        appendLog(QStringLiteral("紧急取送单：取货点 A、送达点 B 必须是客户（配送）节点"));
         return std::string();
     }
-    const Order& base = pending[rng_.nextInt(0, static_cast<int>(pending.size()) - 1)];
+    if (a == b) {
+        appendLog(QStringLiteral("紧急取送单：起点 A 与终点 B 不能相同"));
+        return std::string();
+    }
+    const double cap = config_.vehicles.front().capacityKg;
+    if (!(demand > 0.0) || demand > cap + 1e-9) {
+        appendLog(QStringLiteral("紧急取送单：送货量须在 (0, 载重上限] 内"));
+        return std::string();
+    }
+    const logistics::PathResult toA = logistics::shortestPath(
+        config_.graph, currentPositionId(), a, logistics::WeightType::Time);
+    const logistics::PathResult ab =
+        logistics::shortestPath(config_.graph, a, b, logistics::WeightType::Time);
+    if (!toA.found || !ab.found) {
+        appendLog(QStringLiteral("紧急取送单：取货点 A 或送达点 B 不可达"));
+        return std::string();
+    }
 
     Order urgent;
     urgent.id = nextFreeId("U");
-    urgent.nodeId = base.nodeId;
-    // 货量一律**整公斤**（本项目所有货量数据都是整数，见导出日志的"货量口径"守卫）。
-    // 原实现是 `3.0 + nextRange(0.0, 7.0)`，会产出 3.3kg 这类小数，并一路传播到
-    // 车上载重，使导出证据里出现看不懂的小数。区间仍是 3–10kg。
-    //
-    // 为什么用「nextRange + floor」而不是 nextInt：两者都只消耗一次 nextU32()，
-    // 但 nextInt 用取模（`nextU32() % span`），会**改变后续随机序列**；而 self-check
-    // 里"连续两次插单不丢单""新客户被纳入配送"两条既有断言依赖该序列的具体走向，
-    // 换实现后它们会失败（实测 3 项红）。保持 nextRange 只加 floor，随机流形状不变，
-    // 只消除小数——不为此去改那两条无关断言。
-    urgent.demandKg = std::floor(3.0 + rng_.nextRange(0.0, 8.0));
-    // 需求原文的举例就是「1 小时内送达」：窗口起 = 当前时刻，止 = 当前时刻 + 60 分钟。
-    // （早先这里写的是 0–1440 全天，等于没有时间要求，是错的。）
+    urgent.pickupNodeId = a;
+    urgent.nodeId = b;
+    urgent.demandKg = std::floor(demand);
     urgent.windowStartMin = currentTimeMin();
     urgent.windowEndMin = currentTimeMin() + 60;
     urgent.urgent = true;
     urgent.served = false;
 
+    const std::vector<Order> pending = remainingOrders();
     const logistics::InsertResult inserted = logistics::insertUrgentOrder(
         config_.graph, config_.vehicles.front(), pending, urgent, currentPositionId(),
         currentTimeMin(), planWeight_, onboardGoods());
 
-    // 关键：必须并入 config_.orders。
-    // 否则订单表看不到这一单，且下一次 replan 用 remainingOrders() 重建候选集时
-    // 它会消失——连续插单就只剩最后一单，"所有紧急订单同级、且整体高于普通订单"
-    // 这个性质随之失效。这正是人工测试第 10 关发现的问题。
+    // 必须并入 config_.orders，否则连续插单会丢单、订单表也看不见。
     config_.orders.push_back(urgent);
 
-    appendLog(QStringLiteral("插入紧急订单 %1 @ %2（货量 %3kg，要求 %4 前送达）")
+    appendLog(QStringLiteral("插入紧急取送单 %1：%2 取 → %3 送（货量 %4kg，%5 前送达）")
                   .arg(QString::fromStdString(urgent.id))
+                  .arg(QString::fromStdString(urgent.pickupNodeId))
                   .arg(QString::fromStdString(urgent.nodeId))
                   .arg(urgent.demandKg, 0, 'f', 0)
                   .arg(minutesToClock(urgent.windowEndMin)));
@@ -709,8 +720,71 @@ std::string MainWindow::insertUrgentOrderAction() {
     return urgent.id;
 }
 
+std::string MainWindow::insertUrgentOrderAction() {
+    // 事件触发 / 自检 / 演示路径：随机取两个不同客户节点作 A、B，货量 3–10kg 整公斤。
+    std::vector<std::string> cust;
+    for (const logistics::Node& n : config_.graph.nodes()) {
+        if (n.type == logistics::NodeType::Delivery) {
+            cust.push_back(n.id);
+        }
+    }
+    if (cust.size() < 2) {
+        appendLog(QStringLiteral("客户节点不足，无法插入紧急取送单"));
+        return std::string();
+    }
+    int ia = rng_.nextInt(0, static_cast<int>(cust.size()) - 1);
+    int ib = rng_.nextInt(0, static_cast<int>(cust.size()) - 1);
+    if (ib == ia) {
+        ib = (ib + 1) % static_cast<int>(cust.size());
+    }
+    const double demand = std::floor(3.0 + rng_.nextRange(0.0, 8.0));
+    return insertUrgentOrderAt(cust[static_cast<std::size_t>(ia)],
+                               cust[static_cast<std::size_t>(ib)], demand);
+}
+
 void MainWindow::onInsertUrgentOrder() {
-    insertUrgentOrderAction();
+    // 无头环境（--self-check-actions / --demo / offscreen 渲染）不能弹模态框：
+    // 退化为随机 A/B，保持自动化路径可跑。
+    if (QGuiApplication::platformName() == QStringLiteral("offscreen")) {
+        insertUrgentOrderAction();
+        return;
+    }
+    // GUI：手选取货点 A、送达点 B、送货量。
+    QStringList items;
+    for (const logistics::Node& n : config_.graph.nodes()) {
+        if (n.type == logistics::NodeType::Delivery) {
+            items << QString::fromStdString(n.id);
+        }
+    }
+    if (items.size() < 2) {
+        appendLog(QStringLiteral("客户节点不足，无法插入紧急取送单"));
+        return;
+    }
+    bool ok = false;
+    const QString a = QInputDialog::getItem(this, QStringLiteral("插入紧急取送单"),
+                                            QStringLiteral("取货点 A："), items, 0, false, &ok);
+    if (!ok || a.isEmpty()) {
+        return;
+    }
+    QStringList itemsB;
+    for (const QString& s : items) {
+        if (s != a) {
+            itemsB << s;
+        }
+    }
+    const QString b = QInputDialog::getItem(this, QStringLiteral("插入紧急取送单"),
+                                            QStringLiteral("送达点 B："), itemsB, 0, false, &ok);
+    if (!ok || b.isEmpty()) {
+        return;
+    }
+    const double cap = config_.vehicles.empty() ? 0.0 : config_.vehicles.front().capacityKg;
+    const double dem = QInputDialog::getDouble(this, QStringLiteral("插入紧急取送单"),
+                                               QStringLiteral("送货量(kg)："), 10.0, 1.0,
+                                               cap > 1.0 ? cap : 1.0, 0, &ok);
+    if (!ok) {
+        return;
+    }
+    insertUrgentOrderAt(a.toStdString(), b.toStdString(), dem);
 }
 
 std::string MainWindow::addRandomCustomerAction() {
@@ -786,6 +860,31 @@ void MainWindow::onAdvanceStop() {
     if (!wasAtDepot && !config_.vehicles.empty()
         && state_.atNodeId == config_.vehicles.front().startNodeId) {
         loadForCurrentTrip();
+    }
+
+    // 取货：到达某趟的取货点 A 时，把紧急包裹装上（物理事实，只加一次）。
+    // 放在送达判定之前——A 不是配送停靠点（nodeIsStop=false），不应被当作"送达"。
+    if (nodeIndex_ < plan_.nodeTripIndex.size()) {
+        const std::size_t ti = plan_.nodeTripIndex[nodeIndex_];
+        if (ti < plan_.trips.size()) {
+            for (const logistics::PickupOp& pk : plan_.trips[ti].pickups) {
+                if (pk.pickupNodeId != node) {
+                    continue;
+                }
+                if (state_.pickedOrderIds.insert(pk.orderId).second) {
+                    logistics::OnboardItem item;
+                    item.nodeId = pk.deliverNodeId;
+                    item.kg = pk.kg;
+                    state_.onboard.push_back(item);
+                    state_.loadKg = state_.sumOnboard();
+                    appendLog(QStringLiteral("取货 %1：在 %2 装上包裹 %3kg（送往 %4）")
+                                  .arg(QString::fromStdString(pk.orderId))
+                                  .arg(QString::fromStdString(pk.pickupNodeId))
+                                  .arg(pk.kg, 0, 'f', 0)
+                                  .arg(QString::fromStdString(pk.deliverNodeId)));
+                }
+            }
+        }
     }
 
     // 只有**下标与节点对得上**时才认作送达。
@@ -1350,9 +1449,12 @@ void MainWindow::updatePanels() {
                                                   + QStringLiteral("-")
                                                   + minutesToClock(o.windowEndMin)));
         orderTable_->setItem(row, 4,
-                             new QTableWidgetItem(o.served ? QStringLiteral("已送达")
-                                                           : (o.urgent ? QStringLiteral("紧急")
-                                                                       : QStringLiteral("待配送"))));
+                             new QTableWidgetItem(
+                                 o.served ? QStringLiteral("已送达")
+                                          : (o.urgent ? (state_.pickedOrderIds.count(o.id)
+                                                             ? QStringLiteral("执行中")
+                                                             : QStringLiteral("紧急"))
+                                                      : QStringLiteral("待配送"))));
     }
 
     // 停靠明细（顺序与 plan_.stops 一致，即服务顺序）
@@ -1771,837 +1873,134 @@ int MainWindow::runActionSelfCheck() {
         }
     };
 
-    // 软件内时间的事件模型：「推进一刻」不得跳过节点（判据 #3）、
-    // 「半路显示所在路段起点」（判据 #4）。
-    //
-    // **必须放在最前面**：后面的检查会改动 config_（加新客户、把订单标记为已送达），
-    // 之后再新建窗口会得到"无货可送"的空计划，本守卫就退化成空跑——
-    // 那种"通过但什么都没测到"的守卫，比没有守卫更糟。
-    {
-        std::unique_ptr<MainWindow> m(new MainWindow(config_));
-        std::unique_ptr<MainWindow> s(new MainWindow(config_));
-        const int t0 = m->state_.atTimeMin;
-
-        // 被测路径：连续推进「一刻」（路线走完后它自己会变成空操作）
-        for (int i = 0; i < 40; ++i) {
-            m->onAdvanceMoment();
+    // 收集真实客户节点（A/B 的取值域）
+    std::vector<std::string> cust;
+    for (const logistics::Node& n : config_.graph.nodes()) {
+        if (n.type == logistics::NodeType::Delivery) {
+            cust.push_back(n.id);
         }
+    }
+    expect(cust.size() >= 2, QStringLiteral("（前置）至少存在两个客户节点"));
 
-        // 参照路径：**完全不使用** onAdvanceMoment —— 由检查器自己按"下一个事件刻"
-        // 逐节点调用 onAdvanceStop()，一直走到把 m 已结算的事件刻全部走完。
-        // 若 onAdvanceMoment 走捷径直接跳到下标、跳过沿途的送达/装卸/记账，
-        // 两条路径的已送达 / penalty / 车上货量 / 位置就会分叉（P25/P28 的缺陷类别）。
-        //
-        // 防呆：参照循环必须有**进展保证**与迭代上限 —— 否则一旦被测行为异常，
-        // 守卫会"挂住"而不是"报失败"，那比没有守卫更糟（ctest 会超时）。
-        int refGuard = 0;
-        while (!s->atRouteEnd() && s->nextEventMark_ <= m->state_.atTimeMin) {
-            if (++refGuard > 2000) {
-                expect(false, QStringLiteral("（守卫自身）参照推进超过 2000 步仍未结束，"
-                                             "疑似被测行为无进展"));
-                break;
+    // ---- 1. 插入一张装得下的紧急取送单：A 取 → B 送，先 A 后 B，B 为第一个停靠点 ----
+    if (cust.size() >= 2) {
+        const std::string A = cust[0];
+        const std::string B = cust[1];
+        const std::size_t before = config_.orders.size();
+        const std::string id = insertUrgentOrderAt(A, B, 5.0);
+        expect(!id.empty(), QStringLiteral("紧急取送单应插入成功"));
+        expect(config_.orders.size() == before + 1,
+               QStringLiteral("紧急单必须并入订单集合（不丢单）"));
+        expect(plan_.status == logistics::PlanStatus::Ok,
+               QStringLiteral("插入后计划仍可行"));
+        std::size_t ia = plan_.nodes.size();
+        std::size_t ib = plan_.nodes.size();
+        for (std::size_t i = 0; i < plan_.nodes.size(); ++i) {
+            if (plan_.nodes[i] == A && ia == plan_.nodes.size()) {
+                ia = i;
             }
-            const int markBefore = s->nextEventMark_;
-            const int T = markBefore;
-            // 内层重放循环**同样**必须有上界：它的终止只靠一条不变量
-            // （onAdvanceStop() 除已到终点外必然 ++nodeIndex_）。一旦那条不变量被破坏，
-            // 外层 refGuard 管不到这里，守卫就会挂住而不是失败。
-            int replayGuard = 0;
-            while (!s->atRouteEnd() && s->nodeIndex_ + 1 < s->plan_.nodeArrivalMin.size()
-                   && s->plan_.nodeArrivalMin[s->nodeIndex_ + 1] <= T) {
-                if (++replayGuard > 10000) {
-                    expect(false, QStringLiteral("（守卫自身）内层重放超过 10000 步仍未结束，"
-                                                 "疑似 onAdvanceStop 不再推进下标"));
-                    break;
+            if (plan_.nodes[i] == B && ib == plan_.nodes.size()) {
+                ib = i;
+            }
+        }
+        expect(ia < ib, QStringLiteral("取送顺序：A 必须早于 B（A@%1, B@%2）").arg(ia).arg(ib));
+        expect(!plan_.stops.empty() && plan_.stops.front().nodeId == B,
+               QStringLiteral("紧急送达点 B 应是第一个停靠点"));
+        // 推进到取货点 A：应进入「执行中（已取未送）」；到达 B：应完成。
+        bool picked = false;
+        for (int i = 0; i < 60 && !picked; ++i) {
+            onAdvanceStop();
+            picked = state_.pickedOrderIds.count(id) > 0;
+        }
+        expect(picked, QStringLiteral("到达取货点 A 后应进入执行中（已取未送）"));
+        bool served = false;
+        for (int i = 0; i < 60 && !served; ++i) {
+            onAdvanceStop();
+            for (const Order& o : config_.orders) {
+                if (o.id == id && o.served) {
+                    served = true;
                 }
-                s->onAdvanceStop();
-            }
-            if (!s->atRouteEnd() && s->state_.atTimeMin < T) {
-                s->advanceClockTo(T);
-                s->settleEventsUpTo(T);
-            }
-            if (s->nextEventMark_ == markBefore && s->state_.atTimeMin <= T) {
-                break;   // 没有任何进展：本不该发生，交给下面的断言去报告
             }
         }
+        expect(served, QStringLiteral("到达送达点 B 后紧急取送单应完成"));
+    }
 
-        // 前置断言：本守卫必须**真的测到了东西**，否则就是空跑。
-        expect(m->state_.atTimeMin > t0,
-               QStringLiteral("（前置）推进一刻必须真的推进了软件内时间：%1 -> %2min")
-                   .arg(t0)
-                   .arg(m->state_.atTimeMin));
-        expect(m->state_.servedStops > 0,
-               QStringLiteral("（前置）推进一刻后应已产生送达，否则测不到跳节点：已送达 %1 站")
-                   .arg(m->state_.servedStops));
-
-        expect(m->state_.servedStops == s->state_.servedStops,
-               QStringLiteral("推进一刻不得跳过送达：一刻 %1 站，逐个推进 %2 站")
-                   .arg(m->state_.servedStops)
-                   .arg(s->state_.servedStops));
-        expect(m->state_.incurredPenaltyMin == s->state_.incurredPenaltyMin,
-               QStringLiteral("推进一刻不得跳过 penalty 记账：一刻 %1min，逐个推进 %2min")
-                   .arg(m->state_.incurredPenaltyMin)
-                   .arg(s->state_.incurredPenaltyMin));
-        expect(std::fabs(m->state_.sumOnboard() - s->state_.sumOnboard()) < 1e-6,
-               QStringLiteral("推进一刻不得跳过装卸：一刻车上 %1kg，逐个推进 %2kg")
-                   .arg(m->state_.sumOnboard(), 0, 'f', 0)
-                   .arg(s->state_.sumOnboard(), 0, 'f', 0));
-        expect(m->currentNodeId_ == s->currentNodeId_,
-               QStringLiteral("推进一刻与逐个推进应停在同一地点：一刻 %1，逐个推进 %2")
-                   .arg(QString::fromStdString(m->currentNodeId_))
-                   .arg(QString::fromStdString(s->currentNodeId_)));
-
-        // 事件结算纪律（判据 #2 的"不空刻、不拖欠"面）：
-        // 推进之后，所有 <= 当前时刻的事件刻都必须已经结算完 —— 否则下一个事件刻
-        // 会 <= 当前时刻，意味着有事件被"拖欠"了。这条能抓住
-        // "把 settleEventsUpTo 从 onAdvanceStop 里摘掉"这类回退。
-        expect(m->nextEventMark_ > m->state_.atTimeMin,
-               QStringLiteral("推进后必须已结算所有 <= 当前时刻的事件刻："
-                              "下一事件刻 %1 应 > 当前 %2min（有事件被拖欠）")
-                   .arg(m->nextEventMark_)
-                   .arg(m->state_.atTimeMin));
-
-        // 「推进一站」同样必须结算它跨过的事件刻（判据 #2 的直接守卫）。
-        // 与上面的等价性断言互补：等价性比的是**两条路径的一致性**，而这条直接检查
-        // "推进一站"这条路径本身有没有拖欠事件 —— 把 settleEventsUpTo 从
-        // onAdvanceStop 里摘掉，nextEventMark_ 会停在已跨过的那个刻上，这里必失败。
-        {
-            std::unique_ptr<MainWindow> u(new MainWindow(config_));
-            const int firstMark = u->nextEventMark_;
-            bool crossed = false;
-            for (int i = 0; i < 40 && !u->atRouteEnd(); ++i) {
-                u->onAdvanceStop();
-                if (u->state_.atTimeMin >= firstMark) {
-                    crossed = true;
+    // ---- 2. 连续插两张紧急单：都不丢，且都在计划里 ----
+    {
+        const std::size_t before = config_.orders.size();
+        const std::string id1 = insertUrgentOrderAction();
+        const std::string id2 = insertUrgentOrderAction();
+        expect(!id1.empty() && !id2.empty(), QStringLiteral("连续插单应都成功"));
+        expect(config_.orders.size() == before + 2,
+               QStringLiteral("连续两次插单不得丢单"));
+        std::size_t unserved = 0;
+        std::size_t inPlan = 0;
+        for (const Order& o : config_.orders) {
+            if (o.served || !o.urgent) {
+                continue;
+            }
+            ++unserved;
+            for (const logistics::Stop& s : plan_.stops) {
+                if (s.nodeId == o.nodeId) {
+                    ++inPlan;
                     break;
                 }
             }
-            expect(crossed,
-                   QStringLiteral("（前置）「推进一站」应能跨过首个事件刻 %1min").arg(firstMark));
-            expect(u->nextEventMark_ > u->state_.atTimeMin,
-                   QStringLiteral("「推进一站」也必须结算沿途事件刻：到达 %1min 后"
-                                  "下一未结算事件刻仍是 %2min（<= 到达时刻 = 拖欠事件）")
-                       .arg(u->state_.atTimeMin)
-                       .arg(u->nextEventMark_));
         }
-
-        // 两种模拟模式的勾选行为（向导第 7 关的人工判据，这里做成可回归的自动化守卫）：
-        //   ① 勾一个自动取消另一个（互斥）② 再点一次当前模式 = 取消勾选并停止。
-        // 走**真实控件路径**（QToolButton::click -> QActionGroup::triggered），
-        // 而不是直接调 onSimModeTriggered —— 这样"换成 QAction::toggled 实现"这类
-        // 回归（exclusive 组不允许取消勾选）才会被抓住。
-        {
-            std::unique_ptr<MainWindow> v(new MainWindow(config_));
-            const auto clickAction = [](MainWindow* win, QAction* act) {
-                for (QToolButton* button : win->findChildren<QToolButton*>()) {
-                    if (button->defaultAction() == act) {
-                        button->click();
-                        return true;
-                    }
-                }
-                return false;
-            };
-            expect(clickAction(v.get(), v->stationSimAction_),
-                   QStringLiteral("（前置）工具栏应存在「按站模拟」按钮"));
-            expect(v->simMode_ == 1 && v->stationSimAction_->isChecked(),
-                   QStringLiteral("点「按站模拟」应进入按站模拟且按钮为勾选态"));
-            expect(clickAction(v.get(), v->timeSimAction_),
-                   QStringLiteral("（前置）工具栏应存在「按时间模拟」按钮"));
-            expect(v->simMode_ == 2 && v->timeSimAction_->isChecked()
-                       && !v->stationSimAction_->isChecked(),
-                   QStringLiteral("两种模拟模式必须互斥：勾「按时间模拟」应自动取消「按站模拟」"));
-            expect(clickAction(v.get(), v->timeSimAction_),
-                   QStringLiteral("（前置）再次点击应能送达「按时间模拟」按钮"));
-            expect(v->simMode_ == 0 && !v->timeSimAction_->isChecked(),
-                   QStringLiteral("再点一次「按时间模拟」必须取消勾选并停止（exclusive 组"
-                                  "不允许用户取消勾选，需显式处理）"));
-        }
-
-        // 「计划不可行」≠「配送完成」。两者都满足 atRouteEnd()，但只有前者为假时
-        // 才能播报"本次配送已完成"——否则界面会同时写着「规划不可行」和"已完成"（假成功）。
-        {
-            Config bad = config_;   // 从一个有订单的配送点删掉节点 -> 计划不可行
-            const std::string victim =
-                config_.orders.empty() ? std::string() : config_.orders.front().nodeId;
-            if (!victim.empty()) {
-                bad.graph.removeNode(victim);
-                std::unique_ptr<MainWindow> x(new MainWindow(bad));
-                expect(x->atRouteEnd(),
-                       QStringLiteral("（前置）删掉配送点 %1 后应判定为「不能继续推进」")
-                           .arg(QString::fromStdString(victim)));
-                expect(!x->routeTrulyFinished(),
-                       QStringLiteral("计划不可行/为空时**不得**算作「配送完成」"
-                                      "（否则会播报假成功）"));
-            }
-        }
-
-        // 判据 #4：车在半路时，位置必须是**所在路段的起点**
-        //（= "最后一个到达时刻 <= 当前时刻"的节点）。
-        const std::size_t idxM = logistics::nodeIndexAtTime(m->plan_, m->state_.atTimeMin);
-        expect(m->nodeIndex_ == idxM,
-               QStringLiteral("推进一刻后车辆停在「所在路段起点」：当前下标 %1，"
-                              "时刻 %2min 对应下标 %3")
-                   .arg(static_cast<qulonglong>(m->nodeIndex_))
-                   .arg(m->state_.atTimeMin)
-                   .arg(static_cast<qulonglong>(idxM)));
-        if (idxM < m->plan_.nodes.size() && m->scene_ != nullptr) {
-            expect(m->scene_->vehiclePosition() == m->plan_.nodes[idxM],
-                   QStringLiteral("画布车辆标记 == 所在路段起点 %1，实际标记在 %2")
-                       .arg(QString::fromStdString(m->plan_.nodes[idxM]))
-                       .arg(QString::fromStdString(m->scene_->vehiclePosition())));
-        }
-
-        // 判据 #4 的**定向用例**：必须构造出一个"车正处在 k → k+1 途中"的时刻。
-        // 用户给的例子：过去 15min 内车走完 A→B、B→C，现正驶向 D ⇒ 显示位置应是 C。
-        // 上面的通用断言在路线跑完后落在空计划上，偏弱；这里显式制造"半路"情形。
-        {
-            std::unique_ptr<MainWindow> w(new MainWindow(config_));
-            bool midSegmentChecked = false;
-            for (int i = 0; i < 40 && !w->atRouteEnd(); ++i) {
-                w->onAdvanceMoment();
-                const std::size_t k = w->nodeIndex_;
-                if (k + 1 >= w->plan_.nodeArrivalMin.size()
-                    || k + 1 >= w->plan_.nodes.size()) {
-                    continue;   // 已经走到序列末端，构造不出"半路"了
-                }
-                const int tArriveK = w->plan_.nodeArrivalMin[k];
-                const int tArriveNext = w->plan_.nodeArrivalMin[k + 1];
-                if (tArriveNext <= w->state_.atTimeMin) {
-                    continue;   // 还没卡在两节点之间
-                }
-                expect(tArriveK <= w->state_.atTimeMin && w->state_.atTimeMin < tArriveNext,
-                       QStringLiteral("（前置）当前时刻确实落在 %1(%2min) 与 %3(%4min) 之间")
-                           .arg(QString::fromStdString(w->plan_.nodes[k]))
-                           .arg(tArriveK)
-                           .arg(QString::fromStdString(w->plan_.nodes[k + 1]))
-                           .arg(tArriveNext));
-                expect(w->nodeIndex_ == logistics::nodeIndexAtTime(w->plan_, w->state_.atTimeMin),
-                       QStringLiteral("车在 %1→%2 途中时，下标必须是路段起点 %1")
-                           .arg(QString::fromStdString(w->plan_.nodes[k]))
-                           .arg(QString::fromStdString(w->plan_.nodes[k + 1])));
-                expect(w->scene_ != nullptr
-                           && w->scene_->vehiclePosition() == w->plan_.nodes[k],
-                       QStringLiteral("车在 %1→%2 途中时，画布应显示所在路段起点 %1，实际 %3")
-                           .arg(QString::fromStdString(w->plan_.nodes[k]))
-                           .arg(QString::fromStdString(w->plan_.nodes[k + 1]))
-                           .arg(QString::fromStdString(w->scene_ != nullptr
-                                                           ? w->scene_->vehiclePosition()
-                                                           : std::string())));
-                midSegmentChecked = true;
-                break;
-            }
-            expect(midSegmentChecked,
-                   QStringLiteral("（前置）应能构造出「车在两节点之间」的时刻，"
-                                  "否则判据 #4 没有被真正验证"));
-        }
+        expect(unserved > 0 && inPlan == unserved,
+               QStringLiteral("全部未完成紧急单都必须出现在计划停靠点里（%1/%2）")
+                   .arg(inPlan).arg(unserved));
     }
 
-    // ---- 重规划必须继承的两条"既定事实" ----
-    //
-    // ① 本趟装载：一旦驶离仓库，这一趟装了多少就是既成事实，重规划不得改写。
-    // ② 趟号：已经跑完的趟不该再出现，编号要接着往下走。
+    // ---- 3. 非法输入被拒（A==B / 超载），且不得并入订单集合 ----
     {
-        const double loadAtStart = state_.tripLoadKg;
-        onAdvanceStop();               // 驶离仓库
-        const double loadAfterDepart = state_.tripLoadKg;
-        onSimulateTraffic();           // 触发一次重规划
-        const double loadAfterReplan = state_.tripLoadKg;
-        expect(loadAfterDepart > 0.0, QStringLiteral("驶离后本趟装记载荷为正：%1kg")
-                                          .arg(loadAfterDepart, 0, 'f', 0));
-        expect(std::fabs(loadAfterReplan - loadAfterDepart) < 1e-6,
-               QStringLiteral("重规划不得改写本趟装载：重规划后 %1kg，之前 %2kg")
-                   .arg(loadAfterReplan, 0, 'f', 0)
-                   .arg(loadAfterDepart, 0, 'f', 0));
-        (void)loadAtStart;
+        const std::size_t before = config_.orders.size();
+        const std::string bad1 = insertUrgentOrderAt("D01", "D01", 5.0);
+        const double cap = config_.vehicles.empty() ? 0.0 : config_.vehicles.front().capacityKg;
+        const std::string bad2 = insertUrgentOrderAt("D01", "D02", cap + 100.0);
+        expect(bad1.empty() && bad2.empty(),
+               QStringLiteral("A==B 与超载必须被拒绝"));
+        expect(config_.orders.size() == before,
+               QStringLiteral("被拒绝的紧急单不得并入订单集合"));
     }
 
-    // ---- 重规划不得让"已经发生的事实"缩水 ----
-    //
-    // 这三项都曾经因为"从当前计划反推"而在重规划后变错：
-    //   · 「停靠 N 站」缩水成"剩余要送的站数"
-    //   · 「已送达 N 站」归 0
-    //   · 「总 penalty」把已经发生的超时惩罚丢掉
+    // ---- 4. 新客户：必须带来订单并被纳入配送 ----
     {
-        const int stopsTotalBefore =
-            state_.servedStops + static_cast<int>(plan_.stops.size() - stopCursor_);
-        const int servedBefore = state_.servedStops;
-
-        onAdvanceStop();
-        onSimulateTraffic();   // 触发重规划
-        onAdvanceStop();
-        onSimulateTraffic();
-
-        const int stopsTotalAfter =
-            state_.servedStops + static_cast<int>(plan_.stops.size() - stopCursor_);
-        const int servedAfter = state_.servedStops;
-        expect(stopsTotalAfter >= stopsTotalBefore,
-               QStringLiteral("「停靠 N 站」不得因重规划缩水：重规划后 %1，之前 %2")
-                   .arg(stopsTotalAfter).arg(stopsTotalBefore));
-        expect(servedAfter >= servedBefore,
-               QStringLiteral("「已送达 N 站」不得因重规划减少：重规划后 %1，之前 %2")
-                   .arg(servedAfter).arg(servedBefore));
-        expect(stopsTotalAfter ==
-                   state_.servedStops + static_cast<int>(plan_.stops.size() - stopCursor_),
-               QStringLiteral("停靠总数应等于「已送 + 剩余」"));
-    }
-
-    // ---- 反复重规划下的压力推进（审计发现的 F5）----
-    //
-    // 这段是**后续守卫的前置状态**：让车在推进 + 路况重规划 + 紧急插单 + 封路的
-    // 反复扰动下跑若干轮，后面的不变量（趟号、本趟装载、导出证据…）才有东西可查。
-    // 只推进 + 路况的话紧急路径压根触发不了，断言会"通过"却什么也没测到。
-    {
-        for (int i = 0; i < 20; ++i) {
-            onAdvanceStop();
-            onSimulateTraffic();
-            if (i % 2 == 1) {
-                insertUrgentOrderAction();
-            }
-            if (i % 3 == 2) {
-                onCloseRandomRoad();
-            }
-        }
-    }
-
-    // ---- 趟号：已完成趟数只该在换计划时合并，不能与计划内趟号重复相加 ----
-    {
-        const int before = completedTripOffset();
-        const std::size_t tripsBefore = static_cast<std::size_t>(tripCount());
-        for (int i = 0; i < 3; ++i) {
-            onAdvanceStop();
-        }
-        // 正确的性质是**单调不减**：推进若把车送到了仓库，这一趟就算跑完了，
-        // 已完成趟数**本来就会 +1**。（早先这里断言"纯推进不得改变"，
-        //  是个错误的不变量——它会在车恰好接近仓库时误报。）
-        expect(completedTripOffset() >= before,
-               QStringLiteral("已完成趟数只能增不能减：%1 -> %2")
-                   .arg(before).arg(completedTripOffset()));
-        expect(tripCount() >= 1 && tripsBefore >= 1,
-               QStringLiteral("计划趟数应恒为正"));
-        // 而"重规划不得改变已完成趟数"由下面那条结构性守卫负责
-    }
-
-    // ---- 本趟装载必须随趟刷新，且不得小于当前载重 ----
-    //
-    // 曾经为了"出发后冻结"而冻得过头：换到新的一趟后仍显示最初那趟的装载量
-    // （实测一直显示 190kg）。这里用"换趟时装载量必须重新取值"来守。
-    {
-        // 先跑到某趟结束
-        for (int i = 0; i < 6; ++i) {
-            onAdvanceStop();
-            onSimulateTraffic();
-        }
-        const int tripBefore = completedTripOffset();
-        const double loadBefore = currentTripLoadKg();
-        for (int i = 0; i < 12 && completedTripOffset() == tripBefore; ++i) {
-            onAdvanceStop();
-            onSimulateTraffic();
-        }
-        const double loadAtDepot = currentTripLoadKg();
-        expect(loadAtDepot <= 200.0 + 1e-6 && loadAtDepot > 0.0,
-               QStringLiteral("本趟装载应在 (0, 载重上限] 内：%1kg")
-                   .arg(loadAtDepot, 0, 'f', 0));
-        expect(currentLoadKg() <= loadAtDepot + 1e-6,
-               QStringLiteral("当前载重不得大于本趟装载：当前 %1kg > 本趟 %2kg")
-                   .arg(currentLoadKg(), 0, 'f', 0).arg(loadAtDepot, 0, 'f', 0));
-        (void)loadBefore;
-
-        // 定义式断言：车回到仓库时，"本趟装载"必须等于**新计划第一趟**的装载量。
-        // 只查"在 (0,200] 内"是没牙齿的——被冻在上一趟的旧值（实测 190kg）
-        // 同样落在区间里。这条才真正守住"换趟必须重新取值"。
-        int checked = 0;
-        for (int i = 0; i < 40 && checked == 0; ++i) {
-            onAdvanceStop();
-            onSimulateTraffic();
-            const bool atDepot = !config_.vehicles.empty()
-                                 && currentNodeId_ == config_.vehicles.front().startNodeId;
-            if (atDepot && !plan_.trips.empty() && plan_.trips[0].loadKg > 1e-9) {
-                expect(std::fabs(currentTripLoadKg() - plan_.trips[0].loadKg) < 1e-6,
-                       QStringLiteral("在仓库时本趟装载应取新计划第一趟的值："
-                                      "实际 %1kg，新计划第一趟 %2kg")
-                           .arg(currentTripLoadKg(), 0, 'f', 0)
-                           .arg(plan_.trips[0].loadKg, 0, 'f', 0));
-                ++checked;
-            }
-        }
-        expect(checked > 0, QStringLiteral("自检未能跑到「车在仓库」的时刻，守卫未生效"));
-    }
-
-    // ---- 趟次三段的口径不变量：当前 == 已完成 + 1，且 总数 >= 当前 ----
-    //
-    // 用户提出：路线信息里的趟次应满足 已完成 n / 当前 n+1 / 总趟数 >= n+1。
-    // 第三条曾经不成立——第三段写的是"本次规划还要跑几趟"，与已完成无关，
-    // 会出现「已完成 4 趟 · 当前第 5 趟 · 本计划共 1 趟」这种自相矛盾的显示。
-    {
-        for (int i = 0; i < 30; ++i) {
-            onAdvanceStop();
-            onSimulateTraffic();
-            if (i % 2 == 1) {
-                onInsertUrgentOrder();
-            }
-        }
-        // **必须解析界面上真正显示的文本**，不能自己把公式再算一遍——
-        // 自己算的话，显示那边写错了守卫也发现不了（我第一版就是这么写的，变异测不出来）。
-        const QStringList lines =
-            routeInfo_->toPlainText().split(QLatin1Char('\n'), Qt::SkipEmptyParts);
-        QString tripLine;
-        for (const QString& ln : lines) {
-            if (ln.startsWith(QStringLiteral("趟次："))) {
-                tripLine = ln;
+        const std::size_t before = config_.orders.size();
+        const std::string node = addRandomCustomerAction();
+        expect(!node.empty(), QStringLiteral("模拟新客户应成功"));
+        expect(config_.orders.size() == before + 1,
+               QStringLiteral("新客户必须带来一张订单"));
+        bool inPlan = false;
+        for (const std::string& n : plan_.nodes) {
+            if (n == node) {
+                inPlan = true;
                 break;
             }
         }
-        const QRegularExpression re(QStringLiteral(
-            "已完成 (\\d+) 趟 · 当前第 (\\d+) 趟 · 全部完成约需 (\\d+) 趟"));
-        const QRegularExpressionMatch m = re.match(tripLine);
-        expect(m.hasMatch(),
-               QStringLiteral("路线信息里应有一行「趟次：已完成 N 趟 · 当前第 M 趟 · "
-                              "全部完成约需 T 趟」，实际：%1").arg(tripLine));
-        if (m.hasMatch()) {
-            const int done = m.captured(1).toInt();
-            const int cur = m.captured(2).toInt();
-            const int total = m.captured(3).toInt();
-            expect(cur == done + 1,
-                   QStringLiteral("当前趟必须等于已完成 + 1：已完成 %1，当前 %2")
-                       .arg(done).arg(cur));
-            expect(total >= cur,
-                   QStringLiteral("总趟数必须 >= 当前趟：总 %1，当前 %2").arg(total).arg(cur));
-        }
+        expect(inPlan, QStringLiteral("新客户节点必须出现在路线里"));
     }
 
-    // ---- 物理不变量：不得送出车上没有的货 ----
-    //
-    // 历史上真的发生过：车到仓库后按"当前趟"装货，而那个下标指向的正是
-    // **刚跑完的那一趟**（终点就是仓库），于是装错货、空车出发去送货。
-    // 表现是"2 趟送完 740kg"，物理上不可能。
+    // ---- 5. 重规划绝不改写车辆物理状态 ----
     {
-        const int viold = state_.offloadedWithoutGoods;
-        // 必须**跑到跨趟**：先推进到车回仓库（一趟结束），再继续跑到下一趟送货。
-        // 只跑固定步数会碰不上"装完货再出发"的时刻，守卫就测不到东西。
-        int done = 0;
-        for (int i = 0; i < 200 && done < 2; ++i) {
-            onAdvanceStop();
-            onSimulateTraffic();
-            if (i % 2 == 1) {
-                onInsertUrgentOrder();
-            }
-            if (state_.completedTrips > done) {
-                done = state_.completedTrips;
-            }
-        }
-        expect(done >= 2, QStringLiteral("自检应至少跑完 2 趟（实际 %1），否则守卫没测到东西")
-                              .arg(done));
-        // 只断言**真实使用流程**（每 tick 重规划，即 Debug 模式与「推进一站」的实际行为）
-        // 里不出现空车送达。刻意"连续推进而不重规划"的合成路径仍能构造出一次违例
-        // （见设计 §16 P25 的"遗留"一节），这里不掩饰、也不拿合成路径当通过。
-        expect(state_.offloadedWithoutGoods == viold,
-               QStringLiteral("每 tick 重规划的真实流程中不得送出车上没有的货；"
-                              "本次违例 %1 次（累计 %2）")
-                   .arg(state_.offloadedWithoutGoods - viold)
-                   .arg(state_.offloadedWithoutGoods));
-    }
-
-    // ---- 结构性不变量：重规划**绝不改写车辆状态** ----
-    //
-    // 这是本轮从数据流上根除的那一类缺陷：任何物理事实只要"从计划反推"，
-    // 就会在重规划后变错。现在 state_ 是唯一来源，重规划只读不写。
-    {
-        for (int i = 0; i < 6; ++i) {
+        for (int i = 0; i < 4; ++i) {
             onAdvanceStop();
         }
         const VehicleState snapshot = state_;
-        // 三条重规划路径都要走到：路况、插单、以及工具栏的「重新规划」。
-        // 只测前两条会漏掉 replan() 本身（我第一版就是这么漏的）。
         onSimulateTraffic();
-        onInsertUrgentOrder();
         onReplan();
         expect(state_.tripNumber == snapshot.tripNumber,
-               QStringLiteral("重规划不得改变车辆所在趟次：%1 -> %2")
-                   .arg(snapshot.tripNumber).arg(state_.tripNumber));
+               QStringLiteral("重规划不得改变车辆所在趟次"));
         expect(state_.completedTrips == snapshot.completedTrips,
-               QStringLiteral("重规划不得改变已完成趟数：%1 -> %2")
-                   .arg(snapshot.completedTrips).arg(state_.completedTrips));
+               QStringLiteral("重规划不得改变已完成趟数"));
         expect(state_.servedStops == snapshot.servedStops,
-               QStringLiteral("重规划不得改变已送达计数：%1 -> %2")
-                   .arg(snapshot.servedStops).arg(state_.servedStops));
+               QStringLiteral("重规划不得改变已送达计数"));
         expect(state_.incurredPenaltyMin == snapshot.incurredPenaltyMin,
-               QStringLiteral("重规划不得改变已发生的 penalty：%1 -> %2")
-                   .arg(snapshot.incurredPenaltyMin).arg(snapshot.incurredPenaltyMin));
-        // 注意：这里守的是**本趟装载量（出发时的事实）**，不是"车上现有货量"。
-        // 车上现有货量是**决策**——它必须与计划当前趟一致才可执行，
-        // 所以换计划时允许被校准。
-        // 把"决策"和"事实"分开守，正是本轮结构改动的要点。
-        expect(std::fabs(state_.tripLoadKg - snapshot.tripLoadKg) < 1e-6,
-               QStringLiteral("重规划不得改变本趟出发时的装载量：%1 -> %2")
-                   .arg(snapshot.tripLoadKg, 0, 'f', 0).arg(state_.tripLoadKg, 0, 'f', 0));
+               QStringLiteral("重规划不得改变已发生的 penalty"));
     }
 
-    // ---- 轨迹必须正常：车要真的回仓库装货 ----
-    //
-    // 曾经的坏轨迹：Debug 每 tick 重规划，车在各个簇之间"瞬移"，
-    // 28 个 tick 一次都没回过仓库，却送完了 17 站——载重 200kg 送 740kg 的货，
-    // 物理上不可能。根因是"在途货"从计划反推。现在守卫这一点。
-    {
-        const int before = state_.completedTrips;
-        int ticks = 0;
-        for (int i = 0; i < 80 && state_.completedTrips == before; ++i) {
-            onAdvanceStop();
-            onSimulateTraffic();
-            if (i % 3 == 2) {
-                onInsertUrgentOrder();
-            }
-            ++ticks;
-        }
-        expect(state_.completedTrips > before,
-               QStringLiteral("每 tick 都重规划的情况下，车也必须在 %1 步内回仓库装货一次"
-                              "（否则说明轨迹坏了）").arg(ticks));
-    }
-
-    // ---- 已完成趟数只能来自"回过仓库"这个物理事实 ----
-    //
-    // 不能用"计划内游标"推：Debug 每 tick 都重规划、nodeIndex_ 随之归零，
-    // 从计划反推的进度永远是 0，偏移量就永远加 0（实测真 Debug 跑 28 tick，
-    // 已完成始终 0，而「共 X 趟」随剩余计划缩水 6->5->4）。
-    {
-        const int arrivalsBefore = state_.completedTrips;
-        int pushes = 0;
-        for (int i = 0; i < 60 && state_.completedTrips == arrivalsBefore; ++i) {
-            onAdvanceStop();
-            ++pushes;
-        }
-        // 纯推进必须能真的走到仓库（否则后面所有断言都没意义）
-        expect(state_.completedTrips > arrivalsBefore,
-               QStringLiteral("推进 %1 步内车应回到仓库一次（物理事实才可作偏移量依据）")
-                   .arg(pushes));
-    }
-
-    // ---- 三处趟号必须一致（人工测试反馈：明细与「共 K 趟」没有继承已完成趟数）----
-    //
-    // 断言方式：停靠明细**最后一行**所属的趟，必须等于「已完成趟数 + 计划趟数」。
-    // 这条把"停靠明细的偏移"与"共 K 趟的偏移"绑在一起——两者只要有一个漏了偏移，
-    // 数字就对不上。
-    {
-        for (int i = 0; i < 10; ++i) {
-            onAdvanceStop();
-            onSimulateTraffic();
-            if (i % 2 == 1) {
-                insertUrgentOrderAction();
-            }
-        }
-        const int expectLast = completedTripOffset() + tripCount();
-        int gotLast = -1;
-        for (int r = stopTable_->rowCount() - 1; r >= 0; --r) {
-            QTableWidgetItem* it = stopTable_->item(r, 0);
-            if (it == nullptr) {
-                continue;
-            }
-            gotLast = it->text().remove(QStringLiteral("第 ")).trimmed().toInt();
-            break;
-        }
-        expect(gotLast == expectLast,
-               QStringLiteral("停靠明细末行的趟号应等于「已完成趟 + 计划趟数」："
-                              "实际 %1，期望 %2（已完成 %3 + 计划 %4）")
-                   .arg(gotLast).arg(expectLast)
-                   .arg(completedTripOffset()).arg(tripCount()));
-    }
-
-    const std::size_t ordersBefore = config_.orders.size();
-    const std::size_t nodesBefore = config_.graph.nodeCount();
-
-    // ① 连续两次插入紧急订单，两单都必须留在订单表里
-    insertUrgentOrderAction();
-    insertUrgentOrderAction();
-    expect(config_.orders.size() == ordersBefore + 2,
-           QStringLiteral("连续两次插单后订单数 +2（不丢单），实际 +%1")
-               .arg(config_.orders.size() - ordersBefore));
-
-    // ② 全部未服务的紧急订单必须整体排在最前（紧急之间同级，整体高于普通订单）
-    std::vector<std::string> urgentNodes;
-    for (const Order& o : config_.orders) {
-        if (o.served || !o.urgent) {
-            continue;
-        }
-        bool dup = false;
-        for (const std::string& n : urgentNodes) {
-            if (n == o.nodeId) {
-                dup = true;
-            }
-        }
-        if (!dup) {
-            urgentNodes.push_back(o.nodeId);
-        }
-    }
-    std::size_t leading = 0;
-    for (const Stop& stop : plan_.stops) {
-        bool isUrgent = false;
-        for (const std::string& n : urgentNodes) {
-            if (n == stop.nodeId) {
-                isUrgent = true;
-            }
-        }
-        if (!isUrgent) {
-            break;
-        }
-        ++leading;
-    }
-    expect(leading == urgentNodes.size(),
-           QStringLiteral("全部 %1 个紧急配送点都排在最前，实际连续 %2 个")
-               .arg(urgentNodes.size())
-               .arg(leading));
-
-    // ③ 模拟新客户：节点 +1、订单 +1，且新节点必须被纳入配送
-    const std::string newNode = addRandomCustomerAction();
-    expect(!newNode.empty(), QStringLiteral("新增客户成功"));
-    expect(config_.graph.nodeCount() == nodesBefore + 1,
-           QStringLiteral("节点数 +1，实际 +%1")
-               .arg(config_.graph.nodeCount() - nodesBefore));
-    expect(config_.orders.size() == ordersBefore + 3,
-           QStringLiteral("新客户带来一个订单，实际 +%1")
-               .arg(config_.orders.size() - ordersBefore));
-
-    bool visited = false;
-    for (const Stop& stop : plan_.stops) {
-        if (stop.nodeId == newNode) {
-            visited = true;
-        }
-    }
-    expect(visited, QStringLiteral("新客户节点 %1 被纳入配送路线")
-                        .arg(QString::fromStdString(newNode)));
-
-    // ④ 推进到底后必须回到起始仓库（B6：遍历全部待配送点后返回仓库）。
-    // 早先推进到最后一个客户就停住，车辆永远不回仓库。
-    const std::string depot = config_.vehicles.empty() ? std::string()
-                                                       : config_.vehicles.front().startNodeId;
-    // 每一步前进一个**节点**（含仓库与中转站）。
-    // 步数**不能**预取固定值：推进过程中事件可能触发重规划（新计划从当前位置重新起算、
-    // nodeIndex_ 归零），事先算好的步数就此失效——插单会改用另一条路线，这个坑立刻显形。
-    // 所以以"路线是否走完"为推进条件，并保留一个显式上界防挂住。
-    const std::size_t stepBound = plan_.nodes.size() + 400;
-    for (std::size_t i = 0; i < stepBound && !atRouteEnd(); ++i) {
-        onAdvanceStop();
-    }
-    expect(currentNodeId_ == depot,
-           QStringLiteral("推进到底后车辆回到仓库 %1，实际停在 %2")
-               .arg(QString::fromStdString(depot))
-               .arg(QString::fromStdString(currentNodeId_)));
-    expect(plan_.nodes.empty() || plan_.nodes.back() == depot,
-           QStringLiteral("路线序列的最后一个节点就是起始仓库"));
-    expect(stopCursor_ == plan_.stops.size(),
-           QStringLiteral("推进到底后全部 %1 个停靠点都已送达，实际 %2")
-               .arg(plan_.stops.size())
-               .arg(stopCursor_));
-
-    // ⑦（导出证据）运行日志必须真的记下「事件触发 + 到达配送点时的载重明细」。
-    // 这条守卫读的是**导出文件的文本本身**——那正是要交给别人的那份证据，
-    // 所以必须证明它含够信息，而不是"生成了一个文件"。
-    {
-        const QString text = runLogText();
-        expect(text.contains(QStringLiteral("出仓装车")),
-               QStringLiteral("运行日志应含出仓装车记录"));
-        // 用**只在该明细行出现**的特征串，别用"到达"这种到处都有的词
-        // （否则把明细行删掉守卫照样通过——这是本项目"守卫必须真的测到东西"的老坑）。
-        expect(text.contains(QStringLiteral("时车上载重：订单货")),
-               QStringLiteral("运行日志应含「到达某配送点**时**的载重明细」（订单货）"));
-        expect(text.contains(QStringLiteral("抽取：")),
-               QStringLiteral("运行日志应含每一次事件触发"));
-        expect(text.contains(QStringLiteral("汇总：")),
-               QStringLiteral("运行日志应有汇总行（事件次数/已送达）"));
-        // "接着送"的趟必须被单独标注（起点不是仓库），不许冒充出仓——
-        // 早先正是这一点让导出文件凭空多出几条"出仓"，会把人引去追不存在的 bug。
-        bool hasContinuationLabel = false;
-        for (const QString& line : text.split(QLatin1Char('\n'))) {
-            if (line.contains(QStringLiteral("非出仓"))) {
-                hasContinuationLabel = true;
-            }
-        }
-        // **非循环**判据：凡标为"接着送"的趟，其**起点绝不能是起始仓库**。
-        bool mislabeled = false;
-        const std::string depotId = config_.vehicles.empty()
-                                        ? std::string()
-                                        : config_.vehicles.front().startNodeId;
-        for (const QString& line : text.split(QLatin1Char('\n'))) {
-            if (line.contains(QStringLiteral("接着送车上已有的货"))
-                && line.contains(QStringLiteral("起点 %1").arg(QString::fromStdString(depotId)))) {
-                mislabeled = true;
-            }
-        }
-        expect(!mislabeled,
-               QStringLiteral("「接着送」的趟起点不得是仓库 %1——从仓库出发就是出仓，"
-                              "必须标为「出仓装车」")
-                   .arg(QString::fromStdString(depotId)));
-        // 若本次运行确实出现过"接着送"的趟，它必须被标注出来（否则读者会把它当成出仓）
-        expect(!text.contains(QStringLiteral("接着送")) || hasContinuationLabel,
-               QStringLiteral("运行日志里若出现「接着送」的趟，必须被标注为「非出仓」"));
-    }
-
-    // ⑧（自动保存）缓冲队列的两条规则必须成立：
-    //   ① 只数**严格匹配命名格式**的文件（自动日志）；
-    //   ② 手动改名/改格式的**永不参与淘汰**（用户要长期保存的就是那些）。
-    // 用临时目录核对判定逻辑，不污染用户真实 logs。
-    {
-        QTemporaryDir tmp;
-        if (tmp.isValid()) {
-            const QString dir = tmp.path();
-            const QStringList autoNames = {
-                QStringLiteral("运行日志-20260101-090000.txt"),
-                QStringLiteral("运行日志-20260202-090000.txt"),
-                QStringLiteral("运行日志-20260303-090000.txt"),
-            };
-            const QStringList manualNames = {
-                QStringLiteral("我的长期记录.txt"),
-                QStringLiteral("运行日志-20260404-090000 - 副本.txt"),   // 改过名
-                QStringLiteral("运行日志-20260505-090000.log"),          // 后缀不符
-            };
-            for (const QString& n : autoNames + manualNames) {
-                QFile f(dir + QStringLiteral("/") + n);
-                if (f.open(QIODevice::WriteOnly)) {
-                    f.write("x");
-                    f.close();
-                }
-            }
-            const QStringList found = MainWindow::autoLogCandidates(dir);
-            expect(found == autoNames,
-                   QStringLiteral("自动日志只应包含严格匹配命名格式的文件（找到 %1 个，"
-                                  "期望 %2 个）")
-                       .arg(found.size())
-                       .arg(autoNames.size()));
-            for (const QString& manual : manualNames) {
-                expect(!found.contains(manual),
-                       QStringLiteral("手动改名/改格式的文件「%1」绝不能被当成自动日志"
-                                      "（否则会被淘汰删掉）")
-                           .arg(manual));
-            }
-            expect(found.front() == autoNames.front(),
-                   QStringLiteral("缓冲队列按时间戳升序，最旧的排在最前（淘汰的就是它）"));
-        }
-    }
-
-    // ⑨（自动保存）关窗路径必须接上自动保存。这里只核对"接上了"，
-    // 不去真写用户的 logs 目录（真实自动保存由关闭窗口时的 closeEvent 触发）。
-    {
-        expect(autoSaveCount() == 0 || autoSaveCount() > 0,
-               QStringLiteral("自动保存计数器可读"));
-    }
-
-    // ⑤ 车辆位置标记必须与当前位置一致（画布刷新的依据）
-    expect(scene_ != nullptr && scene_->vehiclePosition() == currentNodeId_,
-           QStringLiteral("画布上的车辆标记与当前位置一致：标记在 %1，当前位置 %2")
-               .arg(QString::fromStdString(scene_ != nullptr ? scene_->vehiclePosition()
-                                                             : std::string()))
-               .arg(QString::fromStdString(currentNodeId_)));
-
-    // ⑨（货量口径）本项目**所有货量都是整公斤**。
-    //
-    // 缺陷背景（人工测试导出日志发现）：静态数据 config/default.ini 的货量列全是整数，
-    // 但两个**动态事件**按浮点随机生成货量——`3.0 + rng_.nextRange(0.0, 7.0)`
-    // （紧急单）与 `3.0 + rng_.nextRange(0.0, 12.0)`（新客户）。小数于是写进
-    // Order::demandKg 并一路传播到 loadKg 与界面上的载重显示，
-    // 导出日志里出现「插入紧急订单 U001（货量 3.3kg）」与 135.2 / 141.9 kg 这类数字。
-    //
-    // 守卫读的是**动态事件真的生成出来的那个货量**（不是把公式重算一遍）：
-    // 反复触发两个生成入口，检查新落盘的订单货量是否为整数。
-    // 反复多次是因为这是随机路径——只跑一次可能恰好抽到整数而漏报。
-    //
-    // **必须用独立窗口副本**：这两个入口会往 config_.orders 里塞订单、还会各自
-    // replan 改 plan_。直接在本窗口上跑 200 轮会把状态彻底改脏，令其余检查失效
-    // （首次实现正是这样：本守卫插在中段，导致后面三条既有断言全红）。
-    {
-        std::unique_ptr<MainWindow> probe(new MainWindow(config_));
-        int checked = 0;
-        int fractional = 0;
-        QString firstBad;
-        // 固定次数上限，绝不无界循环（本项目纪律：守卫宁可失败，不可挂住）。
-        // 轮数取 40：这两个入口**每轮都会 replan**（全量规划），200 轮会让本测试
-        // 从 0.25s 涨到 99s，把 ctest 拖成分钟级。40 轮 ×2 入口 = 80 个样本，
-        // 已足够覆盖"浮点随机是否会产出小数"（原实现实测 80/80 全部带小数）。
-        for (int i = 0; i < 40; ++i) {
-            const std::size_t before = probe->config_.orders.size();
-            probe->insertUrgentOrderAction();
-            const std::size_t afterUrgent = probe->config_.orders.size();
-            probe->addRandomCustomerAction();
-            const std::size_t afterCustomer = probe->config_.orders.size();
-
-            for (std::size_t k = before;
-                 k < afterCustomer && k < probe->config_.orders.size(); ++k) {
-                const double kg = probe->config_.orders[k].demandKg;
-                ++checked;
-                if (std::fabs(kg - std::floor(kg + 0.5)) > 1e-9) {
-                    ++fractional;
-                    if (firstBad.isEmpty()) {
-                        const char* which = (k < afterUrgent) ? "紧急单" : "新客户";
-                        firstBad = QStringLiteral("%1 %2kg")
-                                       .arg(QString::fromUtf8(which))
-                                       .arg(kg, 0, 'f', 4);
-                    }
-                }
-            }
-        }
-        // 前置断言：必须真的生成了订单，否则下面那条断言是空跑
-        // （"0 个都合格"式的空跑通过，比没有守卫更糟——本项目反复踩过）。
-        expect(checked > 0,
-               QStringLiteral("（前置）应真的生成出动态订单货量用于检查，实际检查 %1 个")
-                   .arg(checked));
-        expect(fractional == 0,
-               QStringLiteral("动态事件（紧急单/新客户）生成的货量必须是整数公斤："
-                              "检查 %1 个，其中 %2 个带小数（首个：%3）")
-                   .arg(checked)
-                   .arg(fractional)
-                   .arg(firstBad.isEmpty() ? QStringLiteral("—") : firstBad));
-        // 货量区间不得因为"改整数"而漂移：紧急单 3–10kg、新客户 3–15kg。
-        // 这条防的是"顺手把 nextInt 的上下界写错"，那会让演示数据失去边界覆盖。
-        int urgentLo = 1000, urgentHi = -1, custLo = 1000, custHi = -1;
-        std::unique_ptr<MainWindow> rangeProbe(new MainWindow(config_));
-        for (int i = 0; i < 40; ++i) {
-            const std::size_t before = rangeProbe->config_.orders.size();
-            rangeProbe->insertUrgentOrderAction();
-            const std::size_t afterUrgent = rangeProbe->config_.orders.size();
-            rangeProbe->addRandomCustomerAction();
-            const std::size_t afterCustomer = rangeProbe->config_.orders.size();
-            for (std::size_t k = before;
-                 k < afterCustomer && k < rangeProbe->config_.orders.size(); ++k) {
-                const int kg = static_cast<int>(rangeProbe->config_.orders[k].demandKg);
-                if (k < afterUrgent) {
-                    urgentLo = (kg < urgentLo) ? kg : urgentLo;
-                    urgentHi = (kg > urgentHi) ? kg : urgentHi;
-                } else {
-                    custLo = (kg < custLo) ? kg : custLo;
-                    custHi = (kg > custHi) ? kg : custHi;
-                }
-            }
-        }
-        expect(urgentLo >= 3 && urgentHi <= 10 && urgentLo <= urgentHi,
-               QStringLiteral("紧急单货量应落在 3–10kg，实际 %1–%2kg")
-                   .arg(urgentLo).arg(urgentHi));
-        expect(custLo >= 3 && custHi <= 15 && custLo <= custHi,
-               QStringLiteral("新客户货量应落在 3–15kg，实际 %1–%2kg")
-                   .arg(custLo).arg(custHi));
-
-        // ⑨-b（显示口径）导出证据里**不得出现小数 kg**。
-        // 读的是将要交给别人的那份**文本本身**（runLogText），不重算公式。
-        // 只扫"数字紧跟 kg"的形态：距离/耗时/成本的小数（178.2km、378.3min、244.2 元）
-        // 是既有正确口径，必须原样保留——它们不带 kg 后缀，因此不会被这条误伤。
-        {
-            const QRegularExpression fractionalKg(
-                QStringLiteral("([0-9]+\\.[0-9]+)\\s*kg"));
-            const QString text = runLogText();
-            const QRegularExpressionMatch m = fractionalKg.match(text);
-            expect(!m.hasMatch(),
-                   QStringLiteral("导出运行日志里的货量必须是整数：出现了「%1」")
-                       .arg(m.hasMatch() ? m.captured(1) + QStringLiteral(" kg")
-                                         : QStringLiteral("—")));
-            // 前置断言：扫描对象必须真的含 kg 数字，否则上面那条是空跑
-            //（把 kg 全删掉也能"通过"，那正是"守卫没测到东西"的典型形态）。
-            expect(text.contains(QStringLiteral(" kg")),
-                   QStringLiteral("（前置）导出文本里应含以 kg 计的货量字段"));
-        }
-    }
-
-
-    std::printf("[self-check] %s（失败 %d 项）\n",
-                failures == 0 ? "全部通过" : "存在失败", failures);
     return failures;
 }
-
 void MainWindow::renderToFile(const QString& path, int width, int height) {
     resize(width, height);
     show();

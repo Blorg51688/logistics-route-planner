@@ -304,8 +304,10 @@ void testInsertUrgentOrderIsServedFirstAndServedNodesExcluded() {
 
     const Vehicle v = makeVehicle("W", 1000.0, 480);
     const std::vector<logistics::Order> remaining = {makeOrder("O1", "D1", 10.0, 0, 1440)};
-    // 刻意传 urgent=false：按 §5.3，插入的订单必须被标记为紧急
-    const logistics::Order incoming = makeOrder("O2", "D2", 10.0, 0, 1440, false);
+    // 刻意传 urgent=false：按 §5.3，插入的订单必须被标记为紧急。
+    // 取送式紧急单：A=D1 取货、B=D2 送达。
+    logistics::Order incoming = makeOrder("O2", "D2", 10.0, 0, 1440, false);
+    incoming.pickupNodeId = "D1";
 
     const logistics::InsertResult r = logistics::insertUrgentOrder(
         g, v, remaining, incoming, "W", 480, logistics::WeightType::Distance);
@@ -326,8 +328,8 @@ void testInsertUrgentOrderIsServedFirstAndServedNodesExcluded() {
         check(n != "D0", "已服务节点 D0 不得出现在完整序列中");
     }
 
-    // oracle 值：nodes [W,D1,D2,D1,W]，总距离 6.0，总耗时 12.0
-    check(r.plan.nodes == std::vector<std::string>{"W", "D1", "D2", "D1", "W"},
+    // oracle 值：紧急取送趟 W→D1(取)→D2(送)→D1→W，随后普通趟 W→D1→W。
+    check(r.plan.nodes == std::vector<std::string>{"W", "D1", "D2", "D1", "W", "D1", "W"},
           "完整序列，实际 " + [&] {
               std::string s;
               for (std::size_t i = 0; i < r.plan.nodes.size(); ++i) {
@@ -335,10 +337,10 @@ void testInsertUrgentOrderIsServedFirstAndServedNodesExcluded() {
               }
               return s;
           }());
-    check(fixtures::nearlyEqual(r.plan.totalDistanceKm, 6.0),
-          "总距离 6.0，实际 " + std::to_string(r.plan.totalDistanceKm));
-    check(fixtures::nearlyEqual(r.plan.totalTimeMin, 12.0),
-          "总耗时 12.0，实际 " + std::to_string(r.plan.totalTimeMin));
+    check(fixtures::nearlyEqual(r.plan.totalDistanceKm, 8.0),
+          "总距离 8.0，实际 " + std::to_string(r.plan.totalDistanceKm));
+    check(fixtures::nearlyEqual(r.plan.totalTimeMin, 16.0),
+          "总耗时 16.0，实际 " + std::to_string(r.plan.totalTimeMin));
 }
 
 // 切片 E：新订单必然超时时给出警告，但按 D13 仍纳入规划并记录 penalty
@@ -349,8 +351,10 @@ void testInsertUrgentOrderWarnsButStillPlansWhenWindowCannotBeMet() {
 
     // 从 W 于 600 出发，到 D2 最早 606；窗口止 500 -> 必然超时
     const logistics::Order tight = makeOrder("O2", "D2", 10.0, 400, 500, true);
+    logistics::Order tightP = tight;
+    tightP.pickupNodeId = "D1";
     const logistics::InsertResult bad = logistics::insertUrgentOrder(
-        g, v, none, tight, "W", 600, logistics::WeightType::Distance);
+        g, v, none, tightP, "W", 600, logistics::WeightType::Distance);
 
     check(!bad.warning.empty(), "必然超时必须给出警告");
     check(bad.plan.status == logistics::PlanStatus::Ok,
@@ -370,8 +374,10 @@ void testInsertUrgentOrderWarnsButStillPlansWhenWindowCannotBeMet() {
 
     // 对照：窗口充裕 -> 无警告，无 penalty
     const logistics::Order wide = makeOrder("O3", "D2", 10.0, 0, 1440, true);
+    logistics::Order wideP = wide;
+    wideP.pickupNodeId = "D1";
     const logistics::InsertResult ok = logistics::insertUrgentOrder(
-        g, v, none, wide, "W", 600, logistics::WeightType::Distance);
+        g, v, none, wideP, "W", 600, logistics::WeightType::Distance);
     check(ok.warning.empty(), "窗口充裕时不应有警告，实际: " + ok.warning);
     check(ok.plan.totalPenaltyMin == 0, "窗口充裕时 penalty 为 0");
 }

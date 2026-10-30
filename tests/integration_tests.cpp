@@ -454,6 +454,8 @@ void checkTrafficAndUrgentOrderOnRealData(const Config& cfg) {
     logistics::Order urgent;
     urgent.id = "URG01";
     urgent.nodeId = remaining.front().nodeId;
+    // 取送式紧急单：A 取 → B 送；A 取一个与 B 不同的客户节点。
+    urgent.pickupNodeId = (urgent.nodeId == "D02") ? "D03" : "D02";
     urgent.demandKg = 5.0;
     urgent.windowStartMin = 0;
     urgent.windowEndMin = 1440;

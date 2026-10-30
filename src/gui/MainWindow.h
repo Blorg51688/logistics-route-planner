@@ -78,6 +78,10 @@ public:
         };
         std::vector<LateStop> deliveredLate;
 
+        // 已取货但未送达的紧急取送单（订单 id）：用于"执行中（已取未送）"状态显示，
+        // 以及防止重规划后重复装同一包裹。它是**物理事实**，跨重规划保留。
+        std::set<std::string> pickedOrderIds;
+
         // 车辆现有货量之和（单一算法，避免两处各算一遍）
         double sumOnboard() const {
             double t = 0.0;
@@ -185,6 +189,8 @@ private:
     void buildDocks();
 
     std::string insertUrgentOrderAction();
+    // 以显式给定的取货点 A、送达点 B、送货量插入一张紧急取送单（GUI 手选与自检共用）。
+    std::string insertUrgentOrderAt(const std::string& a, const std::string& b, double demand);
     std::string addRandomCustomerAction();
     std::string nextFreeId(const char* prefix) const;
 
