@@ -1112,7 +1112,11 @@ void testUrgentOffloadToTransitWhenNotFitting() {
 
     // 本趟载重不超过上限
     check(t.loadKg <= v.capacityKg + 1e-9, "降载趟 loadKg 不超过载重上限");
-    check(fixtures::nearlyEqual(t.loadKg, 50.0), "降载趟 loadKg = 紧急单货量 50");
+    // 真实峰值载重：onboardLoad 90 全卸(freed 90)，A 取紧急 50 → 50；B 送完回 S
+    // 取回全部 90kg 后车上又是 90（passingKg=0），才是本趟峰值。
+    check(fixtures::nearlyEqual(t.loadKg, 90.0),
+          "降载趟 loadKg = max((onboardLoad-freed)+紧急 50, onboardLoad-passingKg=90) = 90，实际 "
+              + std::to_string(t.loadKg));
     check(!t.pickups.empty() && t.pickups[0].orderId == "U1",
           "取货记录属于紧急单 U1");
 
@@ -1326,7 +1330,8 @@ void testUrgentOffloadKeepsAAndBDeliversBoth() {
           "A/B 顺路交货后同趟继续配送 D1、D2（停靠顺序 D3,D4,D1,D2）");
     check(t0.loadKg <= v.capacityKg + 1e-9, "降载趟载重不超过上限");
     check(fixtures::nearlyEqual(t0.loadKg, 70.0),
-          "降载趟峰值载重 = 剩余在途 20 + 紧急 50 = 70，实际 " + std::to_string(t0.loadKg));
+          "降载趟峰值载重 = max(剩余在途 20 + 紧急 50 = 70, onboardLoad 90 − passingKg 20 = 70) = 70，实际 "
+              + std::to_string(t0.loadKg));
 
     // D3/D4 全计划各只配送一次
     int countD3 = 0;
@@ -1626,6 +1631,53 @@ void testIncrementalFallbackKeepsStash() {
     check(std::fabs(kg - 90.0) < 1e-6, "取回量与暂存守恒（90kg）");
 }
 
+// ---- issue #15：已取未送紧急单送达后，回 S 取回暂存货 + 继续普通配送并入同一趟 ----
+// 修复前：pickedPool 趟 W→D2→W，stash 趟 W→S→D1→W（拆成两趟）；
+// 修复后：W→…→D2(送达)→S(取回)→D1(普通)→…→W，只一趟且取回记录落在这趟。
+void testPickedUrgentStashReclaimMergedIntoSameTrip() {
+    const LogisticsGraph g = makeOffloadGraph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+
+    Order u;
+    u.id = "U1"; u.pickupNodeId = "D1"; u.nodeId = "D2"; u.demandKg = 5.0;
+    u.windowStartMin = 0; u.windowEndMin = 1440; u.urgent = true; u.picked = true;
+    std::vector<Order> pending;
+    pending.push_back(u);
+    pending.push_back(makeOrder("O1", "D1", 30.0, 0, 1440));
+
+    logistics::StashState stash;
+    stash.station = "S";
+    stash.items.push_back(logistics::OnboardItem{"D1", 30.0});
+    const std::vector<logistics::OnboardItem> onboard{{"D2", 5.0}};   // 已取包裹在车上
+
+    const RoutePlan p = replan(g, v, pending, "W", 480, WeightType::Distance, onboard, stash);
+
+    check(p.status == PlanStatus::Ok, "已取未送 + 暂存重规划可行");
+    check(p.trips.size() == 1,
+          "送达 B 后回 S 取回并继续普通须与已取未送趟合并为一趟，实际趟数 "
+              + std::to_string(p.trips.size()));
+    if (p.trips.empty()) {
+        return;
+    }
+    const logistics::Trip& t = p.trips[0];
+    check(t.reclaimStation == "S", "合并趟记录回 S 取回暂存货");
+    check(t.reclaimAfterOrderId == "U1",
+          "合并趟取回闸：必须先送达已取未送的 U1（B）");
+    check(fixtures::nearlyEqual(t.reclaimKg, 30.0),
+          "取回量与暂存货守恒（30kg），实际 " + std::to_string(t.reclaimKg));
+
+    std::size_t iD2 = t.stops.size();
+    std::size_t iD1 = t.stops.size();
+    for (std::size_t i = 0; i < t.stops.size(); ++i) {
+        if (t.stops[i].nodeId == "D2" && iD2 == t.stops.size()) iD2 = i;
+        if (t.stops[i].nodeId == "D1" && iD1 == t.stops.size()) iD1 = i;
+    }
+    check(iD2 < t.stops.size() && iD1 < t.stops.size(),
+          "合并趟须同时含已取未送送达 D2 与暂存货送达 D1");
+    check(iD2 < iD1, "先送达 B(D2)，再于 S 取回后送暂存货 D1");
+    checkRouteIsWalkable(g, p, "W");
+}
+
 int main() {
     testSingleOrderRouteIsFullyCorrect();
     testEmptyOrdersDegeneratesToNoMovement();
@@ -1660,6 +1712,7 @@ int main() {
     testOffloadStationUsesFullDetour();
     testTwoUrgentOffloadsMergeIntoSingleStashPile();
     testIncrementalFallbackKeepsStash();
+    testPickedUrgentStashReclaimMergedIntoSameTrip();
 
     return testutil::summarize("routeplanner_tests");
 }

@@ -912,7 +912,6 @@ void MainWindow::onAdvanceStop() {
                 key.station = op.station;
                 key.nodeId = op.nodeId;
                 key.kg = static_cast<double>(std::lround(op.kg));
-                key.reclaim = false;
                 if (!state_.appliedOffloads.insert(key).second) {
                     continue;   // 第二次经过同一个站时不重复卸
                 }
@@ -944,7 +943,19 @@ void MainWindow::onAdvanceStop() {
                     allPickedHere = false;
                 }
             }
-            if (trip.reclaimStation == node && allPickedHere && !state_.stashItems.empty()) {
+            // 闸（issue #15）：picked+stash 合并趟里 S 可能位于去 B 的途中；
+            // 必须等 reclaimAfterOrderId 已送达才取回，否则会在 B 前提前把暂存货装回。
+            bool reclaimOrderServed = trip.reclaimAfterOrderId.empty();
+            if (!reclaimOrderServed) {
+                for (const Order& o : config_.orders) {
+                    if (o.id == trip.reclaimAfterOrderId && o.served) {
+                        reclaimOrderServed = true;
+                        break;
+                    }
+                }
+            }
+            if (trip.reclaimStation == node && allPickedHere && reclaimOrderServed
+                && !state_.stashItems.empty()) {
                 double reclaimed = 0.0;
                 for (const logistics::OnboardItem& it : state_.stashItems) {
                     state_.onboard.push_back(it);

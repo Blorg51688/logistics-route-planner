@@ -83,20 +83,19 @@ public:
         // 以及防止重规划后重复装同一包裹。它是**物理事实**，跨重规划保留。
         std::set<std::string> pickedOrderIds;
 
-        // 已执行过的降载/取回键（issue #4），防止 S 一趟出现两次时重复执行。
-        // 结构化键取代旧的「站@点@kg」「R@…」分隔符字符串：kg 存 lround 后的整数值，
-        // 比较口径与旧字符串键一致（同站同点同整数 kg 视为同一件事）；reclaim 排末位。
+        // 已执行过的降载键（issue #4），防止 S 一趟出现两次时重复执行。
+        // 结构化键取代旧的「站@点@kg」分隔符字符串：kg 存 lround 后的整数值，
+        // 比较口径与旧字符串键一致（同站同点同整数 kg 视为同一件事）。
+        // 取回不再进这个键（由本趟 pickups/reclaim 状态单独判定，reclaim 字段已退役）。
         // 同样是**物理事实**，跨重规划保留。
         struct OffloadKey {
             std::string station;
             std::string nodeId;
             double      kg = 0.0;     // 已 lround 到整数，延续旧键的去重口径
-            bool        reclaim = false;
             bool operator<(const OffloadKey& o) const {
                 if (station != o.station)  return station < o.station;
                 if (nodeId != o.nodeId)    return nodeId < o.nodeId;
-                if (kg != o.kg)            return kg < o.kg;
-                return reclaim < o.reclaim;
+                return kg < o.kg;
             }
         };
         std::set<OffloadKey> appliedOffloads;

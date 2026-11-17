@@ -72,6 +72,9 @@ struct Trip {
     // （= offloads 各项 kg 之和，守恒）。空串表示本趟没有降载/取回。
     std::string reclaimStation;
     double      reclaimKg = 0.0;
+    // 取回前**必须已送达**的订单（picked+stash 合并趟的最后一个已取单）。
+    // GUI 据此防止在“去 B 途中经过 S”时提前取回；空串表示无此额外闸门。
+    std::string reclaimAfterOrderId;
     double totalDistanceKm = 0.0;
     double totalCostYuan   = 0.0;
     double totalTimeMin    = 0.0;

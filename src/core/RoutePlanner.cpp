@@ -130,6 +130,9 @@ bool appendLeg(const LogisticsGraph& graph,
     return true;
 }
 
+// 前向声明：定义在本文件下方，weave 与其后的紧急趟共用同一套 Stop 口径。
+Stop makeStop(const Candidate& chosen, double& elapsedMin, double& loadKg);
+
 // 一趟内的贪心串联：从 startPos 出发，若给了 pickupNode 则先到那里装货，
 // 然后在 pool 内反复选"当前位置到它的最短路权重最小"的未服务点送达，
 // 最后走到 endNode。pool 以值传递，调用方保留自己的副本。
@@ -207,31 +210,10 @@ bool weave(const LogisticsGraph& graph,
             return false;
         }
 
-        Stop stop;
-        stop.nodeId = chosen.nodeId;
-
-        const double rawArrival = elapsedMin;
-        const double wait = (static_cast<double>(chosen.windowStartMin) > rawArrival)
-                                ? (static_cast<double>(chosen.windowStartMin) - rawArrival)
-                                : 0.0;
-        const double arrival = rawArrival + wait;
-
-        stop.rawArrivalMin = static_cast<int>(std::lround(rawArrival));
-        stop.waitMin = static_cast<int>(std::lround(wait));
-        stop.arrivalMin = static_cast<int>(std::lround(arrival));
-        stop.late = arrival > static_cast<double>(chosen.windowEndMin);
-        stop.penaltyMin = stop.late
-                              ? static_cast<int>(std::lround(arrival - static_cast<double>(chosen.windowEndMin)))
-                              : 0;
-
-        // 停靠节点在序列中记录的应是**实际送达时刻**（等窗口开启之后的 arrival），
-        // 而不是 appendLeg 记下的未经等待的原始到达时刻。
+        // 与 makeStop 共用同一套到达/等待/late/penalty 与载重扣减口径（#14 漏项收口）。
+        // 末节点由 appendLeg 记为未等待的原始到达时刻，这里写回实际送达时刻。
+        Stop stop = makeStop(chosen, elapsedMin, loadKg);
         trip.nodeArrivalMin[trip.nodeArrivalMin.size() - 1] = stop.arrivalMin;
-
-        elapsedMin = arrival;
-
-        loadKg -= chosen.demandKg;
-        stop.remainingLoadKg = loadKg;
         trip.stops.push_back(stop);
 
         current = chosen.nodeId;
@@ -247,12 +229,29 @@ bool weave(const LogisticsGraph& graph,
     return true;
 }
 
-void eraseCandidateByNode(std::vector<Candidate>& pool, const std::string& nodeId) {
+// 按候选身份擦除：同一 nodeId 可能挂多张订单（orderId / 窗口 / 货量不同）。
+// 优先"节点 + 货量(容差) + 窗口 + 订单号"精确匹配；找不到再退回首个同节点候选，
+// 保持 normalPool 每节点一个候选的现状（旧口径只按 nodeId 擦，可能擦错对象）。
+void eraseCandidateByNode(std::vector<Candidate>& pool, const Candidate& target) {
+    std::size_t fallback = pool.size();
     for (std::size_t i = 0; i < pool.size(); ++i) {
-        if (pool[i].nodeId == nodeId) {
-            pool.erase(pool.begin() + static_cast<std::ptrdiff_t>(i));
-            return;
+        if (pool[i].nodeId != target.nodeId) {
+            continue;
         }
+        if (fallback == pool.size()) {
+            fallback = i;
+        }
+        if (std::fabs(pool[i].demandKg - target.demandKg) > 1e-9
+            || pool[i].windowStartMin != target.windowStartMin
+            || pool[i].windowEndMin != target.windowEndMin
+            || pool[i].orderId != target.orderId) {
+            continue;
+        }
+        pool.erase(pool.begin() + static_cast<std::ptrdiff_t>(i));
+        return;
+    }
+    if (fallback < pool.size()) {
+        pool.erase(pool.begin() + static_cast<std::ptrdiff_t>(fallback));
     }
 }
 
@@ -272,10 +271,10 @@ void erasePassingCandidates(std::vector<Candidate>& normalPool,
                             const std::vector<Candidate>& passingA,
                             const std::vector<Candidate>& passingB) {
     for (const Candidate& p : passingA) {
-        eraseCandidateByNode(normalPool, p.nodeId);
+        eraseCandidateByNode(normalPool, p);
     }
     for (const Candidate& p : passingB) {
-        eraseCandidateByNode(normalPool, p.nodeId);
+        eraseCandidateByNode(normalPool, p);
     }
 }
 
@@ -525,20 +524,79 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
     double elapsed = static_cast<double>(startTimeMin);
     std::string current = startPos;
 
-    // 已取未送的紧急单：包裹已在车上，先从当前位置直接送达 B（**先于**任何新紧急单），
-    // 然后回仓库。FIFO 语义：新紧急单不得凌驾执行中紧急单。
+    // 已取未送的紧急单：包裹已在车上，先从当前位置直接送达 B（**先于**任何新紧急单）。
+    // issue #15：若调用方传入了待取回的暂存货，把「送达 B → 回 S 取回 → 继续普通
+    // 配送 → 仓库」并入这**同一趟**；后续独立 stash 段跳过这一堆，避免二次取回。
+    bool stashHandledByPicked = false;
     if (!pickedPool.empty()) {
         Trip trip;
         std::string fail;
         const double load = totalDemand(pickedPool);
+        const bool mergeStash = !stash.station.empty() && !stash.items.empty();
+        const std::string pickedEnd = mergeStash ? stash.station : vehicle.startNodeId;
         if (!weave(graph, pickedPool, current, elapsed, weight, std::string(),
-                   vehicle.startNodeId, load, trip, fail)) {
+                   pickedEnd, load, trip, fail)) {
             plan.status = PlanStatus::Unreachable;
             plan.reason = fail;
             return plan;
         }
+        if (mergeStash) {
+            // 与独立 stash 段同口径：暂存货对应的普通候选从 normalPool 取（按节点归并）。
+            std::vector<Candidate> stashCands;
+            for (const OnboardItem& it : stash.items) {
+                for (const Candidate& c : normalPool) {
+                    if (c.nodeId != it.nodeId) {
+                        continue;
+                    }
+                    bool seen = false;
+                    for (const Candidate& sc : stashCands) {
+                        if (sc.nodeId == c.nodeId) {
+                            seen = true;
+                        }
+                    }
+                    if (!seen) {
+                        stashCands.push_back(c);
+                    }
+                    break;
+                }
+            }
+            trip.reclaimStation = stash.station;
+            trip.reclaimKg = 0.0;
+            trip.reclaimAfterOrderId = pickedPool.back().orderId;
+            for (const OnboardItem& it : stash.items) {
+                trip.reclaimKg += it.kg;
+            }
+            // 送达 B 后已在 S：车上的已取包裹已卸完，此刻取回暂存货，
+            // 从 S 继续把普通货送到仓库。节点/停靠/距离并入同一 trip。
+            Trip stashTrip;
+            if (!weave(graph, stashCands, stash.station, elapsed, weight,
+                       std::string(), vehicle.startNodeId, totalDemand(stashCands),
+                       stashTrip, fail)) {
+                plan.status = PlanStatus::Unreachable;
+                plan.reason = fail;
+                return plan;
+            }
+            for (std::size_t i = 1; i < stashTrip.nodes.size(); ++i) {
+                trip.nodes.push_back(stashTrip.nodes[i]);
+                trip.nodeArrivalMin.push_back(
+                    i < stashTrip.nodeArrivalMin.size() ? stashTrip.nodeArrivalMin[i] : 0);
+                trip.nodeIsStop.push_back(
+                    i < stashTrip.nodeIsStop.size() ? stashTrip.nodeIsStop[i] : false);
+            }
+            for (const Stop& s : stashTrip.stops) {
+                trip.stops.push_back(s);
+            }
+            trip.totalDistanceKm += stashTrip.totalDistanceKm;
+            trip.totalCostYuan += stashTrip.totalCostYuan;
+            trip.endNodeId = stashTrip.endNodeId;
+            trip.loadKg = std::max(trip.loadKg, stashTrip.loadKg);
+            for (const Candidate& b : stashCands) {
+                eraseCandidateByNode(normalPool, b);
+            }
+            stashHandledByPicked = true;
+        }
         plan.trips.push_back(trip);
-        current = vehicle.startNodeId;
+        current = trip.endNodeId;
     }
 
     // 单堆暂存（issue #10）：全局至多一堆暂存货。第一次降载选定的 S 在此锁定，
@@ -639,7 +697,11 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
             //   · 本计划里已有降载锁定站：必须并入同一站同一堆；
             //   · 两者都为空（首次降载）：才按"最小绕行增量"选站并锁定。
             // 锁定的站若对当前紧急单不可达 → 报错，不允许偷偷选第二堆。
+            // 首次选中时算出的四条路径，锁定校验直接复用（避免两套最短路判定漂移）。
+            // 只从 stash / planStashStation 继承站时才需要重算。
             std::string stashStation;
+            PathResult chosenCs, chosenSa, chosenBs, chosenSd;
+            bool reuseSelectionPaths = false;
             if (!stash.station.empty()) {
                 stashStation = stash.station;
             } else if (!planStashStation.empty()) {
@@ -672,6 +734,10 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
                     if (better) {
                         bestStation = n.id;
                         bestDelta = delta;
+                        chosenCs = cs;
+                        chosenSa = sa;
+                        chosenBs = bs;
+                        chosenSd = sd;
                     }
                 }
                 if (bestStation.empty()) {
@@ -681,15 +747,21 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
                 }
                 stashStation = bestStation;
                 planStashStation = bestStation;   // 锁定，后续降载并入同一堆
+                reuseSelectionPaths = true;
             }
 
             // 锁定的暂存站必须对本单可达（current→S、S→A、B→S、S→仓库）；
             // 不可达才报错，绝不退化为另选一站（那会出现第二堆）。
             {
-                const PathResult cs = shortestPath(graph, current, stashStation, weight);
-                const PathResult sa = shortestPath(graph, stashStation, pickup, weight);
-                const PathResult bs = shortestPath(graph, c.nodeId, stashStation, weight);
-                const PathResult sd = shortestPath(graph, stashStation, vehicle.startNodeId, weight);
+                PathResult cs, sa, bs, sd;
+                if (reuseSelectionPaths) {
+                    cs = chosenCs; sa = chosenSa; bs = chosenBs; sd = chosenSd;
+                } else {
+                    cs = shortestPath(graph, current, stashStation, weight);
+                    sa = shortestPath(graph, stashStation, pickup, weight);
+                    bs = shortestPath(graph, c.nodeId, stashStation, weight);
+                    sd = shortestPath(graph, stashStation, vehicle.startNodeId, weight);
+                }
                 if (!cs.found || !sa.found || !bs.found || !sd.found) {
                     plan.status = PlanStatus::Unreachable;
                     plan.reason = "已锁定的暂存站 " + stashStation
@@ -826,12 +898,15 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
 
             // 本趟已服务的普通候选从 normalPool 移除：后续在途货段与簇逻辑不得再排
             for (const Candidate& nc : continuation) {
-                eraseCandidateByNode(normalPool, nc.nodeId);
+                eraseCandidateByNode(normalPool, nc);
             }
             // 顺路交付的普通候选已并入本趟，从 normalPool 移除，避免二次配送
             erasePassingCandidates(normalPool, passingA, passingB);
-            // 剩余在途货 + 紧急包裹 = 本趟峰值载重（≤ 上限，因已按需降载）
-            trip.loadKg = (onboardLoad - freed) + c.demandKg;
+            // 真实峰值载重：取货后 (onboardLoad - freed) + 紧急货量是一段峰值；
+            // 回 S 取回暂存货后车上还有 onboardLoad - passingKg 的普通货（issue #15），
+            // 取两者较大值才是本趟真正的最重载荷。
+            trip.loadKg = std::max((onboardLoad - freed) + c.demandKg,
+                                   onboardLoad - passingKg);
             plan.trips.push_back(trip);
             current = vehicle.startNodeId;
             urgentPool.erase(urgentPool.begin());
@@ -869,9 +944,9 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
         urgentPool.erase(urgentPool.begin());
     }
 
-    // ---- 中转站暂存货：回站取回并继续配送（跨重规划保住）----
-    // 暂存货不属于任何在车货；重规划时由调用方传入，规划器在计划里保留取回与配送。
-    if (!stash.station.empty() && !stash.items.empty()) {
+    // 中转站暂存货：回站取回并继续配送（跨重规划保住）。
+    // issue #15：若已被「已取未送」趟合并处理，这里跳过，杜绝二次取回/二次配送。
+    if (!stashHandledByPicked && !stash.station.empty() && !stash.items.empty()) {
         std::vector<Candidate> stashCands;
         for (const OnboardItem& it : stash.items) {
             for (const Candidate& c : normalPool) {
@@ -907,7 +982,7 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
         plan.trips.push_back(trip);
         current = trip.endNodeId;
         for (const Candidate& b : stashCands) {
-            eraseCandidateByNode(normalPool, b.nodeId);
+            eraseCandidateByNode(normalPool, b);
         }
     }
 
@@ -981,8 +1056,8 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
                 plan.trips.push_back(trip);
                 current = trip.endNodeId;
                 for (const Candidate& b : carried) {
-                    eraseCandidateByNode(urgentPool, b.nodeId);
-                    eraseCandidateByNode(normalPool, b.nodeId);
+                    eraseCandidateByNode(urgentPool, b);
+                    eraseCandidateByNode(normalPool, b);
                 }
             }
         }
@@ -1070,7 +1145,7 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
             plan.trips.push_back(trip);
             current = vehicle.startNodeId;
             for (const Candidate& b : batch) {
-                eraseCandidateByNode(pool, b.nodeId);
+                eraseCandidateByNode(pool, b);
             }
         }
     }
