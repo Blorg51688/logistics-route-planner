@@ -1288,7 +1288,7 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
         if (!replanOneTrip(graph, pool, prevTrip, report, thresholdRatio, weight,
                            static_cast<int>(std::lround(elapsed)), rebuilt, endTime)) {
             return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin,
-                          weight, onboard);
+                          weight, onboard, stash);
         }
         plan.trips.push_back(rebuilt);
         elapsed = endTime;

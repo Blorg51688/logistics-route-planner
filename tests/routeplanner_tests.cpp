@@ -1442,6 +1442,48 @@ void testOffloadStationUsesFullDetour() {
     checkRouteIsWalkable(g, r.plan, "W");
 }
 
+// ---- issue #11：增量重规划失败回退时也必须保住暂存货 ----
+void testIncrementalFallbackKeepsStash() {
+    const LogisticsGraph g = makeOffloadGraph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+
+    RoutePlan prev;
+    prev.status = PlanStatus::Ok;
+    prev.nodes = {"W", "W"};
+    prev.nodeArrivalMin = {480, 480};
+    prev.nodeIsStop = {false, false};
+    prev.nodeTripIndex = {0, 0};
+    logistics::Trip t;
+    t.nodes = {"W"};
+    t.nodeArrivalMin = {480};
+    t.nodeIsStop = {false};
+    t.endNodeId = "W";
+    prev.trips.push_back(t);   // nodes.size()<2 -> replanOneTrip 必然失败
+
+    logistics::StashState stash;
+    stash.station = "S";
+    stash.items.push_back(logistics::OnboardItem{"D1", 60.0});
+    stash.items.push_back(logistics::OnboardItem{"D2", 30.0});
+
+    const logistics::TrafficReport report;
+    bool used = true;
+    const RoutePlan p = replanIncremental(
+        g, v, std::vector<Order>(), prev, 480, WeightType::Distance, report, 0.2,
+        std::vector<logistics::OnboardItem>(), &used, stash);
+
+    check(p.status == PlanStatus::Ok, "增量失败回退后规划可行");
+    bool hasReclaim = false;
+    double kg = 0.0;
+    for (const logistics::Trip& tr : p.trips) {
+        if (tr.reclaimStation == "S") {
+            hasReclaim = true;
+            kg = tr.reclaimKg;
+        }
+    }
+    check(hasReclaim, "增量失败回退后仍必须包含回 S 取回暂存货");
+    check(std::fabs(kg - 90.0) < 1e-6, "取回量与暂存守恒（90kg）");
+}
+
 int main() {
     testSingleOrderRouteIsFullyCorrect();
     testEmptyOrdersDegeneratesToNoMovement();
@@ -1474,6 +1516,7 @@ int main() {
     testReplanKeepsStash();
     testPickedUrgentNotOvertakenByNewUrgent();
     testOffloadStationUsesFullDetour();
+    testIncrementalFallbackKeepsStash();
 
     return testutil::summarize("routeplanner_tests");
 }
