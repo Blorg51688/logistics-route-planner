@@ -908,8 +908,11 @@ void MainWindow::onAdvanceStop() {
                 if (op.station != node) {
                     continue;
                 }
-                const std::string key = op.station + "@" + op.nodeId + "@"
-                                        + std::to_string(std::lround(op.kg));
+                VehicleState::OffloadKey key;
+                key.station = op.station;
+                key.nodeId = op.nodeId;
+                key.kg = static_cast<double>(std::lround(op.kg));
+                key.reclaim = false;
                 if (!state_.appliedOffloads.insert(key).second) {
                     continue;   // 第二次经过同一个站时不重复卸
                 }

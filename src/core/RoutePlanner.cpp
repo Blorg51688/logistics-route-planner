@@ -256,6 +256,29 @@ void eraseCandidateByNode(std::vector<Candidate>& pool, const std::string& nodeI
     }
 }
 
+// 两处紧急取送都把同一个候选记成一次取货：字段一一对应，抽出来避免逐字重复。
+PickupOp makePickupOp(const Candidate& c) {
+    PickupOp op;
+    op.orderId = c.orderId;
+    op.pickupNodeId = c.pickupNodeId;
+    op.deliverNodeId = c.nodeId;
+    op.kg = c.demandKg;
+    return op;
+}
+
+// 顺路交付的 A/B 普通候选已并入本趟，成对从 normalPool 移除，避免二次配送。
+// A 先于 B 的展开顺序与原来逐处写出的顺序一致。
+void erasePassingCandidates(std::vector<Candidate>& normalPool,
+                            const std::vector<Candidate>& passingA,
+                            const std::vector<Candidate>& passingB) {
+    for (const Candidate& p : passingA) {
+        eraseCandidateByNode(normalPool, p.nodeId);
+    }
+    for (const Candidate& p : passingB) {
+        eraseCandidateByNode(normalPool, p.nodeId);
+    }
+}
+
 // issue #5：从 onboard + normalPool 里挑出"目的地恰为 nodeId、且此刻已在车上"的普通候选。
 // 只有真的在车上的货才顺路交付——仅存在于 normalPool 的普通单仍按原计划单独配送。
 void collectPassingCandidates(const std::vector<OnboardItem>& onboard,
@@ -281,6 +304,39 @@ void collectPassingCandidates(const std::vector<OnboardItem>& onboard,
             return;
         }
     }
+}
+
+// 从停靠候选生成一个 Stop（时间推进口径与 weave / weaveUrgentWithPassing 完全一致）。
+// loadKg 按 chosen.demandKg 扣减后记入 remainingLoadKg。
+Stop makeStop(const Candidate& chosen, double& elapsedMin, double& loadKg) {
+    Stop stop;
+    stop.nodeId = chosen.nodeId;
+    const double rawArrival = elapsedMin;
+    const double wait = (static_cast<double>(chosen.windowStartMin) > rawArrival)
+                            ? (static_cast<double>(chosen.windowStartMin) - rawArrival)
+                            : 0.0;
+    const double arrival = rawArrival + wait;
+    stop.rawArrivalMin = static_cast<int>(std::lround(rawArrival));
+    stop.waitMin = static_cast<int>(std::lround(wait));
+    stop.arrivalMin = static_cast<int>(std::lround(arrival));
+    stop.late = arrival > static_cast<double>(chosen.windowEndMin);
+    stop.penaltyMin = stop.late
+        ? static_cast<int>(std::lround(arrival - static_cast<double>(chosen.windowEndMin))) : 0;
+    elapsedMin = arrival;
+    loadKg -= chosen.demandKg;
+    stop.remainingLoadKg = loadKg;
+    return stop;
+}
+
+// 紧急顺路趟 A/B 两段共用：算好 Stop 后，把实际送达时刻与停靠标记写回 trip 末节点，
+// 再把 Stop 收进 trip。调用方需在进入前把该点的装货增量叠加到 loadKg
+// （A 点先装紧急包裹，B 点无需）。
+Stop commitWeaveStop(const Candidate& merged, double& elapsedMin, double& loadKg, Trip& trip) {
+    Stop stop = makeStop(merged, elapsedMin, loadKg);
+    trip.nodeArrivalMin.back() = stop.arrivalMin;
+    trip.nodeIsStop.back() = true;
+    trip.stops.push_back(stop);
+    return stop;
 }
 
 // issue #5：紧急取送趟顺路交付 A/B 的普通货。
@@ -335,28 +391,10 @@ bool weaveUrgentWithPassing(const LogisticsGraph& graph,
                 merged.windowEndMin = passingA[i].windowEndMin;
             }
         }
-        Stop stop;
-        stop.nodeId = pickupNode;
-        const double rawArrival = elapsedMin;
-        const double wait = (static_cast<double>(merged.windowStartMin) > rawArrival)
-                                ? (static_cast<double>(merged.windowStartMin) - rawArrival) : 0.0;
-        const double arrival = rawArrival + wait;
-        stop.rawArrivalMin = static_cast<int>(std::lround(rawArrival));
-        stop.waitMin = static_cast<int>(std::lround(wait));
-        stop.arrivalMin = static_cast<int>(std::lround(arrival));
-        stop.late = arrival > static_cast<double>(merged.windowEndMin);
-        stop.penaltyMin = stop.late
-            ? static_cast<int>(std::lround(arrival - static_cast<double>(merged.windowEndMin))) : 0;
-        // 该停靠节点就是刚走到的 A（appendLeg 已在此下标置 nodeIsStop=true）；
-        // 到达时刻记为等窗口后的实际送达时刻。
-        trip.nodeArrivalMin.back() = stop.arrivalMin;
-        trip.nodeIsStop.back() = true;
-        elapsedMin = arrival;
-        // 同一停靠先装上紧急包裹、再交付 A 的普通货。
+        // 同一停靠先装上紧急包裹、再交付 A 的普通货；Stop 的到达/等待/late/penalty
+        // 与末节点写回统一由 commitWeaveStop 处理。
         load += urgent.demandKg;
-        load -= merged.demandKg;
-        stop.remainingLoadKg = load;
-        trip.stops.push_back(stop);
+        commitWeaveStop(merged, elapsedMin, load, trip);
     }
 
     // 到 B：紧急送达；与 B 的普通货同点合并为一个停靠。
@@ -378,24 +416,9 @@ bool weaveUrgentWithPassing(const LogisticsGraph& graph,
                 merged.windowEndMin = p.windowEndMin;
             }
         }
-        Stop stop;
-        stop.nodeId = B;
-        const double rawArrival = elapsedMin;
-        const double wait = (static_cast<double>(merged.windowStartMin) > rawArrival)
-                                ? (static_cast<double>(merged.windowStartMin) - rawArrival) : 0.0;
-        const double arrival = rawArrival + wait;
-        stop.rawArrivalMin = static_cast<int>(std::lround(rawArrival));
-        stop.waitMin = static_cast<int>(std::lround(wait));
-        stop.arrivalMin = static_cast<int>(std::lround(arrival));
-        stop.late = arrival > static_cast<double>(merged.windowEndMin);
-        stop.penaltyMin = stop.late
-            ? static_cast<int>(std::lround(arrival - static_cast<double>(merged.windowEndMin))) : 0;
-        trip.nodeArrivalMin.back() = stop.arrivalMin;
-        trip.nodeIsStop.back() = true;
-        elapsedMin = arrival;
-        load -= merged.demandKg;   // 紧急包裹 + B 的普通货一次卸下
-        stop.remainingLoadKg = load;
-        trip.stops.push_back(stop);
+        // 紧急包裹 + B 的普通货一次卸下；与 A 段共用同一套到达/等待/late/penalty
+        // 与末节点写回口径。
+        commitWeaveStop(merged, elapsedMin, load, trip);
     }
 
     if (current != endNode) {
@@ -726,12 +749,7 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
             }
             trip.totalDistanceKm += sub.totalDistanceKm;
             trip.totalCostYuan += sub.totalCostYuan;
-            PickupOp op;
-            op.orderId = c.orderId;
-            op.pickupNodeId = c.pickupNodeId;
-            op.deliverNodeId = c.nodeId;
-            op.kg = c.demandKg;
-            trip.pickups.push_back(op);
+            trip.pickups.push_back(makePickupOp(c));
             trip.reclaimStation = stashStation;
             trip.reclaimKg = freed;
 
@@ -811,12 +829,7 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
                 eraseCandidateByNode(normalPool, nc.nodeId);
             }
             // 顺路交付的普通候选已并入本趟，从 normalPool 移除，避免二次配送
-            for (const Candidate& p : passingA) {
-                eraseCandidateByNode(normalPool, p.nodeId);
-            }
-            for (const Candidate& p : passingB) {
-                eraseCandidateByNode(normalPool, p.nodeId);
-            }
+            erasePassingCandidates(normalPool, passingA, passingB);
             // 剩余在途货 + 紧急包裹 = 本趟峰值载重（≤ 上限，因已按需降载）
             trip.loadKg = (onboardLoad - freed) + c.demandKg;
             plan.trips.push_back(trip);
@@ -847,19 +860,9 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
             }
         }
         // 顺路交付的普通候选已并入本趟，从 normalPool 移除，避免二次配送
-        for (const Candidate& p : passingA) {
-            eraseCandidateByNode(normalPool, p.nodeId);
-        }
-        for (const Candidate& p : passingB) {
-            eraseCandidateByNode(normalPool, p.nodeId);
-        }
+        erasePassingCandidates(normalPool, passingA, passingB);
         if (!c.pickupNodeId.empty()) {
-            PickupOp op;
-            op.orderId = c.orderId;
-            op.pickupNodeId = c.pickupNodeId;
-            op.deliverNodeId = c.nodeId;
-            op.kg = c.demandKg;
-            trip.pickups.push_back(op);
+            trip.pickups.push_back(makePickupOp(c));
         }
         plan.trips.push_back(trip);
         current = vehicle.startNodeId;
@@ -1169,27 +1172,6 @@ const Candidate* findCandidate(const std::vector<Candidate>& pool, const std::st
         }
     }
     return nullptr;
-}
-
-// 从停靠记录生成一个 Stop（时间推进口径与 weave 完全一致）
-Stop makeStop(const Candidate& chosen, double& elapsedMin, double& loadKg) {
-    Stop stop;
-    stop.nodeId = chosen.nodeId;
-    const double rawArrival = elapsedMin;
-    const double wait = (static_cast<double>(chosen.windowStartMin) > rawArrival)
-                            ? (static_cast<double>(chosen.windowStartMin) - rawArrival)
-                            : 0.0;
-    const double arrival = rawArrival + wait;
-    stop.rawArrivalMin = static_cast<int>(std::lround(rawArrival));
-    stop.waitMin = static_cast<int>(std::lround(wait));
-    stop.arrivalMin = static_cast<int>(std::lround(arrival));
-    stop.late = arrival > static_cast<double>(chosen.windowEndMin);
-    stop.penaltyMin = stop.late
-        ? static_cast<int>(std::lround(arrival - static_cast<double>(chosen.windowEndMin))) : 0;
-    elapsedMin = arrival;
-    loadKg -= chosen.demandKg;
-    stop.remainingLoadKg = loadKg;
-    return stop;
 }
 
 } // namespace
