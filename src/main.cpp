@@ -358,21 +358,45 @@ int main(int argc, char** argv) {
 
         // 中转站面板的内容快照：无头环境下据此确定性核对（不必靠肉眼裁图）
         //
-        // 面板为 3 列：中转站 / 子网络 / 下属配送点（「当前库存」列已随
-        // 中转缓冲机制退役而删除，见 issue #2）。
+        // 4 列：中转站 / 子网络 / 下属配送点 / 当前暂存货(kg)（issue #10）。
+        // 「当前库存」旧列随 D23 缓冲退役；本列反映紧急降载暂存货（无暂存为 0）。
+        // 守卫读**界面真实表头**与**实际单元格**，不重算公式、不背预期清单。
+        const QStringList transitHeaders = window.transitPanelHeaders();
+        bool hasStashHeader = false;
+        for (const QString& h : transitHeaders) {
+            if (h.contains(QStringLiteral("当前暂存货"))) {
+                hasStashHeader = true;
+            }
+        }
+        if (transitHeaders.size() != 4 || !hasStashHeader) {
+            const QByteArray headers = transitHeaders.join(QStringLiteral(" | ")).toUtf8();
+            std::fprintf(stderr,
+                         "[ui-probe] 中转站面板应有 4 列且含「当前暂存货」表头，实际 [%s]\n",
+                         headers.constData());
+            return 1;
+        }
         for (const QString& row : panelRows) {
             const QStringList cells = row.split(QStringLiteral(" | "));
-            if (cells.size() < 3) {
+            if (cells.size() != 4) {
                 const QByteArray bad = row.toUtf8();
                 std::fprintf(stderr,
-                             "[ui-probe] 中转站面板应有 3 列（中转站/子网络/下属配送点），"
-                             "实际不足：%s\n",
+                             "[ui-probe] 中转站面板应有 4 列，实际不足：%s\n",
+                             bad.constData());
+                return 1;
+            }
+            bool numeric = false;
+            cells[3].trimmed().toDouble(&numeric);
+            if (!numeric) {
+                const QByteArray bad = row.toUtf8();
+                std::fprintf(stderr,
+                             "[ui-probe] 中转站「当前暂存货」列必须是数字：%s\n",
                              bad.constData());
                 return 1;
             }
         }
         const QByteArray transit = panel.toUtf8();
-        std::printf("[ui-probe] 中转站面板（%s）:\n%s", "中转站|子网络|下属配送点",
+        std::printf("[ui-probe] 中转站面板（%s）:\n%s",
+                    transitHeaders.join(QStringLiteral("|")).toUtf8().constData(),
                     transit.constData());
         // 车辆面板：断言**界面上显示的载重**不超过载重上限。
         //

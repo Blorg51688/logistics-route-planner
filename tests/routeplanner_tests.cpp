@@ -2,6 +2,7 @@
 // 期望值全部来自手工推导的字面量，不复用实现中的任何计算。
 #include <cmath>
 #include <algorithm>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -1442,6 +1443,110 @@ void testOffloadStationUsesFullDetour() {
     checkRouteIsWalkable(g, r.plan, "W");
 }
 
+// ---- issue #10：多紧急单强制单堆暂存 ----
+// 物理事实：同一时刻全局至多一堆暂存货。同一份计划里两张紧急单都需降载时，
+// 必须并入同一站的同一堆，不能各自选最优站。
+// 图：W 仓库；S1/S2 两中转站；U1 的 A1/B1 贴近 S1（绕行增量 0 vs 18），
+// U2 的 A2/B2 贴近 S2（绕行增量 0 vs 18）。若各自选站，必选到不同站。
+LogisticsGraph makeSingleStashGraph() {
+    LogisticsGraph g;
+    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
+    Node s1 = makeNode("S1", NodeType::Transit, "中转站1"); s1.subNetworkId = 1;
+    Node s2 = makeNode("S2", NodeType::Transit, "中转站2"); s2.subNetworkId = 2;
+    g.addNode(s1); g.addNode(s2);
+    for (const char* id : {"A1", "B1", "A2", "B2", "D1", "D2"}) {
+        Node d = makeNode(id, NodeType::Delivery, id);
+        d.subNetworkId = 1;   // 同簇，避免跨簇排线影响
+        g.addNode(d);
+    }
+    addTwoWay(g, "W", "S1", 5.0, 10.0, 5.0);
+    addTwoWay(g, "W", "S2", 5.0, 10.0, 5.0);
+    addTwoWay(g, "S1", "A1", 1.0, 2.0, 1.0);
+    addTwoWay(g, "S1", "B1", 1.0, 2.0, 1.0);
+    addTwoWay(g, "S2", "A2", 1.0, 2.0, 1.0);
+    addTwoWay(g, "S2", "B2", 1.0, 2.0, 1.0);
+    // 另一站到 A/B 远，确保各单最优站唯一且不并列
+    addTwoWay(g, "S2", "A1", 10.0, 20.0, 10.0);
+    addTwoWay(g, "S2", "B1", 10.0, 20.0, 10.0);
+    addTwoWay(g, "S1", "A2", 10.0, 20.0, 10.0);
+    addTwoWay(g, "S1", "B2", 10.0, 20.0, 10.0);
+    // 基准距离：dist(W,A)=6、dist(B,W)=6（与经近站相同）
+    addTwoWay(g, "W", "A1", 6.0, 12.0, 6.0);
+    addTwoWay(g, "W", "B1", 6.0, 12.0, 6.0);
+    addTwoWay(g, "W", "A2", 6.0, 12.0, 6.0);
+    addTwoWay(g, "W", "B2", 6.0, 12.0, 6.0);
+    // 在途货：D2(30kg,距仓库8) > D1(60kg,距仓库7)，按最远优先整单卸
+    addTwoWay(g, "W", "D1", 7.0, 14.0, 7.0);
+    addTwoWay(g, "W", "D2", 8.0, 16.0, 8.0);
+    return g;
+}
+
+void testTwoUrgentOffloadsMergeIntoSingleStashPile() {
+    const LogisticsGraph g = makeSingleStashGraph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+
+    // 车上 90kg（上限 100）→ free 10；每张紧急单 50kg → need 40，
+    // 两张单都必须整单降载。两单在同一份计划里。
+    std::vector<Order> remaining;
+    remaining.push_back(makeOrder("O1", "D1", 60.0, 0, 1440));
+    remaining.push_back(makeOrder("O2", "D2", 30.0, 0, 1440));
+
+    Order u1;
+    u1.id = "U1"; u1.pickupNodeId = "A1"; u1.nodeId = "B1";
+    u1.demandKg = 50.0; u1.windowStartMin = 0; u1.windowEndMin = 1440; u1.urgent = true;
+    Order u2 = u1;
+    u2.id = "U2"; u2.pickupNodeId = "A2"; u2.nodeId = "B2";
+    // 把两张紧急单放进同一份 remaining（顺序即 FIFO）
+    remaining.push_back(u1);
+    remaining.push_back(u2);
+
+    const std::vector<logistics::OnboardItem> onboard{{"D1", 60.0}, {"D2", 30.0}};
+    const RoutePlan p = replan(g, v, remaining, "W", 480, WeightType::Distance, onboard);
+
+    check(p.status == PlanStatus::Ok, "两紧急单单堆暂存场景规划可行");
+
+    std::vector<std::string> offloadStations;
+    std::set<std::string> distinctPiles;
+    std::size_t offTripCount = 0;
+    for (const logistics::Trip& t : p.trips) {
+        if (t.offloads.empty()) {
+            continue;
+        }
+        ++offTripCount;
+        double sum = 0.0;
+        for (const logistics::OffloadOp& op : t.offloads) {
+            offloadStations.push_back(op.station);
+            distinctPiles.insert(op.station);
+            sum += op.kg;
+        }
+        check(fixtures::nearlyEqual(sum, t.reclaimKg),
+              "每个降载趟暂存守恒：Σoffloads.kg == reclaimKg");
+        check(!t.reclaimStation.empty() && t.reclaimStation == t.offloads.front().station,
+              "取回站与本趟降载站一致");
+        distinctPiles.insert(t.reclaimStation);
+    }
+    check(offTripCount == 2, "两张紧急单都需降载（两个降载趟），实际 "
+          + std::to_string(offTripCount));
+    check(offloadStations.size() >= 2, "至少两处 offloads 记录");
+    if (offloadStations.size() >= 2) {
+        bool allSame = true;
+        for (std::size_t i = 1; i < offloadStations.size(); ++i) {
+            if (offloadStations[i] != offloadStations[0]) {
+                allSame = false;
+            }
+        }
+        std::string listed;
+        for (const std::string& station : offloadStations) {
+            listed += (listed.empty() ? "" : ",") + station;
+        }
+        check(allSame, "两紧急单的 offloads 必须并入同一站的同一堆（实际 " + listed + "）");
+    }
+    check(distinctPiles.size() <= 1,
+          "全局至多一堆暂存：所有降载/取回站点去重后不超过 1，实际 "
+              + std::to_string(distinctPiles.size()));
+    checkRouteIsWalkable(g, p, "W");
+}
+
 // ---- issue #11：增量重规划失败回退时也必须保住暂存货 ----
 void testIncrementalFallbackKeepsStash() {
     const LogisticsGraph g = makeOffloadGraph();
@@ -1516,6 +1621,7 @@ int main() {
     testReplanKeepsStash();
     testPickedUrgentNotOvertakenByNewUrgent();
     testOffloadStationUsesFullDetour();
+    testTwoUrgentOffloadsMergeIntoSingleStashPile();
     testIncrementalFallbackKeepsStash();
 
     return testutil::summarize("routeplanner_tests");

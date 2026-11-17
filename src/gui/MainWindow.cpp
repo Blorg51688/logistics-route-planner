@@ -253,12 +253,14 @@ void MainWindow::buildDocks() {
     orderDock->setWidget(orderTable_);
     addDockWidget(Qt::RightDockWidgetArea, orderDock);
 
-    // 中转站 / 集散面板：承担 P3 的"子网络分组标识"与下属配送点归属
+    // 中转站 / 集散面板：承担 P3 的"子网络分组标识"与下属配送点归属；
+    // 第 4 列反映紧急降载暂存货（issue #10，无暂存为 0）。
     auto* transitDock = new QDockWidget(QStringLiteral("中转站 / 集散"), this);
     transitDock->setMinimumWidth(360);
-    transitTable_ = new QTableWidget(0, 3, transitDock);
+    transitTable_ = new QTableWidget(0, 4, transitDock);
     transitTable_->setHorizontalHeaderLabels(
-        {QStringLiteral("中转站"), QStringLiteral("子网络"), QStringLiteral("下属配送点")});
+        {QStringLiteral("中转站"), QStringLiteral("子网络"), QStringLiteral("下属配送点"),
+         QStringLiteral("当前暂存货(kg)")});
     transitTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     transitTable_->horizontalHeader()->setStretchLastSection(true);
     transitTable_->verticalHeader()->setVisible(false);
@@ -1612,12 +1614,13 @@ void MainWindow::updatePanels() {
         stopTable_->setItem(i, 5, new QTableWidgetItem(QString::number(s.remainingLoadKg, 'f', 0)));
     }
 
-    // 中转站 / 集散：子网络标识 + 下属配送点数
+    // 中转站 / 集散：子网络标识 + 下属配送点数 + 当前暂存货（kg）
     {
         struct TransitRow {
-            QString name;
-            int     sub = 0;
-            int     serves = 0;
+            QString     name;
+            std::string id;
+            int         sub = 0;
+            int         serves = 0;
         };
         std::vector<TransitRow> rows;
         for (const logistics::Node& n : config_.graph.nodes()) {
@@ -1625,6 +1628,7 @@ void MainWindow::updatePanels() {
                 continue;
             }
             TransitRow row;
+            row.id = n.id;
             row.name = QString::fromStdString(n.id) + QStringLiteral("（")
                        + QString::fromStdString(n.name) + QStringLiteral("）");
             row.sub = n.subNetworkId;
@@ -1636,6 +1640,12 @@ void MainWindow::updatePanels() {
             }
             rows.push_back(row);
         }
+        // 物理事实：全局至多一堆暂存货；只有 state_.stashStation 那一站显示非 0。
+        // 数据直接来自车辆状态（唯一权威），不从计划反推。
+        double stashKg = 0.0;
+        for (const logistics::OnboardItem& it : state_.stashItems) {
+            stashKg += it.kg;
+        }
         transitTable_->setRowCount(static_cast<int>(rows.size()));
         for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
             transitTable_->setItem(i, 0, new QTableWidgetItem(rows[i].name));
@@ -1643,6 +1653,10 @@ void MainWindow::updatePanels() {
                                    new QTableWidgetItem(QString::number(rows[i].sub)));
             transitTable_->setItem(i, 2,
                                    new QTableWidgetItem(QString::number(rows[i].serves)));
+            const bool here = !state_.stashStation.empty() && state_.stashStation == rows[i].id;
+            transitTable_->setItem(i, 3,
+                                   new QTableWidgetItem(
+                                       QString::number(here ? stashKg : 0.0, 'f', 0)));
         }
     }
 
@@ -1862,6 +1876,17 @@ QString MainWindow::transitPanelSummary() const {
         out += cells.join(QStringLiteral(" | ")) + QLatin1Char('\n');
     }
     return out;
+}
+
+QStringList MainWindow::transitPanelHeaders() const {
+    QStringList names;
+    if (transitTable_ != nullptr) {
+        for (int col = 0; col < transitTable_->columnCount(); ++col) {
+            const QTableWidgetItem* item = transitTable_->horizontalHeaderItem(col);
+            names << (item != nullptr ? item->text() : QString());
+        }
+    }
+    return names;
 }
 
 int MainWindow::vehicleTabCount() const {
@@ -2232,8 +2257,36 @@ int MainWindow::runActionSelfCheck() {
             double maxLoad = 0.0;
             std::string maxNode;
             std::string maxBreak;
+            bool panelMatchesState = true;
+            bool panelColumnsOk = true;
+            bool panelNumeric = true;
             for (int i = 0; i < 600 && !atRouteEnd(); ++i) {
                 onAdvanceStop();
+                // issue #10：中转站面板第 4 列必须逐帧反映车辆物理状态
+                //（stashStation/stashItems），无暂存为 0、有暂存为该站的非 0 kg。
+                const QStringList rows =
+                    transitPanelSummary().split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+                bool anyNonZero = false;
+                for (const QString& row : rows) {
+                    const QStringList cells = row.split(QStringLiteral(" | "));
+                    if (cells.size() != 4) {
+                        panelColumnsOk = false;
+                        continue;
+                    }
+                    bool isNumber = false;
+                    cells[3].trimmed().toDouble(&isNumber);
+                    if (!isNumber) {
+                        panelNumeric = false;
+                    }
+                    if (cells[3].trimmed().toDouble() > 0.0) {
+                        anyNonZero = true;
+                    }
+                }
+                const bool stashExists =
+                    !state_.stashStation.empty() && !state_.stashItems.empty();
+                if (anyNonZero != stashExists) {
+                    panelMatchesState = false;
+                }
                 if (state_.loadKg > maxLoad) {
                     maxLoad = state_.loadKg;
                     maxNode = state_.atNodeId;
@@ -2253,6 +2306,11 @@ int MainWindow::runActionSelfCheck() {
                                .arg(QString::fromStdString(maxNode))
                                .arg(cap, 0, 'f', 0)
                                .arg(QString::fromStdString(maxBreak)));
+            expect(panelColumnsOk, QStringLiteral("中转站面板始终为 4 列"));
+            expect(panelNumeric, QStringLiteral("中转站「当前暂存货」列始终是数字"));
+            expect(panelMatchesState,
+                   QStringLiteral("中转站「当前暂存货」列必须逐帧反映车辆暂存物理状态"
+                                  "（无暂存为 0、有暂存为非 0）"));
             // 若降载真的执行了（未被中途重规划改道），日志里应能看到「降载」
             if (!state_.appliedOffloads.empty()) {
                 expect(runLogText().contains(QStringLiteral("降载")),

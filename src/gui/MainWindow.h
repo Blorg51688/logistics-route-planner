@@ -143,6 +143,9 @@ public:
     static QStringList autoLogCandidates(const QString& dir);
     // 中转站面板的文本快照，供 --ui-probe 在无头环境下确定性核对
     QString transitPanelSummary() const;
+    // 中转站面板**真实表头**（供 --ui-probe 校验「当前暂存货」列确实在界面上）。
+    // 与 stopPanelHeaders() 同理：守卫读界面上真正的列名，不背预期清单。
+    QStringList transitPanelHeaders() const;
     // 停靠明细面板的文本快照（供 --ui-probe）
     QString stopPanelSummary() const;
     // 停靠明细面板**真实表头**（供 --ui-probe 校验表头与数据不错位）。

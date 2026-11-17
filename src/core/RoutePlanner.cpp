@@ -518,6 +518,10 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
         current = vehicle.startNodeId;
     }
 
+    // 单堆暂存（issue #10）：全局至多一堆暂存货。第一次降载选定的 S 在此锁定，
+    // 同一份计划里后续紧急单的降载必须并入这一堆（已有 stash 时以它为准）。
+    std::string planStashStation;
+
     // 紧急取送单：每张独立成趟、最先执行，按插入顺序（FIFO）。
     // 装得下：当前位置 → A(取货) → B(送达) → 仓库；只有 B 是配送停靠点（有窗口/penalty）。
     // 装不下（issue #4）：先到中转站 S 把**整条**普通货卸下暂存腾出空间，再
@@ -607,39 +611,68 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
                 return plan;
             }
 
-            // 选中转站 S：使绕行增量 dist(current,S)+dist(S,A)−dist(current,A) 最小；
-            // 并列时按节点 ID 字典序取，保证输出确定。
-            std::string bestStation;
-            double bestDelta = 0.0;
-            for (const Node& n : graph.nodes()) {
-                if (n.type != NodeType::Transit) {
-                    continue;
+            // 单堆约束（issue #10）：同一时刻全局至多一堆暂存货。
+            //   · 调用方传入了既有暂存货（stash.station）：必须并入那一堆；
+            //   · 本计划里已有降载锁定站：必须并入同一站同一堆；
+            //   · 两者都为空（首次降载）：才按"最小绕行增量"选站并锁定。
+            // 锁定的站若对当前紧急单不可达 → 报错，不允许偷偷选第二堆。
+            std::string stashStation;
+            if (!stash.station.empty()) {
+                stashStation = stash.station;
+            } else if (!planStashStation.empty()) {
+                stashStation = planStashStation;
+            } else {
+                // 选中转站 S：使绕行增量 dist(current,S)+dist(S,A)−dist(current,A) 最小；
+                // 并列时按节点 ID 字典序取，保证输出确定。
+                std::string bestStation;
+                double bestDelta = 0.0;
+                for (const Node& n : graph.nodes()) {
+                    if (n.type != NodeType::Transit) {
+                        continue;
+                    }
+                    const PathResult cs = shortestPath(graph, current, n.id, weight);
+                    const PathResult sa = shortestPath(graph, n.id, pickup, weight);
+                    const PathResult bs = shortestPath(graph, c.nodeId, n.id, weight);
+                    const PathResult sd = shortestPath(graph, n.id, vehicle.startNodeId, weight);
+                    const PathResult ca = shortestPath(graph, current, pickup, weight);
+                    const PathResult bd = shortestPath(graph, c.nodeId, vehicle.startNodeId, weight);
+                    if (!cs.found || !sa.found || !bs.found || !sd.found || !ca.found || !bd.found) {
+                        continue;
+                    }
+                    // 完整绕行增量：current→S→A→B→S→仓库 对比基线 current→A→B→仓库；
+                    // A→B 两侧相同、抵消。旧口径漏了 B→S 与 S→仓库。
+                    const double delta = cs.totalWeight + sa.totalWeight + bs.totalWeight
+                                         + sd.totalWeight - ca.totalWeight - bd.totalWeight;
+                    const bool better = bestStation.empty()
+                                        || delta < bestDelta - 1e-9
+                                        || (delta < bestDelta + 1e-9 && n.id < bestStation);
+                    if (better) {
+                        bestStation = n.id;
+                        bestDelta = delta;
+                    }
                 }
-                const PathResult cs = shortestPath(graph, current, n.id, weight);
-                const PathResult sa = shortestPath(graph, n.id, pickup, weight);
-                const PathResult bs = shortestPath(graph, c.nodeId, n.id, weight);
-                const PathResult sd = shortestPath(graph, n.id, vehicle.startNodeId, weight);
-                const PathResult ca = shortestPath(graph, current, pickup, weight);
-                const PathResult bd = shortestPath(graph, c.nodeId, vehicle.startNodeId, weight);
-                if (!cs.found || !sa.found || !bs.found || !sd.found || !ca.found || !bd.found) {
-                    continue;
+                if (bestStation.empty()) {
+                    plan.status = PlanStatus::OrderExceedsCapacity;
+                    plan.reason = "紧急订单货量装不下，且图中没有可达的中转站可供暂存";
+                    return plan;
                 }
-                // 完整绕行增量：current→S→A→B→S→仓库 对比基线 current→A→B→仓库；
-                // A→B 两侧相同、抵消。旧口径漏了 B→S 与 S→仓库。
-                const double delta = cs.totalWeight + sa.totalWeight + bs.totalWeight
-                                     + sd.totalWeight - ca.totalWeight - bd.totalWeight;
-                const bool better = bestStation.empty()
-                                    || delta < bestDelta - 1e-9
-                                    || (delta < bestDelta + 1e-9 && n.id < bestStation);
-                if (better) {
-                    bestStation = n.id;
-                    bestDelta = delta;
-                }
+                stashStation = bestStation;
+                planStashStation = bestStation;   // 锁定，后续降载并入同一堆
             }
-            if (bestStation.empty()) {
-                plan.status = PlanStatus::OrderExceedsCapacity;
-                plan.reason = "紧急订单货量装不下，且图中没有可达的中转站可供暂存";
-                return plan;
+
+            // 锁定的暂存站必须对本单可达（current→S、S→A、B→S、S→仓库）；
+            // 不可达才报错，绝不退化为另选一站（那会出现第二堆）。
+            {
+                const PathResult cs = shortestPath(graph, current, stashStation, weight);
+                const PathResult sa = shortestPath(graph, stashStation, pickup, weight);
+                const PathResult bs = shortestPath(graph, c.nodeId, stashStation, weight);
+                const PathResult sd = shortestPath(graph, stashStation, vehicle.startNodeId, weight);
+                if (!cs.found || !sa.found || !bs.found || !sd.found) {
+                    plan.status = PlanStatus::Unreachable;
+                    plan.reason = "已锁定的暂存站 " + stashStation
+                                  + " 对本紧急单不可达，无法并入同一堆暂存";
+                    return plan;
+                }
             }
 
             // 构造这一趟：current → S(降载) → A(取) → B(送) → S(取回) → 仓库。
@@ -648,14 +681,14 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
             Trip trip;
             std::string fail;
             beginTrip(trip, current, elapsed);
-            if (!appendLeg(graph, trip, elapsed, current, bestStation, weight, false, fail)) {
+            if (!appendLeg(graph, trip, elapsed, current, stashStation, weight, false, fail)) {
                 plan.status = PlanStatus::Unreachable;
                 plan.reason = fail;
                 return plan;
             }
             for (const OnboardItem& it : freedItems) {
                 OffloadOp op;
-                op.station = bestStation;
+                op.station = stashStation;
                 op.nodeId = it.nodeId;
                 op.kg = it.kg;
                 trip.offloads.push_back(op);
@@ -664,8 +697,8 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
             if (passingA.empty() && passingB.empty()) {
                 std::vector<Candidate> single;
                 single.push_back(c);
-                if (!weave(graph, single, bestStation, elapsed, weight, pickup,
-                           bestStation, c.demandKg, sub, fail)) {
+                if (!weave(graph, single, stashStation, elapsed, weight, pickup,
+                           stashStation, c.demandKg, sub, fail)) {
                     plan.status = PlanStatus::Unreachable;
                     plan.reason = fail;
                     return plan;
@@ -673,8 +706,8 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
             } else {
                 // 顺路交付 A/B 的普通货（issue #5）。降载后剩余在途货 = onboardLoad - freed，
                 // 其中 A/B 的货保证不会被卸（见上），仍在车上，故可顺路交付。
-                if (!weaveUrgentWithPassing(graph, c, passingA, passingB, bestStation, pickup,
-                                            onboardLoad - freed, elapsed, weight, bestStation,
+                if (!weaveUrgentWithPassing(graph, c, passingA, passingB, stashStation, pickup,
+                                            onboardLoad - freed, elapsed, weight, stashStation,
                                             sub, fail)) {
                     plan.status = PlanStatus::Unreachable;
                     plan.reason = fail;
@@ -699,9 +732,9 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
             op.deliverNodeId = c.nodeId;
             op.kg = c.demandKg;
             trip.pickups.push_back(op);
-            trip.reclaimStation = bestStation;
+            trip.reclaimStation = stashStation;
             trip.reclaimKg = freed;
-            if (!appendLeg(graph, trip, elapsed, bestStation, vehicle.startNodeId,
+            if (!appendLeg(graph, trip, elapsed, stashStation, vehicle.startNodeId,
                            weight, false, fail)) {
                 plan.status = PlanStatus::Unreachable;
                 plan.reason = fail;
