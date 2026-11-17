@@ -734,16 +734,82 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
             trip.pickups.push_back(op);
             trip.reclaimStation = stashStation;
             trip.reclaimKg = freed;
-            if (!appendLeg(graph, trip, elapsed, stashStation, vehicle.startNodeId,
-                           weight, false, fail)) {
+
+            // issue #12：取回暂存货后**继续普通配送**，并入**同一趟**后再统一回仓库。
+            // 本趟继续配送的普通候选只取 normalPool 中"此刻在车上"的货（含刚取回的整单），
+            // 并排除本趟已在 A/B 顺路交付的候选——那些货已经卸下，不能再送一次。
+            // 只挑在车货：normalPool 里还可能有仓库待发的新单，若一并塞进本趟，就会按
+            // "取回后载重"凭空多装货，把峰值载重顶过上限。那批仍走后续簇趟。
+            double passingKg = 0.0;
+            for (const Candidate& p : passingA) {
+                passingKg += p.demandKg;
+            }
+            for (const Candidate& p : passingB) {
+                passingKg += p.demandKg;
+            }
+            // 紧急包裹已在 B 卸完；回到 S 取回后车上的普通货量（≤ 上限）
+            const double loadAfterReclaim = onboardLoad - passingKg;
+
+            std::vector<Candidate> continuation;
+            for (const Candidate& nc : normalPool) {
+                bool servedEnRoute = false;
+                for (const Candidate& p : passingA) {
+                    if (p.nodeId == nc.nodeId) {
+                        servedEnRoute = true;
+                        break;
+                    }
+                }
+                if (!servedEnRoute) {
+                    for (const Candidate& p : passingB) {
+                        if (p.nodeId == nc.nodeId) {
+                            servedEnRoute = true;
+                            break;
+                        }
+                    }
+                }
+                if (servedEnRoute) {
+                    continue;
+                }
+                bool onCar = false;
+                for (const OnboardItem& it : onboard) {
+                    if (it.nodeId == nc.nodeId) {
+                        onCar = true;
+                        break;
+                    }
+                }
+                if (onCar) {
+                    continuation.push_back(nc);
+                }
+            }
+
+            // 空集时 weave 只走 S→仓库，与原先直接 appendLeg 回仓库逐位一致。
+            Trip contin;
+            if (!weave(graph, continuation, stashStation, elapsed, weight,
+                       std::string(), vehicle.startNodeId, loadAfterReclaim,
+                       contin, fail)) {
                 plan.status = PlanStatus::Unreachable;
                 plan.reason = fail;
                 return plan;
             }
-            trip.endNodeId = vehicle.startNodeId;
-            // 剩余在途货 + 紧急包裹 = 本趟峰值载重（≤ 上限，因已按需降载）
-            trip.loadKg = (onboardLoad - freed) + c.demandKg;
-            plan.trips.push_back(trip);
+            // 子趟从 S 起步；跳过其首节点 S，避免与已追加的取回点重复。
+            for (std::size_t i = 1; i < contin.nodes.size(); ++i) {
+                trip.nodes.push_back(contin.nodes[i]);
+                trip.nodeArrivalMin.push_back(
+                    i < contin.nodeArrivalMin.size() ? contin.nodeArrivalMin[i] : 0);
+                trip.nodeIsStop.push_back(
+                    i < contin.nodeIsStop.size() ? contin.nodeIsStop[i] : false);
+            }
+            for (const Stop& s : contin.stops) {
+                trip.stops.push_back(s);
+            }
+            trip.totalDistanceKm += contin.totalDistanceKm;
+            trip.totalCostYuan += contin.totalCostYuan;
+            trip.endNodeId = contin.endNodeId;
+
+            // 本趟已服务的普通候选从 normalPool 移除：后续在途货段与簇逻辑不得再排
+            for (const Candidate& nc : continuation) {
+                eraseCandidateByNode(normalPool, nc.nodeId);
+            }
             // 顺路交付的普通候选已并入本趟，从 normalPool 移除，避免二次配送
             for (const Candidate& p : passingA) {
                 eraseCandidateByNode(normalPool, p.nodeId);
@@ -751,6 +817,9 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
             for (const Candidate& p : passingB) {
                 eraseCandidateByNode(normalPool, p.nodeId);
             }
+            // 剩余在途货 + 紧急包裹 = 本趟峰值载重（≤ 上限，因已按需降载）
+            trip.loadKg = (onboardLoad - freed) + c.demandKg;
+            plan.trips.push_back(trip);
             current = vehicle.startNodeId;
             urgentPool.erase(urgentPool.begin());
             continue;

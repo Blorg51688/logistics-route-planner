@@ -1032,8 +1032,13 @@ void testUrgentOffloadToTransitWhenNotFitting() {
     check(offTrip == 0, "降载趟应最先执行（紧急单优先）");
 
     const logistics::Trip& t = p.trips[offTrip];
-    check(t.nodes == std::vector<std::string>({"W", "S", "D3", "D4", "S", "W"}),
-          "降载趟序列 W->S(卸)->D3(取)->D4(送)->S(取回)->W，实际 " + join(t.nodes));
+    check(t.nodes.front() == "W" && t.nodes.back() == "W",
+          "降载趟从仓库出发并回到仓库，实际 " + join(t.nodes));
+    // issue #12：取回暂存货后继续普通配送并入**同一趟**，不再拆成后续簇趟。
+    check(t.nodes == std::vector<std::string>(
+              {"W", "S", "D3", "D4", "S", "D1", "S", "D2", "S", "W"}),
+          "同趟应含 W->S(卸)->D3(取)->D4(送)->S(取回)->D1->S->D2->S->W，实际 "
+              + join(t.nodes));
 
     // 降载发生在取货之前；取回发生在送达之后
     std::size_t s1 = t.nodes.size();
@@ -1056,6 +1061,34 @@ void testUrgentOffloadToTransitWhenNotFitting() {
     }
     check(s1 < ia, "降载站 S 必须出现在取货点 A 之前");
     check(t.reclaimStation == "S" && s2 > ib, "取回站 S 必须出现在送达点 B 之后");
+
+    // issue #12：B 送达并回 S 取回后，同一趟继续停靠普通客户 D1、D2
+    std::size_t iB = t.stops.size();
+    std::size_t iD1 = t.stops.size();
+    std::size_t iD2 = t.stops.size();
+    for (std::size_t i = 0; i < t.stops.size(); ++i) {
+        if (t.stops[i].nodeId == "D4" && iB == t.stops.size()) iB = i;
+        if (t.stops[i].nodeId == "D1" && iD1 == t.stops.size()) iD1 = i;
+        if (t.stops[i].nodeId == "D2" && iD2 == t.stops.size()) iD2 = i;
+    }
+    check(iB < t.stops.size() && iD1 < t.stops.size() && iD2 < t.stops.size(),
+          "同一趟的停靠必须含 B(D4) 与后续普通停靠 D1、D2");
+    check(iB < iD1 && iD1 < iD2, "B 先送达，随后同趟继续普通配送 D1、D2");
+
+    // 后续趟不得再排这批普通货（杜绝二次配送 / 拆趟）
+    bool duplicated = false;
+    for (std::size_t k = 0; k < p.trips.size(); ++k) {
+        if (k == offTrip) {
+            continue;
+        }
+        for (const logistics::Stop& s : p.trips[k].stops) {
+            if (s.nodeId == "D1" || s.nodeId == "D2") {
+                duplicated = true;
+            }
+        }
+    }
+    check(!duplicated, "D1/D2 已在降载趟同趟配送，后续趟不得再排同样的普通趟");
+    check(p.trips.size() == 1, "降载→取回→继续普通应在同一趟完成（计划只有 1 趟）");
 
     // 暂存守恒：Σoffloads.kg == reclaimKg，且两条普通货都被整单卸下
     double sum = 0.0;
@@ -1083,9 +1116,10 @@ void testUrgentOffloadToTransitWhenNotFitting() {
     check(!t.pickups.empty() && t.pickups[0].orderId == "U1",
           "取货记录属于紧急单 U1");
 
-    // 手算距离：W-S 5 + S-D3 4 + D3-D4 2 + D4-S 5 + S-W 5 = 21
-    check(fixtures::nearlyEqual(t.totalDistanceKm, 21.0),
-          "降载趟距离 21.0，实际 " + std::to_string(t.totalDistanceKm));
+    // 手算距离：W-S 5 + S-D3 4 + D3-D4 2 + D4-S 5 + S-D1 2 + D1-S 2
+    //          + S-D2 3 + D2-S 3 + S-W 5 = 31
+    check(fixtures::nearlyEqual(t.totalDistanceKm, 31.0),
+          "同趟降载+取回+继续普通距离 31.0，实际 " + std::to_string(t.totalDistanceKm));
 
     checkRouteIsWalkable(g, p, "W");
 }
@@ -1282,11 +1316,14 @@ void testUrgentOffloadKeepsAAndBDeliversBoth() {
     check(keepsA && keepsB, "降载绝不卸 A/B 目的地的货");
     check(fixtures::nearlyEqual(freed, t0.reclaimKg), "暂存守恒：Σoffloads.kg == reclaimKg");
 
-    // 序列 W->S(卸)->D3(取+交付)->D4(送+交付)->S(取回)->W
-    check(t0.nodes == std::vector<std::string>({"W", "S", "D3", "D4", "S", "W"}),
-          "降载 + 顺路交货趟序列，实际 " + join(t0.nodes));
-    check(t0.stops.size() == 2 && t0.stops[0].nodeId == "D3" && t0.stops[1].nodeId == "D4",
-          "D3(A)、D4(B) 均作为停靠点且顺序不变");
+    // issue #12：W->S(卸)->D3(取+交付)->D4(送+交付)->S(取回)->D1->S->D2->S->W
+    check(t0.nodes == std::vector<std::string>(
+              {"W", "S", "D3", "D4", "S", "D1", "S", "D2", "S", "W"}),
+          "降载 + 顺路交货 + 同趟继续普通序列，实际 " + join(t0.nodes));
+    check(t0.stops.size() == 4 && t0.stops[0].nodeId == "D3"
+              && t0.stops[1].nodeId == "D4" && t0.stops[2].nodeId == "D1"
+              && t0.stops[3].nodeId == "D2",
+          "A/B 顺路交货后同趟继续配送 D1、D2（停靠顺序 D3,D4,D1,D2）");
     check(t0.loadKg <= v.capacityKg + 1e-9, "降载趟载重不超过上限");
     check(fixtures::nearlyEqual(t0.loadKg, 70.0),
           "降载趟峰值载重 = 剩余在途 20 + 紧急 50 = 70，实际 " + std::to_string(t0.loadKg));
