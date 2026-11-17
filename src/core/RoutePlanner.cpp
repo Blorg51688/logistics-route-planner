@@ -19,6 +19,7 @@ struct Candidate {
     int         windowStartMin = 0;
     int         windowEndMin = 0;
     bool        urgent = false;
+    bool        pickedUrgent = false;   // 已取未送的紧急单：只剩送达 B，不再去 A 取货
 };
 
 // 把订单列表折叠成停靠点候选：
@@ -29,6 +30,19 @@ std::vector<Candidate> buildCandidates(const std::vector<Order>& orders) {
     for (const Order& o : orders) {
         // 取送式紧急单（有取货点 A）：各自独立成候选，**不**并入普通停靠点，
         // 因为它不是"仓库→客户"的普通配送，而是"A 取 → B 送"的一段独立行程。
+        if (o.urgent && o.picked) {
+            // 已取未送：包裹已在车上，只剩送达 B；单独成池，先于新紧急单。
+            Candidate c;
+            c.nodeId = o.nodeId;
+            c.orderId = o.id;
+            c.demandKg = o.demandKg;
+            c.windowStartMin = o.windowStartMin;
+            c.windowEndMin = o.windowEndMin;
+            c.urgent = false;
+            c.pickedUrgent = true;
+            candidates.push_back(c);
+            continue;
+        }
         if (!o.pickupNodeId.empty() && !o.picked) {
             Candidate c;
             c.nodeId = o.nodeId;
@@ -473,9 +487,12 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
     // 各自簇的行程隔开，不满足「优先满足紧急订单」。同样地，现实中紧急单
     // 也应当立即派车，因此这里把它摘出来作为独立批次直接从仓库送达。
     std::vector<Candidate> urgentPool;
+    std::vector<Candidate> pickedPool;
     std::vector<Candidate> normalPool;
     for (const Candidate& c : candidates) {
-        if (c.urgent) {
+        if (c.pickedUrgent) {
+            pickedPool.push_back(c);
+        } else if (c.urgent) {
             urgentPool.push_back(c);
         } else {
             normalPool.push_back(c);
@@ -484,6 +501,22 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
 
     double elapsed = static_cast<double>(startTimeMin);
     std::string current = startPos;
+
+    // 已取未送的紧急单：包裹已在车上，先从当前位置直接送达 B（**先于**任何新紧急单），
+    // 然后回仓库。FIFO 语义：新紧急单不得凌驾执行中紧急单。
+    if (!pickedPool.empty()) {
+        Trip trip;
+        std::string fail;
+        const double load = totalDemand(pickedPool);
+        if (!weave(graph, pickedPool, current, elapsed, weight, std::string(),
+                   vehicle.startNodeId, load, trip, fail)) {
+            plan.status = PlanStatus::Unreachable;
+            plan.reason = fail;
+            return plan;
+        }
+        plan.trips.push_back(trip);
+        current = vehicle.startNodeId;
+    }
 
     // 紧急取送单：每张独立成趟、最先执行，按插入顺序（FIFO）。
     // 装得下：当前位置 → A(取货) → B(送达) → 仓库；只有 B 是配送停靠点（有窗口/penalty）。
@@ -776,12 +809,25 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
     // 这一步不能省：若规划器对在途货一无所知，它会按"货物都在仓库"来排线，
     // 于是每次重规划的每一段都可能先跑回仓库——车在仓库与客户之间来回跳，
     // Debug 模式下尤其明显（每个 tick 都重规划一次）。
-    if (!onboard.empty()) {
+    std::vector<OnboardItem> onboardRest;
+    for (const OnboardItem& it : onboard) {
+        bool handledByPicked = false;
+        for (const Candidate& p : pickedPool) {
+            if (p.nodeId == it.nodeId) {
+                handledByPicked = true;
+                break;
+            }
+        }
+        if (!handledByPicked) {
+            onboardRest.push_back(it);
+        }
+    }
+    if (!onboardRest.empty()) {
         // 必须从**剩余池**里取，不能从全量 candidates 取：
         // 紧急批次可能已经把某些客户送掉了，从全量取会把它们再送一遍
         // （表现为两趟行程完全相同，车在原地打转）。
         std::vector<Candidate> carried;
-        for (const OnboardItem& item : onboard) {
+        for (const OnboardItem& item : onboardRest) {
             for (const std::vector<Candidate>* pool : {&urgentPool, &normalPool}) {
                 for (const Candidate& c : *pool) {
                     if (c.nodeId == item.nodeId) {

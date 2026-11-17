@@ -1367,6 +1367,35 @@ void testReplanKeepsStash() {
     checkRouteIsWalkable(g, p, "W");
 }
 
+// ---- issue #8：执行中（已取未送）紧急单不得被新紧急单抢先 ----
+void testPickedUrgentNotOvertakenByNewUrgent() {
+    const LogisticsGraph g = makeOffloadGraph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+
+    Order u1;
+    u1.id = "U1"; u1.pickupNodeId = "D1"; u1.nodeId = "D2"; u1.demandKg = 5.0;
+    u1.windowStartMin = 0; u1.windowEndMin = 1440; u1.urgent = true; u1.picked = true;
+    Order u2;
+    u2.id = "U2"; u2.pickupNodeId = "D3"; u2.nodeId = "D4"; u2.demandKg = 5.0;
+    u2.windowStartMin = 0; u2.windowEndMin = 1440; u2.urgent = true;
+
+    const std::vector<logistics::OnboardItem> onboard{{"D2", 5.0}};
+    const RoutePlan p = replan(g, v, {u1, u2}, "W", 480, WeightType::Distance, onboard);
+    check(p.status == PlanStatus::Ok, "已取未送场景规划可行");
+
+    std::size_t i2 = p.stops.size();
+    std::size_t i4 = p.stops.size();
+    bool d1Stop = false;
+    for (std::size_t i = 0; i < p.stops.size(); ++i) {
+        if (p.stops[i].nodeId == "D2" && i2 == p.stops.size()) i2 = i;
+        if (p.stops[i].nodeId == "D4" && i4 == p.stops.size()) i4 = i;
+        if (p.stops[i].nodeId == "D1") d1Stop = true;
+    }
+    check(i2 < i4, "执行中紧急单必须先于新紧急单送达（D2 早于 D4）");
+    check(!d1Stop, "已取未送的紧急单不得再次到 A 取货（D1 不应成为停靠点）");
+    checkRouteIsWalkable(g, p, "W");
+}
+
 int main() {
     testSingleOrderRouteIsFullyCorrect();
     testEmptyOrdersDegeneratesToNoMovement();
@@ -1397,6 +1426,7 @@ int main() {
     testUrgentOffloadKeepsAAndBDeliversBoth();
     testUrgentFifoOrder();
     testReplanKeepsStash();
+    testPickedUrgentNotOvertakenByNewUrgent();
 
     return testutil::summarize("routeplanner_tests");
 }
