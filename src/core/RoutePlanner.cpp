@@ -617,11 +617,17 @@ RoutePlan multiTripPlanImpl(const LogisticsGraph& graph,
                 }
                 const PathResult cs = shortestPath(graph, current, n.id, weight);
                 const PathResult sa = shortestPath(graph, n.id, pickup, weight);
+                const PathResult bs = shortestPath(graph, c.nodeId, n.id, weight);
+                const PathResult sd = shortestPath(graph, n.id, vehicle.startNodeId, weight);
                 const PathResult ca = shortestPath(graph, current, pickup, weight);
-                if (!cs.found || !sa.found || !ca.found) {
+                const PathResult bd = shortestPath(graph, c.nodeId, vehicle.startNodeId, weight);
+                if (!cs.found || !sa.found || !bs.found || !sd.found || !ca.found || !bd.found) {
                     continue;
                 }
-                const double delta = cs.totalWeight + sa.totalWeight - ca.totalWeight;
+                // 完整绕行增量：current→S→A→B→S→仓库 对比基线 current→A→B→仓库；
+                // A→B 两侧相同、抵消。旧口径漏了 B→S 与 S→仓库。
+                const double delta = cs.totalWeight + sa.totalWeight + bs.totalWeight
+                                     + sd.totalWeight - ca.totalWeight - bd.totalWeight;
                 const bool better = bestStation.empty()
                                     || delta < bestDelta - 1e-9
                                     || (delta < bestDelta + 1e-9 && n.id < bestStation);

@@ -1396,6 +1396,52 @@ void testPickedUrgentNotOvertakenByNewUrgent() {
     checkRouteIsWalkable(g, p, "W");
 }
 
+// ---- issue #9：卸货站选择必须按完整绕行增量（含 B→S 与 S→仓库）最小 ----
+// 构造：旧口径 current→S→A 会选 S1；计入 B→S、S→仓库后应选 S2。
+LogisticsGraph makeStationChoiceGraph() {
+    LogisticsGraph g;
+    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
+    Node s1 = makeNode("S1", NodeType::Transit, "站1"); s1.subNetworkId = 1;
+    Node s2 = makeNode("S2", NodeType::Transit, "站2"); s2.subNetworkId = 2;
+    g.addNode(s1); g.addNode(s2);
+    g.addNode(makeNode("A", NodeType::Delivery, "取货A"));
+    g.addNode(makeNode("B", NodeType::Delivery, "送达B"));
+    g.addNode(makeNode("D1", NodeType::Delivery, "普通D1"));
+    // 旧口径（current→S→A）会选 S1（S1=9 < S2=10）；
+    // 计入 B→S 与 S→仓库后，S2 的完整增量 10 << S1 的 29。
+    addTwoWay(g, "W", "S1", 10.0, 10.0, 10.0);
+    addTwoWay(g, "S1", "A", 1.0, 1.0, 1.0);
+    addTwoWay(g, "W", "A", 2.0, 2.0, 2.0);
+    addTwoWay(g, "W", "S2", 1.0, 1.0, 1.0);
+    addTwoWay(g, "S2", "A", 11.0, 11.0, 11.0);
+    addTwoWay(g, "S2", "B", 1.0, 1.0, 1.0);
+    addTwoWay(g, "B", "S1", 20.0, 20.0, 20.0);
+    addTwoWay(g, "D1", "W", 4.0, 4.0, 4.0);
+    return g;
+}
+
+void testOffloadStationUsesFullDetour() {
+    const LogisticsGraph g = makeStationChoiceGraph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+
+    Order u;
+    u.id = "U1"; u.pickupNodeId = "A"; u.nodeId = "B"; u.demandKg = 50.0;
+    u.windowStartMin = 0; u.windowEndMin = 1440; u.urgent = true;
+
+    const std::vector<logistics::OnboardItem> onboard{{"D1", 60.0}};
+    const InsertResult r = insertUrgentOrder(g, v, {}, u, "W", 480,
+                                             WeightType::Distance, onboard);
+    check(r.plan.status == PlanStatus::Ok, "选站场景规划可行");
+    check(!r.plan.trips.empty() && !r.plan.trips[0].offloads.empty(),
+          "应发生降载");
+    if (!r.plan.trips.empty() && !r.plan.trips[0].offloads.empty()) {
+        check(r.plan.trips[0].offloads[0].station == "S2",
+              "卸货站应按完整绕行增量选 S2（旧口径会错选 S1），实际 "
+                  + r.plan.trips[0].offloads[0].station);
+    }
+    checkRouteIsWalkable(g, r.plan, "W");
+}
+
 int main() {
     testSingleOrderRouteIsFullyCorrect();
     testEmptyOrdersDegeneratesToNoMovement();
@@ -1427,6 +1473,7 @@ int main() {
     testUrgentFifoOrder();
     testReplanKeepsStash();
     testPickedUrgentNotOvertakenByNewUrgent();
+    testOffloadStationUsesFullDetour();
 
     return testutil::summarize("routeplanner_tests");
 }
