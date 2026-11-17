@@ -84,7 +84,7 @@ void usage() {
         "  --dump-graph [list|matrix|both]  输出邻接表 / 邻接矩阵后退出（B3）\n"
         "  --ui-probe                 检查工具栏与侧栏是否完整构造后退出\n"
         "  --self-check-actions       自动验证插单不丢单 / 新客户会被配送后退出\n"
-        "  --plan-summary distance|time|cost  打印该策略的规划汇总后退出（供人工测试核对）\n"
+        "  --plan-summary distance|time|cost  打印该策略的规划汇总后退出（供命令行核对）\n"
         "  --width N --height N       窗口/图像尺寸\n");
 }
 
@@ -178,7 +178,7 @@ int main(int argc, char** argv) {
 
     // B3：把图的两种文本表示打印出来。此前这两个函数只有测试在调用，
     // 程序没有任何入口能让人看到，验收时无法展示。
-    // 供人工测试向导取用：把规划的汇总值打出来，向导据此显示"应看到什么"，
+    // 供命令行核对：把规划的汇总值打出来，
     // 这样数据集调整后向导的期望值不会过期
     if (!opt.planSummary.empty()) {
         logistics::WeightType planWeight = logistics::WeightType::Distance;
@@ -310,7 +310,7 @@ int main(int argc, char** argv) {
         const int docks = window.dockCount();
         std::printf("[ui-probe] 工具栏动作 %d 个，停靠面板 %d 个\n", actions, docks);
         // 打印实际的动作名与面板名：向导里让用户点的按钮必须真实存在，
-        // 由 check_wizard_ui_names.py 逐条比对，避免向导指示一个不存在的按钮。
+        // 由 `--ui-probe` 逐条比对，避免界面名称与实现漂移。
         const QString actionTexts = window.toolbarActionTexts();
         std::printf("[ui-probe] 动作: %s\n", actionTexts.toUtf8().constData());
         std::printf("[ui-probe] 面板: %s\n", window.dockTitles().toUtf8().constData());

@@ -29,11 +29,12 @@
 # 1) 启动主软件（首次会自动构建）
 bash start-here/run/启动软件.sh
 
-# 2) 人工测试向导（8 关，约 5–6 分钟；它自己也会确保已构建）
-bash start-here/run/人工测试向导.sh
+# 2) 定位问题：无头自检与界面探针（不需要图形显示）
+QT_QPA_PLATFORM=offscreen ./build/app --self-check-actions
+QT_QPA_PLATFORM=offscreen ./build/app --ui-probe
 ```
 
-> 命令等价于直接在项目根运行根目录的 `启动软件.sh` / `start-here/run/` 下的 `人工测试向导.sh`——`start-here/run/` 是快捷入口，实现只有一份。
+> 人工测试向导已于 2026-11-17 退役；常规启动 + 上述命令即可快速定位问题。
 
 ---
 
@@ -47,7 +48,7 @@ bash start-here/run/人工测试向导.sh
 ├── CMakeLists.txt           构建定义（找不到 Qt6 时自动跳过 GUI 目标）
 ├── config/default.ini       默认数据：30 节点 / 106 条有向边 / 25 订单
 ├── requirements/            老师给的原始题目与报告要求（.doc/.docx/.pptx，只读）
-├── scripts/                 共享构建逻辑（ensure_build.sh）+ 人工测试向导本体（manual_test_wizard.sh）
+├── scripts/                 共享构建逻辑（ensure_build.sh）
 ├── src/
 │   ├── core/                图、手写堆、Dijkstra、路径规划（零 Qt；算法主体手写）
 │   ├── io/                  手写 INI 解析与配置加载
@@ -56,10 +57,10 @@ bash start-here/run/人工测试向导.sh
 ├── start-here/              用户入口：只放导览与薄封装脚本，原文件不动
 │   ├── README.md            三步走：看 / 跑 / 成果
 │   ├── read/                文档导览（只指路，不复制任何文档内容）
-│   ├── run/                 启动软件.sh（薄封装，指向根目录）+ 人工测试向导.sh（实现在此）
+│   ├── run/                 启动软件.sh（薄封装，指向根目录）
 │   └── deliverables/        报告/流程图/UML/测试用例表的成品出口（本阶段仅有说明）
 ├── tests/                   9 个测试程序，合计 983 项断言
-├── tools/                   预言机对拍、数据生成器自检、向导文案检查器
+├── tools/                   预言机对拍、数据生成器自检、文档链接检查
 ├── docs/                    设计文档、要求核对清单、测试记录……（见 docs/文档导航.md）
 └── build/                   构建产物（已 gitignore，首次运行自动生成）
 ```
@@ -74,7 +75,7 @@ bash start-here/run/人工测试向导.sh
 **先构建一次**（`bash 启动软件.sh` 会顺手做掉），然后：
 
 ```bash
-(cd build && ctest)                      # 跑全部自动化测试（20 个目标 / 983 项断言）
+(cd build && ctest)                      # 跑全部自动化测试（15 个目标 / 983 项断言）
 ```
 
 主程序的各种用法（在**工作区根目录**执行）：
@@ -93,6 +94,6 @@ QT_QPA_PLATFORM=offscreen \
 
 ## 当前状态（不要只看代码，也看 docs/文档导航.md）
 
-- **代码与自动化测试：完成**（`ctest` 20/20，983 项断言全通过，规划结果可复现）。
+- **代码与自动化测试：完成**（`ctest` 15/15，983 项断言全通过，规划结果可复现）。
 - **课程设计报告：尚未编写**——占 30 分，且是参加验收的前置条件。
 - 完整的交付物清单与待完成项，见 [`文档导航.md`](docs/文档导航.md)。

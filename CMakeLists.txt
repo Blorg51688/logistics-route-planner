@@ -114,28 +114,6 @@ if(Qt6_FOUND)
     add_test(NAME cli_action_self_check
              COMMAND ${CMAKE_COMMAND} -E env QT_QPA_PLATFORM=offscreen
                      $<TARGET_FILE:app> --self-check-actions)
-    # 向导文案的引号截断检查：这类错误 bash -n 查不出来（语法合法、语义错），
-    # 本项目已经踩过两次（把中文引号写成英文 "，导致标题/正文被静默截断）。
-    if(Python3_Interpreter_FOUND)
-        add_test(NAME wizard_text_lint
-                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_wizard_text.py)
-        # 向导里写死的规模/结构数字必须与 config/default.ini 一致——
-        # "预期文案过期"已在第 3、6、7 轮反复发生，改由脚本每次守住
-        add_test(NAME wizard_claims_lint
-                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_wizard_claims.py)
-        # 向导让用户点的界面元素必须真实存在——改名/删除/从未实现的按钮
-        # 会让用户卡住，而 bash -n 与引号检查都发现不了
-        add_test(NAME wizard_ui_names_lint
-                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_wizard_ui_names.py)
-        # 向导的"关卡选择"逻辑（输入 0 跑全部 / 关号 / 关名 / 片段）
-        add_test(NAME wizard_stage_pick
-                 COMMAND bash ${CMAKE_SOURCE_DIR}/tools/check_wizard_stage_pick.sh)
-        # 「双击人工测试向导.sh 无反应」的兜底：没有终端时入口必须自己开终端，
-        # 而不是打印一段没人看得到的拒绝信息（本机 KIO 双击 = 不分配终端）。
-        add_test(NAME wizard_terminal_launch
-                 COMMAND bash ${CMAKE_SOURCE_DIR}/tools/check_wizard_terminal.sh)
-    endif()
-
     # UI 完整性：工具栏与侧栏必须真的被构造出来。
     # 曾经交互路径只构造裸 QGraphicsView，工具栏/侧栏在正常启动时完全不存在。
     add_test(NAME cli_ui_probe
