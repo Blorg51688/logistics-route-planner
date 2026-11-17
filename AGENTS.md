@@ -22,7 +22,7 @@
 ```bash
 bash 启动软件.sh                  # 启动 GUI（首次会自动 CMake 配置 + 编译）
 bash start-here/run/人工测试向导.sh  # 8 关人工测试向导（需要真实终端）
-(cd build && ctest)              # 全部自动化测试：20 个目标 / 913 项断言（以 ctest -N 为准）
+(cd build && ctest)              # 全部自动化测试：20 个目标 / 966 项断言（以 ctest -N 为准）
 ./build/app --help               # 主程序全部命令行选项
 ```
 
@@ -32,7 +32,7 @@ bash start-here/run/人工测试向导.sh  # 8 关人工测试向导（需要真
   - distance `178.200km / 378.300min / 244.200元 / penalty 166 / 6 趟`
   - cost `186.300km / 461.000min / 235.900元 / penalty 207 / 6 趟`
   - time `183.200km / 372.100min / 255.200元 / penalty 201 / 6 趟`
-- `ctest` 全绿；9 个测试二进制自报断言合计 **913 项**（与 ctest 目标数是两个口径）。
+- `ctest` 全绿；9 个测试二进制自报断言合计 **966 项**（与 ctest 目标数是两个口径）。
   目标数以 `ctest -N` 为准（当前 20 个；**不要把这个数字背成硬编码**——加了测试就要同步更新文档）。
 - **任何行为改动后**：跑 `ctest` + 对比上面三行黄金值。**数字变了就必须解释为什么**，
   并同步更新断言、`docs/设计.md` 的相关小节与 [`文档导航.md`](docs/文档导航.md) 的事实。不通过不许声称完成。
@@ -89,7 +89,7 @@ bash start-here/run/人工测试向导.sh  # 8 关人工测试向导（需要真
   满载出仓/顺路寄存/紧急单就地满足/两版取优；含四轮商议与实测）。
 - `docs/records/decisions/probes/`（可复现探针 probe.cpp / probeD / probeE / probeF）。
 - `docs/records/handoffs/`（历次阶段交接 `team-*.md`）。
-- `docs/设计.md` §16（P0–P37 开发史，含每个真实缺陷的根因与修法）。
+- `docs/设计.md` §16（P0–P38 开发史，含每个真实缺陷的根因与修法）。
 - `build-gotchas`（构建坑）、`test-targets`（目标数沿革与"以实测为准"口径）、`commit-policy`
   （提交/推送授权与边界）已分别写入本文件 §5 / §3 / §4，不另设文件。
 
