@@ -6,7 +6,6 @@
 #include <QToolBar>
 #include <QTabWidget>
 
-#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -80,6 +79,31 @@ public:
         };
         std::vector<LateStop> deliveredLate;
 
+        // 已取货但未送达的紧急取送单（订单 id）：用于"执行中（已取未送）"状态显示，
+        // 以及防止重规划后重复装同一包裹。它是**物理事实**，跨重规划保留。
+        std::set<std::string> pickedOrderIds;
+
+        // 已执行过的降载键（issue #4），防止 S 一趟出现两次时重复执行。
+        // 结构化键取代旧的「站@点@kg」分隔符字符串：kg 存 lround 后的整数值，
+        // 比较口径与旧字符串键一致（同站同点同整数 kg 视为同一件事）。
+        // 取回不再进这个键（由本趟 pickups/reclaim 状态单独判定，reclaim 字段已退役）。
+        // 同样是**物理事实**，跨重规划保留。
+        struct OffloadKey {
+            std::string station;
+            std::string nodeId;
+            double      kg = 0.0;     // 已 lround 到整数，延续旧键的去重口径
+            bool operator<(const OffloadKey& o) const {
+                if (station != o.station)  return station < o.station;
+                if (nodeId != o.nodeId)    return nodeId < o.nodeId;
+                return kg < o.kg;
+            }
+        };
+        std::set<OffloadKey> appliedOffloads;
+
+        // 中转站暂存货（降载后未取回）：跨重规划保留，传给规划器以保住取回。
+        std::vector<logistics::OnboardItem> stashItems;
+        std::string stashStation;
+
         // 车辆现有货量之和（单一算法，避免两处各算一遍）
         double sumOnboard() const {
             double t = 0.0;
@@ -88,16 +112,6 @@ public:
             }
             return t;
         }
-
-        // ---- 缓冲库存（2026-09-26 用户裁定恢复；只服务紧急单）----
-        // 车上剩余的缓冲货（不属于任何订单）。出仓时按计划装满，到站卸货/紧急单取用时递减。
-        double bufferKg = 0.0;
-        // 各中转站的**当前**库存——这是**权威物理量**：只由"车真的卸了/取了"来改动，
-        // 绝不从计划反推（P25）。计划里的 transitStock 只是投影，用于显示预测值。
-        std::map<std::string, double> stationStock;
-        // 已落账的寄存键（"站@时刻"）：重规划可能重新推导出同一条寄存，
-        // 用它去重，保证同一次物理卸货只记一次账。
-        std::set<std::string> creditedBanks;
     };
 
     // 供 --self-check-actions 核对
@@ -124,8 +138,8 @@ public:
     int toolbarActionCount() const;
     int dockCount() const;
     // ---- 运行日志导出（「导出运行日志…」按钮与 --export-log 共用同一条代码路径）----
-    // 记录：每次**事件触发**、每次**到达配送点时的车辆载重明细**（订单货 / 缓冲货 /
-    // 车上载重）、每次**出仓装车**与**顺路寄存**、以及紧急单的处置方式。
+    // 记录：每次**事件触发**、每次**到达配送点时的车辆载重明细**（订单货 / 车上载重）、
+    // 每次**出仓装车**、以及紧急单的处置方式。
     // 目的：把"确实会出现的问题"变成可以直接带出界面的证据，而不是要求对方复现。
     QString runLogText() const;
     bool exportRunLogTo(const QString& path) const;
@@ -141,6 +155,9 @@ public:
     static QStringList autoLogCandidates(const QString& dir);
     // 中转站面板的文本快照，供 --ui-probe 在无头环境下确定性核对
     QString transitPanelSummary() const;
+    // 中转站面板**真实表头**（供 --ui-probe 校验「当前暂存货」列确实在界面上）。
+    // 与 stopPanelHeaders() 同理：守卫读界面上真正的列名，不背预期清单。
+    QStringList transitPanelHeaders() const;
     // 停靠明细面板的文本快照（供 --ui-probe）
     QString stopPanelSummary() const;
     // 停靠明细面板**真实表头**（供 --ui-probe 校验表头与数据不错位）。
@@ -197,6 +214,8 @@ private:
     void buildDocks();
 
     std::string insertUrgentOrderAction();
+    // 以显式给定的取货点 A、送达点 B、送货量插入一张紧急取送单（GUI 手选与自检共用）。
+    std::string insertUrgentOrderAt(const std::string& a, const std::string& b, double demand);
     std::string addRandomCustomerAction();
     std::string nextFreeId(const char* prefix) const;
 
