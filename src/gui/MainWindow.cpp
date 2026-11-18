@@ -1397,13 +1397,14 @@ void MainWindow::onManualEdit() {
     QDialog dialog(this);
     dialog.setWindowTitle(QStringLiteral("手工增删节点 / 边"));
 
-    // 节点一律从图中选择，避免手输非法 ID；终点下拉自动排除当前起点。
+    // 简化版：只选起点、终点两个节点。
+    //   · 起点 == 终点 → 删除该节点（连同其全部出入边）；
+    //   · 起点 != 终点 → 删除两者之间的双向边。
+    // 添加边仍要求起点 != 终点。节点一律从图中选，杜绝手输非法 ID。
     auto* fromCombo = new QComboBox(&dialog);
     auto* toCombo = new QComboBox(&dialog);
-    auto* nodeCombo = new QComboBox(&dialog);
 
-    auto rebuild = [&](const QString& keepFrom, const QString& keepTo,
-                       const QString& keepNode) {
+    auto rebuild = [&](const QString& keepFrom, const QString& keepTo) {
         QStringList ids;
         for (const logistics::Node& n : config_.graph.nodes()) {
             ids << QString::fromStdString(n.id);
@@ -1420,48 +1421,33 @@ void MainWindow::onManualEdit() {
         {
             const QSignalBlocker blocker(toCombo);
             toCombo->clear();
-            const QString a = fromCombo->currentText();
-            for (const QString& s : ids) {
-                if (s != a) {
-                    toCombo->addItem(s);
-                }
+            toCombo->addItems(ids);
+            int i = keepTo.isEmpty() ? -1 : toCombo->findText(keepTo);
+            if (i < 0 && toCombo->count() > 1) {
+                i = 1;   // 默认选另一个节点，落到"删边"模式
             }
-            const int i = toCombo->findText(keepTo);
             if (i >= 0) {
                 toCombo->setCurrentIndex(i);
             }
         }
-        {
-            const QSignalBlocker blocker(nodeCombo);
-            nodeCombo->clear();
-            nodeCombo->addItems(ids);
-            const int i = nodeCombo->findText(keepNode);
-            if (i >= 0) {
-                nodeCombo->setCurrentIndex(i);
-            }
-        }
     };
-    rebuild(QString(), QString(), QString());
-
-    connect(fromCombo, &QComboBox::currentTextChanged, &dialog, [&](const QString&) {
-        rebuild(fromCombo->currentText(), toCombo->currentText(), nodeCombo->currentText());
-    });
+    rebuild(QString(), QString());
 
     auto* form = new QFormLayout;
     form->addRow(QStringLiteral("起点节点"), fromCombo);
     form->addRow(QStringLiteral("终点节点"), toCombo);
-    form->addRow(QStringLiteral("删除节点"), nodeCombo);
 
-    auto* hint = new QLabel(QStringLiteral("节点均从图中选择；起点与终点不能相同。"), &dialog);
+    auto* hint = new QLabel(
+        QStringLiteral("起点 = 终点：删除该节点；起点 ≠ 终点：删除两者之间的双向边。\n"
+                       "添加边要求起点与终点不同。"),
+        &dialog);
     hint->setWordWrap(true);
 
     auto* addEdgeBtn = new QPushButton(QStringLiteral("添加边"), &dialog);
-    auto* delEdgeBtn = new QPushButton(QStringLiteral("删除边"), &dialog);
-    auto* delNodeBtn = new QPushButton(QStringLiteral("删除节点"), &dialog);
+    auto* delBtn = new QPushButton(QStringLiteral("删除"), &dialog);
     auto* buttons = new QHBoxLayout;
     buttons->addWidget(addEdgeBtn);
-    buttons->addWidget(delEdgeBtn);
-    buttons->addWidget(delNodeBtn);
+    buttons->addWidget(delBtn);
 
     auto* closeBox = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
 
@@ -1476,8 +1462,12 @@ void MainWindow::onManualEdit() {
     connect(addEdgeBtn, &QPushButton::clicked, this, [&] {
         const std::string from = fromCombo->currentText().toStdString();
         const std::string to = toCombo->currentText().toStdString();
-        if (from.empty() || to.empty() || from == to) {
-            appendLog(QStringLiteral("添加边失败：请选择两个不同的节点"));
+        if (from.empty() || to.empty()) {
+            appendLog(QStringLiteral("添加边失败：请选择两个节点"));
+            return;
+        }
+        if (from == to) {
+            appendLog(QStringLiteral("添加边失败：起点与终点不能相同（同点表示删除节点）"));
             return;
         }
 
@@ -1499,42 +1489,37 @@ void MainWindow::onManualEdit() {
         config_.graph.addEdge(backward);
         appendLog(QStringLiteral("手工添加边 %1 <-> %2（双向）")
                       .arg(QString::fromStdString(from), QString::fromStdString(to)));
-        rebuild(fromCombo->currentText(), toCombo->currentText(), nodeCombo->currentText());
+        rebuild(fromCombo->currentText(), toCombo->currentText());
         replan();
     });
 
-    connect(delEdgeBtn, &QPushButton::clicked, this, [&] {
+    connect(delBtn, &QPushButton::clicked, this, [&] {
         const std::string from = fromCombo->currentText().toStdString();
         const std::string to = toCombo->currentText().toStdString();
-        if (from.empty() || to.empty() || from == to) {
-            appendLog(QStringLiteral("删除边失败：请选择两个不同的节点"));
+        if (from.empty() || to.empty()) {
+            appendLog(QStringLiteral("删除失败：请选择节点"));
             return;
         }
-        const bool okForward = config_.graph.removeEdge(from, to);
-        const bool okBackward = config_.graph.removeEdge(to, from);
-        appendLog(okForward || okBackward
-                      ? QStringLiteral("手工删除边 %1 <-> %2")
-                            .arg(QString::fromStdString(from), QString::fromStdString(to))
-                      : QStringLiteral("删除边失败：不存在 %1 -> %2")
-                            .arg(QString::fromStdString(from), QString::fromStdString(to)));
-        rebuild(fromCombo->currentText(), toCombo->currentText(), nodeCombo->currentText());
-        replan();
-    });
-
-    connect(delNodeBtn, &QPushButton::clicked, this, [&] {
-        const std::string id = nodeCombo->currentText().toStdString();
-        if (id.empty()) {
-            appendLog(QStringLiteral("删除节点失败：请选择一个节点"));
-            return;
+        if (from == to) {
+            // 同点 = 节点删除模式（含其全部出入边）。
+            if (!config_.graph.removeNode(from)) {
+                appendLog(QStringLiteral("删除节点失败：%1 不存在")
+                              .arg(QString::fromStdString(from)));
+                return;
+            }
+            appendLog(QStringLiteral("手工删除节点 %1（含其全部出入边）")
+                          .arg(QString::fromStdString(from)));
+        } else {
+            // 异点 = 删除两点之间的双向边。
+            const bool okForward = config_.graph.removeEdge(from, to);
+            const bool okBackward = config_.graph.removeEdge(to, from);
+            appendLog(okForward || okBackward
+                          ? QStringLiteral("手工删除边 %1 <-> %2")
+                                .arg(QString::fromStdString(from), QString::fromStdString(to))
+                          : QStringLiteral("删除边失败：不存在 %1 <-> %2")
+                                .arg(QString::fromStdString(from), QString::fromStdString(to)));
         }
-        if (!config_.graph.removeNode(id)) {
-            appendLog(QStringLiteral("删除节点失败：%1 不存在")
-                          .arg(QString::fromStdString(id)));
-            return;
-        }
-        appendLog(QStringLiteral("手工删除节点 %1（含其全部出入边）")
-                      .arg(QString::fromStdString(id)));
-        rebuild(fromCombo->currentText(), toCombo->currentText(), nodeCombo->currentText());
+        rebuild(fromCombo->currentText(), toCombo->currentText());
         replan();
     });
 
