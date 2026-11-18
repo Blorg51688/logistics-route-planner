@@ -6,6 +6,8 @@
 #include <QActionGroup>
 #include <QPainter>
 #include <QComboBox>
+#include <QDoubleSpinBox>
+#include <QMessageBox>
 #include <QDialog>
 #include <QCoreApplication>
 #include <QDir>
@@ -782,42 +784,82 @@ void MainWindow::onInsertUrgentOrder() {
         insertUrgentOrderAction();
         return;
     }
-    // GUI：手选取货点 A、送达点 B、送货量。
-    QStringList items;
+
+    QStringList customers;
     for (const logistics::Node& n : config_.graph.nodes()) {
         if (n.type == logistics::NodeType::Delivery) {
-            items << QString::fromStdString(n.id);
+            customers << QString::fromStdString(n.id);
         }
     }
-    if (items.size() < 2) {
+    if (customers.size() < 2) {
         appendLog(QStringLiteral("客户节点不足，无法插入紧急取送单"));
         return;
     }
-    bool ok = false;
-    const QString a = QInputDialog::getItem(this, QStringLiteral("插入紧急取送单"),
-                                            QStringLiteral("取货点 A："), items, 0, false, &ok);
-    if (!ok || a.isEmpty()) {
-        return;
-    }
-    QStringList itemsB;
-    for (const QString& s : items) {
-        if (s != a) {
-            itemsB << s;
-        }
-    }
-    const QString b = QInputDialog::getItem(this, QStringLiteral("插入紧急取送单"),
-                                            QStringLiteral("送达点 B："), itemsB, 0, false, &ok);
-    if (!ok || b.isEmpty()) {
-        return;
-    }
+
+    // 与「手工增删」同形态：一张表单一次填完 A / B / 送货量，点确定即插入，
+    // 不再连续弹三个输入框。B 的下拉始终排除当前 A，非法组合从源头拦掉。
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("插入紧急取送单"));
+
+    auto* aCombo = new QComboBox(&dialog);
+    aCombo->addItems(customers);
+    auto* bCombo = new QComboBox(&dialog);
+
     const double cap = config_.vehicles.empty() ? 0.0 : config_.vehicles.front().capacityKg;
-    const double dem = QInputDialog::getDouble(this, QStringLiteral("插入紧急取送单"),
-                                               QStringLiteral("送货量(kg)："), 10.0, 1.0,
-                                               cap > 1.0 ? cap : 1.0, 0, &ok);
-    if (!ok) {
-        return;
-    }
-    insertUrgentOrderAt(a.toStdString(), b.toStdString(), dem);
+    auto* demand = new QDoubleSpinBox(&dialog);
+    demand->setDecimals(0);
+    demand->setRange(1.0, cap > 1.0 ? cap : 1.0);
+    demand->setSingleStep(1.0);
+    demand->setValue(cap >= 10.0 ? 10.0 : (cap > 1.0 ? cap : 1.0));
+
+    auto refreshB = [&]() {
+        const QString a = aCombo->currentText();
+        const QString keep = bCombo->currentText();
+        bCombo->clear();
+        for (const QString& s : customers) {
+            if (s != a) {
+                bCombo->addItem(s);
+            }
+        }
+        if (!keep.isEmpty()) {
+            const int idx = bCombo->findText(keep);
+            if (idx >= 0) {
+                bCombo->setCurrentIndex(idx);
+            }
+        }
+    };
+    connect(aCombo, &QComboBox::currentTextChanged, &dialog,
+            [&](const QString&) { refreshB(); });
+    refreshB();
+
+    auto* form = new QFormLayout;
+    form->addRow(QStringLiteral("取货点 A"), aCombo);
+    form->addRow(QStringLiteral("送达点 B"), bCombo);
+    form->addRow(QStringLiteral("送货量(kg)"), demand);
+
+    auto* box = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    connect(box, &QDialogButtonBox::accepted, &dialog, [&]() {
+        if (aCombo->currentText() == bCombo->currentText()) {
+            QMessageBox::warning(&dialog, QStringLiteral("插入紧急取送单"),
+                                 QStringLiteral("取货点 A 与送达点 B 不能相同"));
+            return;
+        }
+        const std::string id = insertUrgentOrderAt(aCombo->currentText().toStdString(),
+                                                   bCombo->currentText().toStdString(),
+                                                   demand->value());
+        if (id.empty()) {
+            QMessageBox::warning(&dialog, QStringLiteral("插入紧急取送单"),
+                                 QStringLiteral("插入失败（端点不可达或货量超限），详见运行日志"));
+            return;
+        }
+        dialog.accept();
+    });
+    connect(box, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    auto* layout = new QVBoxLayout(&dialog);
+    layout->addLayout(form);
+    layout->addWidget(box);
+    dialog.exec();
 }
 
 std::string MainWindow::addRandomCustomerAction() {
