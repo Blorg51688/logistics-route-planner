@@ -2,7 +2,7 @@
 
 **Status**: accepted（2026-11-23）
 
-**Related**: wayfinder map #16 / issue #19（规格二 · 异构车队模型）；术语见 [`GLOSSARY.md`](../../GLOSSARY.md)。本决定替代 #23 resolution 中「`[vehicles]` 保持 4 列不动」的规格一阶段性口径（迁移归 #20）。
+**Related**: wayfinder map #16 / issue #19（规格二 · 异构车队模型）；术语见 [`GLOSSARY.md`](../../GLOSSARY.md)。本决定替代 #23 resolution 中「`[vehicles]` 保持 4 列不动」的规格一阶段性口径（迁移归 #20）。本 ADR 的 **9 条编号不变量**见 issue #19 resolution §3；其中不变量 4「一单一车全程」已由 #28（转运，[ADR 0004](0004-transit-transfer-network.md)）**精确化**为「恰好被服务一次；默认一台车全程，转运版例外」。
 
 ## 背景与决定
 
