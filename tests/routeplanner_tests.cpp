@@ -70,7 +70,7 @@ std::string join(const std::vector<std::string>& nodes) {
 void testSingleOrderRouteIsFullyCorrect() {
     const LogisticsGraph g = makeWtoD1Graph();
     const Vehicle v = makeVehicle("W", 1000.0, 480);
-    const std::vector<Order> orders = {makeOrder("O1", "D1", 10.0, 540, 1080, false)};
+    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 10.0, 540, 1080, false)};
 
     const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
 
@@ -139,8 +139,8 @@ void testGreedyServesNearestCandidateFirst() {
 
     const Vehicle v = makeVehicle("W", 1000.0, 480);
     const std::vector<Order> orders = {
-        makeOrder("O1", "D1", 10.0, 0, 1440, false),
-        makeOrder("O2", "D2", 10.0, 0, 1440, false),
+        makeOrder("O1", "W", "D1", 10.0, 0, 1440, false),
+        makeOrder("O2", "W", "D2", 10.0, 0, 1440, false),
     };
 
     const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
@@ -171,8 +171,8 @@ void testTieBreakIsDeterministicByNodeId() {
     const Vehicle v = makeVehicle("W", 1000.0, 480);
     // DZ 在列表中排在前头，用来区分"字典序"与"先到先得"
     const std::vector<Order> orders = {
-        makeOrder("OZ", "DZ", 10.0, 0, 1440, false),
-        makeOrder("OA", "DA", 10.0, 0, 1440, false),
+        makeOrder("OZ", "W", "DZ", 10.0, 0, 1440, false),
+        makeOrder("OA", "W", "DA", 10.0, 0, 1440, false),
     };
 
     const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
@@ -198,8 +198,8 @@ void testUrgentOrderIsServedFirstDespiteBeingFarther() {
     const Vehicle v = makeVehicle("W", 1000.0, 480);
 
     const std::vector<Order> withUrgent = {
-        makeOrder("O1", "D1", 10.0, 0, 1440, false),
-        makeOrder("O2", "D2", 10.0, 0, 1440, true),   // 远，但紧急
+        makeOrder("O1", "W", "D1", 10.0, 0, 1440, false),
+        makeOrder("O2", "W", "D2", 10.0, 0, 1440, true),   // 远，但紧急
     };
     const RoutePlan urgentPlan = planRoute(g, v, withUrgent, WeightType::Distance);
 
@@ -215,8 +215,8 @@ void testUrgentOrderIsServedFirstDespiteBeingFarther() {
 
     // 对照组：同样的订单但不紧急，应按距离先服务 D1
     const std::vector<Order> withoutUrgent = {
-        makeOrder("O1", "D1", 10.0, 0, 1440, false),
-        makeOrder("O2", "D2", 10.0, 0, 1440, false),
+        makeOrder("O1", "W", "D1", 10.0, 0, 1440, false),
+        makeOrder("O2", "W", "D2", 10.0, 0, 1440, false),
     };
     const RoutePlan plainPlan = planRoute(g, v, withoutUrgent, WeightType::Distance);
     check(plainPlan.stops.size() == 2 && plainPlan.stops[0].nodeId == "D1",
@@ -229,7 +229,7 @@ void testUrgentOrderIsServedFirstDespiteBeingFarther() {
 void testLateArrivalIsMarkedWithPenalty() {
     const LogisticsGraph g = makeWtoD1Graph();
     const Vehicle v = makeVehicle("W", 1000.0, 480);
-    const std::vector<Order> orders = {makeOrder("O1", "D1", 10.0, 480, 485, false)};
+    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 10.0, 480, 485, false)};
 
     const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
 
@@ -254,8 +254,8 @@ void testMultipleOrdersOnSameNodeMergeIntoOneStop() {
     const LogisticsGraph g = makeWtoD1Graph();
     const Vehicle v = makeVehicle("W", 1000.0, 480);
     const std::vector<Order> orders = {
-        makeOrder("O1", "D1", 30.0, 480, 485, false),
-        makeOrder("O2", "D1", 20.0, 840, 900, false),
+        makeOrder("O1", "W", "D1", 30.0, 480, 485, false),
+        makeOrder("O2", "W", "D1", 20.0, 840, 900, false),
     };
 
     const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
@@ -285,7 +285,7 @@ void testMultipleOrdersOnSameNodeMergeIntoOneStop() {
 void testSingleOrderExceedingCapacityIsInfeasible() {
     const LogisticsGraph g = makeWtoD1Graph();
     const Vehicle v = makeVehicle("W", 10.0, 480);   // 载重仅 10
-    const std::vector<Order> orders = {makeOrder("O1", "D1", 20.0, 0, 1440, false)};
+    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 20.0, 0, 1440, false)};
 
     const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
 
@@ -394,8 +394,8 @@ LogisticsGraph makeTransitClusterGraph() {
 void testTotalDemandOverCapacityBecomesMultiTrip() {
     const LogisticsGraph g = makeTransitClusterGraph();
     const Vehicle v = makeVehicle("W", 20.0, 480);   // 载重 20，总需求 30
-    const std::vector<Order> orders = {makeOrder("O1", "D1", 15.0, 0, 1440, false),
-                                       makeOrder("O2", "D2", 15.0, 0, 1440, false)};
+    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 15.0, 0, 1440, false),
+                                       makeOrder("O2", "W", "D2", 15.0, 0, 1440, false)};
 
     const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
 
@@ -450,8 +450,8 @@ void testTotalDemandOverCapacityBecomesMultiTrip() {
 void testWithinCapacityStaysSingleTrip() {
     const LogisticsGraph g = makeTransitClusterGraph();
     const Vehicle v = makeVehicle("W", 100.0, 480);
-    const std::vector<Order> orders = {makeOrder("O1", "D1", 15.0, 0, 1440, false),
-                                       makeOrder("O2", "D2", 15.0, 0, 1440, false)};
+    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 15.0, 0, 1440, false),
+                                       makeOrder("O2", "W", "D2", 15.0, 0, 1440, false)};
 
     const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
 
@@ -467,7 +467,7 @@ void testUnreachableDeliveryIsInfeasibleAndNamesTheNode() {
     g.addNode(makeNode("D9", NodeType::Delivery, "孤岛客户"));   // 无任何连边
 
     const Vehicle v = makeVehicle("W", 1000.0, 480);
-    const std::vector<Order> orders = {makeOrder("O1", "D9", 10.0, 0, 1440, false)};
+    const std::vector<Order> orders = {makeOrder("O1", "W", "D9", 10.0, 0, 1440, false)};
 
     const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
 
@@ -502,8 +502,8 @@ LogisticsGraph makeIncrementalGraph() {
 void testIncrementalReplanRecomputesOnlyAffectedLeg() {
     LogisticsGraph g = makeIncrementalGraph();
     const Vehicle v = makeVehicle("W", 1000.0, 480);
-    const std::vector<Order> orders = {makeOrder("O1", "D1", 10.0, 0, 1440, false),
-                                       makeOrder("O2", "D2", 10.0, 0, 1440, false)};
+    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 10.0, 0, 1440, false),
+                                       makeOrder("O2", "W", "D2", 10.0, 0, 1440, false)};
 
     const RoutePlan before = planRoute(g, v, orders, WeightType::Time);
     check(before.status == PlanStatus::Ok, "初始规划可行");
@@ -572,8 +572,8 @@ void testIncrementalReplanRecomputesOnlyAffectedLeg() {
 void testIncrementalReplanIsIdempotentWhenNothingAffected() {
     const LogisticsGraph g = makeIncrementalGraph();
     const Vehicle v = makeVehicle("W", 1000.0, 480);
-    const std::vector<Order> orders = {makeOrder("O1", "D1", 10.0, 0, 1440, false),
-                                       makeOrder("O2", "D2", 10.0, 0, 1440, false)};
+    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 10.0, 0, 1440, false),
+                                       makeOrder("O2", "W", "D2", 10.0, 0, 1440, false)};
 
     const RoutePlan before = planRoute(g, v, orders, WeightType::Time);
 
@@ -603,8 +603,8 @@ void testIncrementalReplanIsIdempotentWhenNothingAffected() {
 void testIncrementalReplanHandlesMultiTrip() {
     const LogisticsGraph g = makeTransitClusterGraph();
     const Vehicle v = makeVehicle("W", 20.0, 480);
-    const std::vector<Order> orders = {makeOrder("O1", "D1", 15.0, 0, 1440, false),
-                                       makeOrder("O2", "D2", 15.0, 0, 1440, false)};
+    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 15.0, 0, 1440, false),
+                                       makeOrder("O2", "W", "D2", 15.0, 0, 1440, false)};
 
     const RoutePlan multi = planRoute(g, v, orders, WeightType::Distance);
     check(multi.trips.size() > 1, "前提：上一版确为多趟");
@@ -684,7 +684,7 @@ void testReplanFromCurrentPosition() {
 
     const Vehicle v = makeVehicle("W", 1000.0, 480);
     // 车已在 D2，时刻 600，剩余一个 D1 的订单
-    const std::vector<Order> remaining = {makeOrder("O1", "D1", 10.0, 0, 1440, false)};
+    const std::vector<Order> remaining = {makeOrder("O1", "W", "D1", 10.0, 0, 1440, false)};
 
     const RoutePlan plan = replan(g, v, remaining, "D2", 600, WeightType::Distance);
 
@@ -704,7 +704,7 @@ void testReplanFromCurrentPosition() {
 void testReplanWhenAlreadyAtTheDeliveryNode() {
     const LogisticsGraph g = makeWtoD1Graph();
     const Vehicle v = makeVehicle("W", 1000.0, 480);
-    const std::vector<Order> remaining = {makeOrder("O1", "D1", 10.0, 0, 1440, false)};
+    const std::vector<Order> remaining = {makeOrder("O1", "W", "D1", 10.0, 0, 1440, false)};
 
     const RoutePlan plan = replan(g, v, remaining, "D1", 600, WeightType::Distance);
 
@@ -731,8 +731,8 @@ void testPlanRouteEqualsReplanFromDepot() {
 
     const Vehicle v = makeVehicle("W", 1000.0, 480);
     const std::vector<Order> orders = {
-        makeOrder("O1", "D1", 10.0, 0, 1440, false),
-        makeOrder("O2", "D2", 10.0, 0, 1440, true),
+        makeOrder("O1", "W", "D1", 10.0, 0, 1440, false),
+        makeOrder("O2", "W", "D2", 10.0, 0, 1440, true),
     };
 
     const RoutePlan viaPlanRoute = planRoute(g, v, orders, WeightType::Distance);
@@ -769,7 +769,7 @@ void testIsEdgeOnRoute() {
 void testNodeIndexAtTimeReturnsSegmentStart() {
     const LogisticsGraph g = makeWtoD1Graph();
     const Vehicle v = makeVehicle("W", 1000.0, 480);
-    const std::vector<Order> orders = {makeOrder("O1", "D1", 10.0, 540, 1080, false)};
+    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 10.0, 540, 1080, false)};
     const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
 
     // 先固定前提：到达时刻就是手算的 480 / 540 / 550
@@ -824,8 +824,8 @@ void testNodeIndexAtTimeOnEmptyPlanAndClamp() {
 void testNodeIndexAtTimeIsMonotonicInTime() {
     const LogisticsGraph g = makeTransitClusterGraph();
     const Vehicle v = makeVehicle("W", 20.0, 480);
-    const std::vector<Order> orders = {makeOrder("O1", "D1", 10.0, 0, 1440, false),
-                                       makeOrder("O2", "D2", 10.0, 0, 1440, false)};
+    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 10.0, 0, 1440, false),
+                                       makeOrder("O2", "W", "D2", 10.0, 0, 1440, false)};
     const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
     check(plan.status == PlanStatus::Ok, "前提：多趟路线规划成功");
 
@@ -931,15 +931,15 @@ void testTripContinuityAfterUrgentInsertWhileEnRoute() {
 
     // 车已在途中（位置 T），车上载着 D2 的 30kg；未服务订单 D2 30kg + D3 80kg。
     std::vector<Order> pending;
-    pending.push_back(makeOrder("O2", "D2", 30.0, 0, 1440));
-    pending.push_back(makeOrder("O3", "D3", 80.0, 0, 1440));
+    pending.push_back(makeOrder("O2", "W", "D2", 30.0, 0, 1440));
+    pending.push_back(makeOrder("O3", "W", "D3", 80.0, 0, 1440));
     std::vector<logistics::OnboardItem> onboard;
     logistics::OnboardItem item;
     item.nodeId = "D2";
     item.kg = 30.0;
     onboard.push_back(item);
 
-    const Order urgent = makeOrder("U1", "D1", 10.0, 0, 1440, true);
+    const Order urgent = makeOrder("U1", "W", "D1", 10.0, 0, 1440, true);
     const InsertResult res = insertUrgentOrder(g, v, pending, urgent, "T", 500,
                                                WeightType::Distance, onboard);
     const RoutePlan& p = res.plan;
@@ -999,8 +999,8 @@ void testUrgentOffloadToTransitWhenNotFitting() {
     const Vehicle v = makeVehicle("W", 100.0, 480);
 
     std::vector<Order> pending;
-    pending.push_back(makeOrder("O1", "D1", 60.0, 0, 1440));
-    pending.push_back(makeOrder("O2", "D2", 30.0, 0, 1440));
+    pending.push_back(makeOrder("O1", "W", "D1", 60.0, 0, 1440));
+    pending.push_back(makeOrder("O2", "W", "D2", 30.0, 0, 1440));
     const std::vector<logistics::OnboardItem> onboard{{"D1", 60.0}, {"D2", 30.0}};
 
     Order urgent;
@@ -1134,8 +1134,8 @@ void testUrgentFitsLeavesOffloadsEmpty() {
     const Vehicle v = makeVehicle("W", 100.0, 480);
 
     std::vector<Order> pending;
-    pending.push_back(makeOrder("O1", "D1", 60.0, 0, 1440));
-    pending.push_back(makeOrder("O2", "D2", 30.0, 0, 1440));
+    pending.push_back(makeOrder("O1", "W", "D1", 60.0, 0, 1440));
+    pending.push_back(makeOrder("O2", "W", "D2", 30.0, 0, 1440));
     const std::vector<logistics::OnboardItem> onboard{{"D1", 60.0}, {"D2", 30.0}};
 
     Order urgent;
@@ -1189,9 +1189,9 @@ void testUrgentPassingDeliversAAndBGoods() {
     const Vehicle v = makeVehicle("W", 100.0, 480);
 
     std::vector<Order> pending;
-    pending.push_back(makeOrder("O1", "A", 20.0, 0, 1440));
-    pending.push_back(makeOrder("O2", "B", 15.0, 0, 1440));
-    pending.push_back(makeOrder("O3", "X", 10.0, 0, 1440));
+    pending.push_back(makeOrder("O1", "W", "A", 20.0, 0, 1440));
+    pending.push_back(makeOrder("O2", "W", "B", 15.0, 0, 1440));
+    pending.push_back(makeOrder("O3", "W", "X", 10.0, 0, 1440));
     const std::vector<logistics::OnboardItem> onboard{{"A", 20.0}, {"B", 15.0}};
 
     Order urgent;
@@ -1275,10 +1275,10 @@ void testUrgentOffloadKeepsAAndBDeliversBoth() {
     const Vehicle v = makeVehicle("W", 100.0, 480);
 
     std::vector<Order> pending;
-    pending.push_back(makeOrder("O1", "D1", 40.0, 0, 1440));
-    pending.push_back(makeOrder("O2", "D2", 30.0, 0, 1440));
-    pending.push_back(makeOrder("O3", "D3", 10.0, 0, 1440));
-    pending.push_back(makeOrder("O4", "D4", 10.0, 0, 1440));
+    pending.push_back(makeOrder("O1", "W", "D1", 40.0, 0, 1440));
+    pending.push_back(makeOrder("O2", "W", "D2", 30.0, 0, 1440));
+    pending.push_back(makeOrder("O3", "W", "D3", 10.0, 0, 1440));
+    pending.push_back(makeOrder("O4", "W", "D4", 10.0, 0, 1440));
     const std::vector<logistics::OnboardItem> onboard{
         {"D1", 40.0}, {"D2", 30.0}, {"D3", 10.0}, {"D4", 10.0}};
 
@@ -1380,8 +1380,8 @@ void testReplanKeepsStash() {
     const Vehicle v = makeVehicle("W", 100.0, 480);
 
     std::vector<Order> pending;
-    pending.push_back(makeOrder("O1", "D1", 60.0, 0, 1440));
-    pending.push_back(makeOrder("O2", "D2", 30.0, 0, 1440));
+    pending.push_back(makeOrder("O1", "W", "D1", 60.0, 0, 1440));
+    pending.push_back(makeOrder("O2", "W", "D2", 30.0, 0, 1440));
 
     logistics::StashState stash;
     stash.station = "S";
@@ -1530,8 +1530,8 @@ void testTwoUrgentOffloadsMergeIntoSingleStashPile() {
     // 车上 90kg（上限 100）→ free 10；每张紧急单 50kg → need 40，
     // 两张单都必须整单降载。两单在同一份计划里。
     std::vector<Order> remaining;
-    remaining.push_back(makeOrder("O1", "D1", 60.0, 0, 1440));
-    remaining.push_back(makeOrder("O2", "D2", 30.0, 0, 1440));
+    remaining.push_back(makeOrder("O1", "W", "D1", 60.0, 0, 1440));
+    remaining.push_back(makeOrder("O2", "W", "D2", 30.0, 0, 1440));
 
     Order u1;
     u1.id = "U1"; u1.pickupNodeId = "A1"; u1.nodeId = "B1";
@@ -1643,7 +1643,7 @@ void testPickedUrgentStashReclaimMergedIntoSameTrip() {
     u.windowStartMin = 0; u.windowEndMin = 1440; u.urgent = true; u.picked = true;
     std::vector<Order> pending;
     pending.push_back(u);
-    pending.push_back(makeOrder("O1", "D1", 30.0, 0, 1440));
+    pending.push_back(makeOrder("O1", "W", "D1", 30.0, 0, 1440));
 
     logistics::StashState stash;
     stash.station = "S";

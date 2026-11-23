@@ -246,7 +246,7 @@ void testCongestionTriggersReplanAndChangesTimes() {
     addTwoWay(g, "W", "D1", 5.0, 10.0, 4.0);
 
     const Vehicle v = makeVehicle("W", 1000.0, 480);
-    const std::vector<logistics::Order> orders = {makeOrder("O1", "D1", 10.0, 540, 1080)};
+    const std::vector<logistics::Order> orders = {makeOrder("O1", "W", "D1", 10.0, 540, 1080)};
 
     // 拥堵前：W->D1 耗时 10 -> raw 490，窗口 540 -> 等待 50 -> 总耗时 75
     const logistics::RoutePlan before =
@@ -303,10 +303,10 @@ void testInsertUrgentOrderIsServedFirstAndServedNodesExcluded() {
     addTwoWay(g, "D0", "D1", 2.0, 4.0, 2.0);
 
     const Vehicle v = makeVehicle("W", 1000.0, 480);
-    const std::vector<logistics::Order> remaining = {makeOrder("O1", "D1", 10.0, 0, 1440)};
+    const std::vector<logistics::Order> remaining = {makeOrder("O1", "W", "D1", 10.0, 0, 1440)};
     // 刻意传 urgent=false：按 §5.3，插入的订单必须被标记为紧急。
     // 取送式紧急单：A=D1 取货、B=D2 送达。
-    logistics::Order incoming = makeOrder("O2", "D2", 10.0, 0, 1440, false);
+    logistics::Order incoming = makeOrder("O2", "W", "D2", 10.0, 0, 1440, false);
     incoming.pickupNodeId = "D1";
 
     const logistics::InsertResult r = logistics::insertUrgentOrder(
@@ -350,7 +350,7 @@ void testInsertUrgentOrderWarnsButStillPlansWhenWindowCannotBeMet() {
     const std::vector<logistics::Order> none;
 
     // 从 W 于 600 出发，到 D2 最早 606；窗口止 500 -> 必然超时
-    const logistics::Order tight = makeOrder("O2", "D2", 10.0, 400, 500, true);
+    const logistics::Order tight = makeOrder("O2", "W", "D2", 10.0, 400, 500, true);
     logistics::Order tightP = tight;
     tightP.pickupNodeId = "D1";
     const logistics::InsertResult bad = logistics::insertUrgentOrder(
@@ -373,7 +373,7 @@ void testInsertUrgentOrderWarnsButStillPlansWhenWindowCannotBeMet() {
           "总耗时 12.0，实际 " + std::to_string(bad.plan.totalTimeMin));
 
     // 对照：窗口充裕 -> 无警告，无 penalty
-    const logistics::Order wide = makeOrder("O3", "D2", 10.0, 0, 1440, true);
+    const logistics::Order wide = makeOrder("O3", "W", "D2", 10.0, 0, 1440, true);
     logistics::Order wideP = wide;
     wideP.pickupNodeId = "D1";
     const logistics::InsertResult ok = logistics::insertUrgentOrder(

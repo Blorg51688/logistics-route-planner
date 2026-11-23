@@ -122,11 +122,15 @@ RoutePlan planRoute(const LogisticsGraph& graph,
 
 // 从指定位置与指定时刻出发，对剩余未服务订单重新规划，最后返回车辆起始仓库。
 // 供"配送过程中插入紧急订单"与"路况变化触发重规划"复用同一套贪心逻辑。
-// OnboardItem：车辆**此刻已经载在车上**的货（节点 + 货量）。
+// OnboardItem：车辆**此刻已经载在车上**的货（节点 + 货量 + 订单号）。
 // 供"途中重规划"时告诉规划器车不是空的——否则规划会假设车在起点重新装货。
+// 规格一 MC-A05：改为**按订单记账**（orderId + 目的 B + kg）——同节点多单
+// （A∪B 合并停靠）下按 nodeId 扣货会把别的单一起扣掉。本票只补字段，
+// 规划器内部的 orderId 记账随 #33 构造器重写落地。
 struct OnboardItem {
-    std::string nodeId;
+    std::string nodeId;   // 目的送达点 B
     double      kg = 0.0;
+    std::string orderId;  // 该货所属订单（空 = 旧数据/未知来源）
 };
 
 // 中转站上的暂存货（降载后仍留在站里、待取回的普通货）。

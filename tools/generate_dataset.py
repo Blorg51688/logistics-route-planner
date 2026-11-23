@@ -48,23 +48,66 @@ TRAFFIC_CHANGE_RATIO = 0.1
 TRAFFIC_TIME_INCREASE_MIN = 0.2
 TRAFFIC_TIME_INCREASE_MAX = 0.5
 # 软件内时间的事件模型（见 docs/records/specs/sim-time-events.md §2/§3.2 与 docs/设计.md D24）：
-# 每 EVENT_INTERVAL_MIN 分钟软件内时间抽 1 个带权重的事件。
-# 注：原先的 traffic_change_interval_sec（真实秒级）与 urgent_order_interval_sec 已被本模型取代并移除。
+# 每 EVENT_INTERVAL_MIN 分钟软件内时间抽 1 个事件。概率由四类事件的**等级**决定
+# （规格一 #23 §3.3）：extra_low / low / medium / high -> 代码内固定表 1/3/9/27。
 EVENT_INTERVAL_MIN = 15
-EVENT_WEIGHT_TRAFFIC = 10
-EVENT_WEIGHT_URGENT = 3
-EVENT_WEIGHT_CUSTOMER = 1
-EVENT_WEIGHT_CLOSURE = 1
+EVENT_LEVELS = [
+    ("event_level_traffic", "high"),
+    ("event_level_customer", "medium"),
+    ("event_level_urgent", "low"),
+    ("event_level_closure", "extra_low"),
+]
 
 CAPACITY_KG = 200
 DEPART_TIME = "08:00"
-DEFAULT_WINDOW = ("09:00", "18:00")
-# 刻意收紧的窗口：用于演示 E2（超时标记 + penalty），且保证超时是"少数"
-TIGHT_WINDOWS = {"D05": ("09:00", "10:00"), "D12": ("09:00", "11:00")}
-# 初始数据集中**不放任何紧急订单**：E3 的语义是"配送过程中动态插入紧急订单"，
-# 预置紧急订单会让该功能看起来一开始就存在，混淆演示。
-# 需要演示紧急优先时用界面的「插入紧急订单」，或开启「按站模拟 / 按时间模拟」等事件刻自动抽取。
-URGENT_NODES = set()
+
+# 初始数据集（规格一 #23「四、订单表（权威版，25 行）」**逐字照抄**）。
+# 纪律：kg 与窗口一律照抄，不在生成器里做任何算术或"顺手调整"；
+# 结构事实（A 集合 / B 集合 / 总重 / 窗口分布）由下方 self_check 独立断言。
+ORDER_ROWS = [
+    "O01, D08, D01, 20, 08:00, 13:00, 0",
+    "O02, D08, D02, 20, 08:15, 16:00, 0",
+    "O03, D08, D03, 20, 08:15, 15:00, 0",
+    "O04, D08, D04, 20, 09:00, 20:00, 0",
+    "O05, D08, D07, 20, 08:30, 17:00, 0",
+    "O06, D08, D10, 20, 08:30, 18:00, 0",
+    "O07, D08, D11, 20, 08:00, 08:30, 0",
+    "O08, D08, D12, 20, 08:45, 19:00, 0",
+    "O09, D01, D08, 20, 08:15, 14:00, 0",
+    "O10, D14, D05, 24, 09:15, 21:00, 0",
+    "O11, D14, D06, 24, 10:00, 10:30, 0",
+    "O12, D14, D09, 24, 09:00, 11:00, 0",
+    "O13, D14, D13, 24, 09:00, 09:30, 0",
+    "O14, D14, D15, 24, 09:45, 15:30, 0",
+    "O15, D14, D16, 24, 10:00, 13:00, 0",
+    "O16, D05, D14, 20, 09:30, 12:30, 0",
+    "O17, D20, D17, 19, 13:30, 20:30, 0",
+    "O18, D20, D18, 19, 10:30, 20:00, 0",
+    "O19, D20, D19, 19, 10:30, 19:00, 0",
+    "O20, D20, D21, 19, 13:00, 20:00, 0",
+    "O21, D20, D22, 19, 10:30, 15:30, 0",
+    "O22, D20, D23, 19, 10:30, 17:00, 0",
+    "O23, D20, D24, 19, 10:30, 21:00, 0",
+    "O24, D20, D25, 19, 14:00, 21:00, 0",
+    "O25, D23, D20, 20, 10:30, 18:00, 0",
+]
+
+# 规格一 §3.5 的数据集事实（self_check 的独立期望值）
+EXPECTED_PICKUP_NODES = {"D01", "D05", "D08", "D14", "D20", "D23"}
+EXPECTED_TOTAL_KG = 516.0
+EXPECTED_MAX_SINGLE_KG = 24.0
+EXPECTED_ORDER_COUNT = 25
+TIGHT_WINDOWS = {
+    "D06": ("10:00", "10:30"),
+    "D11": ("08:00", "08:30"),
+    "D13": ("09:00", "09:30"),
+}
+LATE_OPEN_WINDOWS = {
+    "D17": ("13:30", "20:30"),
+    "D21": ("13:00", "20:00"),
+    "D25": ("14:00", "21:00"),
+}
+EXAMPLE_WINDOW = ("D09", ("09:00", "11:00"))  # 需求原文「9:00-11:00 送达」示例窗
 
 # ---------------------------------------------------------------- 拓扑定义
 NODES = [
@@ -84,10 +127,6 @@ DELIVERY_COORDS = {
     "D21": (760, 180), "D22": (820, 260), "D23": (700, 440), "D24": (800, 400),
     "D25": (760, 540),
 }
-
-DEMANDS = [30, 25, 35, 20, 40, 28, 32, 26, 30, 34, 22, 38, 24, 30, 26,
-           42, 28, 20, 36, 30, 24, 26, 32, 28, 34]
-
 
 # 配送点之间的横向连接：把原来的"星形"支路补成网状。
 # 加这 14 对之后，无向道路对数达到 50，满足"路径总数 >= 50"的无向口径（D19）。
@@ -148,8 +187,7 @@ def all_nodes():
     for i in range(1, 26):
         nid = "D%02d" % i
         x, y = DELIVERY_COORDS[nid]
-        # 配送点归属于最近集散站的子网络；这是数据里的**行政归属**，
-        # 多趟规划直接据此划分簇（见 设计 §5.6）
+        # 配送点归属于最近集散站的子网络；这是数据里的**行政归属**。
         nodes.append((nid, "delivery", x, y, "客户%02d" % i, nearest_transit(x, y)))
     return nodes
 
@@ -177,12 +215,10 @@ def build_text():
            "traffic_change_ratio = %s" % TRAFFIC_CHANGE_RATIO,
            "traffic_time_increase_min = %s" % TRAFFIC_TIME_INCREASE_MIN,
            "traffic_time_increase_max = %s" % TRAFFIC_TIME_INCREASE_MAX,
-           "event_interval_min = %d" % EVENT_INTERVAL_MIN,
-           "event_weight_traffic = %d" % EVENT_WEIGHT_TRAFFIC,
-           "event_weight_urgent = %d" % EVENT_WEIGHT_URGENT,
-           "event_weight_customer = %d" % EVENT_WEIGHT_CUSTOMER,
-           "event_weight_closure = %d" % EVENT_WEIGHT_CLOSURE,
-           "", "[nodes]", "# ID, type, x, y, name, sub_network_id"]
+           "event_interval_min = %d" % EVENT_INTERVAL_MIN]
+    for key, level in EVENT_LEVELS:
+        out.append("%s = %s" % (key, level))
+    out += ["", "[nodes]", "# ID, type, x, y, name, sub_network_id"]
     for n in nodes:
         out.append("%s, %s, %d, %d, %s, %d" % n)
 
@@ -197,14 +233,12 @@ def build_text():
         d, t, c = edge_weights(positions, a, b)
         out.append("%s, %s, %s, %s, %s" % (a, b, d, t, c))
 
-    out += ["", "[vehicles]", "# ID, start_node, capacity_kg, depart_time",
-            "V01, W01, %d, %s" % (CAPACITY_KG, DEPART_TIME),
-            "", "[orders]", "# ID, node_id, demand_kg, window_start, window_end, is_urgent"]
-    for i in range(1, 26):
-        nid = "D%02d" % i
-        ws, we = TIGHT_WINDOWS.get(nid, DEFAULT_WINDOW)
-        urgent = 1 if nid in URGENT_NODES else 0
-        out.append("O%02d, %s, %d, %s, %s, %d" % (i, nid, DEMANDS[i - 1], ws, we, urgent))
+    out += ["", "[vehicles]",
+            "# ID, start_node, capacity_kg, depart_time, time_factor, cost_factor",
+            "V01, W01, %d, %s, 1.00, 1.00" % (CAPACITY_KG, DEPART_TIME),
+            "", "[orders]",
+            "# ID, pickup, delivery, demand_kg, window_start, window_end, is_urgent"]
+    out += ORDER_ROWS
 
     return "\n".join(out) + "\n"
 
@@ -255,7 +289,26 @@ def self_check(text):
     if problems:
         return problems
 
+    # ---- [general]：等级键，且退役键一个都不能出现 ----
+    general = {}
+    for row in sec["general"]:
+        key, _, value = row.partition("=")
+        general[key.strip()] = value.strip()
+    allowed_levels = {"extra_low", "low", "medium", "high"}
+    for key, _default in EVENT_LEVELS:
+        if key not in general:
+            problems.append("[general] 缺少 %s" % key)
+        elif general[key] not in allowed_levels:
+            problems.append("%s 取值非法: %s" % (key, general[key]))
+    for retired in ("service_time_min", "event_weight_traffic", "event_weight_urgent",
+                    "event_weight_customer", "event_weight_closure",
+                    "traffic_change_interval_sec", "urgent_order_interval_sec"):
+        if retired in general:
+            problems.append("[general] 仍含退役键 %s" % retired)
+
+    # ---- [nodes] ----
     nodes = {}
+    sub_of = {}
     for row in sec["nodes"]:
         f = [x.strip() for x in row.split(",")]
         if len(f) != 6:
@@ -264,6 +317,7 @@ def self_check(text):
         if f[0] in nodes:
             problems.append("节点 ID 重复: %s" % f[0])
         nodes[f[0]] = f[1]
+        sub_of[f[0]] = f[5]
 
     counts = {"warehouse": 0, "delivery": 0, "transit": 0}
     for t in nodes.values():
@@ -278,6 +332,7 @@ def self_check(text):
     if counts["transit"] < 3:
         problems.append("中转站 %d < 3" % counts["transit"])
 
+    # ---- [edges] ----
     edges = {}
     ratios = set()
     for row in sec["edges"]:
@@ -347,62 +402,126 @@ def self_check(text):
         problems.append("cost/dist 比值变化过小（%.3f~%.3f），双策略可能无法分化"
                         % (min(ratios), max(ratios)))
 
+    # ---- [vehicles]：六列（规格一阶段单车 V01，两因子 1.00/1.00） ----
     vehicles = []
+    vehicle_ids = set()
     for row in sec["vehicles"]:
         f = [x.strip() for x in row.split(",")]
-        if len(f) != 4:
-            problems.append("[vehicles] 字段数不是 4: %s" % row)
+        if len(f) != 6:
+            problems.append("[vehicles] 字段数不是 6: %s" % row)
             continue
+        if not f[0]:
+            problems.append("[vehicles] 车辆 ID 为空")
+        if f[0] in vehicle_ids:
+            problems.append("[vehicles] 车辆 ID 重复: %s" % f[0])
+        vehicle_ids.add(f[0])
         if f[1] not in nodes or nodes.get(f[1]) != "warehouse":
             problems.append("起始节点不是仓库: %s" % f[1])
         try:
             cap = float(f[2])
             to_minutes(f[3])
+            time_factor = float(f[4])
+            cost_factor = float(f[5])
         except ValueError:
             problems.append("[vehicles] 数值非法: %s" % row)
             continue
         if cap <= 0:
             problems.append("载重必须为正: %s" % f[2])
-        vehicles.append((f[0], f[1], cap, f[3]))
+        if time_factor <= 0 or cost_factor <= 0:
+            problems.append("车辆因子必须为正: %s" % row)
+        vehicles.append((f[0], f[1], cap, f[3], time_factor, cost_factor))
 
+    # ---- [orders]：七列 + 规格一 §3.5/§3.8 的全部结构事实 ----
+    delivery_ids = {nid for nid, t in nodes.items() if t == "delivery"}
+    parsed_orders = []
+    seen_order_ids = set()
     total_demand = 0.0
     max_single_demand = 0.0
+    pickup_nodes = set()
+    delivery_nodes = set()
+    window_of = {}
     for row in sec["orders"]:
         f = [x.strip() for x in row.split(",")]
-        if len(f) != 6:
-            problems.append("[orders] 字段数不是 6: %s" % row)
+        if len(f) != 7:
+            problems.append("[orders] 字段数不是 7: %s" % row)
             continue
-        if nodes.get(f[1]) != "delivery":
-            problems.append("订单目标不是配送点: %s" % f[1])
+        oid, a, b = f[0], f[1], f[2]
+        if not oid:
+            problems.append("[orders] 订单 ID 为空: %s" % row)
+        if oid in seen_order_ids:
+            problems.append("[orders] 订单 ID 重复: %s" % oid)
+        seen_order_ids.add(oid)
+        if a == b:
+            problems.append("[orders] 取货点与送达点相同: %s" % oid)
+        if nodes.get(a) != "delivery":
+            problems.append("取货点不是配送点: %s" % a)
+        if nodes.get(b) != "delivery":
+            problems.append("送达点不是配送点: %s" % b)
+        if a in sub_of and b in sub_of and sub_of[a] != sub_of[b]:
+            problems.append("[orders] A/B 不在同一子网络: %s (%s->%s)" % (oid, a, b))
         try:
-            demand = float(f[2])
-            ws, we = to_minutes(f[3]), to_minutes(f[4])
+            demand = float(f[3])
+            ws, we = to_minutes(f[4]), to_minutes(f[5])
+            urgent = int(f[6])
         except ValueError:
             problems.append("[orders] 数值非法: %s" % row)
             continue
         if demand <= 0:
-            problems.append("货物量必须为正: %s" % f[2])
+            problems.append("货物量必须为正: %s" % f[3])
         if ws >= we:
             problems.append("窗口起必须早于止: %s" % row)
+        if urgent not in (0, 1):
+            problems.append("is_urgent 只能为 0 或 1: %s" % f[6])
+        if urgent != 0:
+            problems.append("初始数据集必须全普通（is_urgent = 0）: %s" % oid)
+        pickup_nodes.add(a)
+        delivery_nodes.add(b)
+        window_of[b] = (f[4], f[5])
         total_demand += demand
         if demand > max_single_demand:
             max_single_demand = demand
+        parsed_orders.append((oid, a, b, demand))
+
+    if len(parsed_orders) != EXPECTED_ORDER_COUNT:
+        problems.append("订单数 %d != %d" % (len(parsed_orders), EXPECTED_ORDER_COUNT))
+    if delivery_nodes != delivery_ids:
+        problems.append("B 集合 != 全部配送点（缺 %s / 多 %s）"
+                        % (sorted(delivery_ids - delivery_nodes),
+                           sorted(delivery_nodes - delivery_ids)))
+    if pickup_nodes != EXPECTED_PICKUP_NODES:
+        problems.append("A 集合 != %s（实际 %s）"
+                        % (sorted(EXPECTED_PICKUP_NODES), sorted(pickup_nodes)))
+    if abs(total_demand - EXPECTED_TOTAL_KG) > 1e-9:
+        problems.append("总重 %.1fkg != %.1fkg" % (total_demand, EXPECTED_TOTAL_KG))
+    if abs(max_single_demand - EXPECTED_MAX_SINGLE_KG) > 1e-9:
+        problems.append("最大单笔 %.1fkg != %.1fkg"
+                        % (max_single_demand, EXPECTED_MAX_SINGLE_KG))
+
+    # 窗口分布：3 紧 + 3 晚开 + D09 示例窗仍在
+    for node, expect in TIGHT_WINDOWS.items():
+        if window_of.get(node) != expect:
+            problems.append("紧窗丢失或改动: %s 应为 %s，实际 %s"
+                            % (node, expect, window_of.get(node)))
+    for node, expect in LATE_OPEN_WINDOWS.items():
+        if window_of.get(node) != expect:
+            problems.append("晚开窗丢失或改动: %s 应为 %s，实际 %s"
+                            % (node, expect, window_of.get(node)))
+    if window_of.get(EXAMPLE_WINDOW[0]) != EXAMPLE_WINDOW[1]:
+        problems.append("示例窗丢失: %s 应为 %s" % (EXAMPLE_WINDOW[0], EXAMPLE_WINDOW[1]))
 
     if vehicles:
-        cap = vehicles[0][2]
-        # D21 修订：总需求**可以**超过载重——车辆会多趟往返、经中转站暂存后二次配发。
-        # 真正不可行的是"单个订单的货量就超过载重"，那样分多少趟都装不下。
-        if max_single_demand > cap:
-            problems.append("单个订单最大货量 %.0f > 载重 %.0f（多趟也装不下）"
-                            % (max_single_demand, cap))
-        # 往返可达性：有向图里"能去"不等于"能回"，B6 要求遍历后返回
+        min_capacity = min(v[2] for v in vehicles)
+        if not (max_single_demand < min_capacity):
+            problems.append("最大单笔 %.1fkg 不小于最小车辆载重 %.1fkg（Q1 严格小于）"
+                            % (max_single_demand, min_capacity))
+        # 往返可达性：有向图里"能去"不等于"能回"；A 与 B 都要能往返
         start = vehicles[0][1]
-        for row in sec["orders"]:
-            nid = row.split(",")[1].strip()
-            if not reachable(edges, start, nid):
-                problems.append("从仓库 %s 不可达配送点 %s" % (start, nid))
-            if not reachable(edges, nid, start):
-                problems.append("配送点 %s 无法返回仓库 %s" % (nid, start))
+        for oid, a, b, _demand in parsed_orders:
+            for nid in (a, b):
+                if not reachable(edges, start, nid):
+                    problems.append("从仓库 %s 不可达节点 %s（订单 %s）" % (start, nid, oid))
+                if not reachable(edges, nid, start):
+                    problems.append("节点 %s 无法返回仓库 %s（订单 %s）" % (nid, start, oid))
 
     return problems
 
@@ -422,7 +541,8 @@ def main():
         for p in problems:
             print("  - " + p)
         return 1
-    print("[generate_dataset] 自检通过（双口径规模 / 单向边 / 中转站归属 / 端点 / 可达性 / 载重 / 双策略可分化）")
+    print("[generate_dataset] 自检通过（七列订单 / 六列车辆 / 等级键 / 双口径规模 / 单向边 / "
+          "中转站归属 / A-B 同子网络 / 总重与窗口分布 / 往返可达 / 双策略可分化）")
 
     if args.write:
         os.makedirs(os.path.dirname(DEFAULT_INI), exist_ok=True)

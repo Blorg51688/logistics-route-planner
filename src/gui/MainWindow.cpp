@@ -1278,11 +1278,12 @@ void MainWindow::settleEventsUpTo(int timeMin) {
         const int mark = nextEventMark_;
         nextEventMark_ = logistics::nextEventTimeMin(mark, interval);
 
+        // 权重由 event_level_* 按代码内固定表（1/3/9/27）派生——唯一派生点见 core/Config.h。
         logistics::EventWeights w;
-        w.traffic  = config_.general.eventWeightTraffic;
-        w.urgent   = config_.general.eventWeightUrgent;
-        w.customer = config_.general.eventWeightCustomer;
-        w.closure  = config_.general.eventWeightClosure;
+        w.traffic  = logistics::eventLevelWeight(config_.general.eventLevelTraffic);
+        w.urgent   = logistics::eventLevelWeight(config_.general.eventLevelUrgent);
+        w.customer = logistics::eventLevelWeight(config_.general.eventLevelCustomer);
+        w.closure  = logistics::eventLevelWeight(config_.general.eventLevelClosure);
 
         // 紧急订单已达"待处理上限"时**改抽其余事件**，保证不出现空刻。
         std::size_t pendingUrgent = 0;

@@ -7,7 +7,14 @@
 **独立性保证（避免同义反复）**——本脚本刻意不复用被测代码的算法：
   1. 最短路用「穷举所有简单路径取最小」的暴力法，与 C++ 侧的 Dijkstra + 手写堆
      是两种不同方法；两者同时错成一样的概率极低。
-  2. 时间模型直接按 docs/设计.md §4.3 的定义转写，不复用 RoutePlanner 的实现。
+  2. 时间模型直接按规格一（#18 §4.4 / #23 §5.4）的定义转写，不复用 RoutePlanner 的实现。
+
+**A→B 取送时间模型（规格一 #23 §5.4）**：
+  - 取货停靠（A）无窗口、不记 penalty、零服务时间；
+  - 只在送达点 B 做早到等待与 penalty；等待 = max(0, max{ws_i} - raw)（一个停靠只有一个到达时刻）；
+  - 停靠零耗时（departure == arrival）；
+  - penalty 逐单累加：每张送达单按自己的 we 计，arrival == windowEnd **不算迟到**（严格 >）；
+  - **oracle 不实现选路**——节点序列由被测方给出，oracle 只对给定序列复算算术。
 
 用法：
     python3 tools/oracle.py            # 打印全部测试夹具的期望值
@@ -87,13 +94,36 @@ def path_weight(g, path, kind):
     return sum(g.weight(g.edges[(path[i - 1], path[i])], kind) for i in range(1, len(path)))
 
 
-def route_metrics(g, start_pos, return_to, start_time, stops, windows, service_min, kind):
-    """按 设计.md §4.3 的时间模型推进。
+def _normalize_stops(stops, windows):
+    """把简写（str 节点或 {'node': ...}）统一成 dict；str 视为纯送达停靠。"""
+    result = []
+    for stop in stops:
+        if isinstance(stop, str):
+            if windows is None or stop not in windows:
+                raise ValueError("纯字符串停靠 %s 缺少窗口（windows 参数）" % stop)
+            result.append({"node": stop, "pickups": [],
+                           "deliveries": [(stop, windows[stop][0], windows[stop][1])]})
+            continue
+        node = stop["node"]
+        pickups = list(stop.get("pickups", []))
+        deliveries = [(d[0], d[1], d[2]) for d in stop.get("deliveries", [])]
+        result.append({"node": node, "pickups": pickups, "deliveries": deliveries})
+    return result
 
-    stops: 依次服务的节点；windows: {node: (start, end)} 已合并后的窗口。
-    返回完整节点序列、逐站记录与汇总。distance/cost 始终按实际维度累加，
-    时间推进始终用耗时维度（与所选策略无关）。
+
+def route_metrics(g, start_pos, return_to, start_time, stops, kind, windows=None):
+    """A→B 取送时间模型（规格一 #18 §4.4 / #23 §5.4）。
+
+    stops: 依次停靠的节点描述，每项可为
+      - dict: {"node": 节点,
+               "pickups": [订单 id, ...]                      # A：无窗口、不记 penalty、零耗时
+               "deliveries": [(订单 id, 窗口起, 窗口止), ...]}  # B：早到等待 + 逐单 penalty
+      - str : 纯送达停靠的简写，窗口由 windows 提供。
+    windows: {节点: (窗口起, 窗口止)}，仅供 str 简写使用。
+    返回 dict: nodes / stops / total_distance / total_time / total_cost / total_penalty。
+    距离 / 成本始终按实际边权累加；时间推进始终用耗时维度（与所选策略无关）。
     """
+    normalized = _normalize_stops(stops, windows)
     seq = [start_pos]
     cur = start_pos
     elapsed = float(start_time)
@@ -102,39 +132,53 @@ def route_metrics(g, start_pos, return_to, start_time, stops, windows, service_m
     records = []
     total_penalty = 0
 
-    for node in stops:
-        path, _w = shortest(g, cur, node, kind)
+    def travel(to):
+        nonlocal cur, elapsed, total_dist, total_cost
+        path, _w = shortest(g, cur, to, kind)
         if path is None:
-            return None
+            return False
         for i in range(1, len(path)):
-            total_dist += g.edges[(path[i - 1], path[i])]["dist"]
-            total_cost += g.edges[(path[i - 1], path[i])]["cost"]
-            elapsed += g.edges[(path[i - 1], path[i])]["time"]
+            edge = g.edges[(path[i - 1], path[i])]
+            total_dist += edge["dist"]
+            total_cost += edge["cost"]
+            elapsed += edge["time"]
             seq.append(path[i])
+        cur = to
+        return True
 
-        ws, we = windows[node]
+    for stop in normalized:
+        if not travel(stop["node"]):
+            return None
+
         raw = elapsed
-        wait = max(0.0, ws - raw)
+        # 只在 B 做早到等待：一个停靠只有一个到达时刻，等到**全部**送达单窗口都开启
+        if stop["deliveries"]:
+            wait = max(0.0, max(ws for _id, ws, _we in stop["deliveries"]) - raw)
+        else:
+            wait = 0.0
         arrival = raw + wait
-        late = arrival > we + EPS
-        penalty = round(arrival - we) if late else 0
-        elapsed = arrival + service_min
-        total_penalty += penalty
-        records.append({
-            "node": node, "raw": round(raw), "wait": round(wait),
-            "arrival": round(arrival), "departure": round(elapsed),
-            "late": late, "penalty": penalty,
-        })
-        cur = node
 
-    back, _w = shortest(g, cur, return_to, kind)
-    if back is None:
+        deliveries = []
+        stop_penalty = 0
+        stop_late = False
+        for oid, ws, we in stop["deliveries"]:
+            late = arrival > we + EPS          # arrival == windowEnd 不算迟到（严格 >）
+            penalty = round(arrival - we) if late else 0
+            stop_penalty += penalty
+            stop_late = stop_late or late
+            deliveries.append({"id": oid, "arrival": round(arrival), "late": late,
+                              "penalty": penalty})
+        total_penalty += stop_penalty
+        elapsed = arrival                       # 停靠零耗时：departure == arrival
+        records.append({
+            "node": stop["node"], "raw": round(raw), "wait": round(wait),
+            "arrival": round(arrival), "departure": round(elapsed),
+            "late": stop_late, "penalty": stop_penalty,
+            "pickups": list(stop["pickups"]), "deliveries": deliveries,
+        })
+
+    if not travel(return_to):
         return None
-    for i in range(1, len(back)):
-        total_dist += g.edges[(back[i - 1], back[i])]["dist"]
-        total_cost += g.edges[(back[i - 1], back[i])]["cost"]
-        elapsed += g.edges[(back[i - 1], back[i])]["time"]
-        seq.append(back[i])
 
     return {
         "nodes": seq,
@@ -144,6 +188,44 @@ def route_metrics(g, start_pos, return_to, start_time, stops, windows, service_m
         "total_cost": round(total_cost, 6),
         "total_penalty": total_penalty,
     }
+
+
+def stops_from_route_nodes(route_nodes, orders):
+    """由「完整节点序列 + 订单表」推出每站的取货/送达动作（oracle 不实现选路）。
+
+    route_nodes: 被测方给出的完整节点序列（含首尾仓库）。
+    orders: [{"id": .., "pickup": A, "delivery": B, "ws": .., "we": ..}, ...]
+    规则：送达先于取货（合并停靠内先卸后装）；同一节点既是某单取货点又是另一单
+    送达点时并成一次停靠；重访节点只承接尚未完成的动作。
+    """
+    by_pickup, by_delivery = {}, {}
+    for o in orders:
+        by_pickup.setdefault(o["pickup"], []).append(o)
+        by_delivery.setdefault(o["delivery"], []).append(o)
+
+    picked, delivered = set(), set()
+    stops = []
+    for node in route_nodes:
+        pickups, deliveries = [], []
+        for o in by_delivery.get(node, []):
+            if o["id"] in delivered:
+                continue
+            if o["id"] not in picked:
+                raise ValueError("订单 %s 在取货前被送达（序列非法）" % o["id"])
+            deliveries.append((o["id"], o["ws"], o["we"]))
+            delivered.add(o["id"])
+        for o in by_pickup.get(node, []):
+            if o["id"] in picked or o["id"] in delivered:
+                continue
+            pickups.append(o["id"])
+            picked.add(o["id"])
+        if pickups or deliveries:
+            stops.append({"node": node, "pickups": pickups, "deliveries": deliveries})
+
+    unserved = [o["id"] for o in orders if o["id"] not in delivered]
+    if unserved:
+        raise ValueError("节点序列未覆盖全部订单: %s" % unserved)
+    return stops
 
 
 # ---------------------------------------------------------------- 测试夹具
@@ -182,6 +264,24 @@ def fixture_tie():
     return g
 
 
+def fixture_pdp():
+    """取送链：W - A - B，B 回 W 的直达边故意更长（避免与绕行并列）。"""
+    g = Graph()
+    g.two_way("W", "A", 1.0, 10.0, 4.0)
+    g.two_way("A", "B", 1.0, 10.0, 4.0)
+    g.two_way("W", "B", 5.0, 50.0, 20.0)
+    return g
+
+
+def fixture_merged():
+    """合并停靠：M 同时是 X1 的送达点与 X2 的取货点。"""
+    g = Graph()
+    g.two_way("W", "M", 1.0, 10.0, 4.0)
+    g.two_way("M", "N", 1.0, 10.0, 4.0)
+    g.two_way("W", "N", 5.0, 50.0, 20.0)
+    return g
+
+
 def show(title, result):
     print(f"\n=== {title} ===")
     if result is None:
@@ -189,9 +289,13 @@ def show(title, result):
         return
     print(f"  nodes        = {result['nodes']}")
     for r in result["stops"]:
+        picks = ",".join(r["pickups"]) or "-"
+        dels = " ".join("%s(arr %d%s p%d)" % (d["id"], d["arrival"],
+                                              "+" if d["late"] else "",
+                                              d["penalty"]) for d in r["deliveries"]) or "-"
         print(f"  stop {r['node']}: raw={r['raw']} wait={r['wait']} "
               f"arrival={r['arrival']} departure={r['departure']} "
-              f"late={r['late']} penalty={r['penalty']}")
+              f"late={r['late']} penalty={r['penalty']} 取[{picks}] 送[{dels}]")
     print(f"  totalDistance = {result['total_distance']}")
     print(f"  totalTime     = {result['total_time']}")
     print(f"  totalCost     = {result['total_cost']}")
@@ -223,15 +327,127 @@ def self_check():
         print(f"[FAIL] 自检 A->E 应不可达: {path}")
         ok = False
 
-    # 三节点链上的时间模型：(W->D1 10min) 到达 490，窗口 540 -> 等待 50
+    # ---- 时间模型：等待 + 停靠零耗时（旧服务时间已退役）----
+    # W->D1 10min 到达 490，窗口 540 开 -> 等待 50，arrival 540，departure == 540
     g2 = fixture_w_d1()
-    r = route_metrics(g2, "W", "W", 480, ["D1"], {"D1": (540, 1080)}, 5.0, "distance")
-    if r["stops"][0]["raw"] != 490 or r["stops"][0]["wait"] != 50 or r["stops"][0]["arrival"] != 540:
-        print(f"[FAIL] 自检时间模型: {r['stops'][0]}")
+    r = route_metrics(g2, "W", "W", 480, ["D1"], "distance", windows={"D1": (540, 1080)})
+    s = r["stops"][0]
+    if s["raw"] != 490 or s["wait"] != 50 or s["arrival"] != 540:
+        print(f"[FAIL] 自检时间模型: {s}")
         ok = False
-    if abs(r["total_time"] - 75.0) > EPS:
-        print(f"[FAIL] 自检总耗时: {r['total_time']}")
+    if s["departure"] != s["arrival"]:
+        print(f"[FAIL] 自检停靠零耗时: departure={s['departure']} arrival={s['arrival']}")
         ok = False
+    if abs(r["total_time"] - 70.0) > EPS:
+        print(f"[FAIL] 自检总耗时: {r['total_time']}（应为 70，服务时间已退役）")
+        ok = False
+
+    # ---- 边界：arrival == windowEnd 不算迟到（严格 >）；略晚 1 分钟记 1 ----
+    r = route_metrics(g2, "W", "W", 480, ["D1"], "distance", windows={"D1": (480, 490)})
+    if r["stops"][0]["late"] or r["stops"][0]["penalty"] != 0 or r["total_penalty"] != 0:
+        print(f"[FAIL] 自检 arrival==windowEnd 不算迟到: {r['stops'][0]}")
+        ok = False
+    r = route_metrics(g2, "W", "W", 480, ["D1"], "distance", windows={"D1": (480, 489)})
+    if not r["stops"][0]["late"] or r["total_penalty"] != 1:
+        print(f"[FAIL] 自检略晚 1 分钟记 penalty 1: {r['stops'][0]}")
+        ok = False
+
+    # ---- A→B 取送：取货停靠无窗口、不等待、不记 penalty ----
+    r = route_metrics(fixture_pdp(), "W", "W", 480,
+                      [{"node": "A", "pickups": ["X1"], "deliveries": []},
+                       {"node": "B", "pickups": [], "deliveries": [("X1", 0, 1440)]}],
+                      "distance")
+    a, b = r["stops"][0], r["stops"][1]
+    if a["wait"] != 0 or a["penalty"] != 0 or a["arrival"] != 490:
+        print(f"[FAIL] 自检取货停靠无窗口: {a}")
+        ok = False
+    if a["departure"] != a["arrival"]:
+        print(f"[FAIL] 自检取货零耗时: {a}")
+        ok = False
+    if b["arrival"] != 500 or b["penalty"] != 0:
+        print(f"[FAIL] 自检送达停靠: {b}")
+        ok = False
+    if abs(r["total_time"] - 40.0) > EPS:
+        print(f"[FAIL] 自检取送总耗时 40: {r['total_time']}")
+        ok = False
+    if abs(r["total_distance"] - 4.0) > EPS or abs(r["total_cost"] - 16.0) > EPS:
+        print(f"[FAIL] 自检取送距离/成本: {r}")
+        ok = False
+
+    # ---- 合并停靠：M 先送 X1 再取 X2，等待只由送达单决定 ----
+    r = route_metrics(fixture_merged(), "W", "W", 480,
+                      [{"node": "M", "pickups": ["X2"], "deliveries": [("X1", 480, 1440)]},
+                       {"node": "N", "pickups": [], "deliveries": [("X2", 0, 1440)]}],
+                      "distance")
+    m = r["stops"][0]
+    if m["wait"] != 0 or m["arrival"] != 490 or m["departure"] != 490:
+        print(f"[FAIL] 自检合并停靠零耗时: {m}")
+        ok = False
+    if r["stops"][1]["arrival"] != 500:
+        print(f"[FAIL] 自检合并停靠后续: {r['stops'][1]}")
+        ok = False
+    if abs(r["total_time"] - 40.0) > EPS:
+        print(f"[FAIL] 自检合并停靠总耗时 40: {r['total_time']}")
+        ok = False
+
+    # ---- 逐单 penalty：同一停靠两张单各按自己的 we 记 ----
+    r = route_metrics(g2, "W", "W", 480,
+                      [{"node": "D1", "pickups": [],
+                        "deliveries": [("P1", 480, 485), ("P2", 480, 600)]}],
+                      "distance")
+    d = r["stops"][0]
+    if d["arrival"] != 490 or d["wait"] != 0:
+        print(f"[FAIL] 自检同停靠双单到达: {d}")
+        ok = False
+    if d["deliveries"][0]["penalty"] != 5 or not d["deliveries"][0]["late"]:
+        print(f"[FAIL] 自检逐单 penalty（紧窗单）: {d['deliveries'][0]}")
+        ok = False
+    if d["deliveries"][1]["penalty"] != 0 or d["deliveries"][1]["late"]:
+        print(f"[FAIL] 自检逐单 penalty（宽窗单）: {d['deliveries'][1]}")
+        ok = False
+    if r["total_penalty"] != 5:
+        print(f"[FAIL] 自检逐单 penalty 合计: {r['total_penalty']}")
+        ok = False
+    # 等待取所有送达单窗口起的最大值：一张单 480 已开、另一张 540 才开 -> 等 50
+    r = route_metrics(g2, "W", "W", 480,
+                      [{"node": "D1", "pickups": [],
+                        "deliveries": [("P1", 480, 600), ("P2", 540, 600)]}],
+                      "distance")
+    if r["stops"][0]["wait"] != 50 or r["stops"][0]["arrival"] != 540:
+        print(f"[FAIL] 自检等待取全部窗口开启: {r['stops'][0]}")
+        ok = False
+
+    # ---- stops_from_route_nodes：由节点序列 + 订单表推出动作（合并停靠）----
+    orders = [
+        {"id": "X1", "pickup": "W", "delivery": "M", "ws": 480, "we": 1080},
+        {"id": "X2", "pickup": "M", "delivery": "N", "ws": 0, "we": 1440},
+    ]
+    stops = stops_from_route_nodes(["W", "M", "N", "W"], orders)
+    if len(stops) != 3 or [s["node"] for s in stops] != ["W", "M", "N"]:
+        print(f"[FAIL] 自检序列推动作: {stops}")
+        ok = False
+    else:
+        if stops[1]["pickups"] != ["X2"] or [d[0] for d in stops[1]["deliveries"]] != ["X1"]:
+            print(f"[FAIL] 自检合并停靠动作集（先卸后装）: {stops[1]}")
+            ok = False
+        r = route_metrics(fixture_merged(), "W", "W", 480, stops, "distance")
+        if abs(r["total_time"] - 40.0) > EPS or r["total_penalty"] != 0:
+            print(f"[FAIL] 自检序列推动作复算: {r}")
+            ok = False
+    # 序列不合法（送达先于取货）必须报错，而不是给出"看起来合理"的数
+    try:
+        stops_from_route_nodes(["W", "N", "W"], orders)
+        print("[FAIL] 自检非法序列应报错")
+        ok = False
+    except ValueError:
+        pass
+    # 序列未覆盖全部订单必须报错
+    try:
+        stops_from_route_nodes(["W", "M", "W"], orders)
+        print("[FAIL] 自检未覆盖订单应报错")
+        ok = False
+    except ValueError:
+        pass
 
     # 贪心夹具：W->D2 的最短路是绕经 D1 的 3.0，而非直达 5.0
     path, w = shortest(fixture_greedy(), "W", "D2", "distance")
@@ -253,17 +469,17 @@ def self_check():
             print(f"[FAIL] 自检 traffic_count({e_count},{ratio}) = {got}，应为 {expect}")
             ok = False
 
-    # 全部边 +50% 后的重规划：总耗时 75 -> 80
-    r = route_metrics(fixture_w_d1_congested(0.5), "W", "W", 480, ["D1"],
-                      {"D1": (540, 1080)}, 5.0, "distance")
-    if abs(r["total_time"] - 80.0) > EPS or r["stops"][0]["raw"] != 495:
+    # 全部边 +50% 后的重规划：总耗时 75（服务时间退役后在旧 80 上减 5）
+    r = route_metrics(fixture_w_d1_congested(0.5), "W", "W", 480, ["D1"], "distance",
+                      windows={"D1": (540, 1080)})
+    if abs(r["total_time"] - 75.0) > EPS or r["stops"][0]["raw"] != 495:
         print(f"[FAIL] 自检拥堵后重规划: {r}")
         ok = False
 
-    # 紧急单场景：先 D2 后 D1，总耗时 22.0
-    r = route_metrics(fixture_greedy(), "W", "W", 480, ["D2", "D1"],
-                      {"D1": (0, 1440), "D2": (0, 1440)}, 5.0, "distance")
-    if abs(r["total_time"] - 22.0) > EPS or r["stops"][0]["node"] != "D2":
+    # 紧急单场景：先 D2 后 D1，总耗时 12.0（旧值 22 = 12 + 2×5 服务时间，已退役）
+    r = route_metrics(fixture_greedy(), "W", "W", 480, ["D2", "D1"], "distance",
+                      windows={"D1": (0, 1440), "D2": (0, 1440)})
+    if abs(r["total_time"] - 12.0) > EPS or r["stops"][0]["node"] != "D2":
         print(f"[FAIL] 自检紧急优先: {r}")
         ok = False
 
@@ -303,39 +519,72 @@ def main():
     print(f"  A->E distance 不可达: {path is None}")
 
     print("\n" + "=" * 72)
-    print("RoutePlanner 夹具（tests/routeplanner_tests.cpp）")
+    print("RoutePlanner 夹具（tests/routeplanner_tests.cpp，A→B 时间模型）")
     print("=" * 72)
 
-    show("切片1 单订单 W<->D1，窗口 540-1080，发车 480，服务 5",
-         route_metrics(fixture_w_d1(), "W", "W", 480, ["D1"], {"D1": (540, 1080)}, 5.0, "distance"))
+    show("切片1 单订单 W<->D1，窗口 540-1080，发车 480（停靠零耗时）",
+         route_metrics(fixture_w_d1(), "W", "W", 480, ["D1"], "distance",
+                       windows={"D1": (540, 1080)}))
 
     show("切片1 空订单",
-         route_metrics(fixture_w_d1(), "W", "W", 480, [], {}, 5.0, "distance"))
+         route_metrics(fixture_w_d1(), "W", "W", 480, [], "distance"))
 
     show("切片2 贪心 D1 优先（W-D1=1.0 近于 W-D2=5.0）",
-         route_metrics(fixture_greedy(), "W", "W", 480, ["D1", "D2"],
-                       {"D1": (0, 1440), "D2": (0, 1440)}, 5.0, "distance"))
+         route_metrics(fixture_greedy(), "W", "W", 480, ["D1", "D2"], "distance",
+                       windows={"D1": (0, 1440), "D2": (0, 1440)}))
 
     show("切片2 并列：应取字典序 DA",
-         route_metrics(fixture_tie(), "W", "W", 480, ["DA", "DZ"],
-                       {"DA": (0, 1440), "DZ": (0, 1440)}, 5.0, "distance"))
+         route_metrics(fixture_tie(), "W", "W", 480, ["DA", "DZ"], "distance",
+                       windows={"DA": (0, 1440), "DZ": (0, 1440)}))
 
     show("切片3 紧急优先：先 D2 再 D1",
-         route_metrics(fixture_greedy(), "W", "W", 480, ["D2", "D1"],
-                       {"D1": (0, 1440), "D2": (0, 1440)}, 5.0, "distance"))
+         route_metrics(fixture_greedy(), "W", "W", 480, ["D2", "D1"], "distance",
+                       windows={"D1": (0, 1440), "D2": (0, 1440)}))
 
     show("切片4 晚到：窗口 480-485",
-         route_metrics(fixture_w_d1(), "W", "W", 480, ["D1"], {"D1": (480, 485)}, 5.0, "distance"))
+         route_metrics(fixture_w_d1(), "W", "W", 480, ["D1"], "distance",
+                       windows={"D1": (480, 485)}))
 
-    show("切片4 合并：窗口并集 480-900",
-         route_metrics(fixture_w_d1(), "W", "W", 480, ["D1"], {"D1": (480, 900)}, 5.0, "distance"))
+    show("切片4 同停靠两单各按自己的窗口（P1 485 止 / P2 600 止）",
+         route_metrics(fixture_w_d1(), "W", "W", 480,
+                       [{"node": "D1", "pickups": [],
+                         "deliveries": [("P1", 480, 485), ("P2", 480, 600)]}], "distance"))
 
     show("切片6 replan：已到 D2，时刻 600，剩余 D1",
-         route_metrics(fixture_greedy(), "D2", "W", 600, ["D1"],
-                       {"D1": (0, 1440)}, 5.0, "distance"))
+         route_metrics(fixture_greedy(), "D2", "W", 600, ["D1"], "distance",
+                       windows={"D1": (0, 1440)}))
 
     show("切片6 replan：已在 D1，时刻 600",
-         route_metrics(fixture_w_d1(), "D1", "W", 600, ["D1"], {"D1": (0, 1440)}, 5.0, "distance"))
+         route_metrics(fixture_w_d1(), "D1", "W", 600, ["D1"], "distance",
+                       windows={"D1": (0, 1440)}))
+
+    print("\n" + "=" * 72)
+    print("A→B 取送时间模型（规格一 #23 §5.4 / #18 §4.4）")
+    print("=" * 72)
+
+    show("取送链：W->A 取 X1（无窗口）-> B 送 X1 -> 回 W",
+         route_metrics(fixture_pdp(), "W", "W", 480,
+                       [{"node": "A", "pickups": ["X1"], "deliveries": []},
+                        {"node": "B", "pickups": [], "deliveries": [("X1", 0, 1440)]}],
+                       "distance"))
+
+    show("合并停靠：M 先送 X1 再取 X2 -> N 送 X2 -> 回 W",
+         route_metrics(fixture_merged(), "W", "W", 480,
+                       [{"node": "M", "pickups": ["X2"], "deliveries": [("X1", 480, 1440)]},
+                        {"node": "N", "pickups": [], "deliveries": [("X2", 0, 1440)]}],
+                       "distance"))
+
+    show("边界：arrival == windowEnd（490 到、窗口止 490）不算迟到",
+         route_metrics(fixture_w_d1(), "W", "W", 480, ["D1"], "distance",
+                       windows={"D1": (480, 490)}))
+
+    orders = [
+        {"id": "X1", "pickup": "W", "delivery": "M", "ws": 480, "we": 1080},
+        {"id": "X2", "pickup": "M", "delivery": "N", "ws": 0, "we": 1440},
+    ]
+    show("由节点序列 W M N W 推动作后复算（合并停靠：M 卸 X1 + 取 X2）",
+         route_metrics(fixture_merged(), "W", "W", 480,
+                       stops_from_route_nodes(["W", "M", "N", "W"], orders), "distance"))
 
     # ------------------------------------------------------------ E1 路况
     print("\n" + "=" * 72)
@@ -349,9 +598,9 @@ def main():
               f"{traffic_count(greedy_edges, ratio)}")
 
     show("切片C 全部边 +50% 后重规划（W 480 出发，服务 D1，窗口 540-1080）",
-         route_metrics(fixture_w_d1_congested(0.5), "W", "W", 480, ["D1"],
-                       {"D1": (540, 1080)}, 5.0, "distance"))
-    print("  对照（未拥堵）: totalDistance 10.0  totalTime 75.0")
+         route_metrics(fixture_w_d1_congested(0.5), "W", "W", 480, ["D1"], "distance",
+                       windows={"D1": (540, 1080)}))
+    print("  对照（未拥堵）: totalDistance 10.0  totalTime 70.0")
 
     # ------------------------------------------------------------ E3 插单
     print("\n" + "=" * 72)
@@ -359,8 +608,8 @@ def main():
     print("=" * 72)
 
     show("切片D 插入紧急单：从 W 480 出发服务 [D2(紧急), D1]",
-         route_metrics(fixture_greedy(), "W", "W", 480, ["D2", "D1"],
-                       {"D1": (0, 1440), "D2": (0, 1440)}, 5.0, "distance"))
+         route_metrics(fixture_greedy(), "W", "W", 480, ["D2", "D1"], "distance",
+                       windows={"D1": (0, 1440), "D2": (0, 1440)}))
 
     path, w = shortest(fixture_greedy(), "W", "D2", "time")
     print(f"\n  切片E 冲突判定：W->D2 最短路 path={path} travel={w}min")
@@ -369,10 +618,12 @@ def main():
     print("    新单窗口止 1440 >= 606 -> 无冲突 -> warning 为空")
 
     show("切片E 紧张窗口 [400,500] 的实际结果（超时不弃，仍生成路线）",
-         route_metrics(fixture_greedy(), "W", "W", 600, ["D2"], {"D2": (400, 500)}, 5.0, "distance"))
+         route_metrics(fixture_greedy(), "W", "W", 600, ["D2"], "distance",
+                       windows={"D2": (400, 500)}))
 
     show("切片E 对照：窗口 [0,1440]",
-         route_metrics(fixture_greedy(), "W", "W", 600, ["D2"], {"D2": (0, 1440)}, 5.0, "distance"))
+         route_metrics(fixture_greedy(), "W", "W", 600, ["D2"], "distance",
+                       windows={"D2": (0, 1440)}))
 
     return 0
 

@@ -51,11 +51,16 @@ inline logistics::Vehicle makeVehicle(const std::string& startId, double capacit
     return v;
 }
 
-inline logistics::Order makeOrder(const std::string& id, const std::string& nodeId,
-                                 double demandKg, int windowStartMin, int windowEndMin,
+// 订单夹具：全部订单统一 A→B 取送（规格一 #23）。pickup 必填，调用方需显式给出取货点。
+// 注：本票（#32）只把签名与调用点迁到七列口径，各用例的期望值仍按旧语义书写，
+// 重算归 #33（构造器重写）——因此 routeplanner_tests 暂时允许红。
+inline logistics::Order makeOrder(const std::string& id, const std::string& pickupNodeId,
+                                 const std::string& nodeId, double demandKg,
+                                 int windowStartMin, int windowEndMin,
                                  bool urgent = false) {
     logistics::Order o;
     o.id = id;
+    o.pickupNodeId = pickupNodeId;
     o.nodeId = nodeId;
     o.demandKg = demandKg;
     o.windowStartMin = windowStartMin;

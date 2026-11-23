@@ -1,5 +1,12 @@
 // 配置加载测试：不依赖 Qt，不引入测试框架。
 // 覆盖三类用例：正确运行 / 错误输入 / 边界数据。
+//
+// 本版对应规格一（#23）的数据契约：
+//   [orders]   七列 ID, pickup, delivery, demand_kg, window_start, window_end, is_urgent
+//   [vehicles] 六列 ID, start_node, capacity_kg, depart_time, time_factor, cost_factor
+//   [general]  事件改 event_level_*（固定表 1/3/9/27），退役键出现即带行号报错
+#include <cmath>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -12,8 +19,10 @@
 using logistics::Config;
 using logistics::ConfigLoader;
 using logistics::Edge;
+using logistics::EventLevel;
 using logistics::LogisticsGraph;
 using logistics::NodeType;
+using logistics::OrderSource;
 using testutil::check;
 
 #ifndef DEFAULT_CONFIG_PATH
@@ -60,6 +69,16 @@ double totalDemand(const Config& cfg) {
     return sum;
 }
 
+double minCapacity(const Config& cfg) {
+    double best = 0.0;
+    for (std::size_t i = 0; i < cfg.vehicles.size(); ++i) {
+        if (i == 0 || cfg.vehicles[i].capacityKg < best) {
+            best = cfg.vehicles[i].capacityKg;
+        }
+    }
+    return best;
+}
+
 std::size_t countType(const Config& cfg, NodeType type) {
     std::size_t n = 0;
     for (const logistics::Node& node : cfg.graph.nodes()) {
@@ -70,17 +89,46 @@ std::size_t countType(const Config& cfg, NodeType type) {
     return n;
 }
 
-// 最小但完整的合法配置，供错误用例做局部替换
+// 最小但完整的合法配置底座，供错误用例做局部替换。
+// 注意：订单已改为 A→B 取送，所以至少要两个配送点（D01 取、D02 送）。
+const char* kNodesBase =
+    "[nodes]\n"
+    "W01, warehouse, 0, 0, 仓库, 0\n"
+    "D01, delivery, 10, 10, 客户一, 0\n"
+    "D02, delivery, 20, 10, 客户二, 0\n";
+const char* kEdgesBase =
+    "[edges]\n"
+    "W01, D01, 1.0, 2.0, 1.5\n"
+    "W01, D02, 1.0, 2.0, 1.5\n"
+    "D01, D02, 1.0, 2.0, 1.5\n";
+const char* kValidVehicleRow = "V01, W01, 100, 08:00, 1.00, 1.00";
+
 const char* kMinimalConfig =
     "[nodes]\n"
     "W01, warehouse, 0, 0, 仓库, 0\n"
-    "D01, delivery, 10, 10, 客户, 0\n"
+    "D01, delivery, 10, 10, 客户一, 0\n"
+    "D02, delivery, 20, 10, 客户二, 0\n"
     "[edges]\n"
     "W01, D01, 1.0, 2.0, 1.5\n"
+    "W01, D02, 1.0, 2.0, 1.5\n"
+    "D01, D02, 1.0, 2.0, 1.5\n"
     "[vehicles]\n"
-    "V01, W01, 100, 08:00\n"
+    "V01, W01, 100, 08:00, 1.00, 1.00\n"
     "[orders]\n"
-    "O01, D01, 10, 09:00, 18:00, 0\n";
+    "O01, D01, D02, 10, 09:00, 18:00, 0\n";
+
+// [orders] 数据行固定落在第 12 行：底座 1–11 行见 kNodesBase/kEdgesBase/[vehicles]。
+std::string configWithOrderRows(const std::string& rows,
+                                const std::string& vehicleRow = kValidVehicleRow) {
+    return std::string(kNodesBase) + kEdgesBase + "[vehicles]\n" + vehicleRow +
+           "\n[orders]\n" + rows;
+}
+
+// [vehicles] 数据行固定落在第 10 行。
+std::string configWithVehicleRow(const std::string& row) {
+    return std::string(kNodesBase) + kEdgesBase + "[vehicles]\n" + row +
+           "\n[orders]\nO01, D01, D02, 10, 09:00, 18:00, 0\n";
+}
 
 // 用一段文本尝试加载，期望失败
 void expectParseFailure(const std::string& text, const std::string& what) {
@@ -118,6 +166,20 @@ void expectParseFailureAtLine(const std::string& text, int expectLineNo,
                           "\"）: " + what);
 }
 
+// 在"带对了行号"之外再断言具体文案：数据契约要求报错文案逐字可读，
+// 只断行号会让"把原因写成别的话"也通过。
+void expectParseFailureAtLineWithMessage(const std::string& text, int expectLineNo,
+                                         const std::string& needle, const std::string& what) {
+    expectParseFailureAtLine(text, expectLineNo, what);
+    Config cfg;
+    std::string error;
+    if (ConfigLoader::parse(text, cfg, error)) {
+        return;
+    }
+    check(error.find(needle) != std::string::npos,
+          "错误信息应含 \"" + needle + "\"（实际 \"" + error + "\"）: " + what);
+}
+
 std::string nodeName(int index) {
     if (index == 0) {
         return "W01";
@@ -149,8 +211,8 @@ std::string buildScaleBoundaryConfig() {
             ++made;
         }
     }
-    os << "[vehicles]\nV01, W01, 1000, 08:00\n";
-    os << "[orders]\nO01, N1, 10, 09:00, 18:00, 0\n";
+    os << "[vehicles]\nV01, W01, 1000, 08:00, 1.00, 1.00\n";
+    os << "[orders]\nO01, N1, N2, 10, 09:00, 18:00, 0\n";
     return os.str();
 }
 
@@ -172,48 +234,81 @@ void testLoadDefaultConfig() {
     check(countType(cfg, NodeType::Transit) >= 3, "中转站 ≥ 3");
     check(cfg.graph.edgeCount() >= 50, "路径总数 ≥ 50");
 
-    // 车辆
-    check(cfg.vehicles.size() == 1, "第一版恰有 1 辆车");
+    // 车辆：规格一阶段保持单车主 V01，六列（含两因子）
+    check(cfg.vehicles.size() == 1, "规格一默认车队恰有 1 辆车");
     if (!cfg.vehicles.empty()) {
         const logistics::Vehicle& v = cfg.vehicles[0];
-        check(v.capacityKg > 0.0, "载重上限为正");
+        check(v.id == "V01", "默认车辆 ID 为 V01");
+        check(v.capacityKg == 200.0, "默认载重 200kg");
         check(v.departTimeMin == 8 * 60, "发车时刻 08:00 解析为 480 分钟");
+        check(v.timeFactor == 1.0, "默认耗时倍率 1.00");
+        check(v.costFactor == 1.0, "默认成本倍率 1.00");
         const logistics::Node* start = cfg.graph.findNode(v.startNodeId);
         check(start != nullptr && start->type == NodeType::Warehouse, "起始节点是仓库");
     }
 
-    // 订单
-    check(cfg.orders.size() >= 15, "订单数量满足配送点要求");
-    for (const logistics::Order& o : cfg.orders) {
-        check(cfg.graph.findNode(o.nodeId) != nullptr, "订单目标节点存在: " + o.id);
-        check(o.windowStartMin < o.windowEndMin, "订单窗口起早于止: " + o.id);
-        check(o.demandKg > 0.0, "订单货物量为正: " + o.id);
+    // 订单：25 单 A→B 取送，七列口径
+    check(cfg.orders.size() == 25, "默认数据集恰有 25 张订单");
+    std::set<std::string> pickupNodes;
+    std::set<std::string> deliveryNodes;
+    std::set<std::string> allDeliveryNodes;
+    for (const logistics::Node& node : cfg.graph.nodes()) {
+        if (node.type == NodeType::Delivery) {
+            allDeliveryNodes.insert(node.id);
+        }
     }
-
-    // D21（修订 D14）：总需求**可以**超过载重——车辆会多趟往返取货、
-    // 把货暂存在中转站再二次配发。真正不可行的是"**单个订单**的货量就超过载重"，
-    // 那样分多少趟都装不下。
     double maxOrderDemand = 0.0;
     for (const logistics::Order& o : cfg.orders) {
+        const logistics::Node* pickup = cfg.graph.findNode(o.pickupNodeId);
+        const logistics::Node* delivery = cfg.graph.findNode(o.nodeId);
+        check(pickup != nullptr, "订单取货点存在: " + o.id);
+        check(delivery != nullptr, "订单送达点存在: " + o.id);
+        if (pickup != nullptr) {
+            check(pickup->type == NodeType::Delivery, "取货点必须是配送点: " + o.id);
+            pickupNodes.insert(o.pickupNodeId);
+        }
+        if (delivery != nullptr) {
+            check(delivery->type == NodeType::Delivery, "送达点必须是配送点: " + o.id);
+            deliveryNodes.insert(o.nodeId);
+        }
+        check(!o.pickupNodeId.empty(), "订单取货点必填: " + o.id);
+        check(o.pickupNodeId != o.nodeId, "取货点与送达点不能相同: " + o.id);
+        check(o.windowStartMin < o.windowEndMin, "订单窗口起早于止: " + o.id);
+        check(o.demandKg > 0.0, "订单货物量为正: " + o.id);
+        check(!o.urgent, "初始数据集全普通（is_urgent = 0）: " + o.id);
+        check(o.source == OrderSource::Initial, "配置加载的订单来源为 initial: " + o.id);
         if (o.demandKg > maxOrderDemand) {
             maxOrderDemand = o.demandKg;
         }
     }
-    check(!cfg.vehicles.empty() && maxOrderDemand <= cfg.vehicles[0].capacityKg,
-          "单个订单最大货量 " + std::to_string(maxOrderDemand) + " ≤ 载重");
+    check(deliveryNodes == allDeliveryNodes, "B 集合 = 全部 25 个配送点");
+    check(deliveryNodes.size() == 25, "B 集合恰有 25 个节点");
+    const std::set<std::string> expectedPickups = {"D01", "D05", "D08", "D14", "D20", "D23"};
+    check(pickupNodes == expectedPickups, "A 集合 = {D01,D05,D08,D14,D20,D23}");
+    check(totalDemand(cfg) == 516.0, "默认数据集总重 516kg");
+
+    // Q1：跨节校验是**严格小于**——任何一台车都要能至少单独装下一张单
+    check(maxOrderDemand < minCapacity(cfg),
+          "单个订单最大货量 " + std::to_string(maxOrderDemand) + " < 最小车辆载重 " +
+              std::to_string(minCapacity(cfg)));
 
     // [general] 参数
-    // 注：service_time_min 已移除——要求原文从未提及服务时间（搜「服务/停留/装卸」
-    // 均为 0 处），按用户要求删掉，到达时刻即离开时刻。
+    // 注：service_time_min 已退役且保持不存在——要求原文从未提及服务时间，
+    // 停靠零耗时（ADR 0002 Q3）。
     check(cfg.general.trafficChangeRatio == 0.1, "traffic_change_ratio == 0.1");
     check(cfg.general.trafficTimeIncreaseMin == 0.2, "traffic_time_increase_min == 0.2");
-
-    // 软件内时间的事件模型键（sim-time-events §2/§3.2）：默认数据集中的取值
+    check(cfg.general.trafficTimeIncreaseMax == 0.5, "traffic_time_increase_max == 0.5");
     check(cfg.general.eventIntervalMin == 15, "event_interval_min == 15");
-    check(cfg.general.eventWeightTraffic == 10, "event_weight_traffic == 10");
-    check(cfg.general.eventWeightUrgent == 3, "event_weight_urgent == 3");
-    check(cfg.general.eventWeightCustomer == 1, "event_weight_customer == 1");
-    check(cfg.general.eventWeightClosure == 1, "event_weight_closure == 1");
+
+    // 事件等级：默认组合 高/中/低/极低 -> 27:9:3:1（#23 §3.3）
+    check(cfg.general.eventLevelTraffic == EventLevel::High, "默认 traffic = high");
+    check(cfg.general.eventLevelCustomer == EventLevel::Medium, "默认 customer = medium");
+    check(cfg.general.eventLevelUrgent == EventLevel::Low, "默认 urgent = low");
+    check(cfg.general.eventLevelClosure == EventLevel::ExtraLow, "默认 closure = extra_low");
+    check(logistics::eventLevelWeight(cfg.general.eventLevelTraffic) == 27, "high -> 27");
+    check(logistics::eventLevelWeight(cfg.general.eventLevelCustomer) == 9, "medium -> 9");
+    check(logistics::eventLevelWeight(cfg.general.eventLevelUrgent) == 3, "low -> 3");
+    check(logistics::eventLevelWeight(cfg.general.eventLevelClosure) == 1, "extra_low -> 1");
 }
 
 void testDefaultConfigRoutingPreconditions() {
@@ -224,13 +319,29 @@ void testDefaultConfigRoutingPreconditions() {
         return;
     }
 
-    // B6 要求遍历全部待配送点后返回仓库：每个订单点都必须能从起点仓库到达、
-    // 且能返回起点仓库，否则默认数据无法支撑完整路线。
+    // B6 要求遍历全部待配送点后返回仓库：取货点 A 与送达点 B 都必须能从起点仓库
+    // 到达、且能返回起点仓库，否则默认数据无法支撑完整路线。
     const std::string& start = cfg.vehicles[0].startNodeId;
     for (const logistics::Order& o : cfg.orders) {
-        check(reaches(cfg.graph, start, o.nodeId), "从起点可达配送点: " + o.nodeId);
-        check(reaches(cfg.graph, o.nodeId, start), "从配送点可返回起点: " + o.nodeId);
+        check(reaches(cfg.graph, start, o.pickupNodeId), "从起点可达取货点: " + o.pickupNodeId);
+        check(reaches(cfg.graph, o.pickupNodeId, start), "从取货点可返回起点: " + o.pickupNodeId);
+        check(reaches(cfg.graph, start, o.nodeId), "从起点可达送达点: " + o.nodeId);
+        check(reaches(cfg.graph, o.nodeId, start), "从送达点可返回起点: " + o.nodeId);
     }
+}
+
+void testOrderSourcePrefixes() {
+    // #24 R5：来源是运行时字段，ID 前缀 O/N/U/C（规格二预留 M）。
+    check(logistics::orderIdPrefix(OrderSource::Initial) == std::string("O"), "initial -> O");
+    check(logistics::orderIdPrefix(OrderSource::EventNormal) == std::string("N"),
+          "event_normal -> N");
+    check(logistics::orderIdPrefix(OrderSource::EventUrgent) == std::string("U"),
+          "event_urgent -> U");
+    check(logistics::orderIdPrefix(OrderSource::ManualCustomer) == std::string("C"),
+          "manual_customer -> C");
+    const logistics::Order fresh;
+    check(fresh.source == OrderSource::Initial, "订单来源默认 initial");
+    check(!fresh.urgent, "订单默认非紧急");
 }
 
 void testDynamicAddRemove() {
@@ -257,7 +368,7 @@ void testDynamicAddRemove() {
     link.costYuan = 2.4;
     check(cfg.graph.addEdge(link), "动态添加边");
     check(cfg.graph.removeNode("X01"), "动态删除节点");
-    check(cfg.graph.nodeCount() == before, "删除后节点数还原");
+    check(cfg.graph.nodeCount() == before, "删除节点数还原");
     check(cfg.graph.findEdge("W01", "X01") == nullptr, "删除节点时同步删除其边");
 }
 
@@ -271,11 +382,10 @@ void testErrorCases() {
                        "缺少 [edges] 节");
     expectParseFailure("[edges]\n[vehicles]\n[orders]\n", "缺少 [nodes] 节");
     expectParseFailure(
-        "[nodes]\nW01, warehouse, 0, 0, 仓, 0\n"
-        "[edges]\nW01, W01, 1, 1, 1\n[orders]\n", "缺少 [vehicles] 节");
+        std::string(kNodesBase) + kEdgesBase + "[orders]\n", "缺少 [vehicles] 节");
     expectParseFailure(
-        "[nodes]\nW01, warehouse, 0, 0, 仓, 0\n"
-        "[edges]\nW01, W01, 1, 1, 1\n[vehicles]\nV01, W01, 10, 08:00\n", "缺少 [orders] 节");
+        std::string(kNodesBase) + kEdgesBase +
+            "[vehicles]\nV01, W01, 100, 08:00, 1.00, 1.00\n", "缺少 [orders] 节");
 
     // 字段数不符
     expectParseFailure(
@@ -298,51 +408,151 @@ void testErrorCases() {
         "[nodes]\nW01, warehouse, 0, 0, 仓, 0\n"
         "[edges]\nW01, NOPE, 1, 1, 1\n[vehicles]\n[orders]\n", "边端点不存在");
 
-    // 起始节点不是仓库
+    // ---- [vehicles] 八条校验（数据行在第 10 行） ----
+    expectParseFailureAtLineWithMessage(
+        configWithVehicleRow("V01, W01, 200, 08:00"), 10, "需要 6 个字段，实际 4 个",
+        "[vehicles] 旧 4 列按字段数报错");
     expectParseFailure(
-        "[nodes]\nW01, warehouse, 0, 0, 仓, 0\nD01, delivery, 1, 1, 客, 0\n"
-        "[edges]\n[vehicles]\nV01, D01, 10, 08:00\n[orders]\n", "起始节点必须为仓库");
+        std::string(kNodesBase) + kEdgesBase + "[vehicles]\n[orders]\n",
+        "[vehicles] 空节报错（车队不能为空）");
+    expectParseFailureAtLineWithMessage(
+        configWithVehicleRow(", W01, 100, 08:00, 1.00, 1.00"), 10, "车辆 ID 为空",
+        "[vehicles] 车辆 ID 为空");
+    expectParseFailureAtLineWithMessage(
+        configWithVehicleRow("V01, W01, 100, 08:00, 1.00, 1.00\n"
+                             "V01, W01, 100, 08:00, 1.00, 1.00"),
+        11, "车辆 ID 重复: V01", "[vehicles] 车辆 ID 重复（第 11 行）");
+    expectParseFailureAtLineWithMessage(
+        configWithVehicleRow("V01, , 100, 08:00, 1.00, 1.00"), 10, "起始节点为空",
+        "[vehicles] 起始节点为空");
+    expectParseFailureAtLineWithMessage(
+        configWithVehicleRow("V01, NOPE, 100, 08:00, 1.00, 1.00"), 10, "起始节点不存在: NOPE",
+        "[vehicles] 起始节点不存在");
+    expectParseFailureAtLineWithMessage(
+        configWithVehicleRow("V01, D01, 100, 08:00, 1.00, 1.00"), 10,
+        "起始节点必须是仓库: D01", "[vehicles] 起始节点不是仓库");
+    expectParseFailureAtLineWithMessage(
+        configWithVehicleRow("V01, W01, abc, 08:00, 1.00, 1.00"), 10,
+        "载重上限不是合法数值", "[vehicles] 载重不是合法数值");
+    expectParseFailureAtLineWithMessage(
+        configWithVehicleRow("V01, W01, 0, 08:00, 1.00, 1.00"), 10, "载重上限必须为正数",
+        "[vehicles] 载重必须为正数");
+    expectParseFailureAtLineWithMessage(
+        configWithVehicleRow("V01, W01, 100, 8点, 1.00, 1.00"), 10,
+        "发车时刻格式应为 HH:MM", "[vehicles] 发车时刻格式非法");
+    expectParseFailureAtLineWithMessage(
+        configWithVehicleRow("V01, W01, 100, 25:00, 1.00, 1.00"), 10,
+        "发车时刻格式应为 HH:MM", "[vehicles] 发车时刻超范围");
+    expectParseFailureAtLineWithMessage(
+        configWithVehicleRow("V01, W01, 100, 08:00, abc, 1.00"), 10,
+        "耗时倍率不是合法数值", "[vehicles] 耗时倍率不是数值");
+    expectParseFailureAtLineWithMessage(
+        configWithVehicleRow("V01, W01, 100, 08:00, 0, 1.00"), 10, "耗时倍率必须为正数",
+        "[vehicles] 耗时倍率必须为正数");
+    expectParseFailureAtLineWithMessage(
+        configWithVehicleRow("V01, W01, 100, 08:00, -1.5, 1.00"), 10, "耗时倍率必须为正数",
+        "[vehicles] 耗时倍率为负");
+    expectParseFailureAtLineWithMessage(
+        configWithVehicleRow("V01, W01, 100, 08:00, 1.00, abc"), 10,
+        "成本倍率不是合法数值", "[vehicles] 成本倍率不是数值");
+    expectParseFailureAtLineWithMessage(
+        configWithVehicleRow("V01, W01, 100, 08:00, 1.00, 0"), 10, "成本倍率必须为正数",
+        "[vehicles] 成本倍率必须为正数");
+    expectParseFailureAtLineWithMessage(
+        configWithVehicleRow("V01, W01, 100, 08:00, , 1.00"), 10,
+        "耗时倍率不是合法数值", "[vehicles] 耗时倍率为空");
 
-    // 非法时间格式
-    expectParseFailure(
-        "[nodes]\nW01, warehouse, 0, 0, 仓, 0\n"
-        "[edges]\n[vehicles]\nV01, W01, 10, 25:00\n[orders]\n", "小时超范围的发车时刻");
-    expectParseFailure(
-        "[nodes]\nW01, warehouse, 0, 0, 仓, 0\n"
-        "[edges]\n[vehicles]\nV01, W01, 10, 8点\n[orders]\n", "非 HH:MM 的发车时刻");
+    // ---- [orders] 十条校验（数据行在第 12 行） ----
+    expectParseFailureAtLineWithMessage(
+        configWithOrderRows("O01, D01, 10, 09:00, 18:00, 0"), 12,
+        "需要 7 个字段，实际 6 个", "[orders] 旧 6 列按字段数报错");
+    expectParseFailureAtLineWithMessage(
+        configWithOrderRows("O01, D01, D02, 10, 09:00, 18:00, 0, 998"), 12,
+        "需要 7 个字段，实际 8 个", "[orders] 多一列按字段数报错");
+    expectParseFailureAtLineWithMessage(
+        configWithOrderRows(", D01, D02, 10, 09:00, 18:00, 0"), 12, "订单 ID 为空",
+        "[orders] 订单 ID 为空");
+    expectParseFailureAtLineWithMessage(
+        configWithOrderRows("O01, D01, D02, 10, 09:00, 18:00, 0\n"
+                            "O01, D01, D02, 10, 09:00, 18:00, 0"),
+        13, "订单 ID 重复: O01", "[orders] 订单 ID 重复（第 13 行）");
+    expectParseFailureAtLineWithMessage(
+        configWithOrderRows("O01, , D02, 10, 09:00, 18:00, 0"), 12, "取货点为空",
+        "[orders] 取货点为空");
+    expectParseFailureAtLineWithMessage(
+        configWithOrderRows("O01, NOPE, D02, 10, 09:00, 18:00, 0"), 12,
+        "取货点不存在: NOPE", "[orders] 取货点不存在");
+    expectParseFailureAtLineWithMessage(
+        configWithOrderRows("O01, W01, D02, 10, 09:00, 18:00, 0"), 12,
+        "取货点必须是配送点: W01", "[orders] 取货点不是配送点");
+    expectParseFailureAtLineWithMessage(
+        configWithOrderRows("O01, D01, , 10, 09:00, 18:00, 0"), 12, "送达点为空",
+        "[orders] 送达点为空");
+    expectParseFailureAtLineWithMessage(
+        configWithOrderRows("O01, D01, NOPE, 10, 09:00, 18:00, 0"), 12,
+        "送达点不存在: NOPE", "[orders] 送达点不存在");
+    expectParseFailureAtLineWithMessage(
+        configWithOrderRows("O01, D01, W01, 10, 09:00, 18:00, 0"), 12,
+        "送达点必须是配送点: W01", "[orders] 送达点不是配送点");
+    expectParseFailureAtLineWithMessage(
+        configWithOrderRows("O01, D01, D01, 10, 09:00, 18:00, 0"), 12,
+        "取货点与送达点不能相同: D01", "[orders] A == B");
+    expectParseFailureAtLineWithMessage(
+        configWithOrderRows("O01, D01, D02, abc, 09:00, 18:00, 0"), 12,
+        "货物量不是合法数值", "[orders] 货物量不是数值");
+    expectParseFailureAtLineWithMessage(
+        configWithOrderRows("O01, D01, D02, 0, 09:00, 18:00, 0"), 12, "货物量必须为正数",
+        "[orders] 货物量为 0");
+    expectParseFailureAtLineWithMessage(
+        configWithOrderRows("O01, D01, D02, -5, 09:00, 18:00, 0"), 12, "货物量必须为正数",
+        "[orders] 货物量为负");
+    expectParseFailureAtLineWithMessage(
+        configWithOrderRows("O01, D01, D02, 10, 9点, 18:00, 0"), 12,
+        "时间窗口格式应为 HH:MM", "[orders] 窗口格式非法");
+    expectParseFailureAtLineWithMessage(
+        configWithOrderRows("O01, D01, D02, 10, 18:00, 09:00, 0"), 12,
+        "窗口起必须早于窗口止", "[orders] 窗口起晚于止");
+    expectParseFailureAtLineWithMessage(
+        configWithOrderRows("O01, D01, D02, 10, 09:00, 18:00, 2"), 12,
+        "is_urgent 只能为 0 或 1", "[orders] is_urgent 非法");
 
-    // 窗口起不早于止
-    expectParseFailure(
-        "[nodes]\nW01, warehouse, 0, 0, 仓, 0\nD01, delivery, 1, 1, 客, 0\n"
-        "[edges]\n[vehicles]\nV01, W01, 100, 08:00\n"
-        "[orders]\nO01, D01, 10, 18:00, 09:00, 0\n", "窗口起晚于止");
+    // 跨节校验（Q1）：demand_kg 严格小于 min(capacity)
+    expectParseFailureAtLineWithMessage(
+        configWithOrderRows("O01, D01, D02, 10, 09:00, 18:00, 0",
+                            "V01, W01, 10, 08:00, 1.00, 1.00"),
+        12, "货物量 10 kg 不小于最小车辆载重 10 kg（任何车都装不下这一单）",
+        "[orders] 单笔货量等于最小载重时报错");
 
-    // is_urgent 非 0/1
-    expectParseFailure(
-        "[nodes]\nW01, warehouse, 0, 0, 仓, 0\nD01, delivery, 1, 1, 客, 0\n"
-        "[edges]\n[vehicles]\nV01, W01, 100, 08:00\n"
-        "[orders]\nO01, D01, 10, 09:00, 18:00, 2\n", "is_urgent 取值非法");
+    // ---- [general] 退役键白名单（每个键都带行号 + 迁移提示） ----
+    const std::string baseWithGeneral = std::string("[general]\n");
+    expectParseFailureAtLineWithMessage(baseWithGeneral + "service_time_min = 5\n" + base, 2,
+                                        "service_time_min", "退役键 service_time_min");
+    expectParseFailureAtLineWithMessage(baseWithGeneral + "event_weight_traffic = 10\n" + base, 2,
+                                        "event_weight_traffic", "退役键 event_weight_traffic");
+    expectParseFailureAtLineWithMessage(baseWithGeneral + "event_weight_urgent = 3\n" + base, 2,
+                                        "event_weight_urgent", "退役键 event_weight_urgent");
+    expectParseFailureAtLineWithMessage(baseWithGeneral + "event_weight_customer = 1\n" + base, 2,
+                                        "event_weight_customer", "退役键 event_weight_customer");
+    expectParseFailureAtLineWithMessage(baseWithGeneral + "event_weight_closure = 1\n" + base, 2,
+                                        "event_weight_closure", "退役键 event_weight_closure");
+    expectParseFailureAtLineWithMessage(
+        baseWithGeneral + "traffic_change_interval_sec = 60\n" + base, 2,
+        "traffic_change_interval_sec", "退役键 traffic_change_interval_sec");
+    expectParseFailureAtLineWithMessage(
+        baseWithGeneral + "urgent_order_interval_sec = 10\n" + base, 2,
+        "urgent_order_interval_sec", "退役键 urgent_order_interval_sec");
 
-    // 订单目标不是配送点
-    expectParseFailure(
-        "[nodes]\nW01, warehouse, 0, 0, 仓, 0\n"
-        "[edges]\n[vehicles]\nV01, W01, 100, 08:00\n"
-        "[orders]\nO01, W01, 10, 09:00, 18:00, 0\n", "订单目标不是配送点");
-
-    // 订单货物量非正
-    expectParseFailure(
-        "[nodes]\nW01, warehouse, 0, 0, 仓, 0\nD01, delivery, 1, 1, 客, 0\n"
-        "[edges]\n[vehicles]\nV01, W01, 100, 08:00\n"
-        "[orders]\nO01, D01, 0, 09:00, 18:00, 0\n", "货物量必须为正");
-
-    // 载重非正
-    expectParseFailure(
-        "[nodes]\nW01, warehouse, 0, 0, 仓, 0\n"
-        "[edges]\n[vehicles]\nV01, W01, 0, 08:00\n[orders]\n", "载重必须为正");
+    // 非退役的未知键仍按既有口径静默忽略（白名单之外不炸）
+    {
+        Config cfg;
+        std::string error;
+        const bool ok = ConfigLoader::parse(
+            std::string("[general]\nsome_future_key = 1\n") + base, cfg, error);
+        check(ok, "未知但非退役的键仍被忽略（错误: " + error + "）");
+    }
 
     // 重复 section
-    expectParseFailure(
-        std::string(base) + "[nodes]\n", "重复 [section]");
+    expectParseFailure(std::string(base) + "[nodes]\n", "重复 [section]");
 
     // 配置项出现在任何 section 之前
     expectParseFailure("key = value\n" + std::string(base), "配置项出现在节之前");
@@ -388,6 +598,9 @@ void testBoundaryCases() {
         if (ok) {
             check(cfg.graph.nodeCount() == 30, "节点数恰好 30");
             check(cfg.graph.edgeCount() == 50, "边数恰好 50");
+            check(cfg.orders.size() == 1 && cfg.orders[0].pickupNodeId == "N1" &&
+                      cfg.orders[0].nodeId == "N2",
+                  "七列订单的 A/B 解析正确");
         }
     }
 
@@ -397,23 +610,29 @@ void testBoundaryCases() {
         std::string error;
         const bool ok = ConfigLoader::parse(
             "[nodes]\nW01, warehouse, 0, 0, 仓, 0\n"
-            "[edges]\n[vehicles]\nV01, W01, 100, 08:00\n[orders]\n", cfg, error);
+            "[edges]\n[vehicles]\nV01, W01, 100, 08:00, 1.00, 1.00\n[orders]\n", cfg, error);
         check(ok, "空订单列表合法（错误: " + error + "）");
         check(ok && cfg.orders.empty(), "空订单列表解析为空");
     }
 
-    // 载重恰好等于总需求：应合法（边界为 ≤，不是 <）
+    // MC-D05 / B7：单笔货量 == 最小载重 → **不合法**（严格小于）
+    {
+        const std::string text = configWithOrderRows(
+            "O01, D01, D02, 10, 09:00, 18:00, 0", "V01, W01, 10, 08:00, 1.00, 1.00");
+        expectParseFailureAtLine(text, 12, "单笔货量等于最小载重时应报错（B7）");
+    }
+    // 略小于最小载重 → 合法
     {
         Config cfg;
         std::string error;
         const bool ok = ConfigLoader::parse(
-            "[nodes]\nW01, warehouse, 0, 0, 仓, 0\nD01, delivery, 1, 1, 客, 0\n"
-            "[edges]\nW01, D01, 1, 2, 1.5\n"
-            "[vehicles]\nV01, W01, 10, 08:00\n"
-            "[orders]\nO01, D01, 10, 09:00, 18:00, 0\n", cfg, error);
-        check(ok, "载重等于总需求时合法（错误: " + error + "）");
+            configWithOrderRows("O01, D01, D02, 9.5, 09:00, 18:00, 0",
+                                "V01, W01, 10, 08:00, 1.00, 1.00"),
+            cfg, error);
+        check(ok, "单笔货量略小于最小载重时合法（错误: " + error + "）");
         if (ok) {
-            check(totalDemand(cfg) == cfg.vehicles[0].capacityKg, "总需求恰好等于载重");
+            check(cfg.orders.size() == 1 && cfg.orders[0].demandKg == 9.5,
+                  "小数货量 9.5 保留");
         }
     }
 
@@ -422,10 +641,7 @@ void testBoundaryCases() {
         Config cfg;
         std::string error;
         const bool ok = ConfigLoader::parse(
-            "[nodes]\nW01, warehouse, 0, 0, 仓, 0\nD01, delivery, 1, 1, 客, 0\n"
-            "[edges]\nW01, D01, 1, 2, 1.5\n"
-            "[vehicles]\nV01, W01, 100, 08:00\n"
-            "[orders]\nO01, D01, 10, 08:00, 08:02, 0\n", cfg, error);
+            configWithOrderRows("O01, D01, D02, 10, 08:00, 08:02, 0"), cfg, error);
         check(ok, "紧时间窗口配置可加载（错误: " + error + "）");
         if (ok) {
             check(cfg.orders[0].windowStartMin == 480 && cfg.orders[0].windowEndMin == 482,
@@ -433,7 +649,23 @@ void testBoundaryCases() {
         }
     }
 
-    // 可选 [general]：完全不提供时使用默认值
+    // 六列车辆的因子确实被读取（非默认值）
+    {
+        Config cfg;
+        std::string error;
+        const bool ok = ConfigLoader::parse(
+            configWithVehicleRow("V01, W01, 160, 08:15, 1.25, 0.80"), cfg, error);
+        check(ok, "六列车辆可加载（错误: " + error + "）");
+        if (ok) {
+            check(cfg.vehicles.size() == 1, "恰有 1 台车");
+            check(cfg.vehicles[0].capacityKg == 160.0, "载重 160");
+            check(cfg.vehicles[0].departTimeMin == 8 * 60 + 15, "发车 08:15");
+            check(cfg.vehicles[0].timeFactor == 1.25, "耗时倍率 1.25（非默认）");
+            check(cfg.vehicles[0].costFactor == 0.80, "成本倍率 0.80（非默认）");
+        }
+    }
+
+    // 可选 [general]：完全不提供时使用默认值（含事件等级回落）
     {
         Config cfg;
         std::string error;
@@ -443,64 +675,91 @@ void testBoundaryCases() {
               "默认 traffic_change_ratio == 0.1");
         check(ok && cfg.general.eventIntervalMin == 15,
               "默认 event_interval_min == 15");
-        check(ok && cfg.general.eventWeightTraffic == 10,
-              "默认 event_weight_traffic == 10");
-        check(ok && cfg.general.eventWeightUrgent == 3,
-              "默认 event_weight_urgent == 3");
-        check(ok && cfg.general.eventWeightCustomer == 1,
-              "默认 event_weight_customer == 1");
-        check(ok && cfg.general.eventWeightClosure == 1,
-              "默认 event_weight_closure == 1");
+        check(ok && cfg.general.eventLevelTraffic == EventLevel::High,
+              "缺键回落 traffic = high");
+        check(ok && cfg.general.eventLevelCustomer == EventLevel::Medium,
+              "缺键回落 customer = medium");
+        check(ok && cfg.general.eventLevelUrgent == EventLevel::Low,
+              "缺键回落 urgent = low");
+        check(ok && cfg.general.eventLevelClosure == EventLevel::ExtraLow,
+              "缺键回落 closure = extra_low");
     }
 
-    // [general] 存在但缺事件模型键：逐键回落到各自默认值（与其他键同口径）
+    // [general] 存在但缺事件等级键：逐个回落到各自默认等级
     {
         Config cfg;
         std::string error;
         const bool ok = ConfigLoader::parse(std::string("[general]\n")
                                                 + "traffic_change_ratio = 0.25\n"
                                                 + kMinimalConfig, cfg, error);
-        check(ok, "[general] 缺事件键时用默认值（错误: " + error + "）");
+        check(ok, "[general] 缺事件键时用默认等级（错误: " + error + "）");
         check(ok && cfg.general.trafficChangeRatio == 0.25, "已给键取文件值");
         check(ok && cfg.general.eventIntervalMin == 15,
               "缺口键 event_interval_min 回落到 15");
-        check(ok && cfg.general.eventWeightTraffic == 10,
-              "缺口键 event_weight_traffic 回落到 10");
-        check(ok && cfg.general.eventWeightUrgent == 3,
-              "缺口键 event_weight_urgent 回落到 3");
-        check(ok && cfg.general.eventWeightCustomer == 1,
-              "缺口键 event_weight_customer 回落到 1");
-        check(ok && cfg.general.eventWeightClosure == 1,
-              "缺口键 event_weight_closure 回落到 1");
+        check(ok && cfg.general.eventLevelTraffic == EventLevel::High,
+              "缺口键 event_level_traffic 回落到 high");
+        check(ok && cfg.general.eventLevelCustomer == EventLevel::Medium,
+              "缺口键 event_level_customer 回落到 medium");
+        check(ok && cfg.general.eventLevelUrgent == EventLevel::Low,
+              "缺口键 event_level_urgent 回落到 low");
+        check(ok && cfg.general.eventLevelClosure == EventLevel::ExtraLow,
+              "缺口键 event_level_closure 回落到 extra_low");
     }
 
-    // 事件模型键**确实被读取**——而不是"恰好永远等于默认值"。
-    //
-    // 为什么单列这一段：上面两个用例（默认值 / 缺口键回落）的期望值**都等于代码默认值**，
-    // 因此"解析绑定被删掉"与"解析正常"会产出**完全相同**的结果——守卫没有牙齿。
-    // 这里喂**非默认值**：删掉任意一条 IntBinder 绑定，对应断言立刻失败。
+    // 事件等级键**确实被读取**——而不是"恰好永远等于默认值"。
+    // 喂非默认等级：删掉任意一条绑定，对应断言立刻失败。
     {
         Config cfg;
         std::string error;
         const bool ok = ConfigLoader::parse(std::string("[general]\n")
                                                 + "event_interval_min = 7\n"
-                                                + "event_weight_traffic = 11\n"
-                                                + "event_weight_urgent = 5\n"
-                                                + "event_weight_customer = 2\n"
-                                                + "event_weight_closure = 3\n"
+                                                + "event_level_traffic = extra_low\n"
+                                                + "event_level_customer = high\n"
+                                                + "event_level_urgent = medium\n"
+                                                + "event_level_closure = low\n"
                                                 + kMinimalConfig, cfg, error);
-        check(ok, "非默认事件键可加载（错误: " + error + "）");
-        check(ok && cfg.general.eventIntervalMin == 7,
-              "已给键取文件值 event_interval_min == 7（非默认值）");
-        check(ok && cfg.general.eventWeightTraffic == 11,
-              "已给键取文件值 event_weight_traffic == 11（非默认值）");
-        check(ok && cfg.general.eventWeightUrgent == 5,
-              "已给键取文件值 event_weight_urgent == 5（非默认值）");
-        check(ok && cfg.general.eventWeightCustomer == 2,
-              "已给键取文件值 event_weight_customer == 2（非默认值）");
-        check(ok && cfg.general.eventWeightClosure == 3,
-              "已给键取文件值 event_weight_closure == 3（非默认值）");
+        check(ok, "非默认事件等级可加载（错误: " + error + "）");
+        check(ok && cfg.general.eventIntervalMin == 7, "已给键取文件值 event_interval_min == 7");
+        check(ok && cfg.general.eventLevelTraffic == EventLevel::ExtraLow,
+              "traffic == extra_low（非默认）");
+        check(ok && cfg.general.eventLevelCustomer == EventLevel::High,
+              "customer == high（非默认）");
+        check(ok && cfg.general.eventLevelUrgent == EventLevel::Medium,
+              "urgent == medium（非默认）");
+        check(ok && cfg.general.eventLevelClosure == EventLevel::Low,
+              "closure == low（非默认）");
+        check(ok && logistics::eventLevelWeight(cfg.general.eventLevelTraffic) == 1, "1");
+        check(ok && logistics::eventLevelWeight(cfg.general.eventLevelCustomer) == 27, "27");
+        check(ok && logistics::eventLevelWeight(cfg.general.eventLevelUrgent) == 9, "9");
+        check(ok && logistics::eventLevelWeight(cfg.general.eventLevelClosure) == 3, "3");
     }
+
+    // 值 trim 后不区分大小写；键名仍精确匹配
+    {
+        Config cfg;
+        std::string error;
+        const bool ok = ConfigLoader::parse(std::string("[general]\n")
+                                                + "event_level_traffic = HIGH\n"
+                                                + kMinimalConfig, cfg, error);
+        check(ok, "事件等级大小写不敏感（错误: " + error + "）");
+        check(ok && cfg.general.eventLevelTraffic == EventLevel::High, "HIGH -> high");
+    }
+
+    // 非法等级值：带行号报错，不猜、不回落
+    expectParseFailureAtLineWithMessage(std::string("[general]\n")
+                                            + "event_level_traffic = hihg\n" + kMinimalConfig,
+                                        2, "event_level_traffic 取值非法: hihg（允许 extra_low/low/medium/high）",
+                                        "非法事件等级值");
+    expectParseFailureAtLineWithMessage(std::string("[general]\n")
+                                            + "event_level_closure = 27\n" + kMinimalConfig,
+                                        2, "event_level_closure 取值非法: 27",
+                                        "事件等级写成权重数字也应报错");
+
+    // 等级 → 固定表 1/3/9/27 的唯一派生
+    check(logistics::eventLevelWeight(EventLevel::ExtraLow) == 1, "extra_low -> 1");
+    check(logistics::eventLevelWeight(EventLevel::Low) == 3, "low -> 3");
+    check(logistics::eventLevelWeight(EventLevel::Medium) == 9, "medium -> 9");
+    check(logistics::eventLevelWeight(EventLevel::High) == 27, "high -> 27");
 }
 
 } // namespace
@@ -508,6 +767,7 @@ void testBoundaryCases() {
 int main() {
     testLoadDefaultConfig();
     testDefaultConfigRoutingPreconditions();
+    testOrderSourcePrefixes();
     testDynamicAddRemove();
     testErrorCases();
     testBoundaryCases();

@@ -2,6 +2,9 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <iomanip>
+#include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -56,6 +59,16 @@ bool parseClockMinutes(const std::string& s, int& out) {
     return true;
 }
 
+// 数值 → 报错文案里的写法：整数不带小数点，小数按最小必要位数。
+std::string formatNumber(double value) {
+    if (std::isfinite(value) && value == std::floor(value) && std::fabs(value) < 1e15) {
+        return std::to_string(static_cast<long long>(value));
+    }
+    std::ostringstream os;
+    os << std::setprecision(10) << value;
+    return os.str();
+}
+
 // 数据行：记录本体 + 已按逗号切分并裁剪的字段
 struct Row {
     const IniRecord*         rec = nullptr;
@@ -92,11 +105,50 @@ bool requireSection(const IniFile& ini, const char* name, const IniSection*& out
     return true;
 }
 
+// 退役键白名单（规格一 #23 §3.4）：出现即带行号报错 + 迁移提示；其余未知键仍忽略。
+// service_time_min **保持不存在**：不重新引入、不参与任何计算（ADR 0002 Q3）。
+bool retiredGeneralKeyHint(const std::string& key, std::string& hint) {
+    if (key == "service_time_min") {
+        hint = "停靠零耗时（ADR 0002 Q3），该键保持不存在、不参与任何计算，请删除";
+        return true;
+    }
+    if (key == "event_weight_traffic" || key == "event_weight_urgent"
+        || key == "event_weight_customer" || key == "event_weight_closure") {
+        const std::string levelKey = "event_level_" + key.substr(std::string("event_weight_").size());
+        hint = "概率改由等级派生，请改用 " + levelKey
+               + " = extra_low|low|medium|high（代码内固定表 1/3/9/27）";
+        return true;
+    }
+    if (key == "traffic_change_interval_sec") {
+        hint = "事件只由软件内事件刻驱动，请改用 event_interval_min（软件内分钟）";
+        return true;
+    }
+    if (key == "urgent_order_interval_sec") {
+        hint = "紧急订单改由事件刻与待处理上限驱动，请删除该键";
+        return true;
+    }
+    return false;
+}
+
 bool loadGeneral(const IniFile& ini, GeneralConfig& out, std::string& error) {
     const IniSection* sec = ini.findSection("general");
     if (sec == nullptr) {
         return true;  // [general] 可选，缺省用默认值
     }
+
+    // 退役键先查：即使数值本身能解析也必须报错，否则旧配置会静默变默认值。
+    for (const IniRecord& rec : sec->records) {
+        if (!rec.isKeyValue) {
+            continue;
+        }
+        std::string hint;
+        if (retiredGeneralKeyHint(rec.key, hint)) {
+            error = "第 " + std::to_string(rec.lineNo) + " 行 [general]: " + rec.key
+                    + " 已退役；" + hint;
+            return false;
+        }
+    }
+
     struct Binder {
         const char* key;
         double*     target;
@@ -112,10 +164,6 @@ bool loadGeneral(const IniFile& ini, GeneralConfig& out, std::string& error) {
     };
     const IntBinder intBinders[] = {
         {"event_interval_min", &out.eventIntervalMin},
-        {"event_weight_traffic", &out.eventWeightTraffic},
-        {"event_weight_urgent", &out.eventWeightUrgent},
-        {"event_weight_customer", &out.eventWeightCustomer},
-        {"event_weight_closure", &out.eventWeightClosure},
     };
     for (const Binder& b : binders) {
         const IniRecord* rec = sec->findValue(b.key);
@@ -137,6 +185,33 @@ bool loadGeneral(const IniFile& ini, GeneralConfig& out, std::string& error) {
         int value = 0;
         if (!parseInt(rec->value, value)) {
             fail(error, rec->lineNo, "general", std::string(b.key) + " 不是合法整数: " + rec->value);
+            return false;
+        }
+        *b.target = value;
+    }
+
+    // 事件等级键（#23 §3.3）：缺键回落各自默认等级，非法值带行号报错、不猜不回落。
+    // 键名精确匹配（沿用 IniFile::findValue）；值 trim 后不区分大小写。
+    struct LevelBinder {
+        const char* key;
+        EventLevel* target;
+    };
+    const LevelBinder levelBinders[] = {
+        {"event_level_traffic", &out.eventLevelTraffic},
+        {"event_level_customer", &out.eventLevelCustomer},
+        {"event_level_urgent", &out.eventLevelUrgent},
+        {"event_level_closure", &out.eventLevelClosure},
+    };
+    for (const LevelBinder& b : levelBinders) {
+        const IniRecord* rec = sec->findValue(b.key);
+        if (rec == nullptr) {
+            continue;
+        }
+        EventLevel value = EventLevel::ExtraLow;
+        if (!parseEventLevel(rec->value, value)) {
+            fail(error, rec->lineNo, "general",
+                 std::string(b.key) + " 取值非法: " + rec->value
+                     + "（允许 extra_low/low/medium/high）");
             return false;
         }
         *b.target = value;
@@ -213,6 +288,7 @@ bool loadEdges(const IniFile& ini, LogisticsGraph& graph, std::string& error) {
     return true;
 }
 
+// [vehicles] 六列 + 八条校验（规格一 #19 Q1、规格二 §3.1）。
 bool loadVehicles(const IniFile& ini, const LogisticsGraph& graph,
                   std::vector<Vehicle>& out, std::string& error) {
     const IniSection* sec = nullptr;
@@ -220,23 +296,29 @@ bool loadVehicles(const IniFile& ini, const LogisticsGraph& graph,
         return false;
     }
     std::vector<Row> rows;
-    if (!collectRows(*sec, "vehicles", 4, rows, error)) {
+    if (!collectRows(*sec, "vehicles", 6, rows, error)) {
         return false;
     }
+    // 与 [orders] 不同：车队不能为空（没有车就没有任何配送能力）。
+    if (rows.empty()) {
+        error = "[vehicles] 节为空：至少需要 1 台车";
+        return false;
+    }
+    std::set<std::string> seenIds;
     for (const Row& row : rows) {
         Vehicle vehicle;
         vehicle.id = row.fields[0];
+        if (vehicle.id.empty()) {
+            fail(error, row.rec->lineNo, "vehicles", "车辆 ID 为空");
+            return false;
+        }
+        if (!seenIds.insert(vehicle.id).second) {
+            fail(error, row.rec->lineNo, "vehicles", "车辆 ID 重复: " + vehicle.id);
+            return false;
+        }
         vehicle.startNodeId = row.fields[1];
-        if (!parseDouble(row.fields[2], vehicle.capacityKg)) {
-            fail(error, row.rec->lineNo, "vehicles", "载重上限不是合法数值: " + row.fields[2]);
-            return false;
-        }
-        if (vehicle.capacityKg <= 0.0) {
-            fail(error, row.rec->lineNo, "vehicles", "载重上限必须为正数");
-            return false;
-        }
-        if (!parseClockMinutes(row.fields[3], vehicle.departTimeMin)) {
-            fail(error, row.rec->lineNo, "vehicles", "发车时刻格式应为 HH:MM: " + row.fields[3]);
+        if (vehicle.startNodeId.empty()) {
+            fail(error, row.rec->lineNo, "vehicles", "起始节点为空");
             return false;
         }
         const Node* start = graph.findNode(vehicle.startNodeId);
@@ -248,57 +330,134 @@ bool loadVehicles(const IniFile& ini, const LogisticsGraph& graph,
             fail(error, row.rec->lineNo, "vehicles", "起始节点必须是仓库: " + vehicle.startNodeId);
             return false;
         }
+        if (!parseDouble(row.fields[2], vehicle.capacityKg)) {
+            fail(error, row.rec->lineNo, "vehicles", "载重上限不是合法数值");
+            return false;
+        }
+        if (vehicle.capacityKg <= 0.0) {
+            fail(error, row.rec->lineNo, "vehicles", "载重上限必须为正数");
+            return false;
+        }
+        if (!parseClockMinutes(row.fields[3], vehicle.departTimeMin)) {
+            fail(error, row.rec->lineNo, "vehicles", "发车时刻格式应为 HH:MM");
+            return false;
+        }
+        if (!parseDouble(row.fields[4], vehicle.timeFactor)) {
+            fail(error, row.rec->lineNo, "vehicles", "耗时倍率不是合法数值");
+            return false;
+        }
+        if (vehicle.timeFactor <= 0.0) {
+            fail(error, row.rec->lineNo, "vehicles", "耗时倍率必须为正数");
+            return false;
+        }
+        if (!parseDouble(row.fields[5], vehicle.costFactor)) {
+            fail(error, row.rec->lineNo, "vehicles", "成本倍率不是合法数值");
+            return false;
+        }
+        if (vehicle.costFactor <= 0.0) {
+            fail(error, row.rec->lineNo, "vehicles", "成本倍率必须为正数");
+            return false;
+        }
         out.push_back(vehicle);
     }
     return true;
 }
 
+// [orders] 七列 + 十条校验 + 跨节严格小于（规格一 #23 §一 / Q1）。
 bool loadOrders(const IniFile& ini, const LogisticsGraph& graph,
-                std::vector<Order>& out, std::string& error) {
+                const std::vector<Vehicle>& vehicles, std::vector<Order>& out,
+                std::string& error) {
     const IniSection* sec = nullptr;
     if (!requireSection(ini, "orders", sec, error)) {
         return false;
     }
     std::vector<Row> rows;
-    if (!collectRows(*sec, "orders", 6, rows, error)) {
+    if (!collectRows(*sec, "orders", 7, rows, error)) {
         return false;
     }
+    // 空节合法（0 单，测试夹具要用）；非空时按 cross-section 口径取最小载重。
+    double minCapacityKg = 0.0;
+    for (std::size_t i = 0; i < vehicles.size(); ++i) {
+        if (i == 0 || vehicles[i].capacityKg < minCapacityKg) {
+            minCapacityKg = vehicles[i].capacityKg;
+        }
+    }
+
+    std::set<std::string> seenIds;
     for (const Row& row : rows) {
         Order order;
         order.id = row.fields[0];
-        order.nodeId = row.fields[1];
-        if (!parseDouble(row.fields[2], order.demandKg)) {
-            fail(error, row.rec->lineNo, "orders", "货物量不是合法数值: " + row.fields[2]);
+        if (order.id.empty()) {
+            fail(error, row.rec->lineNo, "orders", "订单 ID 为空");
+            return false;
+        }
+        if (!seenIds.insert(order.id).second) {
+            fail(error, row.rec->lineNo, "orders", "订单 ID 重复: " + order.id);
+            return false;
+        }
+        order.pickupNodeId = row.fields[1];
+        order.nodeId = row.fields[2];
+        if (order.pickupNodeId.empty()) {
+            fail(error, row.rec->lineNo, "orders", "取货点为空");
+            return false;
+        }
+        if (order.nodeId.empty()) {
+            fail(error, row.rec->lineNo, "orders", "送达点为空");
+            return false;
+        }
+        const Node* pickup = graph.findNode(order.pickupNodeId);
+        if (pickup == nullptr) {
+            fail(error, row.rec->lineNo, "orders", "取货点不存在: " + order.pickupNodeId);
+            return false;
+        }
+        if (pickup->type != NodeType::Delivery) {
+            fail(error, row.rec->lineNo, "orders", "取货点必须是配送点: " + order.pickupNodeId);
+            return false;
+        }
+        const Node* delivery = graph.findNode(order.nodeId);
+        if (delivery == nullptr) {
+            fail(error, row.rec->lineNo, "orders", "送达点不存在: " + order.nodeId);
+            return false;
+        }
+        if (delivery->type != NodeType::Delivery) {
+            fail(error, row.rec->lineNo, "orders", "送达点必须是配送点: " + order.nodeId);
+            return false;
+        }
+        if (order.pickupNodeId == order.nodeId) {
+            // 报同一个节点 ID（与规则 3 的 <ID> 同指节点 ID）；行号已能定位订单行。
+            fail(error, row.rec->lineNo, "orders",
+                 "取货点与送达点不能相同: " + order.pickupNodeId);
+            return false;
+        }
+        if (!parseDouble(row.fields[3], order.demandKg)) {
+            fail(error, row.rec->lineNo, "orders", "货物量不是合法数值");
             return false;
         }
         if (order.demandKg <= 0.0) {
-            fail(error, row.rec->lineNo, "orders", "货物量必须为正数: " + row.fields[2]);
+            fail(error, row.rec->lineNo, "orders", "货物量必须为正数");
             return false;
         }
-        if (!parseClockMinutes(row.fields[3], order.windowStartMin)
-            || !parseClockMinutes(row.fields[4], order.windowEndMin)) {
+        if (!parseClockMinutes(row.fields[4], order.windowStartMin)
+            || !parseClockMinutes(row.fields[5], order.windowEndMin)) {
             fail(error, row.rec->lineNo, "orders", "时间窗口格式应为 HH:MM");
             return false;
         }
         if (order.windowStartMin >= order.windowEndMin) {
-            fail(error, row.rec->lineNo, "orders",
-                 "窗口起必须早于窗口止: " + row.fields[3] + "-" + row.fields[4]);
+            fail(error, row.rec->lineNo, "orders", "窗口起必须早于窗口止");
             return false;
         }
         int urgent = 0;
-        if (!parseInt(row.fields[5], urgent) || (urgent != 0 && urgent != 1)) {
-            fail(error, row.rec->lineNo, "orders", "is_urgent 只能为 0 或 1: " + row.fields[5]);
+        if (!parseInt(row.fields[6], urgent) || (urgent != 0 && urgent != 1)) {
+            fail(error, row.rec->lineNo, "orders", "is_urgent 只能为 0 或 1");
             return false;
         }
         order.urgent = (urgent == 1);
-
-        const Node* node = graph.findNode(order.nodeId);
-        if (node == nullptr) {
-            fail(error, row.rec->lineNo, "orders", "配送点不存在: " + order.nodeId);
-            return false;
-        }
-        if (node->type != NodeType::Delivery) {
-            fail(error, row.rec->lineNo, "orders", "订单目标必须是配送点: " + order.nodeId);
+        // Q1 跨节校验（本人拍板）：demand_kg < min(capacity_kg) **严格小于**，
+        // 口径是"任何车都能至少单独装一个订单"。取 min、不写死 200。
+        if (!vehicles.empty() && !(order.demandKg < minCapacityKg)) {
+            fail(error, row.rec->lineNo, "orders",
+                 "货物量 " + formatNumber(order.demandKg) + " kg 不小于最小车辆载重 "
+                     + formatNumber(minCapacityKg) + " kg（任何车都装不下这一单）");
             return false;
         }
         out.push_back(order);
@@ -313,7 +472,7 @@ bool buildFromIni(const IniFile& ini, Config& out, std::string& error) {
         || !loadNodes(ini, out.graph, error)
         || !loadEdges(ini, out.graph, error)
         || !loadVehicles(ini, out.graph, out.vehicles, error)
-        || !loadOrders(ini, out.graph, out.orders, error)) {
+        || !loadOrders(ini, out.graph, out.vehicles, out.orders, error)) {
         return false;
     }
     return true;
