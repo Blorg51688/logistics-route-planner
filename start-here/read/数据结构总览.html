@@ -38,7 +38,7 @@ footer { margin-top: 44px; padding-top: 14px; border-top: 1px solid #e2e8f0;
 <h1>数据结构总览</h1>
 <p class="lead">系统的每一种结构画成一个方块，箭头写「传的是<strong>什么</strong>」。橙色 = 手写算法，蓝色 = 容器／结构本体，绿色 = 被算法承载的记录（Stop / OffloadLeg / StashState / RoutePlan / 各类记账），紫色 = Qt 视图层。虚线 = 非顺序的控制流（改图、回写计划）。</p>
 <p class="lead">读法：从左上 <code>config/default.ini</code> 顺着箭头往下，第三条带（事件与重规划）末尾会沿虚线回到 <code>RoutePlan</code> —— 这就是「重规划后计划换了一版」。表在下面，逐格与 <a href="../../docs/数据结构地图.md">docs/数据结构地图.md</a> 一致。</p>
-<p class="meta">数字口径：n = 节点数 30、m = 有向边数 106、k = 订单数（25）、s = 堆内条目数；config = 2 仓库 + 3 中转站 + 25 配送点、25 订单（全部 A→B 取送，总需求 516kg）、车 V01 200kg·08:00·1.00·1.00。事实取自 <code>src/</code>（已提交基线 <code>cdc98e2</code>，2026-11-24）。</p>
+<p class="meta">数字口径：n = 节点数 30、m = 有向边数 106、k = 订单数（25）、s = 堆内条目数；config = 2 仓库 + 3 中转站 + 25 配送点、25 订单（全部 A→B 取送，总需求 516kg）、三车 V01 400kg·1.00·1.50 / V02·V03 160kg·1.25·0.80（全部 W01 08:00）。规格二新增 <code>FleetPlan</code> / <code>TransitLeg</code> / 三阶段分配器 / 复调度输入，表与流图见 <a href="../../docs/数据结构地图.md">docs/数据结构地图.md</a>（事实取自 <code>src/</code>；口径 = #43 工作区实测，2026-11-24）。</p>
 <div class="legend"><span><i class="sw" style="background:#fff4e5;border:1.8px solid #e08a1e"></i>手写算法</span><span><i class="sw" style="background:#e9f2fd;border:1.8px solid #3a7bd5"></i>容器 / 结构本体</span><span><i class="sw" style="background:#eafaf0;border:1.8px solid #2f9e6b"></i>记录（被承载的数据）</span><span><i class="sw" style="background:#f3ecfd;border:1.8px solid #8a5cd6"></i>Qt 视图层</span><span><i class="dashline"></i>虚线 = 改图 / 回写计划</span></div>
 <div class="box"><svg viewBox="0 0 1200 1742" width="100%" xmlns="http://www.w3.org/2000/svg" font-family="Noto Sans CJK SC, Source Han Sans SC, Microsoft YaHei, sans-serif">
 <defs>
