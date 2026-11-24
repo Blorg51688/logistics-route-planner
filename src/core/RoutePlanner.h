@@ -375,6 +375,11 @@ FleetTransitResult applyTransitLayer(const LogisticsGraph& graph,
                                      WeightType weight);
 
 // 从指定位置与指定时刻出发，对剩余未服务订单重新规划，最后返回车辆起始仓库。
+//
+// allowOffload（规格二 §6.4 / #27）：是否允许构造器在最后手段里**降载**。
+//   · 默认 true —— 规格一的整条构造链（含降载）原样不变；
+//   · 复调度的第 ①②③ 级传 false：降载属于第 ④ 级的「改变货物路径的重手段」，
+//     不在局部/再分配/全车队三级的射程内（否则第 ④ 级永不可达，分级就退化成摆设）。
 RoutePlan replan(const LogisticsGraph& graph,
                  const Vehicle& vehicle,
                  const std::vector<Order>& remainingOrders,
@@ -382,7 +387,8 @@ RoutePlan replan(const LogisticsGraph& graph,
                  int currentTimeMin,
                  WeightType weight,
                  const std::vector<OnboardItem>& onboard = std::vector<OnboardItem>(),
-                 const StashState& stash = StashState());
+                 const StashState& stash = StashState(),
+                 bool allowOffload = true);
 
 struct InsertResult {
     RoutePlan   plan;
@@ -410,6 +416,134 @@ InsertResult insertOrder(const LogisticsGraph& graph,
                           const std::vector<OnboardItem>& onboard
                               = std::vector<OnboardItem>(),
                           const StashState& stash = StashState());
+
+// ===========================================================================
+// 动态事件复调度（规格二 §6 / #27）
+// ===========================================================================
+//
+// 分工：**本层只做「计划」**，不碰任何已发生的物理事实。调用方（GUI）负责：
+//   · 用 VehicleState 提供「复调度的输入常量」（§6.2：位置/时刻/在车货/已执行账本）；
+//   · 把本层产出的计划写回该车游标（nodeIndex/stopCursor 归零），并**只**对被重算的车写回
+//     （未受影响车的路线逐字不变，不变量 5）。
+// 本层属核心层：不得出现任何 Qt 类型。
+
+// 触发复调度的事件种类。只列**会改变规划输入**的那几类。
+enum class RescheduleTrigger {
+    Traffic,      // 路况：改动一批边的权重（带 increaseRatio）
+    RoadClosure,  // 封路：删掉一批边（双向各一条），图已先被改过
+    NewOrder,     // 新订单（普通/紧急/手动三者共用 §6.6 的选车规则）
+    Manual        // 手动「重新规划」：全车队都算受影响
+};
+
+struct RescheduleEvent {
+    RescheduleTrigger trigger = RescheduleTrigger::Manual;
+    // Traffic / RoadClosure：本次被改变的**有向**边（封路时两个方向各一条）。
+    std::vector<TrafficChange> changes;
+    // Traffic：增幅门槛（config 的 traffic_time_increase_min）。低于它不算「受影响」。
+    double thresholdRatio = 0.0;
+    // NewOrder：新插入的订单（已并入调用方的订单集合）。
+    Order newOrder;
+};
+
+// 站内**已执行**的转运卸入（§6.9）：货已经在站里，只等某台车取走。
+// 它是复调度的一等输入：不得凭空消失（期末 0 是硬门槛）。
+struct ExecutedTransitEntry {
+    TransitLeg leg;    // 站、kg、卸入车、卸入时刻（out 端此刻通常还没发生）
+    Order      order;  // 订单本体（A/B/窗口/kg）
+};
+
+// 复调度的输入常量（§6.2：已执行前缀不重排）。
+struct FleetRescheduleInput {
+    // 每车当前位置/时刻/在车货/暂存（StashState 归**原车**）。
+    std::vector<VehicleStartState> starts;
+    // 每车当前计划所服务的**未送达**订单（顺序无关；构造器内部按 EDD/FIFO 排）。
+    std::vector<std::vector<Order> > vehicleOrders;
+    // 每车**剩余**路线的上一版计划（R1 的重放来源；由 sliceRemainder 切出）。
+    std::vector<RoutePlan> remainingPlans;
+    // 全队未送达订单（第 ③ 级「全车队重调度」的输入）。
+    std::vector<Order> allRemainingOrders;
+    // 站内已执行、尚未被取走的转运卸入（§6.9：任一可行车可取走；dwell ≤ 60）。
+    std::vector<ExecutedTransitEntry> executedInStation;
+};
+
+// 局部重规划的两版结果（§6.3）。
+struct LocalReplanOutcome {
+    RoutePlan chosen;            // 最终采用的那一版（都不可行时 status != Ok）
+    RoutePlan byReplay;          // R1 顺序不变版（重放）
+    RoutePlan byRebuild;         // R2 重排版（规格一构造器）
+    bool replayFeasible = false;
+    bool rebuildFeasible = false;
+    bool adoptedRebuild = false; // 采用 R2（当且仅当 R2 可行且 key(R2) < key(R1)，严格更优）
+    bool feasible = false;       // chosen 可用
+    int    penaltyReplay = 0;
+    int    penaltyRebuild = 0;
+    double weightReplay = 0.0;
+    double weightRebuild = 0.0;
+};
+
+// §6.3：R1 = 停靠顺序完全不变、只按新边权重重放；R2 = 剩余订单重跑规格一构造器。
+// **采用 R2 当且仅当 R2 可行且 key(R2) < key(R1)**（严格字典序，并列保留 R1）。
+// R1 不可行 ⇒ 本级失败（由调用方进入升级链第 ② 级）。
+LocalReplanOutcome localReplanTwoVersion(const LogisticsGraph& graph, const Vehicle& vehicle,
+                                         const RoutePlan& previousRemaining,
+                                         const std::vector<Order>& remainingOrders,
+                                         const std::string& startNodeId, int startTimeMin,
+                                         WeightType weight,
+                                         const std::vector<OnboardItem>& onboard,
+                                         const StashState& stash);
+
+// §6.5 受影响车集合（路况）：存在被改动的边 e 使「e 在该车剩余路线上（有向、相邻两站）」
+// 且 e.increaseRatio >= thresholdRatio。返回车辆**行下标**升序。
+std::vector<std::size_t> affectedVehiclesForTraffic(
+    const std::vector<RoutePlan>& remainingPlans, const std::vector<TrafficChange>& changes,
+    double thresholdRatio);
+
+// §6.5 受影响车集合（封路）：该车剩余路线**用到**被封闭的边（任一方向）。
+// changes 里封路的两条有向边各一条，这里只关心 (from,to) 的**无向**出现。
+std::vector<std::size_t> affectedVehiclesForClosure(
+    const std::vector<RoutePlan>& remainingPlans, const std::vector<TrafficChange>& closedEdges);
+
+// §6.6 新订单的选车（普通/紧急共用）：
+//   cands = 全部车按 Δkey(o, v) 升序（并列按车辆 ID）；逐个试可行插入，首个可行即接受。
+// Δkey 用**候选车自己的因子**重放。局部可行即接受，**不做「局部 vs 全局两版取优」**。
+struct NewOrderAssignment {
+    bool                     feasible = false;
+    std::size_t              vehicleIndex = 0;   // 命中车（feasible 时有效）
+    RoutePlan                plan;               // 命中车的重规划结果
+    std::vector<std::size_t> candidates;         // 实际尝试顺序（Δkey 升序，供守卫/播报）
+};
+NewOrderAssignment chooseVehicleForNewOrder(const LogisticsGraph& graph,
+                                             const std::vector<Vehicle>& vehicles,
+                                             const std::vector<std::vector<Order> >& vehicleOrders,
+                                             const std::vector<RoutePlan>& currentPlans,
+                                             const std::vector<VehicleStartState>& starts,
+                                             WeightType weight, const Order& order);
+
+// 五级升级链的产物（§6.4）。
+struct FleetRescheduleResult {
+    // 每车的新计划（与 vehicles 下标对应）。**未被重算的车保持输入的原样**。
+    std::vector<RoutePlan> plans;
+    std::vector<std::vector<Order> > vehicleOrders;   // 重分配后的逐车订单集合
+    int  level = 0;            // 0 = 无事可做（受影响集合为空）；1–4 = 采用的分级；5 = 拒绝
+    bool rejected = false;
+    std::string reason;
+    std::vector<std::size_t> replanned;               // 被重算的车（不变量 5 用它判「未受影响车不变」）
+    std::vector<std::string> log;                     // 分级播报行（每行都以「[复调度] 」开头）
+};
+
+// §6.4 五级升级链：① 局部重排 → ② 跨车再分配 → ③ 全车队重调度 → ④ 降载/转运并列 → ⑤ 拒绝。
+// 每级都复用既有构造器/Δkey/转运层，**不新增算法**。
+// 「失败」= 该级产不出可行解（容量 + 可达 + 先取后送 + 紧急硬优先/FIFO 全成立；
+// 窗口只影响 penalty，不判不可行）。
+FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
+                                       const std::vector<Vehicle>& vehicles, WeightType weight,
+                                       const FleetRescheduleInput& input,
+                                       const RescheduleEvent& event);
+
+// 从逐车计划反推「每车此刻服务的未送达订单」（GUI 用它把计划翻译成逐车订单集合，
+// 免得再存一份可能与计划不一致的副本）。按 allOrders 的顺序输出。
+std::vector<std::vector<Order> > vehicleOrdersFromPlans(
+    const std::vector<RoutePlan>& plans, const std::vector<Order>& allOrders);
 
 // 从已规划好的单条路线中切出"尚未走完的部分"（规格一 MC-A01/A10）：
 // 节点序列从 fromNodeIndex 起，停靠只保留该下标及其之后的。

@@ -1883,7 +1883,7 @@ void repairRoute(const Ctx& ctx, Builder& b, int maxRounds) {
 
 
 // 紧急段：按 FIFO 追加；装不下先降载（Q5=A 最后手段）。
-bool appendUrgentAll(const Ctx& ctx, Builder& b, Outcome& out) {
+bool appendUrgentAll(const Ctx& ctx, Builder& b, Outcome& out, bool allowOffload) {
     for (const Request& r : ctx.urgent) {
         if (r.kg > ctx.capacityKg + kEps) {
             std::ostringstream os;
@@ -1920,6 +1920,12 @@ bool appendUrgentAll(const Ctx& ctx, Builder& b, Outcome& out) {
         }
 
         // 装不下 -> 降载（只卸整张普通单；不卸 A/B 目的地的货）。
+        // 规格二 §6.4：降载属第 ④ 级的重手段 —— 第 ①②③ 级传 allowOffload=false，
+        // 这里必须如实报「装不下」而不是偷偷降载（否则第 ④ 级永不可达）。
+        if (!allowOffload) {
+            out.reason = "紧急单 " + r.orderId + " 装不下（当前级不允许降载）";
+            return false;
+        }
         double loadNow = 0.0;
         loadStateAt(ctx, b.route, b.route.size(), &loadNow);
         const double need = loadNow + r.kg - ctx.capacityKg;
@@ -2134,7 +2140,7 @@ bool buildWithOrder(const Ctx& ctx, const std::vector<Request>& normalOrder,
     b.stashStation = ctx.stashStation;
     b.stashOrders = ctx.stashOrderIds;
 
-    if (!appendUrgentAll(ctx, b, out)) {
+    if (!appendUrgentAll(ctx, b, out, allowOffload)) {
         out.ok = false;
         return false;
     }
@@ -2261,7 +2267,7 @@ std::vector<std::vector<Request> > insertionStarts(const Ctx& ctx, bool multiSta
 //   ② 失败时把「插不进去的那张单」提到最前再整体构造一次；
 //   两版都可行则按 key 取优（penalty 是第一键，等价于「penalty 一票否决」）。
 // 不做周期性全量重算：只有插入失败这一个触发点。
-bool buildAll(const Ctx& ctx, Outcome& out, bool multiStart) {
+bool buildAll(const Ctx& ctx, Outcome& out, bool multiStart, bool allowOffload) {
     // ① 多起点构造：每版都跑满同一条链（构造 + repair R≤3），可行者按规格三键取优。
     const std::vector<std::vector<Request> > starts = insertionStarts(ctx, multiStart);
     Outcome first;            // 版 1（EDD）的结果：兜底链要用它的失败原因
@@ -2325,6 +2331,11 @@ bool buildAll(const Ctx& ctx, Outcome& out, bool multiStart) {
     }
 
     // ③ 降载（最后手段）：重跑一次，允许在普通段降载腾出空间。
+    // allowOffload == false（规格二 §6.4 的第 ①②③ 级）时跳过：降载属第 ④ 级。
+    if (!allowOffload) {
+        out = first;
+        return false;
+    }
     Outcome third;
     if (buildWithOrder(ctx, std::vector<Request>(), true, third)) {
         out = third;
@@ -2711,7 +2722,8 @@ RoutePlan replan(const LogisticsGraph& graph,
                  int currentTimeMin,
                  WeightType weight,
                  const std::vector<OnboardItem>& onboard,
-                 const StashState& stash) {
+                 const StashState& stash,
+                 bool allowOffload) {
     RoutePlan plan;
     Ctx ctx;
     std::string reason;
@@ -2731,7 +2743,7 @@ RoutePlan replan(const LogisticsGraph& graph,
                             && (currentTimeMin == vehicle.departTimeMin)
                             && onboard.empty() && stash.station.empty();
     Outcome out;
-    if (!buildAll(ctx, out, multiStart)) {
+    if (!buildAll(ctx, out, multiStart, allowOffload)) {
         plan.status = (out.reason.find("超过载重上限") != std::string::npos)
                           ? PlanStatus::OrderExceedsCapacity
                           : PlanStatus::Unreachable;
@@ -4882,4 +4894,1125 @@ std::size_t nodeIndexAtTime(const RoutePlan& plan, int timeMin) {
     return best;
 }
 
+
+// ===========================================================================
+// 动态事件复调度（规格二 §6 / #27）——实现
+// ===========================================================================
+namespace {
+
+// 把停靠序列翻成重放规格（R1「顺序不变版」的唯一来源）。
+std::vector<StopSpec> specsOfStops(const std::vector<Stop>& stops) {
+    std::vector<StopSpec> specs;
+    specs.reserve(stops.size());
+    for (std::size_t i = 0; i < stops.size(); ++i) {
+        const Stop& s = stops[i];
+        StopSpec spec;
+        spec.nodeId = s.nodeId;
+        spec.phase = s.phase;
+        spec.pickups = s.pickups;
+        spec.offloads = s.offloads;
+        spec.reclaims = s.reclaims;
+        spec.transitUnloads = s.transitUnloads;
+        spec.transitPickups = s.transitPickups;
+        for (std::size_t d = 0; d < s.deliveries.size(); ++d) {
+            spec.deliveries.push_back(s.deliveries[d].orderId);
+        }
+        specs.push_back(spec);
+    }
+    return specs;
+}
+
+struct PlanKey {
+    int    penalty = 0;
+    double weight = 0.0;
+    std::vector<StopSpec> specs;   // tieKey 用（并列才比较）
+};
+
+PlanKey makePlanKey(const RoutePlan& plan, WeightType weight) {
+    PlanKey k;
+    k.penalty = plan.totalPenaltyMin;
+    k.weight = strategyWeightOf(plan, weight);
+    k.specs = specsOfStops(plan.stops);
+    return k;
+}
+
+// 两版比较用的完整三键：penalty -> 策略权重（该车缩放后）-> tieKey。
+// <0 表示 a 更好，0 表示完全并列（并列保留 R1）。
+int comparePlanKey(const PlanKey& a, const PlanKey& b) {
+    Key ka;
+    ka.penalty = a.penalty;
+    ka.weight = a.weight;
+    Key kb;
+    kb.penalty = b.penalty;
+    kb.weight = b.weight;
+    const int c = compareKey(ka, kb);
+    if (c != 0) {
+        return c;
+    }
+    return compareTie(a.specs, b.specs);
+}
+
+bool planUsable(const RoutePlan& plan) {
+    return plan.status == PlanStatus::Ok && !plan.nodes.empty();
+}
+
+// 计划是否覆盖这批订单的**送达**（转运卸入也算：货已交给接力车，由它送达）。
+// 顺序不变版若漏掉一张单 ⇒ 不可行（不变量 14「不丢单」）。
+bool planCoversOrders(const RoutePlan& plan, const std::vector<Order>& orders,
+                      std::string& missing) {
+    for (std::size_t i = 0; i < orders.size(); ++i) {
+        bool found = false;
+        for (std::size_t s = 0; s < plan.stops.size() && !found; ++s) {
+            const Stop& st = plan.stops[s];
+            for (std::size_t d = 0; d < st.deliveries.size() && !found; ++d) {
+                if (st.deliveries[d].orderId == orders[i].id) {
+                    found = true;
+                }
+            }
+            for (std::size_t t = 0; t < st.transitUnloads.size() && !found; ++t) {
+                if (st.transitUnloads[t] == orders[i].id) {
+                    found = true;
+                }
+            }
+        }
+        if (!found) {
+            missing = orders[i].id;
+            return false;
+        }
+    }
+    return true;
+}
+
+// R1：停靠顺序完全不变，只把「剩余停靠序列」按**当前边权重**重放一遍。
+// 任一 leg 不可达 / 前缀载重越界 / 漏单 ⇒ 该版不可行（status != Ok，原因在 reason）。
+RoutePlan replayPreservingOrder(const LogisticsGraph& graph, const Vehicle& vehicle,
+                                const std::vector<Order>& remainingOrders,
+                                const RoutePlan& previousRemaining,
+                                const std::string& startNodeId, int startTimeMin,
+                                WeightType weight, const std::vector<OnboardItem>& onboard,
+                                const StashState& stash, std::string& why) {
+    why.clear();
+    RoutePlan out;
+    out.status = PlanStatus::Unreachable;
+    // 无剩余订单时「顺序不变版」是平凡可行的（车就地不动、直接回仓库）：
+    // 不能因为"上一版没有停靠序列"就把空车判成不可行（否则 Manual 事件下
+    // 每台空车都会被误判为第 ① 级失败）。
+    if (previousRemaining.status != PlanStatus::Ok
+        || (previousRemaining.stops.empty() && !remainingOrders.empty())) {
+        why = "上一版没有剩余停靠序列";
+        out.reason = why;
+        return out;
+    }
+    std::string missing;
+    if (!planCoversOrders(previousRemaining, remainingOrders, missing)) {
+        why = "顺序不变版缺少订单 " + missing + " 的送达动作";
+        out.reason = why;
+        return out;
+    }
+    Ctx ctx;
+    std::string reason;
+    if (!makeCtx(graph, vehicle, remainingOrders, startNodeId, startTimeMin, weight, onboard,
+                 stash, ctx, reason)) {
+        why = reason;
+        out.reason = reason;
+        return out;
+    }
+    const std::vector<StopSpec> specs = specsOfStops(previousRemaining.stops);
+    Eval ev;
+    if (!replay(ctx, specs, true, ev)) {
+        why = ev.reason.empty() ? std::string("重放不可行") : ev.reason;
+        out.reason = why;
+        return out;
+    }
+    Outcome oc;
+    oc.ok = true;
+    oc.route = specs;
+    oc.stashStation = stash.station;
+    for (std::size_t i = 0; i < stash.items.size(); ++i) {
+        oc.stashOrders.push_back(stash.items[i].orderId);
+    }
+    finalize(ctx, oc, out);
+    if (!planUsable(out)) {
+        why = out.reason.empty() ? std::string("重放后路线不可用") : out.reason;
+    }
+    return out;
+}
+
+// 从各车**当前状态**重规划（已执行前缀不重排）。allowOffload 只由升级链的分级决定。
+RoutePlan replanFromState(const LogisticsGraph& graph, const Vehicle& vehicle,
+                          const std::vector<Order>& orders, const VehicleStartState& start,
+                          WeightType weight, bool allowOffload) {
+    return replan(graph, vehicle, orders, start.startNodeId, start.startTimeMin, weight,
+                  start.onboard, start.stash, allowOffload);
+}
+
+// 复调度里「要挪走的订单」的尝试顺序：紧急单整体优先（FIFO：窗口起点、订单 ID），
+// 普通单按 EDD（窗口止、订单 ID）。与构造器的排序口径一致（手写插入排序）。
+void sortRescheduleCandidates(std::vector<Order>& v) {
+    for (std::size_t i = 1; i < v.size(); ++i) {
+        const Order key = v[i];
+        std::size_t j = i;
+        while (j > 0) {
+            const Order& prev = v[j - 1];
+            bool move = false;
+            if (prev.urgent != key.urgent) {
+                move = key.urgent;
+            } else if (key.urgent) {
+                move = (key.windowStartMin < prev.windowStartMin)
+                       || (key.windowStartMin == prev.windowStartMin && key.id < prev.id);
+            } else {
+                move = (key.windowEndMin < prev.windowEndMin)
+                       || (key.windowEndMin == prev.windowEndMin && key.id < prev.id);
+            }
+            if (!move) {
+                break;
+            }
+            v[j] = prev;
+            --j;
+        }
+        v[j] = key;
+    }
+}
+
+bool containsOrderId(const std::vector<Order>& v, const std::string& id) {
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        if (v[i].id == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<Order> ordersWithout(const std::vector<Order>& v, const std::string& id) {
+    std::vector<Order> out;
+    out.reserve(v.size());
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        if (v[i].id != id) {
+            out.push_back(v[i]);
+        }
+    }
+    return out;
+}
+
+// 车队内部用的键（第 ② 级的「候选 vs 当前」比较）：两台车合起来的 (Σpenalty, Σ权重)。
+struct PairKey {
+    int    penalty = 0;
+    double weight = 0.0;
+    std::vector<StopSpec> specs;   // 收尾的确定性比较（先 v 后 d 的停靠序列）
+};
+
+PairKey pairKeyOf(const RoutePlan& vPlan, const RoutePlan& dPlan, WeightType weight) {
+    PairKey k;
+    k.penalty = vPlan.totalPenaltyMin + dPlan.totalPenaltyMin;
+    k.weight = strategyWeightOf(vPlan, weight) + strategyWeightOf(dPlan, weight);
+    k.specs = specsOfStops(vPlan.stops);
+    const std::vector<StopSpec> d = specsOfStops(dPlan.stops);
+    k.specs.insert(k.specs.end(), d.begin(), d.end());
+    return k;
+}
+
+int comparePairKey(const PairKey& a, const PairKey& b) {
+    Key ka;
+    ka.penalty = a.penalty;
+    ka.weight = a.weight;
+    Key kb;
+    kb.penalty = b.penalty;
+    kb.weight = b.weight;
+    const int c = compareKey(ka, kb);
+    if (c != 0) {
+        return c;
+    }
+    return compareTie(a.specs, b.specs);
+}
+
+// 「不可行」时把它当成 +inf 键：可行候选恒更优（第 ② 级的当前侧可能是不可行计划）。
+PairKey pairKeyInfeasible() {
+    PairKey k;
+    k.penalty = std::numeric_limits<int>::max();
+    k.weight = std::numeric_limits<double>::infinity();
+    return k;
+}
+
+// Δkey 升序的候选车顺序（并列按车辆 ID 升序）。§6.6 / §6.4② 共用同一把尺子。
+std::vector<std::size_t> vehiclesByMarginal(const LogisticsGraph& graph,
+                                            const std::vector<Vehicle>& vehicles,
+                                            const std::vector<std::vector<Order> >& vehicleOrders,
+                                            const std::vector<RoutePlan>& plans, WeightType weight,
+                                            const Order& order, std::size_t exclude) {
+    struct Row {
+        std::size_t v = 0;
+        MarginalCost mc;
+        bool feasible = false;
+    };
+    std::vector<Row> rows;
+    for (std::size_t v = 0; v < vehicles.size(); ++v) {
+        if (v == exclude) {
+            continue;
+        }
+        Row row;
+        row.v = v;
+        std::vector<Order> candOrders = vehicleOrders[v];
+        if (!containsOrderId(candOrders, order.id)) {
+            candOrders.push_back(order);
+        }
+        const RoutePlan cand = planRoute(graph, vehicles[v], candOrders, weight);
+        row.feasible = planUsable(cand);
+        row.mc = row.feasible ? marginalCostBetween(plans[v], cand, vehicles[v], weight)
+                              : MarginalCost{std::numeric_limits<double>::infinity(),
+                                             std::numeric_limits<double>::infinity(),
+                                             std::numeric_limits<double>::infinity()};
+        rows.push_back(row);
+    }
+    // 手写插入排序：Δkey 升序（并列按车辆 ID 升序；不可行恒在最后）。
+    for (std::size_t i = 1; i < rows.size(); ++i) {
+        const Row key = rows[i];
+        std::size_t j = i;
+        while (j > 0) {
+            const Row& prev = rows[j - 1];
+            bool move = false;
+            if (prev.feasible != key.feasible) {
+                move = key.feasible;
+            } else {
+                const int c = compareMarginal(key.mc, prev.mc);
+                if (c < 0) {
+                    move = true;
+                } else if (c == 0 && vehicles[key.v].id < vehicles[prev.v].id) {
+                    move = true;
+                }
+            }
+            if (!move) {
+                break;
+            }
+            rows[j] = prev;
+            --j;
+        }
+        rows[j] = key;
+    }
+    std::vector<std::size_t> out;
+    out.reserve(rows.size());
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        out.push_back(rows[i].v);
+    }
+    return out;
+}
+
+// 从计划里读出该单的**送达**到达时刻；找不到返回 -1。
+int deliveryArrivalOf(const RoutePlan& plan, const std::string& orderId) {
+    for (std::size_t s = 0; s < plan.stops.size(); ++s) {
+        for (std::size_t d = 0; d < plan.stops[s].deliveries.size(); ++d) {
+            if (plan.stops[s].deliveries[d].orderId == orderId) {
+                return plan.stops[s].arrivalMin;
+            }
+        }
+    }
+    return -1;
+}
+
+// 从计划里读出该单在某站的**取走（取回）**到达时刻；找不到返回 -1。
+int pickupArrivalOf(const RoutePlan& plan, const std::string& stationId,
+                    const std::string& orderId) {
+    for (std::size_t s = 0; s < plan.stops.size(); ++s) {
+        if (plan.stops[s].nodeId != stationId) {
+            continue;
+        }
+        for (std::size_t r = 0; r < plan.stops[s].reclaims.size(); ++r) {
+            if (plan.stops[s].reclaims[r] == orderId) {
+                return plan.stops[s].arrivalMin;
+            }
+        }
+        for (std::size_t t = 0; t < plan.stops[s].transitPickups.size(); ++t) {
+            if (plan.stops[s].transitPickups[t] == orderId) {
+                return plan.stops[s].arrivalMin;
+            }
+        }
+    }
+    return -1;
+}
+
+std::string vehicleIdOf(const std::vector<Vehicle>& vehicles, std::size_t v) {
+    return (v < vehicles.size()) ? vehicles[v].id : std::string("?");
+}
+
+}   // namespace
+
+LocalReplanOutcome localReplanTwoVersion(const LogisticsGraph& graph, const Vehicle& vehicle,
+                                         const RoutePlan& previousRemaining,
+                                         const std::vector<Order>& remainingOrders,
+                                         const std::string& startNodeId, int startTimeMin,
+                                         WeightType weight,
+                                         const std::vector<OnboardItem>& onboard,
+                                         const StashState& stash) {
+    LocalReplanOutcome r;
+    std::string why;
+    r.byReplay = replayPreservingOrder(graph, vehicle, remainingOrders, previousRemaining,
+                                       startNodeId, startTimeMin, weight, onboard, stash, why);
+    r.replayFeasible = planUsable(r.byReplay);
+
+    // R2：对该车剩余订单重跑规格一构造器（pair-insertion + repair R≤3）。
+    // **不带降载**：降载属第 ④ 级（改变货物路径的重手段），这里传 false。
+    r.byRebuild = replanFromState(graph, vehicle, remainingOrders,
+                                  VehicleStartState{startNodeId, startTimeMin, onboard, stash},
+                                  weight, false);
+    r.rebuildFeasible = planUsable(r.byRebuild);
+
+    if (r.replayFeasible) {
+        const PlanKey k1 = makePlanKey(r.byReplay, weight);
+        r.penaltyReplay = k1.penalty;
+        r.weightReplay = k1.weight;
+        if (r.rebuildFeasible) {
+            const PlanKey k2 = makePlanKey(r.byRebuild, weight);
+            r.penaltyRebuild = k2.penalty;
+            r.weightRebuild = k2.weight;
+            // **严格字典序更优才改序**；完全并列保留 R1（停靠顺序不变版）。
+            r.adoptedRebuild = (comparePlanKey(k2, k1) < 0);
+        }
+        r.chosen = r.adoptedRebuild ? r.byRebuild : r.byReplay;
+        r.feasible = true;
+        return r;
+    }
+    // R1 不可行 ⇒ 本级失败（§6.3 的字面口径：R1 也不可行则进第 ② 级）。
+    // 仍把 R2 的可行性与键值带出去，供播报与守卫如实显示「重排版可行但顺序不变版不可行」。
+    if (r.rebuildFeasible) {
+        const PlanKey k2 = makePlanKey(r.byRebuild, weight);
+        r.penaltyRebuild = k2.penalty;
+        r.weightRebuild = k2.weight;
+    }
+    r.feasible = false;
+    r.chosen = r.byReplay;
+    return r;
+}
+
+std::vector<std::size_t> affectedVehiclesForTraffic(
+    const std::vector<RoutePlan>& remainingPlans, const std::vector<TrafficChange>& changes,
+    double thresholdRatio) {
+    std::vector<std::size_t> out;
+    for (std::size_t v = 0; v < remainingPlans.size(); ++v) {
+        bool hit = false;
+        for (std::size_t c = 0; c < changes.size() && !hit; ++c) {
+            if (changes[c].increaseRatio + 1e-12 < thresholdRatio) {
+                continue;   // 增幅不足：这条改动对该车不构成「受影响」
+            }
+            if (isEdgeOnRoute(remainingPlans[v].nodes, changes[c].fromId, changes[c].toId)) {
+                hit = true;
+            }
+        }
+        if (hit) {
+            out.push_back(v);
+        }
+    }
+    return out;
+}
+
+std::vector<std::size_t> affectedVehiclesForClosure(
+    const std::vector<RoutePlan>& remainingPlans,
+    const std::vector<TrafficChange>& closedEdges) {
+    std::vector<std::size_t> out;
+    for (std::size_t v = 0; v < remainingPlans.size(); ++v) {
+        bool hit = false;
+        for (std::size_t c = 0; c < closedEdges.size() && !hit; ++c) {
+            // 封路是双向的：任一方向出现在剩余路线上都算用到。
+            if (isEdgeOnRoute(remainingPlans[v].nodes, closedEdges[c].fromId,
+                              closedEdges[c].toId)
+                || isEdgeOnRoute(remainingPlans[v].nodes, closedEdges[c].toId,
+                                 closedEdges[c].fromId)) {
+                hit = true;
+            }
+        }
+        if (hit) {
+            out.push_back(v);
+        }
+    }
+    return out;
+}
+
+NewOrderAssignment chooseVehicleForNewOrder(const LogisticsGraph& graph,
+                                            const std::vector<Vehicle>& vehicles,
+                                            const std::vector<std::vector<Order> >& vehicleOrders,
+                                            const std::vector<RoutePlan>& currentPlans,
+                                            const std::vector<VehicleStartState>& starts,
+                                            WeightType weight, const Order& order) {
+    NewOrderAssignment res;
+    if (vehicles.empty()) {
+        return res;
+    }
+    res.candidates = vehiclesByMarginal(graph, vehicles, vehicleOrders, currentPlans, weight, order,
+                                        vehicles.size());
+    for (std::size_t i = 0; i < res.candidates.size(); ++i) {
+        const std::size_t v = res.candidates[i];
+        std::vector<Order> candOrders = vehicleOrders[v];
+        if (!containsOrderId(candOrders, order.id)) {
+            candOrders.push_back(order);
+        }
+        const RoutePlan cand = replanFromState(graph, vehicles[v], candOrders, starts[v], weight,
+                                              /*allowOffload=*/false);
+        if (!planUsable(cand)) {
+            continue;   // 不可行 ⇒ 试下一台（Δkey 升序）
+        }
+        // Δkey 必须由**该车自己的因子**重放（上面 replanFromState 已用该车因子）。
+        if (planUsable(currentPlans[v])) {
+            const MarginalCost mc =
+                marginalCostBetween(currentPlans[v], cand, vehicles[v], weight);
+            if (mc.penaltyDelta == std::numeric_limits<double>::infinity()) {
+                continue;
+            }
+        }
+        res.feasible = true;
+        res.vehicleIndex = v;
+        res.plan = cand;
+        return res;
+    }
+    return res;
+}
+
+std::vector<std::vector<Order> > vehicleOrdersFromPlans(const std::vector<RoutePlan>& plans,
+                                                        const std::vector<Order>& allOrders) {
+    std::vector<std::vector<Order> > out(plans.size());
+    for (std::size_t o = 0; o < allOrders.size(); ++o) {
+        if (allOrders[o].served) {
+            continue;
+        }
+        const std::string& id = allOrders[o].id;
+        std::size_t best = plans.size();
+        int bestScore = 0;   // 3 = 送达本车，2 = 取货本车，1 = 转运取走
+        for (std::size_t v = 0; v < plans.size(); ++v) {
+            for (std::size_t s = 0; s < plans[v].stops.size(); ++s) {
+                const Stop& st = plans[v].stops[s];
+                for (std::size_t d = 0; d < st.deliveries.size(); ++d) {
+                    if (st.deliveries[d].orderId == id && bestScore < 3) {
+                        best = v;
+                        bestScore = 3;
+                    }
+                }
+                for (std::size_t p = 0; p < st.pickups.size(); ++p) {
+                    if (st.pickups[p] == id && bestScore < 2) {
+                        best = v;
+                        bestScore = 2;
+                    }
+                }
+                for (std::size_t t = 0; t < st.transitPickups.size(); ++t) {
+                    if (st.transitPickups[t] == id && bestScore < 1) {
+                        best = v;
+                        bestScore = 1;
+                    }
+                }
+            }
+        }
+        if (best < plans.size()) {
+            out[best].push_back(allOrders[o]);
+        }
+    }
+    return out;
+}
+
+namespace {
+
+// 整批不改：每一车的每一张单都必须在**它自己的**计划里被送达（转运卸入也算）。
+// 「不丢单」是硬门槛 —— 分级里任何一版若漏单，就不许被接受。
+bool allWorkCovered(const std::vector<std::vector<Order> >& work,
+                    const std::vector<RoutePlan>& plans, std::string& missing) {
+    for (std::size_t v = 0; v < work.size() && v < plans.size(); ++v) {
+        if (!planCoversOrders(plans[v], work[v], missing)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 单台车的「候选 vs 当前」：可行候选 + 严格更优才接受（§6.4② 的接受判据）。
+// 当前不可行（没有可用计划）时，任何可行候选都算更优 —— 这就是"失败车"的语义。
+bool keyStrictlyBetterThan(const RoutePlan& cand, const RoutePlan& base, WeightType weight) {
+    if (!planUsable(cand)) {
+        return false;
+    }
+    if (!planUsable(base)) {
+        return true;
+    }
+    return comparePlanKey(makePlanKey(cand, weight), makePlanKey(base, weight)) < 0;
+}
+
+// §6.9 已执行卸入的继承：站里的货（已执行、尚未被取走）必须由**某个可行车**取走并送达。
+// 取走车 = argmin Δkey 且可行；站内等待 dwell ≤ 60 否则该候选不可行；期末 0 是硬门槛。
+bool inheritExecutedInStation(const LogisticsGraph& graph, const std::vector<Vehicle>& vehicles,
+                              WeightType weight, const FleetRescheduleInput& input,
+                              std::vector<std::vector<Order> >& work,
+                              std::vector<RoutePlan>& plans,
+                              std::vector<std::size_t>& replanned,
+                              std::vector<std::string>& log, std::string& why) {
+    for (std::size_t e = 0; e < input.executedInStation.size(); ++e) {
+        const ExecutedTransitEntry& entry = input.executedInStation[e];
+        const std::string& station = entry.leg.stationId;
+        if (station.empty() || entry.order.id.empty()) {
+            continue;
+        }
+        bool done = false;
+        const std::vector<std::size_t> cands = vehiclesByMarginal(
+            graph, vehicles, work, plans, weight, entry.order, vehicles.size());
+        for (std::size_t c = 0; c < cands.size() && !done; ++c) {
+            const std::size_t d = cands[c];
+            VehicleStartState st = input.starts[d];
+            // 暂存状态只有一个站：已有暂存且不同站 ⇒ 该车接不了这一笔。
+            if (!st.stash.station.empty() && st.stash.station != station) {
+                continue;
+            }
+            st.stash.station = station;
+            bool hasItem = false;
+            for (std::size_t i = 0; i < st.stash.items.size(); ++i) {
+                if (st.stash.items[i].orderId == entry.order.id) {
+                    hasItem = true;
+                }
+            }
+            if (!hasItem) {
+                OnboardItem item;
+                item.nodeId = entry.order.nodeId;
+                item.kg = entry.order.demandKg;
+                item.orderId = entry.order.id;
+                st.stash.items.push_back(item);
+            }
+            std::vector<Order> candOrders = work[d];
+            if (!containsOrderId(candOrders, entry.order.id)) {
+                candOrders.push_back(entry.order);
+            }
+            const RoutePlan cand =
+                replan(graph, vehicles[d], candOrders, st.startNodeId, st.startTimeMin, weight,
+                       st.onboard, st.stash, /*allowOffload=*/true);
+            if (!planUsable(cand)) {
+                continue;
+            }
+            const int pick = pickupArrivalOf(cand, station, entry.order.id);
+            if (pick < 0) {
+                continue;   // 计划里没有"在该站取走"的动作 ⇒ 这一笔接不住
+            }
+            const int dwell = pick - entry.leg.inTimeMin;
+            if (dwell < 0 || dwell > kTransferMaxDwellMin) {
+                continue;   // 站内等待超限 ⇒ 该候选不可行
+            }
+            work[d] = candOrders;
+            plans[d] = cand;
+            replanned.push_back(d);
+            log.push_back("[复调度] 继承已执行卸入 " + entry.order.id + "@" + station + " → "
+                          + vehicleIdOf(vehicles, d) + "（站内等待 " + std::to_string(dwell)
+                          + "min）");
+            done = true;
+        }
+        if (!done) {
+            why = "站内已执行卸入 " + entry.order.id + "@" + station + " 没有可行车能在 "
+                  + std::to_string(kTransferMaxDwellMin) + "min 内取走（期末 0 是硬门槛）";
+            return false;
+        }
+    }
+    return true;
+}
+
+// 第 ④ 级的两版播报：先降载、后转运（顺序固定，保证确定性）。
+void appendOffloadLines(const std::vector<Vehicle>& vehicles,
+                        const std::vector<RoutePlan>& plans,
+                        std::vector<std::string>& log) {
+    // 按（站、订单 ID）升序汇总：同一站的多张单合成一行「降载（T01，2 张单）」。
+    struct StationOffload {
+        std::string station;
+        int count = 0;
+    };
+    std::vector<StationOffload> rows;
+    for (std::size_t v = 0; v < plans.size() && v < vehicles.size(); ++v) {
+        for (std::size_t o = 0; o < plans[v].offloads.size(); ++o) {
+            const std::string& station = plans[v].offloads[o].station;
+            std::size_t at = rows.size();
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+                if (rows[i].station == station) {
+                    at = i;
+                    break;
+                }
+            }
+            if (at == rows.size()) {
+                StationOffload row;
+                row.station = station;
+                rows.push_back(row);
+            }
+            ++rows[at].count;
+        }
+    }
+    for (std::size_t i = 1; i < rows.size(); ++i) {
+        const StationOffload key = rows[i];
+        std::size_t j = i;
+        while (j > 0 && key.station < rows[j - 1].station) {
+            rows[j] = rows[j - 1];
+            --j;
+        }
+        rows[j] = key;
+    }
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        log.push_back("[复调度] 降载（" + rows[i].station + "，" + std::to_string(rows[i].count)
+                      + " 张单）");
+    }
+}
+
+void appendTransitLines(const std::vector<TransitLeg>& legs,
+                        std::vector<std::string>& log) {
+    for (std::size_t i = 0; i < legs.size(); ++i) {
+        log.push_back("[复调度] 转运（" + legs[i].stationId + "，" + legs[i].inVehicleId + "→"
+                      + legs[i].outVehicleId + "）");
+    }
+}
+
+std::string vehicleListText(const std::vector<Vehicle>& vehicles,
+                            const std::vector<std::size_t>& idx) {
+    std::string out;
+    for (std::size_t i = 0; i < idx.size(); ++i) {
+        if (!out.empty()) {
+            out += "、";
+        }
+        out += vehicleIdOf(vehicles, idx[i]);
+    }
+    return out;
+}
+
+}   // namespace
+
+FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
+                                      const std::vector<Vehicle>& vehicles, WeightType weight,
+                                      const FleetRescheduleInput& input,
+                                      const RescheduleEvent& event) {
+    FleetRescheduleResult res;
+    res.plans = input.remainingPlans;      // 未被重算的车保持原样
+    res.vehicleOrders = input.vehicleOrders;
+    const std::size_t k = vehicles.size();
+    if (k == 0) {
+        res.level = 0;
+        return res;
+    }
+
+    std::vector<std::vector<Order> > work = input.vehicleOrders;
+    std::vector<RoutePlan> plans = input.remainingPlans;
+    while (work.size() < k) {
+        work.push_back(std::vector<Order>());
+    }
+    while (plans.size() < k) {
+        plans.push_back(RoutePlan());
+    }
+    const Order pending = (event.trigger == RescheduleTrigger::NewOrder) ? event.newOrder : Order();
+    const bool hasPending = (event.trigger == RescheduleTrigger::NewOrder) && !pending.id.empty();
+
+    // ---- 受影响车集合（§6.5）----
+    // 第 ① 级失败的车：他们的上一版计划在当前图/当前订单集合下已经**不可实现**
+    //（这正是 ① 失败的含义）。第 ② 级比较时把它们的"当前键"视为 +inf ——
+    // 否则会拿一张已经走不通的旧计划去和可行候选比大小，改派永远不够"严格更优"。
+    std::vector<char> failedFlag(k, 0);
+
+    std::vector<std::size_t> affected;
+    if (event.trigger == RescheduleTrigger::Traffic) {
+        affected = affectedVehiclesForTraffic(input.remainingPlans, event.changes,
+                                              event.thresholdRatio);
+    } else if (event.trigger == RescheduleTrigger::RoadClosure) {
+        affected = affectedVehiclesForClosure(input.remainingPlans, event.changes);
+    } else if (event.trigger == RescheduleTrigger::Manual) {
+        for (std::size_t v = 0; v < k; ++v) {
+            affected.push_back(v);
+        }
+    }
+    // NewOrder：不重算任何既有车（§6.5 第三行），只对选中的车做插入。
+    std::vector<std::size_t> failed;   // 第 ① 级失败的车（进第 ② 级）
+
+    // ---- ① 新订单的选车（§6.6，普通/紧急共用） / 局部重排（§6.3）----
+    if (hasPending) {
+        const NewOrderAssignment a =
+            chooseVehicleForNewOrder(graph, vehicles, work, plans, input.starts, weight, pending);
+        if (a.feasible) {
+            const std::size_t v = a.vehicleIndex;
+            work[v].push_back(pending);
+            plans[v] = a.plan;
+            res.replanned.push_back(v);
+            res.level = 1;
+            res.log.push_back("[复调度] 局部重排（1 台车）");
+            res.log.push_back("[复调度] 新单 " + pending.id + " 插入 " + vehicleIdOf(vehicles, v)
+                              + "（Δkey 升序首个可行）");
+            std::string why;
+            if (!inheritExecutedInStation(graph, vehicles, weight, input, work, plans,
+                                          res.replanned, res.log, why)) {
+                res.level = 5;
+                res.rejected = true;
+                res.reason = why;
+                res.log.push_back("[复调度] 拒绝：" + why);
+                return res;
+            }
+            res.plans = plans;
+            res.vehicleOrders = work;
+            return res;
+        }
+        res.log.push_back("[复调度] 新单 " + pending.id
+                          + " 在全部车上都无法可行插入 → 进入升级链");
+    } else if (!affected.empty()) {
+        std::vector<LocalReplanOutcome> local(k);
+        bool allOk = true;
+        for (std::size_t i = 0; i < affected.size(); ++i) {
+            const std::size_t v = affected[i];
+            local[v] = localReplanTwoVersion(graph, vehicles[v], input.remainingPlans[v], work[v],
+                                             input.starts[v].startNodeId,
+                                             input.starts[v].startTimeMin, weight,
+                                             input.starts[v].onboard, input.starts[v].stash);
+            if (!local[v].feasible) {
+                allOk = false;
+            }
+        }
+        if (allOk) {
+            for (std::size_t i = 0; i < affected.size(); ++i) {
+                const std::size_t v = affected[i];
+                plans[v] = local[v].chosen;
+                res.replanned.push_back(v);
+            }
+            res.level = 1;
+            res.log.push_back("[复调度] 局部重排（" + std::to_string(affected.size())
+                              + " 台车）");
+            for (std::size_t i = 0; i < affected.size(); ++i) {
+                const std::size_t v = affected[i];
+                res.log.push_back("[复调度]   " + vehicles[v].id + "："
+                                  + (local[v].adoptedRebuild
+                                         ? std::string("采用重排版（key 严格更优）")
+                                         : std::string("停靠顺序不变（顺序不变版）")));
+            }
+            std::string why;
+            if (!inheritExecutedInStation(graph, vehicles, weight, input, work, plans,
+                                          res.replanned, res.log, why)) {
+                res.level = 5;
+                res.rejected = true;
+                res.reason = why;
+                res.log.push_back("[复调度] 拒绝：" + why);
+                return res;
+            }
+            res.plans = plans;
+            res.vehicleOrders = work;
+            return res;
+        }
+        // 部分车成功：保留它们的 ① 结果；失败车进第 ② 级。
+        for (std::size_t i = 0; i < affected.size(); ++i) {
+            const std::size_t v = affected[i];
+            if (local[v].feasible) {
+                plans[v] = local[v].chosen;
+                res.replanned.push_back(v);
+            } else {
+                failed.push_back(v);
+                failedFlag[v] = 1;
+            }
+        }
+        res.log.push_back("[复调度] 局部重排失败（" + std::to_string(failed.size())
+                          + " 台车无可行解）→ 升级链第 ② 级");
+    } else if (affected.empty() && !hasPending) {
+        res.level = 0;
+        return res;   // 受影响集合为空：不重算任何车（§6.5 的「不重算既有车」）
+    }
+
+    // ---- ② 跨车再分配 ----
+    bool ok2 = true;
+    if (hasPending) {
+        bool placed = false;
+        const std::vector<std::size_t> cands = vehiclesByMarginal(
+            graph, vehicles, work, plans, weight, pending, k);
+        for (std::size_t c = 0; c < cands.size() && !placed; ++c) {
+            const std::size_t d = cands[c];
+            std::vector<Order> candOrders = work[d];
+            if (!containsOrderId(candOrders, pending.id)) {
+                candOrders.push_back(pending);
+            }
+            const RoutePlan cand =
+                replanFromState(graph, vehicles[d], candOrders, input.starts[d], weight, false);
+            // §6.6：新单的接受判据是**可行插入**（Δkey 只决定"先试哪台车"），
+            // 不是「比该车现状更优」——否则任何让路线变长的单都永远插不进去。
+            if (!planUsable(cand)) {
+                continue;
+            }
+            work[d] = candOrders;
+            plans[d] = cand;
+            res.replanned.push_back(d);
+            res.log.push_back("[复调度] 跨车再分配 " + pending.id + " → "
+                              + vehicleIdOf(vehicles, d) + "（新单改派）");
+            placed = true;
+        }
+        if (!placed) {
+            ok2 = false;
+        }
+    }
+    if (ok2) {
+        for (std::size_t f = 0; f < failed.size() && ok2; ++f) {
+            const std::size_t v = failed[f];
+            std::vector<Order> cands = work[v];
+            sortRescheduleCandidates(cands);
+            bool allMoved = true;
+            for (std::size_t oi = 0; oi < cands.size() && allMoved; ++oi) {
+                const Order o = cands[oi];
+                bool moved = false;
+                const std::vector<std::size_t> dsts = vehiclesByMarginal(
+                    graph, vehicles, work, plans, weight, o, v);
+                for (std::size_t di = 0; di < dsts.size() && !moved; ++di) {
+                    const std::size_t d = dsts[di];
+                    std::vector<Order> vOrders = ordersWithout(work[v], o.id);
+                    std::vector<Order> dOrders = work[d];
+                    if (!containsOrderId(dOrders, o.id)) {
+                        dOrders.push_back(o);
+                    }
+                    const RoutePlan candV = replanFromState(graph, vehicles[v], vOrders,
+                                                           input.starts[v], weight, false);
+                    const RoutePlan candD = replanFromState(graph, vehicles[d], dOrders,
+                                                           input.starts[d], weight, false);
+                    if (!planUsable(candV) || !planUsable(candD)) {
+                        continue;
+                    }
+                    const bool curFeasible = !failedFlag[v] && planUsable(plans[v])
+                                             && planUsable(plans[d]);
+                    if (curFeasible) {
+                        const PairKey candKey = pairKeyOf(candV, candD, weight);
+                        const PairKey curKey = pairKeyOf(plans[v], plans[d], weight);
+                        if (comparePairKey(candKey, curKey) >= 0) {
+                            continue;   // 必须**严格更优**才接受
+                        }
+                    }
+                    work[v] = vOrders;
+                    work[d] = dOrders;
+                    plans[v] = candV;
+                    plans[d] = candD;
+                    res.replanned.push_back(v);
+                    res.replanned.push_back(d);
+                    res.log.push_back("[复调度] 跨车再分配 " + o.id + " "
+                                      + vehicleIdOf(vehicles, v) + "→"
+                                      + vehicleIdOf(vehicles, d));
+                    moved = true;
+                }
+                if (!moved) {
+                    allMoved = false;
+                }
+            }
+            if (!allMoved) {
+                ok2 = false;
+            }
+        }
+    }
+    // 第 ② 级算「成功」的判据：**失败车都重新拿到了可行计划**（不是"日志非空"），
+    // 且整批订单仍然**一张不丢**（不变量 14）。
+    for (std::size_t f = 0; f < failed.size() && ok2; ++f) {
+        if (!planUsable(plans[failed[f]])) {
+            ok2 = false;
+        }
+    }
+    if (ok2) {
+        std::string missing;
+        if (!allWorkCovered(work, plans, missing)) {
+            ok2 = false;
+        }
+    }
+    if (ok2) {
+        res.level = 2;
+        std::string why;
+        if (!inheritExecutedInStation(graph, vehicles, weight, input, work, plans, res.replanned,
+                                      res.log, why)) {
+            res.level = 5;
+            res.rejected = true;
+            res.reason = why;
+            res.log.push_back("[复调度] 拒绝：" + why);
+            return res;
+        }
+        res.plans = plans;
+        res.vehicleOrders = work;
+        return res;
+    }
+
+    // ---- ③ 全车队重调度：#40 的三阶段全跑 ----
+    {
+        std::vector<Order> allRemaining;
+        for (std::size_t i = 0; i < input.allRemainingOrders.size(); ++i) {
+            if (!input.allRemainingOrders[i].served) {
+                allRemaining.push_back(input.allRemainingOrders[i]);
+            }
+        }
+        if (hasPending && !containsOrderId(allRemaining, pending.id)) {
+            allRemaining.push_back(pending);
+        }
+        const FleetPlan fp = planFleet(graph, vehicles, allRemaining, weight);
+        bool ok3 = fp.allOk && fp.allocationOrderIds.size() == allRemaining.size();
+        std::vector<std::vector<Order> > work3(k);
+        std::vector<RoutePlan> plans3(k);
+        if (ok3) {
+            for (std::size_t i = 0; i < fp.allocationOrderIds.size() && ok3; ++i) {
+                const std::size_t v = fp.allocationVehicleIndex[i];
+                if (v >= k) {
+                    ok3 = false;
+                    break;
+                }
+                bool found = false;
+                for (std::size_t o = 0; o < allRemaining.size(); ++o) {
+                    if (allRemaining[o].id == fp.allocationOrderIds[i]) {
+                        work3[v].push_back(allRemaining[o]);
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    ok3 = false;
+                }
+            }
+        }
+        if (ok3) {
+            for (std::size_t v = 0; v < k && ok3; ++v) {
+                plans3[v] = replanFromState(graph, vehicles[v], work3[v], input.starts[v], weight,
+                                           false);
+                if (!planUsable(plans3[v])) {
+                    ok3 = false;
+                }
+            }
+        }
+        if (ok3) {
+            std::string missing;
+            if (!allWorkCovered(work3, plans3, missing)) {
+                ok3 = false;   // 漏单（不变量 14）：这一版不许被接受
+                res.log.push_back("[复调度] 全车队重调度漏单 " + missing + " → 升级链第 ④ 级");
+            }
+        }
+        if (ok3) {
+            work = work3;
+            plans = plans3;
+            res.replanned.clear();
+            for (std::size_t v = 0; v < k; ++v) {
+                res.replanned.push_back(v);
+            }
+            res.level = 3;
+            res.log.push_back("[复调度] 全车队重调度");
+            std::string why;
+            if (!inheritExecutedInStation(graph, vehicles, weight, input, work, plans,
+                                          res.replanned, res.log, why)) {
+                res.level = 5;
+                res.rejected = true;
+                res.reason = why;
+                res.log.push_back("[复调度] 拒绝：" + why);
+                return res;
+            }
+            res.plans = plans;
+            res.vehicleOrders = work;
+            return res;
+        }
+        res.log.push_back("[复调度] 全车队重调度失败 → 升级链第 ④ 级");
+    }
+
+    // ---- ④ 降载 / 转运并列比较：**先构造降载版、再构造转运版** ----
+    {
+        // 待放的新单在第 ④ 级必须**真的落地**（允许降载）：否则「整计划可行」只是因为
+        // 悄悄把它丢了 —— 那正是"用违反约束凑解"的反面，一样不允许。
+        bool pendingPlaced = !hasPending;
+        if (hasPending) {
+            const std::vector<std::size_t> cands = vehiclesByMarginal(
+                graph, vehicles, work, plans, weight, pending, k);
+            for (std::size_t c = 0; c < cands.size() && !pendingPlaced; ++c) {
+                const std::size_t d = cands[c];
+                std::vector<Order> candOrders = work[d];
+                if (!containsOrderId(candOrders, pending.id)) {
+                    candOrders.push_back(pending);
+                }
+                const RoutePlan cand = replanFromState(graph, vehicles[d], candOrders,
+                                                       input.starts[d], weight, true);
+                if (!planUsable(cand)) {
+                    continue;
+                }
+                work[d] = candOrders;
+                plans[d] = cand;
+                res.replanned.push_back(d);
+                res.log.push_back("[复调度] 降载级新单落位 " + pending.id + " → "
+                                  + vehicleIdOf(vehicles, d));
+                pendingPlaced = true;
+            }
+            if (!pendingPlaced) {
+                res.level = 5;
+                res.rejected = true;
+                res.reason = "订单 " + pending.id
+                             + " 在全部车上都无法可行插入（容量 / 可达 / 先取后送）";
+                res.log.push_back("[复调度] 拒绝：" + res.reason);
+                res.plans = input.remainingPlans;
+                res.vehicleOrders = input.vehicleOrders;
+                return res;
+            }
+        }
+        std::vector<RoutePlan> offloadPlans(k);
+        bool offloadOk = true;
+        for (std::size_t v = 0; v < k && offloadOk; ++v) {
+            offloadPlans[v] = replanFromState(graph, vehicles[v], work[v], input.starts[v], weight,
+                                              /*allowOffload=*/true);
+            if (!planUsable(offloadPlans[v])) {
+                offloadOk = false;
+            }
+        }
+        bool transitOk = false;
+        FleetTransitResult transit;
+        if (offloadOk) {
+            transit = applyTransitLayer(graph, vehicles, work, offloadPlans, input.starts, weight);
+            transitOk = transit.plans.size() == k;
+            for (std::size_t v = 0; v < k && transitOk; ++v) {
+                if (!planUsable(transit.plans[v])) {
+                    transitOk = false;
+                }
+            }
+        }
+        if (offloadOk) {
+            std::string missing;
+            if (!allWorkCovered(work, offloadPlans, missing)) {
+                offloadOk = false;   // 降载版漏单 ⇒ 不可行（不变量 14）
+            }
+        }
+        if (transitOk) {
+            std::string missing;
+            if (!allWorkCovered(work, transit.plans, missing)) {
+                transitOk = false;
+            }
+        }
+        if (offloadOk || transitOk) {
+            bool transitBetter = false;
+            std::vector<RoutePlan> chosen;
+            if (offloadOk && transitOk) {
+                const FleetKey ko = fleetKeyOf(vehicles, offloadPlans, weight);
+                const FleetKey kt = fleetKeyOf(vehicles, transit.plans, weight);
+                transitBetter = (compareFleetKey(kt, ko) < 0);
+                chosen = transitBetter ? transit.plans : offloadPlans;
+            } else if (offloadOk) {
+                chosen = offloadPlans;
+            } else {
+                chosen = transit.plans;
+            }
+            res.level = 4;
+            res.replanned.clear();
+            for (std::size_t v = 0; v < k; ++v) {
+                res.replanned.push_back(v);
+            }
+            if (offloadOk) {
+                appendOffloadLines(vehicles, offloadPlans, res.log);
+            }
+            if (transitOk) {
+                appendTransitLines(transit.legs, res.log);
+            }
+            if (offloadOk && transitOk && !transitBetter) {
+                res.log.push_back("[复调度] 降载与转运并列（或降载更优），保留降载版");
+            }
+            plans = chosen;
+            std::string why;
+            if (!inheritExecutedInStation(graph, vehicles, weight, input, work, plans,
+                                          res.replanned, res.log, why)) {
+                res.level = 5;
+                res.rejected = true;
+                res.reason = why;
+                res.log.push_back("[复调度] 拒绝：" + why);
+                return res;
+            }
+            res.plans = plans;
+            res.vehicleOrders = work;
+            return res;
+        }
+        res.log.push_back("[复调度] 降载 / 转运均不可行 → 升级链第 ⑤ 级");
+    }
+
+    // ---- ⑤ 拒绝并报原因（不通过违反容量或先取后送去凑解）----
+    res.level = 5;
+    res.rejected = true;
+    if (hasPending) {
+        res.reason = "订单 " + pending.id + " 在全部车上都无法可行插入（容量 / 可达 / 先取后送）";
+    } else {
+        res.reason = "第 ①②③④ 级均产不出可行解（容量 / 可达 / 先取后送 / 紧急 FIFO）";
+    }
+    res.log.push_back("[复调度] 拒绝：" + res.reason);
+    res.plans = input.remainingPlans;      // 拒绝时不留下半成品计划
+    res.vehicleOrders = input.vehicleOrders;
+    return res;
+}
 } // namespace logistics
