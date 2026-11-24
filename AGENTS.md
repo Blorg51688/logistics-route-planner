@@ -21,7 +21,8 @@
 
 ```bash
 bash 启动软件.sh                  # 启动 GUI（首次会自动 CMake 配置 + 编译）
-(cd build && ctest)              # 全部自动化测试：16 个目标 / 2441 项断言（以 ctest -N 为准）
+(cd build && ctest)              # 全部自动化测试：16 个目标（以 ctest -N 为准）
+                                 # 三套断言口径：9 个二进制 2273 项 / cli_plan_summary 162 项 / --self-check-actions 79 条 OK
 ./build/app --help               # 主程序全部命令行选项
 ```
 
@@ -36,8 +37,11 @@ bash 启动软件.sh                  # 启动 GUI（首次会自动 CMake 配�
   - time `130.200 / 378.200 / 165.700 / 0 / 28 / 50 / 100.0 / 100.0 / — / 100.0 / 56.8 / 28.4 / 164.0`
   - 第 9 项「紧急」分母 0 时 stdout 打印「紧急 —」，表里记 `—`。旧黄金值（178.200 / 378.300 /
     244.200 / 166 等「6 趟」口径）**已作废、只留历史**（见 `tests/plan_golden.h` 注释）。
-- `ctest` 全绿；9 个原测试二进制自报断言合计 **2273 项**（实测），另有 `cli_plan_summary`
-  （L2 文本守卫）168 项；这与 ctest 目标数（当前 **16**）是两个口径。
+- `ctest` 全绿；**三套断言口径，不许混**（2026-11-24 实测，HEAD `cdc98e2`）：
+  ① 9 个 C++ 测试二进制自报合计 **2273 项**（core 101 / config 654 / minheap 28 / simevent 53 /
+  dijkstra 19 / routeplanner 904 / integration 381 / traffic 99 / graphedit 34）；
+  ② `cli_plan_summary`（L2 文本守卫）**162 项**；③ `--self-check-actions` **79 条 OK**。
+  三者与 ctest 目标数（当前 **16**）是**不同载体**的计数，不能相加。
   目标数以 `ctest -N` 为准（**不要把这个数字背成硬编码**——加了测试就要同步更新文档）。
 - **任何行为改动后**：跑 `ctest` + 对比上面三行黄金值。**数字变了就必须解释为什么**，
   并同步更新断言、`docs/设计.md` 的相关小节与 [`文档导航.md`](docs/文档导航.md) 的事实。不通过不许声称完成。

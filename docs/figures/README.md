@@ -16,10 +16,10 @@
 |---|---|---|---|---|
 | F1 | [F1-minheap.png](F1-minheap.png) | 手写最小堆：入堆 / 出堆 / 上浮 / 下沉 | `src/core/MinHeap.h:MinHeap`；`src/core/MinHeap.cpp:MinHeap::push`/`popMin`/`siftUp`/`siftDown`/`swapEntries` | 【详细设计】最短路的手写堆 |
 | F2 | [F2-dijkstra.png](F2-dijkstra.png) | Dijkstra 单源最短路：`dist[]`/`previous[]` + 惰性删除 + 路径复原 | `src/core/Dijkstra.cpp:shortestPath`；`src/core/WeightType.h:pickWeight`；`src/core/MinHeap.cpp:push`/`popMin` | 【详细设计】 |
-| F3 | [F3-greedy-weave.png](F3-greedy-weave.png) | 贪心串联 weave：逐轮选最近、紧急优先内嵌、tie-break、`Stop` 结算、三个 `appendLeg` 失败出口 | `src/core/RoutePlanner.cpp:weave`/`appendLeg`/`beginTrip`/`buildCandidates` | 【详细设计】 |
-| F4 | [F4-multitrip.png](F4-multitrip.png) | 多趟分批：紧急批 → 在途货批 → 按簇分批 → 收尾；满载出仓 + 顺路寄存 + 唯一展平点 | `src/core/RoutePlanner.cpp:multiTripPlanImpl`/`multiTripPlan`/`fillBufferFromDepot`/`bankBufferEnRoute`/`flatten` | 【详细设计】多趟与载重约束 |
-| F5 | [F5-urgent-insert.png](F5-urgent-insert.png) | 紧急插单：候选 A（现状）vs 候选 B（缓冲库存就地满足）两版取优 | `src/core/RoutePlanner.cpp:insertUrgentOrder`/`replan`/`multiTripPlan`/`recordStationDraw`/`candidateDemand`/`hubOfNode`/`stockOf` | 【详细设计】动态订单插入 |
-| F6 | [F6-traffic-replan.png](F6-traffic-replan.png) | 路况 → 增量式重规划（按 leg 只重算受影响段）→ 任一趟失败退回全量 | `src/gui/MainWindow.cpp:onSimulateTraffic`；`src/core/Traffic.cpp:simulateTrafficChange`/`needsReplan`；`src/core/RoutePlanner.cpp:sliceRemainder`/`replanIncremental`/`replanOneTrip`/`makeStop`/`findCandidate` | 【详细设计】路况与增量重规划 |
+| F3 | [F3-greedy-weave.png](F3-greedy-weave.png) | **pair-insertion**：普通段全位置对枚举 → 逐个重放评价 → 字典序三键取最小；失败走 repair / 兜底 / 降载 | `src/core/RoutePlanner.cpp:tryInsertPair`/`replay`/`compareRoutes`/`repairRoute`/`insertNormalAll` | 【详细设计】主构造 |
+| F4 | [F4-multitrip.png](F4-multitrip.png) | **单条连续路线构造**：`buildAll` 多起点（EDD / 按 A 聚簇 / 按 B 聚簇）→ 紧急段 FIFO → 普通段 pair-insertion → 两级兜底 → 降载 → 拒绝 | `src/core/RoutePlanner.cpp:buildAll`/`insertionStarts`/`buildWithOrder`/`appendUrgentAll`/`insertNormalAll`/`finalize` | 【详细设计】单条连续路线与载重约束 |
+| F5 | [F5-urgent-insert.png](F5-urgent-insert.png) | **通用插单**：`insertOrder` 按订单自己的 `urgent` 分流——紧急 FIFO 尾插 / 普通 pair-insertion；装不下先降载 | `src/core/RoutePlanner.cpp:insertOrder`/`replan`/`appendUrgentAll`/`insertNormalAll`/`shortestPath`（冲突判定） | 【详细设计】动态订单插入 |
+| F6 | [F6-traffic-replan.png](F6-traffic-replan.png) | 路况 → **顺序不变版重放**的增量重规划 → 不可行退回全量 | `src/gui/MainWindow.cpp:onSimulateTraffic`；`src/core/Traffic.cpp:simulateTrafficChange`/`needsReplan`；`src/core/RoutePlanner.cpp:sliceRemainder`/`replanIncremental`/`replay`/`finalize`/`replan` | 【详细设计】路况与增量重规划 |
 
 ## 二、UML 图（U1–U4）
 
@@ -34,16 +34,20 @@
 
 1. `Dijkstra` / `RoutePlanner` / `Traffic` / `SimEvent` / `GraphEdit` 画成 `«utility»`，
    **因为它们不是类**——源码里是 `logistics` 命名空间下的自由函数，不存在 `class RoutePlanner`。
-2. `weave` / `multiTripPlanImpl` / `replanOneTrip` / `appendLeg` / `flatten` / `makeStop` 在
-   `RoutePlanner.cpp` 的匿名命名空间里、无头文件声明（`replanOneTrip` 例外：外部链接但同样没有
-   头文件声明），所以 U1 只列头文件里的公开 API；这几个内部函数看 F3–F6。
+2. `tryInsertPair` / `replay` / `repairRoute` / `buildAll` / `insertionStarts` / `finalize` 在
+   `RoutePlanner.cpp` 的匿名命名空间里、无头文件声明，所以 U1 只列头文件里的公开 API；
+   这几个内部函数看 F3–F6。（旧图里的 `weave`/`multiTripPlanImpl`/`replanOneTrip`/`appendLeg`/`flatten`
+   已随规格一删除，`grep` 0 命中。）
 3. `VehicleState` 是 `MainWindow` 的嵌套 struct，不是独立顶层类；它是**物理事实唯一权威来源**，
    重规划只读它作输入，绝不改写（`plan_` 只描述"接下来怎么走"）。
 
 ## 三、文件格式与「谁权威」
 
-- **`.mmd` 是真相源，`.png` 是它的渲染产物。** 要改图，改 `src/*.mmd` 后重跑 `render.sh`，
+- **`.mmd` 是真相源，`.png` 是它的渲染产物。** 要改图，改 `src/*.mmd` 后重跑 `docs/figures/src/render.sh`，
   连 PNG 一起提交；不要直接改 PNG（改不了，也查不出 diff）。
+- **本机可重渲（2026-11-24 实测）**：`render.sh` 存在且可用——它经 `npx @mermaid-js/mermaid-cli@11`
+  调用 mermaid（不需要全局装 `mmdc`），依赖 `chrome-headless-shell`（已缓存在 `~/.cache/puppeteer/`）。
+  本轮 F3/F4/F5/F6/U1/U2/U3/U4 的 `.mmd` 更新后**已重渲 PNG**；F1/F2 未改动，PNG 保持原样。
 - `.mmd` 是纯文本、可 `git diff`，改图不用重画；PNG 宽 1600px、白底，报告可直接插图。
 - 选 mermaid 而非 StarUML / PlantUML 的理由：源文件是纯文本，便于版本管理与评审；
   PNG 满足报告插图需求；若后续要更"专业"的 UML 记号，可从 `.mmd` 快速迁移到 PlantUML。
@@ -67,30 +71,30 @@ npx -y puppeteer browsers install chrome-headless-shell
 渲染参数固定为 `-w 1600 -b white`，因此同一份 `.mmd` 在不同机器上应得到同一张 PNG
 （本机实测：重渲 U3 与仓库内 PNG 字节数一致）。
 
-## 五、文档与代码差异（图以代码为准）
+## 五、文档与代码差异（**2026-11-24 重核：原四条已全部消解**）
 
-以下几处 `docs/设计.md` 的文字描述已滞后于源码实现，图的画法以 `src/` 为准：
+本节原先列了 4 处「`docs/设计.md` 滞后于源码」的地方。规格一实施（#32–#37）+ 本轮文档同步（#38）后，**四处都已对齐**：
 
-1. **中转站不参与排线**：`设计.md` §5.6 仍保留 `stock[t]` 中转站暂存分支、`枢纽 = 中转站 t`
-   代码块，但 `RoutePlanner.cpp:multiTripPlanImpl` 已删除该分支（§16 P25/P30）。
-   F4 按实际实现画——每趟从仓库直达后返回，不经中转站；`sub_network_id` 只用于**簇划分**。
-2. **中转站暂存不变量**：`设计.md` §5.5/§5.6 不变量表 #3/#4 仍写"中转站暂存 ≥ 0 /
-   规划结束时 == 0"，但代码里 `TransitStock` 的用途已变为"仅服务紧急单的缓冲库存"
-   （2026-09-26 用户裁定恢复，D23），语义不同。U1 按实际字段画。
-3. **紧急插单的取优判据**：`设计.md` §5.3 未提及 A/B 取优、penalty 一票否决、
-   车上缓冲就地满足等机制，这些在 `insertUrgentOrder` 里是核心逻辑。F5 按源码画全。
-4. **增量重规划的适用范围**：`设计.md` §5.7「范围限制」写的是"只适用于单趟路线，
-   上一版是多趟时直接退回全量"，但 `replanIncremental` 已改为**逐趟增量**
-   （任何一趟失败才整体退回全量）。F6 按当前实现画。
+| # | 原差异 | 现状 |
+| --- | --- | --- |
+| 1 | 设计 §5.6 仍保留 `stock[t]` / 「枢纽 = 中转站」分支 | **已消解**：§5.6 整节退役为「单条连续路线构造概述」；F4 按新构造画 |
+| 2 | 设计 §5.5/§5.6 不变量表写「中转站暂存 ≥0 / 期末 ==0」但语义是缓冲库存 | **已消解**：现行不变量是**降载暂存**守恒（Σ卸入 − Σ取回、期末 0、全局一堆锁站），见设计 §4.6；U1 按 `OffloadLeg`/`StashState` 画 |
+| 3 | 设计 §5.3 未提 A/B 取优、penalty 一票否决、车上缓冲就地满足 | **已消解（机制本身退役）**：D23 缓冲库存整体删除；现行是通用插单 + FIFO 硬优先 + 降载最后手段（设计 §5.3），F5 按此画 |
+| 4 | 设计 §5.7「只适用于单趟」vs 逐趟增量 | **已消解**：趟结构不存在；增量改为**顺序不变版重放**（规格二 §10 裁定 1 / ADR 0007），设计 §5.7 与 F6/U4 同口径 |
+
+> **仍需注意的历史件**（不是差异，是历史）：`docs/中转站策略分析.md`、`docs/records/specs/transit-urgent-buffer.md`、
+> `docs/records/decisions/transit-stock-full-load.md`、`docs/records/decisions/probes/`、`docs/archive/设计-交接.md`
+> 都含「趟 / 满载出仓 / 缓冲库存」叙事——**保留原文作历史**，别当现状引用。
 
 ## 六、事实与口径
 
 - 所有图的事实取自 `src/` 与 [`docs/设计.md`](../设计.md) §4/§5/§6，未新编。
-- 图里的数字（30 节点 / 106 有向边 / 25 订单 / 740kg 总需求 / 车 200kg·08:00 /
-  事件权重 10:3:1:1 / 事件刻 15min）均来自 `config/default.ini` 与当前源码，
-  属**已提交基线**口径。
-- `ctest` **目标数 15**（`ctest -N` 为准）与测试二进制**自报检查项 983 项**（2026-11-17 复核）是两个口径，不许混。
-- 图不是功能清单：每张图都落在「结构怎么支撑调度决策」上——堆支撑"取最小"、
-  前驱数组支撑路径复原、`trips` 真源支撑逐趟增量、`TrafficReport` 支撑"只重算受影响段"的判定。
+- 图里的数字（30 节点 / 106 有向边 / 25 订单 / **516kg 总需求** / 车 V01 200kg·08:00·1.00·1.00 /
+  事件等级派生权重 **27:3:9:1** / 事件刻 15min）均来自 `config/default.ini` 与当前源码，
+  属**已提交基线**口径（HEAD `cdc98e2`）。
+- **四个口径不许混**（2026-11-24 实测）：`ctest` **目标数 16**（`ctest -N` 为准）、9 个二进制**自报 2273 项**、`cli_plan_summary` **162 项**、`--self-check-actions` **79 条 OK**。
+- 图不是功能清单：每张图都落在「结构怎么支撑调度决策」上——堆支撑「取最小」、
+  前驱数组支撑路径复原、`CostMatrix` 支撑 O(1) leg 查询、`stops` 动作集支撑状态转移与顺序不变版重放、
+  `TrafficReport` 支撑「要不要重算」的判定。
 - 结构侧的完整依据（为什么选这个结构、代价多大、没有它得自己写什么）见
   [`docs/数据结构地图.md`](../数据结构地图.md)；本目录只放图本身。

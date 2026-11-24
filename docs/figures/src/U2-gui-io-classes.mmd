@@ -55,8 +55,6 @@ classDiagram
             +afterPlanReplaced()
             +syncScene()
             +updatePanels()
-            +loadForCurrentTrip()
-            +loadForTrip(idx)
             -settleEventsUpTo(timeMin)
             -advanceClockTo(timeMin)
             -currentPositionId() string
@@ -70,17 +68,13 @@ classDiagram
             +int atTimeMin
             +double loadKg
             +vector~OnboardItem~ onboard
-            +int tripNumber
-            +double tripLoadKg
             +bool departed
-            +int completedTrips
             +int servedStops
             +int offloadedWithoutGoods
             +int incurredPenaltyMin
             +vector~LateStop~ deliveredLate
-            +double bufferKg
-            +map~string,double~ stationStock
-            +set~string~ creditedBanks
+            +set~string~ pickedOrderIds
+            +set~OffloadKey~ executedOffloads
             +sumOnboard() double
         }
 

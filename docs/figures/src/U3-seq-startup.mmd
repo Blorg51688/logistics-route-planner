@@ -5,9 +5,9 @@
 %%      src/io/IniFile.cpp         IniFile::loadFromFile / parse
 %%      src/io/StringUtil.h        trim（去注释与首尾空白）
 %%      src/gui/MainWindow.cpp     MainWindow 构造函数 / buildActions / buildDocks
-%%      src/gui/MainWindow.cpp     syncScene / replan / afterPlanReplaced / loadForCurrentTrip
+%%      src/gui/MainWindow.cpp     syncScene / replan / afterPlanReplaced
 %%      src/core/RoutePlanner.cpp  logistics::replan（首次规划入口）
-%%      src/core/RoutePlanner.cpp  buildCandidates / weave / multiTripPlan（内部）
+%%      src/core/RoutePlanner.cpp  makeCtx / buildAll / insertionStarts / finalize（内部）
 %%      src/gui/GraphScene.cpp     GraphScene::build / highlightRoute
 %% ----
 %% 注意：首次规划走 MainWindow::replan → logistics::replan（以当前位置/时刻为起点），
@@ -30,19 +30,19 @@ sequenceDiagram
 
     Note over main: 构建 QApplication
     main->>MW: new MainWindow(config)
-    Note right of MW: 初始化 state_（物理事实唯一权威来源）：<br/>atNodeId = 仓库, atTimeMin = 发车时刻<br/>loadKg = 0, tripNumber = 1<br/>nextEventMark_ = nextEventTimeMin(发车时刻, 15)
+    Note right of MW: 初始化 state_（物理事实唯一权威来源）：<br/>atNodeId = 基地, atTimeMin = 发车时刻<br/>loadKg = 0（空载发车）, onboard 空<br/>nextEventMark_ = nextEventTimeMin(发车时刻, event_interval_min)
 
     MW->>MW: buildActions()（5 条具名工具栏）/ buildDocks()
     MW->>Scene: build(config_.graph, weight)
     Note right of Scene: 按坐标摆放 NodeItem<br/>按有向边画 EdgeItem（箭头 + 权重标签）<br/>双向对同线，标签只让字典序小的一端显示
     MW->>MW: replan()
 
-    MW->>Core: replan(graph, vehicle, remainingOrders(),<br/>currentPositionId(), currentTimeMin(),<br/>weight, onboardGoods(), state_.stationStock)
-    Note over Core: buildCandidates：同点多单合并成一个停靠点<br/>总需求 ≤ 载重 → weave 单趟贪心<br/>总需求 > 载重 → multiTripPlan 分批<br/>随后 fillBufferFromDepot / bankBufferEnRoute / flatten
-    Core-->>MW: RoutePlan（trips 是真源）
+    MW->>Core: replan(graph, vehicle, remainingOrders(),<br/>currentPositionId(), currentTimeMin(),<br/>weight, onboardGoods(), stash)
+    Note over Core: makeCtx：Order → Request（单笔超载/不可达一次判死）<br/>CostMatrix 建全源最短路（V×V×3）<br/>buildAll：三版插入序 → 紧急段 FIFO → 普通段 pair-insertion<br/>失败 repair → 全量兜底 → 降载；finalize 展平
+    Core-->>MW: RoutePlan（stops 是真源，含 offloads 与 metrics）
 
     MW->>MW: afterPlanReplaced()
-    Note right of MW: nodeIndex_ = 0, stopCursor_ = 0<br/>补齐 plan_.transitStock 里新出现的站<br/>loadForCurrentTrip()（车在仓库 ⇒ 装第 0 趟）
+    Note right of MW: nodeIndex_ = 0, stopCursor_ = 0<br/>updateVehicleTabs()（页签数 == [vehicles] 行数）<br/>不装货：车空载发车，货只在取货点 A 上车
     MW->>MW: syncScene()
     MW->>Scene: highlightRoute(plan_.nodes 从 nodeIndex_ 起)
     Note right of Scene: 只高亮尚未走完的段<br/>setVehiclePosition(currentNodeId_)
