@@ -350,6 +350,7 @@ struct Ctx {
 // 与同样多的 vector —— 那是 34 万次候选评价里最大的一笔分配开销。
 struct Key {
     int    penalty = 0;
+    double peak = 0.0;
     double weight = 0.0;
 };
 
@@ -357,6 +358,9 @@ struct Key {
 int compareKey(const Key& a, const Key& b) {
     if (a.penalty != b.penalty) {
         return a.penalty < b.penalty ? -1 : 1;
+    }
+    if (!nearlyEq(a.peak, b.peak)) {
+        return a.peak < b.peak ? -1 : 1;
     }
     if (!nearlyEq(a.weight, b.weight)) {
         return a.weight < b.weight ? -1 : 1;
@@ -587,6 +591,7 @@ bool replay(const Ctx& ctx, const std::vector<StopSpec>& specs, bool detail, Eva
         return false;
     }
 
+    out.key.peak = peak;
     out.ok = true;
     out.penalty = out.key.penalty;
     // 总耗时 = 返回仓库时刻 − 出发时刻（**含早到等待**，规格一 §6.1）。
@@ -787,7 +792,7 @@ struct OrderSlots {
 };
 
 bool checkOrderingCore(const Ctx& ctx, const Builder& b, const std::vector<StopSpec>& specs,
-                       std::string& reason, bool includeFifo) {
+                       std::string& reason, bool includeFifo, bool skipRevisitRule = false) {
     // 每个订单的动作落点只记第一次出现的下标与次数（够 F1/F2/F6 用）。
     // 单表 + 无序查找：早先三张 std::map 的构造成本在每个候选中都要付一次，
     // 34 万次候选评价下它是纯开销（判定结果完全等价）。
@@ -988,7 +993,7 @@ bool checkOrderingCore(const Ctx& ctx, const Builder& b, const std::vector<StopS
     //   ② FIFO 强制（并入会让 U2 的取货早于 U1 的送达）。
     // 默认数据集里还有普通段的 A/B 互逆对（O01: D08→D01 与 O09: D01→D08），
     // 判据逐字不变，只是适用范围从紧急段扩到普通段（偏离已在提交信息里点名）。
-    {
+    if (!skipRevisitRule) {
         // 两张表而不是「阶段前缀 + 节点 ID」拼字符串：后者每个停靠都要一次分配。
         std::unordered_map<std::string, std::size_t> urgentFirst;
         std::unordered_map<std::string, std::size_t> normalFirst;
@@ -1033,10 +1038,14 @@ bool checkOrderingCore(const Ctx& ctx, const Builder& b, const std::vector<StopS
                 target.reclaims.push_back(s.reclaims.front());
             }
             merged.erase(merged.begin() + static_cast<std::ptrdiff_t>(i));
+            // 判据严格按规格原文：并入后 **F2（先取后送）/ F3（前缀载重、先卸后装）
+            // / F5（紧急 FIFO）** 是否仍成立。**不再**在合并评价里递归跑"重访规则"
+            // —— 那会让同一节点的两处重复互相"掩护"：A 并入后 B 仍是非强制重复，
+            // 于是合并被判不可行，A 也被当成"强制"，重复就活下来了（实测 8 处全这样）。
             std::string mergeReason;
             Eval mergedEval;
             const bool mergeViable = replay(ctx, merged, false, mergedEval)
-                                     && checkOrderingCore(ctx, b, merged, mergeReason, true);
+                                     && checkOrderingCore(ctx, b, merged, mergeReason, true, true);
             if (mergeViable) {
                 reason = "节点 " + s.nodeId + " 在同阶段重复停靠，但该动作可以并入首次停靠（非强制重访）";
                 return false;
@@ -1205,35 +1214,41 @@ bool hasStopAt(const std::vector<StopSpec>& specs, const std::string& nodeId, St
 // 这样撤 B 时 A 还在原处、撤 A 时 B 已消失 —— 两边下标都不用回头修正。
 // ---------------------------------------------------------------------------
 struct PairApply {
-    bool        newA = false;    // true = A 是**新插**的停靠（撤销 = erase），false = 并入既有
+    bool        aPlaced = false;  // 动作是否真的放进去了（放失败时撤销必须跳过它）
+    bool        bPlaced = false;
+    bool        newA = false;     // true = A 是**新插**的停靠（撤销 = erase），false = 并入既有
     bool        newB = false;
-    std::size_t posA = 0;        // A 动作落在的停靠下标（放置后）
+    std::size_t posA = 0;         // A 动作落在的停靠下标（放置后）
     std::size_t posB = 0;
 };
 
-// 并入**首个**同阶段同节点停靠（与 mode=0 的语义一致），返回其下标。
-bool mergeIntoFirstAt(std::vector<StopSpec>& specs, const std::string& nodeId, StopPhase phase,
-                      const std::string& orderId, bool isPickup, bool isDelivery,
-                      std::size_t* indexOut) {
-    for (std::size_t i = 0; i < specs.size(); ++i) {
-        if (specs[i].nodeId != nodeId || specs[i].phase != phase) {
-            continue;
+// 并入既有停靠（同阶段同节点）。index == kNoTarget 表示并入该节点的**第一个**停靠；
+// 否则并入指定的那一个（同一节点可能因强制重访有多处停靠）。
+bool mergeIntoStopAt(std::vector<StopSpec>& specs, const std::string& nodeId, StopPhase phase,
+                     std::size_t index, const std::string& orderId, bool isPickup,
+                     std::size_t* indexOut) {
+    if (index == static_cast<std::size_t>(-1)) {
+        for (std::size_t i = 0; i < specs.size(); ++i) {
+            if (specs[i].nodeId == nodeId && specs[i].phase == phase
+                && !specs[i].hasAction(orderId)) {
+                index = i;
+                break;
+            }
         }
-        if (specs[i].hasAction(orderId)) {
-            continue;
-        }
-        if (isPickup) {
-            specs[i].pickups.push_back(orderId);
-        }
-        if (isDelivery) {
-            specs[i].deliveries.push_back(orderId);
-        }
-        if (indexOut != nullptr) {
-            *indexOut = i;
-        }
-        return true;
     }
-    return false;
+    if (index >= specs.size() || specs[index].nodeId != nodeId
+        || specs[index].phase != phase || specs[index].hasAction(orderId)) {
+        return false;
+    }
+    if (isPickup) {
+        specs[index].pickups.push_back(orderId);
+    } else {
+        specs[index].deliveries.push_back(orderId);
+    }
+    if (indexOut != nullptr) {
+        *indexOut = index;
+    }
+    return true;
 }
 
 // 在 pos 处放一个动作；若**相邻**停靠已是同阶段同节点，则并入它
@@ -1275,31 +1290,38 @@ std::size_t insertActionAt(std::vector<StopSpec>& specs, const std::string& node
 }
 
 void undoPair(std::vector<StopSpec>& specs, const PairApply& rec, bool needPickup) {
+    (void)needPickup;
     // 先撤 B（新插的 B 一定在 A 之后，erase 不会影响 A 的下标）。
-    if (rec.newB) {
-        specs.erase(specs.begin() + static_cast<std::ptrdiff_t>(rec.posB));
-    } else {
-        specs[rec.posB].deliveries.pop_back();
+    if (rec.bPlaced) {
+        if (rec.newB) {
+            specs.erase(specs.begin() + static_cast<std::ptrdiff_t>(rec.posB));
+        } else {
+            specs[rec.posB].deliveries.pop_back();
+        }
     }
-    if (!needPickup) {
-        return;
-    }
-    // 再撤 A：B 已撤掉，A 的下标仍有效。
-    if (rec.newA) {
-        specs.erase(specs.begin() + static_cast<std::ptrdiff_t>(rec.posA));
-    } else {
-        specs[rec.posA].pickups.pop_back();
+    // 再撤 A：B 已撤掉，A 的下标仍有效。没放进去的不要碰（否则会误 pop 别的动作）。
+    if (rec.aPlaced) {
+        if (rec.newA) {
+            specs.erase(specs.begin() + static_cast<std::ptrdiff_t>(rec.posA));
+        } else {
+            specs[rec.posA].pickups.pop_back();
+        }
     }
 }
 
-// 枚举「A 放在 i、B 放在 j」的四种落位组合（并入既有 / 新插），
-// 由 checkOrdering 过滤掉违反先取后送的那些。
+// 请求落位：**「同阶段同节点合并」是默认约束**（规格一不变量 ⑦）。
 //
-// 为什么必须两种都试：并入既有停靠是**首选**（同阶段同节点至多一次停靠），
-// 但当并入会让送达早于取货时（例如 A=D01、B=D08，而 D08 已有取货停靠），
-// 并入必然不可行 —— 此时只能重访该节点。默认数据里的 O09(D01->D08) 正是这种形态。
+// 规则：只要某种「并入既有停靠」的落位**可行**，就不生成该节点的独立停靠候选；
+// 只有当并入确实不可行（会让 F2 先取后送 / F3 前缀载重失败）时，才允许重访该节点
+// —— 那才是规格里的「强制重访」，且重访停靠只含该单的一个动作。
+//
+// 因此候选按「并入优先」分四层求值，**第一层有可行候选就停**：
+//   (A 并入, B 并入) → (A 并入, B 新插) → (A 新插, B 并入) → (A 新插, B 新插)
+// 后两层只在前面全部不可行时才枚举。早先四层混在一起按 key 取优，于是
+// 「新插一个同点停靠」会因为当时局部更省里程而胜出，把默认数据做成 31 站
+// （其中 8 处同阶段重复都是这种次优，不是结构性必需）。
 bool tryInsertPair(const Ctx& ctx, Builder& b, const Request& r,
-                   std::vector<StopSpec>& best, Key& bestKey) {
+                   std::vector<StopSpec>& best, Key& bestKey, bool mergeStrict = true) {
     const std::size_t lo = normalBegin(b.route);
     const std::size_t hi = b.route.size();
     const bool canMergeB = hasStopAt(b.route, r.delivery, StopPhase::Normal);
@@ -1311,69 +1333,136 @@ bool tryInsertPair(const Ctx& ctx, Builder& b, const Request& r,
     std::vector<StopSpec>& route = b.route;
 
     // 评价一个（A 落位, B 落位）组合：就地放 → 评价 → 撤销；改进才复制。
-    const auto attempt = [&](std::size_t i, std::size_t j, int modeA, int modeB) {
+    // mode = 0 表示并入 aTarget/bTarget（SIZE_MAX = 失败），mode = 1 表示在 i/j 新插。
+    // 返回「该组合可行」，供「并入优先」的分层驱动判断这一层是否已经有候选。
+    const auto attempt = [&](std::size_t i, std::size_t j, int modeA, int modeB,
+                             std::size_t aTarget, std::size_t bTarget) -> bool {
         PairApply rec;
         if (needPickup) {
             if (modeA == 0) {
-                if (!mergeIntoFirstAt(route, r.pickup, StopPhase::Normal, r.orderId, true, false,
-                                      &rec.posA)) {
-                    return;
+                if (!mergeIntoStopAt(route, r.pickup, StopPhase::Normal, aTarget,
+                                     r.orderId, true, &rec.posA)) {
+                    return false;
                 }
+                rec.aPlaced = true;
             } else {
                 rec.posA = insertActionAt(route, r.pickup, StopPhase::Normal, r.orderId, true, i,
                                           &rec.newA);
+                rec.aPlaced = true;
             }
         }
-        const std::size_t jPos = j + ((needPickup && rec.newA && rec.posA <= j) ? 1u : 0u);
-        if (modeB == 0) {
-            if (!mergeIntoFirstAt(route, r.delivery, StopPhase::Normal, r.orderId, false, true,
-                                  &rec.posB)) {
+        // A 若新插在 B 的落点之前，B 的目标下标整体右移一位（并入目标同样会漂移）。
+        const bool shiftB = needPickup && rec.newA && rec.posA <= j;
+        const std::size_t jPos = j + (shiftB ? 1u : 0u);
+        std::size_t bTargetShifted = bTarget;
+        if (modeB == 0 && shiftB && bTargetShifted != static_cast<std::size_t>(-1)) {
+            bTargetShifted += 1;
+            if (bTargetShifted >= route.size()) {
                 undoPair(route, rec, needPickup);
-                return;
+                return false;
             }
+        }
+        if (modeB == 0) {
+            if (!mergeIntoStopAt(route, r.delivery, StopPhase::Normal, bTargetShifted,
+                                 r.orderId, false, &rec.posB)) {
+                undoPair(route, rec, needPickup);
+                return false;
+            }
+            rec.bPlaced = true;
         } else {
             rec.posB = insertActionAt(route, r.delivery, StopPhase::Normal, r.orderId, false,
                                       jPos > route.size() ? route.size() : jPos, &rec.newB);
+            rec.bPlaced = true;
         }
         if (needPickup && rec.posA >= rec.posB) {   // F2：先取后送
             undoPair(route, rec, needPickup);
-            return;
+            return false;
         }
         Eval ev;
-        if (evaluate(ctx, b, route, ev)
-            && (!found || compareRoutes(route, ev.key, best, bestKey) < 0)) {
+        const bool ok = evaluate(ctx, b, route, ev);
+        if (ok && (!found || compareRoutes(route, ev.key, best, bestKey) < 0)) {
             found = true;
             bestKey = ev.key;
             best = route;   // 只有确认改进时才复制整条路线
         }
         undoPair(route, rec, needPickup);
+        return ok;
     };
 
-    // 候选去重：**并入既有停靠**这一 mode 与插入位置无关（mergeIntoFirstAt 只认节点），
-    // 因此 (i, j) 全枚举会把同一个候选评价 n² 次。按四种 mode 组合分别只扫它真正
-    // 依赖的位置维度 —— 结果集合与全枚举完全相同，只是不再重复评价同一件事。
-    if (needPickup && canMergeA && canMergeB) {
-        attempt(lo, lo, 0, 0);                                   // 两个都并入：唯一候选
-    }
-    if (needPickup && canMergeA) {
-        for (std::size_t j = lo; j <= hi; ++j) {
-            attempt(lo, j, 0, 1);                                // A 并入、B 新插：只依赖 j
+    // 四层「并入优先」：前一层只要有可行候选就直接胜出，后一层不再枚举
+    // （这就是「并入可行 ⇒ 不再生成该节点的独立停靠候选」；后两层只服务
+    //  「强制重访」——并入会让 F2 先取后送 / F3 前缀载重失败）。
+    const std::size_t kNone = static_cast<std::size_t>(-1);
+    const bool canMergeA2 = needPickup && hasStopAt(route, r.pickup, StopPhase::Normal);
+    const bool canMergeB2 = hasStopAt(route, r.delivery, StopPhase::Normal);
+    bool any = false;
+
+    if (!mergeStrict) {
+        // 修复阶段：把「落位」当普通的局部搜索邻域 —— 四种组合全试、按 key 取优。
+        // 合法性仍由 checkOrdering 把关（并入可行时独立停靠会被判成"非强制重访"而拒绝），
+        // 所以这里放宽候选**不会**产生非强制重复，只是不让构造期的分层限制把修复卡死。
+        if (needPickup && canMergeA2 && canMergeB2) {
+            any = attempt(lo, lo, 0, 0, kNone, kNone) || any;
         }
-    }
-    if (needPickup && canMergeB) {
-        for (std::size_t i = lo; i <= hi; ++i) {
-            attempt(i, lo, 1, 0);                                // A 新插、B 并入：只依赖 i
+        if (needPickup && canMergeA2) {
+            for (std::size_t j = lo; j <= hi; ++j) {
+                any = attempt(lo, j, 0, 1, kNone, kNone) || any;
+            }
         }
-    }
-    if (!needPickup) {
-        for (std::size_t j = lo; j <= hi; ++j) {
-            attempt(lo, j, 0, 1);                                // 无取货动作：只摆送达位
+        if (needPickup && canMergeB2) {
+            for (std::size_t i = lo; i <= hi; ++i) {
+                any = attempt(i, lo, 1, 0, kNone, kNone) || any;
+            }
         }
-    } else {
+        if (!needPickup) {
+            for (std::size_t j = lo; j <= hi; ++j) {
+                any = attempt(lo, j, 0, 1, kNone, kNone) || any;
+            }
+            return found;
+        }
         for (std::size_t i = lo; i <= hi; ++i) {
             for (std::size_t j = i; j <= hi; ++j) {
-                attempt(i, j, 1, 1);                             // 两个都新插：依赖 (i, j)
+                any = attempt(i, j, 1, 1, kNone, kNone) || any;
             }
+        }
+        return found;
+    }
+
+    // 第 1 层：A 并入、B 并入
+    if (needPickup && canMergeA2 && canMergeB2) {
+        any = attempt(lo, lo, 0, 0, kNone, kNone);
+        if (any) {
+            return found;
+        }
+    }
+    // 第 2 层：A 并入、B 新插（位置枚举 j）
+    if (needPickup && canMergeA2) {
+        for (std::size_t j = lo; j <= hi; ++j) {
+            any = attempt(lo, j, 0, 1, kNone, kNone) || any;
+        }
+        if (any) {
+            return found;
+        }
+    }
+    // 第 3 层：A 新插（位置枚举 i）、B 并入
+    if (canMergeB2) {
+        for (std::size_t i = lo; i <= hi; ++i) {
+            any = attempt(i, lo, 1, 0, kNone, kNone) || any;
+        }
+        if (any) {
+            return found;
+        }
+    }
+    // 第 4 层：A 新插 + B 新插（最后的兜底 = 强制重访形态）
+    if (!needPickup) {
+        for (std::size_t j = lo; j <= hi; ++j) {
+            any = attempt(lo, j, 0, 1, kNone, kNone) || any;
+        }
+        return found;
+    }
+    for (std::size_t i = lo; i <= hi; ++i) {
+        for (std::size_t j = i; j <= hi; ++j) {
+            any = attempt(i, j, 1, 1, kNone, kNone) || any;
         }
     }
     return found;
@@ -1694,7 +1783,7 @@ void repairRoute(const Ctx& ctx, Builder& b, int maxRounds) {
             probe.route = base;
             std::vector<StopSpec> cand;
             Key candKey;
-            if (!tryInsertPair(ctx, probe, r, cand, candKey)) {
+            if (!tryInsertPair(ctx, probe, r, cand, candKey, false)) {
                 continue;
             }
             Eval cur;
