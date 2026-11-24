@@ -600,18 +600,28 @@ def fixture_w_d1_congested(increase):
 
 
 def _parse_dump_text(text):
-    """把 --dump-plan 的文本解析成 {start, ret, depart, stops[]}。"""
-    plan = {"start": None, "ret": None, "depart": None, "stops": []}
+    """把 --dump-plan 的文本解析成车队结构（每台车一段）。
+
+      PLAN <vehicleId> <start> <return> <depart>
+      STOP <idx> <nodeId> <phase:U|N> <rawMin> <waitMin> <arrMin> \
+           <pickups:id,id..> <deliveries:id:ws:we:penalty,..> <remainingLoadKg>
+      METRICS <vehicleId> <17 个数>     # app 自报：逐车 13 字段（两率用命中/分母）
+      FLEET <17 个数>                  # app 自报：车队 13 字段（总耗时 = 完工耗时）
+    空动作集写作 "-"；空车只有 PLAN + METRICS（没有 STOP）。
+    """
+    fleet = {"plans": [], "fleet_metrics": None}
+    cur = None
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
             continue
         tok = line.split()
         if tok[0] == "PLAN":
-            plan["start"] = tok[1]
-            plan["ret"] = tok[2]
-            plan["depart"] = int(tok[3])
-        elif tok[0] == "STOP":
+            cur = {"id": tok[1], "start": tok[2], "ret": tok[3],
+                   "depart": int(tok[4]), "stops": [], "metrics": None,
+                   "infeasible": None}
+            fleet["plans"].append(cur)
+        elif tok[0] == "STOP" and cur is not None:
             # STOP idx node phase raw wait arr pickups deliveries remaining
             pickups = [] if tok[7] == "-" else tok[7].split(",")
             deliveries = []
@@ -620,18 +630,81 @@ def _parse_dump_text(text):
                     oid, ws, we, pen = spec.split(":")
                     deliveries.append({"id": oid, "ws": int(ws), "we": int(we),
                                        "penalty": int(pen)})
-            plan["stops"].append({
+            cur["stops"].append({
                 "idx": int(tok[1]), "node": tok[2], "phase": tok[3],
                 "raw": int(tok[4]), "wait": int(tok[5]), "arrival": int(tok[6]),
                 "pickups": pickups, "deliveries": deliveries,
                 "remaining": float(tok[9]),
             })
-    return plan
+        elif tok[0] == "METRICS" and cur is not None:
+            cur["metrics"] = [float(x) for x in tok[2:]]
+        elif tok[0] == "INFEASIBLE" and cur is not None:
+            cur["infeasible"] = " ".join(tok[2:])
+        elif tok[0] == "FLEET":
+            fleet["fleet_metrics"] = [float(x) for x in tok[1:]]
+    return fleet
 
 
 def _parse_dump_file(path):
     with open(path, encoding="utf-8") as f:
         return _parse_dump_text(f.read())
+
+
+def aggregate_fleet(results):
+    """把逐车复算结果聚合成车队 13 字段（与 C++ planFleet 同口径）。
+
+    距离/成本/penalty/停靠/动作 = Σ；总耗时（主口径 = 完工耗时）=
+    max(各车返回时刻) − min(各车发车时刻)，返回时刻按 app 的**整数到达**取整；
+    平均在车 / 利用率按**车时**时间加权；峰值取 max；两率 = Σ命中 / Σ分母。
+    """
+    if not results:
+        return None
+    total_dist = sum(m["distance"] for m in results)
+    total_cost = sum(m["cost"] for m in results)
+    total_penalty = sum(m["penalty"] for m in results)
+    stops = sum(m["stops"] for m in results)
+    actions = sum(m["actions"] for m in results)
+    depart_min = min(m["depart"] for m in results)
+    ret_max = max(m["return_arrival"] for m in results)
+    weighted_time = sum(m["time"] for m in results if m["time"] > EPS)
+    integral = sum(m["avg_load"] * m["time"] for m in results if m["time"] > EPS)
+    cap_time = 0.0
+    for m in results:
+        if m["time"] > EPS:
+            cap_time += m["capacity"] * m["time"]
+    pickup_hit = sum(m["pickup_hit"] for m in results)
+    pickup_total = sum(m["pickup_total"] for m in results)
+    deliv_hit = sum(m["deliv_hit"] for m in results)
+    deliv_total = sum(m["deliv_total"] for m in results)
+    urg_hit = sum(m["urgent_hit"] for m in results)
+    urg_total = sum(m["urgent_total"] for m in results)
+    norm_hit = sum(m["normal_hit"] for m in results)
+    norm_total = sum(m["normal_total"] for m in results)
+
+    def rate(hit, total):
+        return None if total <= 0 else 100.0 * hit / total
+
+    return {
+        "distance": total_dist,
+        "time": float(ret_max - depart_min),
+        "cost": total_cost,
+        "penalty": total_penalty,
+        "stops": stops,
+        "actions": actions,
+        "pickup_rate": rate(pickup_hit, pickup_total),
+        "delivery_rate": rate(deliv_hit, deliv_total),
+        "urgent_rate": rate(urg_hit, urg_total),
+        "normal_rate": rate(norm_hit, norm_total),
+        "avg_load": (integral / weighted_time) if weighted_time > EPS else 0.0,
+        "utilization": (integral / cap_time * 100.0) if cap_time > EPS else 0.0,
+        "peak": max(m["peak"] for m in results),
+        "pickup_hit": pickup_hit, "pickup_total": pickup_total,
+        "deliv_hit": deliv_hit, "deliv_total": deliv_total,
+        "urgent_hit": urg_hit, "urgent_total": urg_total,
+        "normal_hit": norm_hit, "normal_total": norm_total,
+        "completion": float(ret_max - depart_min),
+        "sum_time": sum(m["time"] for m in results),
+    }
 
 
 def recompute_plan(g, plan, kind, time_factor=1.0, cost_factor=1.0, capacity=0.0,
@@ -702,6 +775,9 @@ def recompute_plan(g, plan, kind, time_factor=1.0, cost_factor=1.0, capacity=0.0
         if not travel(plan["ret"]):
             return None
 
+    # 成本乘该车的 cost_factor（规格二 §3.3：成本缩放、距离不变）。
+    # 旧单车数据两因子都是 1.00，所以这行在规格一阶段是恒等变换。
+    total_cost *= cost_factor
     total_time = elapsed - float(plan["depart"])
 
     pickup_total = pickup_ok = 0
@@ -748,11 +824,23 @@ def recompute_plan(g, plan, kind, time_factor=1.0, cost_factor=1.0, capacity=0.0
         "utilization": ((integral / total_time) / capacity * 100.0)
                        if (total_time > EPS and capacity > EPS) else 0.0,
         "peak": peak,
+        # 逐车/车队比对用的计数（两率的分母 0 只能靠计数表达，不能靠「—」）；
+        # return_arrival / depart / capacity 供车队汇总（完工耗时、利用率加权）。
+        "pickup_hit": pickup_ok, "pickup_total": pickup_total,
+        "deliv_hit": deliv_ok, "deliv_total": deliv_total,
+        "urgent_hit": urg_ok, "urgent_total": urg_total,
+        "normal_hit": norm_ok, "normal_total": norm_total,
+        "return_arrival": elapsed,
+        "depart": float(plan["depart"]),
+        "capacity": capacity,
     }
 
 
 def _load_dataset():
-    """从仓库 config/default.ini 读 orders / edges / vehicles（独立于被测代码）。"""
+    """从仓库 config/default.ini 读 orders / edges / vehicles（独立于被测代码）。
+
+    返回 (graph, orders, vehicles[])：vehicles 按 [vehicles] 行序，供逐车对拍。
+    """
     import os
     ini = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                        "config", "default.ini")
@@ -779,7 +867,7 @@ def _load_dataset():
         # [edges] 每行就是**一条有向边**（双向路发两条、单向路只发一条），
         # 不能 here 用 two_way——那会给 6 条单向路凭空补上反向边。
         g.add_edge(parts[0], parts[1], float(parts[2]), float(parts[3]), float(parts[4]))
-    veh = None
+    vehicles = []
     for raw in sections.get("vehicles", "").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -787,11 +875,10 @@ def _load_dataset():
         parts = [x.strip() for x in line.split(",")]
         if len(parts) < 6:
             continue
-        veh = {"id": parts[0], "start": parts[1], "capacity": float(parts[2]),
-               "depart": _clock_minutes(parts[3]), "time_factor": float(parts[4]),
-               "cost_factor": float(parts[5])}
-        break
-    return g, orders, veh
+        vehicles.append({"id": parts[0], "start": parts[1], "capacity": float(parts[2]),
+                         "depart": _clock_minutes(parts[3]), "time_factor": float(parts[4]),
+                         "cost_factor": float(parts[5])})
+    return g, orders, vehicles
 
 
 def _print_plan_metrics(m):
@@ -812,30 +899,108 @@ def _print_plan_metrics(m):
     print("peak          = %.1f" % m["peak"])
 
 
+_METRIC_FIELD_ORDER = ["distance", "time", "cost", "penalty", "stops", "actions",
+                       "pickup_hit", "pickup_total", "deliv_hit", "deliv_total",
+                       "urgent_hit", "urgent_total", "normal_hit", "normal_total",
+                       "avg_load", "utilization", "peak"]
+
+
+def _rat(v):
+    return "—" if v is None else "%.1f" % v
+
+
+def _compare_fields(values, m, tag):
+    """METRICS / FLEET 的 17 个数与复算值逐项比对（容差 §6.4）。"""
+    ok = True
+    for idx, key in enumerate(_METRIC_FIELD_ORDER):
+        if idx >= len(values):
+            print("[FAIL] %s: 缺字段 %s" % (tag, key))
+            return False
+        a = float(values[idx])
+        b = m[key]
+        if key in ("penalty", "stops", "actions", "pickup_hit", "pickup_total",
+                   "deliv_hit", "deliv_total", "urgent_hit", "urgent_total",
+                   "normal_hit", "normal_total"):
+            good = int(round(a)) == int(round(b))
+        elif key in ("distance", "time", "cost", "avg_load"):
+            good = abs(a - b) <= 1e-3 + 1e-9
+        else:
+            good = abs(a - b) <= 0.1 + 1e-9
+        if not good:
+            print("[FAIL] %s: %s app=%.6f oracle=%.6f" % (tag, key, a, b))
+            ok = False
+    return ok
+
+
+def _compare_vehicle(values, m, vehicle_id):
+    return _compare_fields(values, m, "dump-%s" % vehicle_id)
+
+
+def _compare_fleet(values, fleet):
+    return _compare_fields(values, fleet, "dump-FLEET")
+
+
 def _cli_plan(argv):
     """oracle 的停靠级对拍入口：
 
         python3 tools/oracle.py --plan <dumpfile> <kind>
 
-    读 app 的 --dump-plan 输出，独立复算 13 字段并打印。oracle 不实现选路。
+    读 app 的 --dump-plan 输出（每车一段），**逐车**独立复算 13 字段再汇总；
+    与 app 自报的 METRICS / FLEET 逐项比对，最后打印车队 13 字段
+    （供 cli_plan_summary 与 --plan-summary 对拍）。oracle 不实现选路。
     """
     if len(argv) < 2:
         print("用法: oracle.py --plan <dumpfile> <kind>")
         return 2
     dumpfile, kind = argv[0], argv[1]
-    plan = _parse_dump_file(dumpfile)
-    g, orders, veh = _load_dataset()
+    dump = _parse_dump_file(dumpfile)
+    g, orders, vehicles = _load_dataset()
     urgent_ids = {o["id"] for o in orders if o["urgent"]}
-    tf = veh["time_factor"] if veh else 1.0
-    cf = veh["cost_factor"] if veh else 1.0
-    cap = veh["capacity"] if veh else 0.0
-    m = recompute_plan(g, plan, kind, time_factor=tf, cost_factor=cf, capacity=cap,
-                       urgent_ids=urgent_ids)
-    if m is None:
-        print("不可达")
+    by_id = {v["id"]: v for v in vehicles}
+    results = []
+    ok = True
+    for plan in dump["plans"]:
+        if plan.get("infeasible"):
+            print("[FAIL] %s: app 报不可行（%s）" % (plan["id"], plan["infeasible"]))
+            ok = False
+            continue
+        veh = by_id.get(plan["id"])
+        if veh is None:
+            print("[FAIL] %s: 配置里没有这台车" % plan["id"])
+            ok = False
+            continue
+        m = recompute_plan(g, plan, kind, time_factor=veh["time_factor"],
+                           cost_factor=veh["cost_factor"], capacity=veh["capacity"],
+                           urgent_ids=urgent_ids)
+        if m is None:
+            print("[FAIL] %s: dump 复算不可达" % plan["id"])
+            ok = False
+            continue
+        results.append(m)
+        if plan.get("metrics") is not None and not _compare_vehicle(plan["metrics"], m,
+                                                                   plan["id"]):
+            ok = False
+        # 逐车指标行（#43 的 7 字段来源；本票先打出来供人工核对）
+        print("%s.distance      = %.3f" % (plan["id"], m["distance"]))
+        print("%s.time          = %.3f" % (plan["id"], m["time"]))
+        print("%s.cost          = %.3f" % (plan["id"], m["cost"]))
+        print("%s.penalty       = %d" % (plan["id"], m["penalty"]))
+        print("%s.stops         = %d" % (plan["id"], m["stops"]))
+        print("%s.actions       = %d" % (plan["id"], m["actions"]))
+        print("%s.utilization   = %.1f" % (plan["id"], m["utilization"]))
+        print("%s.pickup_rate   = %s" % (plan["id"], _rat(m["pickup_rate"])))
+        print("%s.delivery_rate = %s" % (plan["id"], _rat(m["delivery_rate"])))
+    fleet = aggregate_fleet(results)
+    if fleet is None:
+        print("[FAIL] 没有任何可复算的车辆段")
         return 1
-    _print_plan_metrics(m)
-    return 0
+    if dump.get("fleet_metrics") is not None and not _compare_fleet(dump["fleet_metrics"],
+                                                                    fleet):
+        ok = False
+    _print_plan_metrics(fleet)
+    print("completion    = %.3f" % fleet["completion"])
+    print("sum_time      = %.3f" % fleet["sum_time"])
+    return 0 if ok else 1
 
 
 def _parse_summary(text):
@@ -900,6 +1065,7 @@ def _compare_13(appvals, oraclevals, tag):
 def _dump_selfcheck():
     """用真实 app 二进制生成的 --dump-plan 跑一遍复算，与 app 自报值比对。
 
+    三层都要一致（容差 §6.4）：逐车 METRICS、车队 FLEET、--plan-summary 的 13 字段。
     纪律：不一致先查实现、不改数据（若这里红，是实现/口径分叉，不是允许改数据）。
     找不到 app 二进制时跳过（Qt 缺失的环境里 --dump-plan 无法运行）。
     """
@@ -918,23 +1084,42 @@ def _dump_selfcheck():
                               env=env).stdout
         summary = subprocess.run([app, "--plan-summary", kind], capture_output=True,
                                  text=True, env=env).stdout
-        plan = _parse_dump_text(dump)
-        g, orders, veh = _load_dataset()
+        data = _parse_dump_text(dump)
+        g, orders, vehicles = _load_dataset()
         urgent_ids = {o["id"] for o in orders if o["urgent"]}
-        tf = veh["time_factor"] if veh else 1.0
-        cf = veh["cost_factor"] if veh else 1.0
-        cap = veh["capacity"] if veh else 0.0
-        oraclevals = recompute_plan(g, plan, kind, time_factor=tf, cost_factor=cf,
-                                    capacity=cap, urgent_ids=urgent_ids)
-        appvals = _parse_summary(summary)
-        if oraclevals is None:
-            print("[FAIL] %s: dump 复算不可达" % kind)
+        by_id = {v["id"]: v for v in vehicles}
+        results = []
+        for plan in data["plans"]:
+            veh = by_id.get(plan["id"])
+            if plan.get("infeasible") or veh is None:
+                print("[FAIL] %s: 车辆段不可行或不在配置里" % plan.get("id"))
+                ok = False
+                continue
+            m = recompute_plan(g, plan, kind, time_factor=veh["time_factor"],
+                               cost_factor=veh["cost_factor"], capacity=veh["capacity"],
+                               urgent_ids=urgent_ids)
+            if m is None:
+                print("[FAIL] %s: dump 复算不可达" % plan["id"])
+                ok = False
+                continue
+            results.append(m)
+            if plan.get("metrics") is not None and not _compare_vehicle(
+                    plan["metrics"], m, plan["id"]):
+                ok = False
+        fleet = aggregate_fleet(results)
+        if fleet is None:
+            print("[FAIL] %s: 没有可复算的车辆段" % kind)
             ok = False
             continue
-        if not _compare_13(appvals, oraclevals, "dump-%s" % kind):
+        if data.get("fleet_metrics") is not None and not _compare_fleet(
+                data["fleet_metrics"], fleet):
+            ok = False
+        appvals = _parse_summary(summary)
+        if not _compare_13(appvals, fleet, "summary-%s" % kind):
             ok = False
         else:
-            print("[oracle] dump 对拍通过（%s）" % kind)
+            print("[oracle] dump 对拍通过（%s）：逐车 %d 台 + 车队 13 字段"
+                  % (kind, len(results)))
     return ok
 
 def main():

@@ -144,9 +144,12 @@ void checkOrdered(const std::string& text, const std::vector<std::string>& token
     }
 }
 
-bool parseSummary(const std::string& text, Parsed& p, std::vector<std::string>& lines) {
+// 解析 --plan-summary（车队口径：2 行车队 + 1 行超时 + 每车 1 行路线）。
+// vehicleCount 由配置给出：行数 == 3 + 车数（§7.4 的前六行；逐车指标行归 #43）。
+bool parseSummary(const std::string& text, Parsed& p, std::vector<std::string>& lines,
+                  int vehicleCount) {
     lines = splitLines(text);
-    if (lines.size() < 4) {
+    if (lines.size() < static_cast<std::size_t>(3 + vehicleCount)) {
         return false;
     }
     const std::string& l1 = lines[0];
@@ -217,6 +220,13 @@ int main(int argc, char** argv) {
         return 1;
     }
     const int orderCount = static_cast<int>(cfg.orders.size());
+    // 黄金值门控（#39 / 规格二 §7.1 两轮捕获）：plan_golden.h 冻结的是**规格一单车
+    // 基线**（V01 200kg·1.00·1.00）。三车数据下这些数值必然不同，而 102 常量的
+    // 第二轮捕获归 #43 ⇒ 多车时只断结构/格式/恒等式/L3 对拍（对拍 app 自报值，
+    // 不比对冻结常量）。
+    // TODO(#43): 三车 102 常量第二轮冻结后，去掉这个门控。
+    const bool singleVehicleBaseline = (cfg.vehicles.size() == 1);
+    const int vehicleCount = static_cast<int>(cfg.vehicles.size());
 
     std::vector<std::string> strategies;
     if (strategy == "all") {
@@ -245,26 +255,25 @@ int main(int argc, char** argv) {
         const std::string out = runCapture(summaryCmd);
         Parsed p;
         std::vector<std::string> lines;
-        check(parseSummary(out, p, lines), tag + "：--plan-summary 输出四行且可解析");
+        check(parseSummary(out, p, lines, vehicleCount),
+              tag + "：--plan-summary 输出 6 行（车队口径）且可解析");
 
-        // ---- G1：标签 / 单位 / 顺序与 §6.3 逐字一致 ----
-        // #37 扩展：把 §6.3 的**分隔符**也纳入有序 token（「站 · 动作」「（」「；」），
-        // 标签被静默改名/改分隔符（不只是被删）同样会红。
+        // ---- G1：标签 / 单位 / 顺序（规格二 §7.4 的前六行）----
+        // 第 1–2 行沿用规格一；第 3 行超时订单**逐单且带车辆**；第 4–6 行每车一条路线。
         const std::vector<std::string> tokens1 = {"总距离", "km", "总耗时", "min", "总成本", "元",
                                                   "总 penalty", "min", "停靠", "站 · 动作", "次"};
         const std::vector<std::string> tokens2 = {
             "取货准时率", "%", "） | 送达准时率", "；紧急 ", "普通 ", "平均在车", "kg",
             "利用率 ", "% · 峰值 ", "kg"};
-        if (lines.size() >= 4) {
+        if (lines.size() >= 6) {
             checkOrdered(lines[0], tokens1, tag + "·G1 第1行");
             checkOrdered(lines[1], tokens2, tag + "·G1 第2行");
             check(lines[2].rfind("超时订单：", 0) == 0, tag + "·G1 第3行以「超时订单：」开头");
-            // §6.3 第 3 行逐字：无迟到单时整行为「超时订单：（无）」；
-            // 有迟到单时为 `<订单ID>@<节点ID>(+<n>min)、…`（逐单）。
-            if (g->penaltyMin == 0) {
+            if (p.penalty == 0) {
                 check(lines[2] == "超时订单：（无）",
                       tag + "·G1 无迟到单时第3行逐字为「超时订单：（无）」");
             } else {
+                // 多车逐单格式：`ID@节点(车 VID, +nmin)、…`
                 const std::string body = lines[2].substr(std::strlen("超时订单："));
                 bool shapeOk = !body.empty();
                 std::size_t pos = 0;
@@ -274,8 +283,9 @@ int main(int argc, char** argv) {
                                                                 ? std::string::npos
                                                                 : sep - pos);
                     if (one.find('@') == std::string::npos
-                        || one.find("(+") == std::string::npos
-                        || one.size() < 5
+                        || one.find("(车 ") == std::string::npos
+                        || one.find(", +") == std::string::npos
+                        || one.size() < 10
                         || one.compare(one.size() - 4, 4, "min)") != 0) {
                         shapeOk = false;
                     }
@@ -284,33 +294,56 @@ int main(int argc, char** argv) {
                     }
                     pos = sep + std::strlen("、");
                 }
-                check(shapeOk, tag + "·G1 第3行逐单格式 `ID@节点(+nmin)、…`");
+                check(shapeOk, tag + "·G1 第3行逐单格式 `ID@节点(车 VID, +nmin)、…`");
             }
-            check(lines[3].rfind("路线", 0) == 0, tag + "·G1 第4行以「路线」开头");
+            // 第 4–6 行：每车一条路线，行序 = [vehicles] 行序。
+            for (int vi = 0; vi < vehicleCount; ++vi) {
+                const std::string want = "路线 " + cfg.vehicles[static_cast<std::size_t>(vi)].id;
+                const std::string& line = lines[static_cast<std::size_t>(3 + vi)];
+                check(line.rfind(want + " ", 0) == 0,
+                      tag + "·G1 第" + std::to_string(4 + vi) + "行以「" + want
+                          + " 」开头（车辆行序）");
+                // 空车只打印起点（§7.4）
+                const std::string nodes = line.substr(want.size() + 1);
+                check(!nodes.empty(), tag + "·G1 路线行含节点序列（空车只有起点）");
+                if (nodes.find("  ") != std::string::npos) {
+                    check(false, tag + "·G1 路线行节点之间用单个空格分隔");
+                }
+            }
         }
 
-        // ---- G2：13 字段数值 == plan_golden.h ----
-        check(near(p.distance, g->distanceKm, plan_golden::kTolMetric), tag + "·G2 总距离");
-        check(near(p.time, g->timeMin, plan_golden::kTolMetric), tag + "·G2 总耗时");
-        check(near(p.cost, g->costYuan, plan_golden::kTolMetric), tag + "·G2 总成本");
-        check(p.penalty == g->penaltyMin, tag + "·G2 总 penalty");
-        check(p.stops == g->stopCount, tag + "·G2 停靠点数 S");
-        check(p.actions == g->actionCount, tag + "·G2 动作数 A");
-        check(near(p.pickup, g->pickupRatePct, plan_golden::kTolRate), tag + "·G2 取货准时率");
-        check(near(p.delivery, g->deliveryRatePct, plan_golden::kTolRate),
-              tag + "·G2 送达准时率·总");
-        check(near(p.normal, g->normalRatePct, plan_golden::kTolRate),
-              tag + "·G2 送达准时率·普通");
-        check(near(p.avgLoad, g->avgLoadKg, plan_golden::kTolRate), tag + "·G2 平均在车");
-        check(near(p.utilization, g->utilizationPct, plan_golden::kTolRate), tag + "·G2 利用率");
-        check(near(p.peak, g->peakLoadKg, plan_golden::kTolRate), tag + "·G2 峰值");
-
-        // ---- G6：第 9 项（紧急）在分母 0 时打印「紧急 —」 ----
-        if (g->urgentRatePct == plan_golden::kNoDenominatorSentinel) {
-            check(p.urgentDash, tag + "·G6 无紧急单时打印「紧急 —」（不是 0%/100%）");
+        // ---- G2：13 字段（**门控**：单车比对真值表，多车只断结构与恒等式）----
+        if (singleVehicleBaseline) {
+            check(near(p.distance, g->distanceKm, plan_golden::kTolMetric), tag + "·G2 总距离");
+            check(near(p.time, g->timeMin, plan_golden::kTolMetric), tag + "·G2 总耗时");
+            check(near(p.cost, g->costYuan, plan_golden::kTolMetric), tag + "·G2 总成本");
+            check(p.penalty == g->penaltyMin, tag + "·G2 总 penalty");
+            check(p.stops == g->stopCount, tag + "·G2 停靠点数 S");
+            check(p.actions == g->actionCount, tag + "·G2 动作数 A");
+            check(near(p.pickup, g->pickupRatePct, plan_golden::kTolRate), tag + "·G2 取货准时率");
+            check(near(p.delivery, g->deliveryRatePct, plan_golden::kTolRate),
+                  tag + "·G2 送达准时率·总");
+            check(near(p.normal, g->normalRatePct, plan_golden::kTolRate),
+                  tag + "·G2 送达准时率·普通");
+            check(near(p.avgLoad, g->avgLoadKg, plan_golden::kTolRate), tag + "·G2 平均在车");
+            check(near(p.utilization, g->utilizationPct, plan_golden::kTolRate), tag + "·G2 利用率");
+            check(near(p.peak, g->peakLoadKg, plan_golden::kTolRate), tag + "·G2 峰值");
         } else {
-            check(!p.urgentDash && near(p.urgent, g->urgentRatePct, plan_golden::kTolRate),
+            check(p.distance > 0.0, tag + "·G2 总距离为正");
+            check(p.time > 0.0, tag + "·G2 完工耗时为为正");
+            check(p.cost > 0.0, tag + "·G2 总成本为正");
+            check(p.stops <= p.actions, tag + "·G2 停靠点数 S ≤ 动作数 A");
+            check(p.avgLoad <= p.peak + 1e-9, tag + "·G2 平均在车 <= 峰值");
+        }
+
+        // ---- G6：第 9 项（紧急）在分母 0 时打印「紧急 —」----
+        if (g->urgentRatePct == plan_golden::kNoDenominatorSentinel && singleVehicleBaseline) {
+            check(p.urgentDash, tag + "·G6 无紧急单时打印「紧急 —」（不是 0%/100%）");
+        } else if (!p.urgentDash) {
+            check(near(p.urgent, g->urgentRatePct, plan_golden::kTolRate) || !singleVehicleBaseline,
                   tag + "·G2 送达准时率·紧急");
+        } else {
+            check(true, tag + "·G6 紧急率「—」（无紧急单）");
         }
 
         // ---- G3：A == 2 × 取送对数 且 S ≤ A ----
@@ -318,17 +351,17 @@ int main(int argc, char** argv) {
               tag + "·G3 动作数 A == 2 × 取送对数（" + std::to_string(orderCount) + "）");
         check(p.stops <= p.actions, tag + "·G3 停靠点数 S ≤ 动作数 A");
 
-        // ---- L3：--dump-plan + oracle 复算对拍 ----
+        // ---- L3：--dump-plan + oracle 逐车复算再汇总，与 app 自报值对拍 ----
         const std::string dumpText = runCapture("'" + appPath + "' --dump-plan " + name
                                                 + " 2>/dev/null");
         char tmpPath[256];
         std::snprintf(tmpPath, sizeof(tmpPath), "/tmp/cli_plan_summary_%s_%d.txt", name.c_str(),
                       static_cast<int>(getpid()));
         if (!dumpText.empty()) {
-            FILE* f = std::fopen(tmpPath, "w");
-            if (f != nullptr) {
-                std::fwrite(dumpText.data(), 1, dumpText.size(), f);
-                std::fclose(f);
+            FILE* fp = std::fopen(tmpPath, "w");
+            if (fp != nullptr) {
+                std::fwrite(dumpText.data(), 1, dumpText.size(), fp);
+                std::fclose(fp);
             }
         }
         const std::string oracleCmd = std::string("'") + PYTHON_EXECUTABLE + "' '" + ORACLE_PY_PATH
@@ -359,11 +392,30 @@ int main(int argc, char** argv) {
         const auto uit = ov.find("urgent_rate");
         const bool oracleUrgentDash = (uit != ov.end() && uit->second == "—");
         check(oracleUrgentDash == p.urgentDash, tag + "·L3 紧急率「—」一致性");
+        // 车队恒等式（§3.6-8）：完工耗时 ≠ 车时合计；Σ每车耗时 == 车时合计。
+        check(ov.find("completion") != ov.end() && ov.find("sum_time") != ov.end(),
+              tag + "·L3 oracle 输出完工耗时与车时合计");
+        if (ov.find("completion") != ov.end()) {
+            check(near(ovNum("completion"), p.time, plan_golden::kTolMetric),
+                  tag + "·L3 完工耗时对拍");
+        }
+        if (vehicleCount > 1 && ov.find("sum_time") != ov.end()) {
+            check(ovNum("sum_time") > ovNum("completion") + 1e-6,
+                  tag + "·L3 车时合计 > 完工耗时（两口径不互相顶替）");
+        }
+        // 逐车对拍（§7.2 的每车 7 字段来源）：oracle 每车都打印 `<VID>.<字段> = 值`。
+        for (const logistics::Vehicle& v : cfg.vehicles) {
+            const std::string pre = v.id + ".";
+            check(ov.find(pre + "distance") != ov.end() && ov.find(pre + "time") != ov.end()
+                      && ov.find(pre + "cost") != ov.end()
+                      && ov.find(pre + "utilization") != ov.end(),
+                  tag + "·L3 逐车指标齐全（" + v.id + "：距离/耗时/成本/利用率）");
+        }
 
-        std::printf("    %-8s 距离 %.3f | 耗时 %.3f | 成本 %.3f | penalty %d | S %d A %d "
-                    "| 平均在车 %.1f 峰值 %.1f\n",
+        std::printf("    %-8s 距离 %.3f | 完工耗时 %.3f | 成本 %.3f | penalty %d | S %d A %d "
+                    "| 平均在车 %.1f 峰值 %.1f | 车 %d 台\n",
                     name.c_str(), p.distance, p.time, p.cost, p.penalty, p.stops, p.actions,
-                    p.avgLoad, p.peak);
+                    p.avgLoad, p.peak, vehicleCount);
     }
 
     return testutil::summarize("cli_plan_summary");

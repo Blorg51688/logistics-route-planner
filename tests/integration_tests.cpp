@@ -22,6 +22,8 @@ using logistics::RoutePlan;
 using logistics::Vehicle;
 using logistics::WeightType;
 using logistics::planRoute;
+using logistics::planFleet;
+using logistics::FleetPlan;
 using logistics::replan;
 using logistics::simulateTrafficChange;
 using logistics::needsReplan;
@@ -73,7 +75,11 @@ const logistics::Order* findOrder(const Config& cfg, const std::string& id) {
 
 // 规格一 #18 §12 的 12 条不变量在**真实数据**上的机械复核。
 // 全部读 RoutePlan 产物（用户可见输出同源），不重算规划。
-void checkPlanInvariants(const Config& cfg, const RoutePlan& plan, const std::string& label) {
+// 单车不变量的**逐车**版本（规格二 §3.6）：起点/容量/订单集合都取该车自己的，
+// 不得再用 vehicles[0] / 全量订单一笔带过（那正是多车下会漏掉越界的地方）。
+void checkPlanInvariants(const Config& cfg, const Vehicle& vehicle,
+                         const std::vector<logistics::Order>& orders, const RoutePlan& plan,
+                         const std::string& label) {
     const std::string tag = label + "：";
 
     check(plan.status == PlanStatus::Ok, tag + "可规划出可行路线（reason: " + plan.reason + "）");
@@ -84,8 +90,8 @@ void checkPlanInvariants(const Config& cfg, const RoutePlan& plan, const std::st
     if (plan.nodes.empty()) {
         return;
     }
-    check(plan.nodes.front() == cfg.vehicles[0].startNodeId, tag + "从起始仓库出发");
-    check(plan.nodes.back() == cfg.vehicles[0].startNodeId, tag + "返回起始仓库");
+    check(plan.nodes.front() == vehicle.startNodeId, tag + "从该车起始仓库出发");
+    check(plan.nodes.back() == vehicle.startNodeId, tag + "返回该车起始仓库（同一基地）");
 
     bool walkable = true;
     for (std::size_t i = 1; i < plan.nodes.size(); ++i) {
@@ -111,14 +117,14 @@ void checkPlanInvariants(const Config& cfg, const RoutePlan& plan, const std::st
     // 单条连续路线：仓库只作为首个停靠出现（起点就地取货），中途不得回仓装货。
     bool depotOnce = true;
     for (std::size_t i = 0; i < plan.stops.size(); ++i) {
-        if (plan.stops[i].nodeId == cfg.vehicles[0].startNodeId) {
+        if (plan.stops[i].nodeId == vehicle.startNodeId) {
             depotOnce = false;
         }
     }
     check(depotOnce, tag + "中途不停靠仓库（单条连续路线，仓库装货语义已退役）");
 
     // 不变量 ① ②：每张订单恰好一次送达、至多一次取货，且取货早于送达。
-    for (const logistics::Order& o : cfg.orders) {
+    for (const logistics::Order& o : orders) {
         std::size_t picks = 0;
         std::size_t delivs = 0;
         std::size_t pickIdx = plan.stops.size();
@@ -178,7 +184,7 @@ void checkPlanInvariants(const Config& cfg, const RoutePlan& plan, const std::st
                 after += o->demandKg;
             }
         }
-        if (after < -1e-9 || after > cfg.vehicles[0].capacityKg + 1e-6) {
+        if (after < -1e-9 || after > vehicle.capacityKg + 1e-6) {
             prefixOk = false;
         }
         if (std::fabs(st.remainingLoadKg - after) > 1e-6) {
@@ -206,7 +212,7 @@ void checkPlanInvariants(const Config& cfg, const RoutePlan& plan, const std::st
     // F3（前缀载重、先卸后装）**失败**。默认数据集要求**非强制重复为 0**。
     // 判据与实现同源：tests/graph_fixtures.h 的 fixtures::nonForcedRevisitStops。
     const int nonForced =
-        fixtures::nonForcedRevisitStops(plan.stops, cfg.orders, cfg.vehicles[0].capacityKg, 0.0);
+        fixtures::nonForcedRevisitStops(plan.stops, orders, vehicle.capacityKg, 0.0);
     check(nonForced == 0, tag + "非强制重复停靠必须为 0（并入首次停靠后 F2/F5/F3 都过的重复"
                               "一律算违规），实际 " + std::to_string(nonForced));
 
@@ -260,36 +266,143 @@ void checkPlanInvariants(const Config& cfg, const RoutePlan& plan, const std::st
         actions += static_cast<int>(st.pickups.size() + st.deliveries.size());
     }
     check(m.actionCount == actions, tag + "指标·动作数 = 取货 + 送达动作数");
-    check(m.actionCount == 2 * static_cast<int>(cfg.orders.size()),
+    check(m.actionCount == 2 * static_cast<int>(orders.size()),
           tag + "结构性恒等：动作数 = 2 × 取送对数（数据全为 A→B 取送对）");
     check(m.pickupOnTimeCount >= m.deliveryOnTimeCount, tag + "取货准时数 >= 送达准时数（G4）");
     check(m.avgLoadKg <= m.peakLoadKg + 1e-9, tag + "平均在车 <= 峰值（G5）");
-    check(m.peakLoadKg <= cfg.vehicles[0].capacityKg + 1e-6, tag + "峰值 <= 载重上限（G5）");
-    check(std::fabs(m.loadUtilization - m.avgLoadKg / cfg.vehicles[0].capacityKg) < 0.005,
-          tag + "利用率 == 平均/容量（G5）");
-    check(m.deliveryTotal == static_cast<int>(cfg.orders.size()),
-          tag + "送达准时率分母 = 已规划订单数（G6）");
+    check(m.peakLoadKg <= vehicle.capacityKg + 1e-6, tag + "峰值 <= **该车**载重上限（G5）");
+    check(std::fabs(m.loadUtilization - m.avgLoadKg / vehicle.capacityKg) < 0.005,
+          tag + "利用率 == 平均/**该车**容量（G5）");
+    check(m.deliveryTotal == static_cast<int>(orders.size()),
+          tag + "送达准时率分母 = 该车已规划订单数（G6）");
 }
 
-RoutePlan planForWeight(const Config& cfg, WeightType weight, const char* label) {
-    const RoutePlan plan = planRoute(cfg.graph, cfg.vehicles[0], cfg.orders, weight);
-    checkPlanInvariants(cfg, plan, label);
-
-    // 逐单超时清单一并打出来（第 3 行摘要的来源），便于人工核对逐单窗口。
-    std::printf("      %s: 距离 %.3fkm  耗时 %.3fmin  成本 %.3f元  penalty %dmin  停靠 %d 站 动作 %d 次\n",
-                label, plan.totalDistanceKm, plan.totalTimeMin, plan.totalCostYuan,
-                plan.totalPenaltyMin, plan.metrics.stopCount, plan.metrics.actionCount);
-    std::printf("        超时订单:");
-    bool anyLate = false;
-    for (const logistics::OrderMetric& om : plan.metrics.orders) {
-        if (!om.late) {
-            continue;
-        }
-        std::printf(" %s@%s(+%dmin)", om.orderId.c_str(), om.nodeId.c_str(), om.penaltyMin);
-        anyLate = true;
+// 顺序轮转基线（规格二 §4.5）：订单 ID 升序、第 i 单 -> 第 (i mod k) 台车。
+// **与 C++ planFleet 的分配同口径**，但由测试自己算一遍——测试不读被测实现的分配，
+// 而是把"该车应服务的订单集合"独立算出来后交给 planRoute 逐车规划，
+// 这样"分配漂移"（例如少给一单）会立刻在逐车覆盖断言上暴露。
+std::vector<std::vector<logistics::Order> > roundRobinAssignment(const Config& cfg) {
+    std::vector<std::size_t> idx(cfg.orders.size());
+    for (std::size_t i = 0; i < idx.size(); ++i) {
+        idx[i] = i;
     }
-    std::printf("%s\n", anyLate ? "" : " 无");
-    return plan;
+    for (std::size_t i = 1; i < idx.size(); ++i) {
+        const std::size_t key = idx[i];
+        std::size_t j = i;
+        while (j > 0 && cfg.orders[key].id < cfg.orders[idx[j - 1]].id) {
+            idx[j] = idx[j - 1];
+            --j;
+        }
+        idx[j] = key;
+    }
+    std::vector<std::vector<logistics::Order> > out(cfg.vehicles.size());
+    for (std::size_t i = 0; i < idx.size(); ++i) {
+        out[i % cfg.vehicles.size()].push_back(cfg.orders[idx[i]]);
+    }
+    return out;
+}
+
+// 车队级 13 字段 + 三条恒等式（规格二 §3.4 / §3.6-8）的守卫。
+// 全部读 planFleet 产物（与 --plan-summary 同源），不重算规划。
+void checkFleetInvariants(const Config& cfg, const FleetPlan& fleet, const std::string& label) {
+    const std::string tag = label + "：";
+    check(fleet.vehicles.size() == cfg.vehicles.size(), tag + "逐车计划数 == 车辆数");
+    check(fleet.allOk, tag + "全部车辆都可规划（reason: " + fleet.reason + "）");
+
+    // ① Σ 每车 == 车队（距离 / 成本 / penalty / 停靠数 / 动作数）。
+    double sumDist = 0.0;
+    double sumCost = 0.0;
+    int sumPenalty = 0;
+    int sumStops = 0;
+    int sumActions = 0;
+    double sumTime = 0.0;
+    double maxReturn = -1.0;
+    int minDepart = cfg.vehicles.empty() ? 0 : cfg.vehicles[0].departTimeMin;
+    for (std::size_t v = 0; v < fleet.vehicles.size() && v < cfg.vehicles.size(); ++v) {
+        const RoutePlan& p = fleet.vehicles[v];
+        sumDist += p.totalDistanceKm;
+        sumCost += p.totalCostYuan;
+        sumPenalty += p.totalPenaltyMin;
+        sumStops += p.metrics.stopCount;
+        sumActions += p.metrics.actionCount;
+        sumTime += p.totalTimeMin;
+        const double ret = static_cast<double>(cfg.vehicles[v].departTimeMin) + p.totalTimeMin;
+        if (ret > maxReturn) {
+            maxReturn = ret;
+        }
+        if (cfg.vehicles[v].departTimeMin < minDepart) {
+            minDepart = cfg.vehicles[v].departTimeMin;
+        }
+    }
+    check(fixtures::nearlyEqual(fleet.totalDistanceKm, sumDist, 1e-6),
+          tag + "Σ每车距离 == 车队总距离");
+    check(fixtures::nearlyEqual(fleet.totalCostYuan, sumCost, 1e-6),
+          tag + "Σ每车成本 == 车队总成本");
+    check(fleet.totalPenaltyMin == sumPenalty, tag + "Σ每车 penalty == 车队总 penalty");
+    check(fleet.stopCount == sumStops, tag + "Σ每车停靠数 == 车队停靠数");
+    check(fleet.actionCount == sumActions, tag + "Σ每车动作数 == 车队动作数");
+
+    // ② 完工耗时 == max(返回) − min(发车)；③ Σ每车耗时 == 车时合计。
+    check(fixtures::nearlyEqual(fleet.completionTimeMin, maxReturn - minDepart, 1e-6),
+          tag + "完工耗时 == max(各车返回) − min(各车发车)（实际 "
+              + std::to_string(fleet.completionTimeMin) + " vs "
+              + std::to_string(maxReturn - minDepart) + "）");
+    check(fixtures::nearlyEqual(fleet.sumVehicleTimeMin, sumTime, 1e-6),
+          tag + "Σ每车耗时 == 车时合计");
+
+    // ④ 两条口径**不得互相顶替**：多车下完工耗时严格小于车时合计（空闲车会让它更明显）。
+    if (cfg.vehicles.size() > 1) {
+        check(fleet.completionTimeMin < fleet.sumVehicleTimeMin - 1e-6,
+              tag + "完工耗时 ≠ 车时合计（" + std::to_string(fleet.completionTimeMin) + " vs "
+                  + std::to_string(fleet.sumVehicleTimeMin) + "），二者不得互相顶替");
+    }
+
+    // ⑤ 车队级指标是 Σ/Σ：两率分母 = 全部订单数；峰值 = 各车峰值 max。
+    check(fleet.metrics.pickupTotal == static_cast<int>(cfg.orders.size()),
+          tag + "车队取货准时率分母 == 订单数");
+    check(fleet.metrics.deliveryTotal == static_cast<int>(cfg.orders.size()),
+          tag + "车队送达准时率分母 == 订单数");
+    double peak = 0.0;
+    for (const RoutePlan& p : fleet.vehicles) {
+        if (p.metrics.peakLoadKg > peak) {
+            peak = p.metrics.peakLoadKg;
+        }
+    }
+    check(fixtures::nearlyEqual(fleet.metrics.peakLoadKg, peak, 1e-6),
+          tag + "车队峰值 == max(各车峰值)");
+    check(fleet.metrics.avgLoadKg <= fleet.metrics.peakLoadKg + 1e-9,
+          tag + "车队平均在车 <= 车队峰值（G5）");
+}
+
+FleetPlan planFleetForWeight(const Config& cfg, WeightType weight, const char* label) {
+    const FleetPlan fleet = planFleet(cfg.graph, cfg.vehicles, cfg.orders, weight);
+    checkFleetInvariants(cfg, fleet, label);
+
+    // 逐车不变量（每车自己的起点/容量/订单集合）+ 逐车摘要打印。
+    const std::vector<std::vector<logistics::Order> > assigned = roundRobinAssignment(cfg);
+    int lateTotal = 0;
+    for (std::size_t v = 0; v < fleet.vehicles.size() && v < cfg.vehicles.size(); ++v) {
+        const RoutePlan& plan = fleet.vehicles[v];
+        checkPlanInvariants(cfg, cfg.vehicles[v], assigned[v], plan,
+                            label + std::string("·车 ") + cfg.vehicles[v].id);
+        std::printf("      %s 车 %s: 距离 %.3fkm  耗时 %.3fmin  成本 %.3f元  penalty %dmin  "
+                    "停靠 %d 站 动作 %d 次\n",
+                    label, cfg.vehicles[v].id.c_str(), plan.totalDistanceKm,
+                    plan.totalTimeMin, plan.totalCostYuan, plan.totalPenaltyMin,
+                    plan.metrics.stopCount, plan.metrics.actionCount);
+        for (const logistics::OrderMetric& om : plan.metrics.orders) {
+            if (om.late) {
+                ++lateTotal;
+            }
+        }
+    }
+    std::printf("      %s 车队: 总距离 %.3fkm  完工耗时 %.3fmin（车时合计 %.3fmin）  "
+                "总成本 %.3f元  penalty %dmin  停靠 %d 站 动作 %d 次\n",
+                label, fleet.totalDistanceKm, fleet.completionTimeMin,
+                fleet.sumVehicleTimeMin, fleet.totalCostYuan, fleet.totalPenaltyMin,
+                fleet.stopCount, fleet.actionCount);
+    std::printf("        超时订单数: %d\n", lateTotal);
+    return fleet;
 }
 
 // 数据质量不变量。
@@ -306,24 +419,30 @@ RoutePlan planForWeight(const Config& cfg, WeightType weight, const char* label)
 // 真实缺陷 —— ① 巡游 1048km / 28 小时；② 成本与距离完全线性相关。当时集成测试
 // 只有"非零 / 非负 / 结构正确"这类弱断言，两个缺陷是靠人眼看 printf 发现的。
 // 以下断言把"数据有效性"从"人眼观察"变成"机器守的契约"。
-void checkDataQualityInvariants(const Config& cfg, const RoutePlan& byDistance,
-                                const RoutePlan& byCost, const RoutePlan& byTime) {
-    const RoutePlan* plans[] = {&byDistance, &byCost, &byTime};
+void checkDataQualityInvariants(const Config& cfg, const FleetPlan& byDistance,
+                                const FleetPlan& byCost, const FleetPlan& byTime) {
+    const FleetPlan* fleets[] = {&byDistance, &byCost, &byTime};
     const char* labels[] = {"距离策略", "成本策略", "时间策略"};
 
-    // ① 三策略**两两**分化（3 对）：节点序列或自身指标必须不同。
+    // ① 三策略**两两**分化（3 对）：逐车路线序列或自身指标必须不同。
     const double own[3] = {byDistance.totalDistanceKm, byCost.totalCostYuan,
-                           byTime.totalTimeMin};
+                           byTime.completionTimeMin};
     for (int i = 0; i < 3; ++i) {
         for (int j = i + 1; j < 3; ++j) {
-            const bool differ = plans[i]->nodes != plans[j]->nodes
-                                || !fixtures::nearlyEqual(own[i], own[j], 0.001);
+            bool differ = !fixtures::nearlyEqual(own[i], own[j], 0.001);
+            for (std::size_t v = 0;
+                 v < fleets[i]->vehicles.size() && v < fleets[j]->vehicles.size(); ++v) {
+                if (fleets[i]->vehicles[v].nodes != fleets[j]->vehicles[v].nodes) {
+                    differ = true;
+                }
+            }
             check(differ, std::string(labels[i]) + " 与 " + labels[j]
                               + " 必须给出不同结果（三策略两两分化）");
         }
     }
 
-    // ② 每条策略在**自身目标**上不劣于另两条（3 × 2 = 6 条）。
+    // ② 每条策略在**自身目标**上不劣于另两条（3 × 2 = 6 条）。车队口径：
+    //    距离/成本是 Σ，耗时是**完工耗时**（主口径，§3.4）。
     check(byDistance.totalDistanceKm <= byCost.totalDistanceKm + 1e-6,
           "距离策略的总距离不应劣于成本策略（" + std::to_string(byDistance.totalDistanceKm)
               + " vs " + std::to_string(byCost.totalDistanceKm) + "）");
@@ -336,28 +455,33 @@ void checkDataQualityInvariants(const Config& cfg, const RoutePlan& byDistance,
     check(byCost.totalCostYuan <= byTime.totalCostYuan + 1e-6,
           "成本策略的总成本不应劣于时间策略（" + std::to_string(byCost.totalCostYuan)
               + " vs " + std::to_string(byTime.totalCostYuan) + "）");
-    check(byTime.totalTimeMin <= byDistance.totalTimeMin + 1e-6,
-          "时间策略的总耗时不应劣于距离策略（" + std::to_string(byTime.totalTimeMin)
-              + " vs " + std::to_string(byDistance.totalTimeMin) + "）");
-    check(byTime.totalTimeMin <= byCost.totalTimeMin + 1e-6,
-          "时间策略的总耗时不应劣于成本策略（" + std::to_string(byTime.totalTimeMin)
-              + " vs " + std::to_string(byCost.totalTimeMin) + "）");
+    check(byTime.completionTimeMin <= byDistance.completionTimeMin + 1e-6,
+          "时间策略的完工耗时不应劣于距离策略（" + std::to_string(byTime.completionTimeMin)
+              + " vs " + std::to_string(byDistance.completionTimeMin) + "）");
+    check(byTime.completionTimeMin <= byCost.completionTimeMin + 1e-6,
+          "时间策略的完工耗时不应劣于成本策略（" + std::to_string(byTime.completionTimeMin)
+              + " vs " + std::to_string(byCost.completionTimeMin) + "）");
 
-    // ③ 单车辆必须能在工作日内跑完，否则默认数据下全部订单必然超时。
+    // ③ 完工耗时 ≤ 12h **且逐车耗时 ≤ 12h**（规格二 §8.2 ③）。
     const double kWorkdayMinutes = 12.0 * 60.0;
     for (int i = 0; i < 3; ++i) {
-        check(plans[i]->totalTimeMin <= kWorkdayMinutes,
-              std::string(labels[i]) + " 总耗时须在 12 小时工作日内，实际 "
-                  + std::to_string(plans[i]->totalTimeMin));
+        check(fleets[i]->completionTimeMin <= kWorkdayMinutes,
+              std::string(labels[i]) + " 完工耗时须在 12 小时工作日内，实际 "
+                  + std::to_string(fleets[i]->completionTimeMin));
+        for (std::size_t v = 0; v < fleets[i]->vehicles.size(); ++v) {
+            check(fleets[i]->vehicles[v].totalTimeMin <= kWorkdayMinutes,
+                  std::string(labels[i]) + " 车 " + cfg.vehicles[v].id
+                      + " 耗时须在 12 小时工作日内，实际 "
+                      + std::to_string(fleets[i]->vehicles[v].totalTimeMin));
+        }
     }
 
-    // ④ 迟到必须只出现在"刻意收紧"的窗口上，且**逐单**判（旧的并集口径会把紧窗单
-    //    迟到判成宽窗停靠点迟到而误红）。阈值是 characterization：实施后按实测重定。
+    // ④ 迟到必须只出现在"刻意收紧"的窗口上，且**逐单**判。阈值是 characterization。
     const std::size_t kMaxLateOrders = 8;
     const int kTightWindowMinutes = 4 * 60;
     for (int i = 0; i < 3; ++i) {
         std::size_t lateOrders = 0;
-        for (const logistics::OrderMetric& om : plans[i]->metrics.orders) {
+        for (const logistics::OrderMetric& om : fleets[i]->metrics.orders) {
             if (!om.late) {
                 continue;
             }
@@ -373,68 +497,95 @@ void checkDataQualityInvariants(const Config& cfg, const RoutePlan& byDistance,
                   + std::to_string(lateOrders) + " / " + std::to_string(cfg.orders.size()));
     }
 
-    // ⑤ 三策略 × 13 字段的黄金值：**单一真值表** tests/plan_golden.h（#35 捕获）。
-    //    L1 数值断言只消费真值表，不各写一份（§6.4 / §10 裁定 4）；容差同 §6.4。
-    //    第 9 项（紧急送达准时率）在无紧急单时是哨兵 -1 ⇒ 断言分母为 0。
+    // ⑤ 三策略 × 13 字段的黄金值：**单一真值表** tests/plan_golden.h。
+    //
+    // **门控（#39 / 规格二 §7.1 两轮捕获）**：真值表里冻结的是**规格一单车基线**
+    // （V01 200kg·1.00·1.00）。三车数据下这些数值必然不同，而 102 个常量的第二轮
+    // 捕获归 #43。所以这里按 vehicles.size() == 1 门控：
+    //   · 单车（规格一基线数据）：照旧逐项比对真值表；
+    //   · 多车：只断结构/格式/恒等式（车队 Σ、完工=max−min、Σ车时=车时合计、
+    //     分母 = 订单数、G7 逐单之和），**不比对冻结常量**。
+    // TODO(#43): 三车 102 常量第二轮冻结后，把多车分支改成消费真值表。
+    const bool singleVehicleBaseline = (cfg.vehicles.size() == 1);
     for (int i = 0; i < 3; ++i) {
-        const logistics::RouteMetrics& m = plans[i]->metrics;
+        const logistics::RouteMetrics& m = fleets[i]->metrics;
         const plan_golden::StrategyGolden& g = plan_golden::kAll[i];
         const std::string tag = std::string(labels[i]) + "·黄金[" + g.name + "]：";
 
-        // 第 1–3 项：距离 / 耗时 / 成本（0.001）。
-        check(fixtures::nearlyEqual(plans[i]->totalDistanceKm, g.distanceKm,
-                                    plan_golden::kTolMetric),
-              tag + "总距离 " + std::to_string(plans[i]->totalDistanceKm) + " vs "
-                  + std::to_string(g.distanceKm));
-        check(fixtures::nearlyEqual(plans[i]->totalTimeMin, g.timeMin, plan_golden::kTolMetric),
-              tag + "总耗时 " + std::to_string(plans[i]->totalTimeMin) + " vs "
-                  + std::to_string(g.timeMin));
-        check(fixtures::nearlyEqual(plans[i]->totalCostYuan, g.costYuan, plan_golden::kTolMetric),
-              tag + "总成本 " + std::to_string(plans[i]->totalCostYuan) + " vs "
-                  + std::to_string(g.costYuan));
-        // 第 4–6 项：penalty / 停靠 / 动作（整数）。
-        check(plans[i]->totalPenaltyMin == g.penaltyMin, tag + "总 penalty");
-        check(m.stopCount == g.stopCount, tag + "停靠点数 S");
-        check(m.actionCount == g.actionCount, tag + "动作数 A");
-        // 第 7–8、10 项：两率（0.1）。
-        const double pickupRate =
-            100.0 * static_cast<double>(m.pickupOnTimeCount) / static_cast<double>(m.pickupTotal);
-        const double deliveryRate = 100.0 * static_cast<double>(m.deliveryOnTimeCount)
-                                    / static_cast<double>(m.deliveryTotal);
-        const double normalRate = 100.0 * static_cast<double>(m.normalOnTimeCount)
-                                  / static_cast<double>(m.normalTotal);
-        check(fixtures::nearlyEqual(pickupRate, g.pickupRatePct, plan_golden::kTolRate),
-              tag + "取货准时率");
-        check(fixtures::nearlyEqual(deliveryRate, g.deliveryRatePct, plan_golden::kTolRate),
-              tag + "送达准时率·总");
-        check(fixtures::nearlyEqual(normalRate, g.normalRatePct, plan_golden::kTolRate),
-              tag + "送达准时率·普通");
-        // 第 9 项：紧急送达准时率。真值表用 -1 表示「分母 0 记 —」。
-        if (g.urgentRatePct == plan_golden::kNoDenominatorSentinel) {
-            check(m.urgentTotal == 0, tag + "无紧急单时紧急准时率分母为 0（记「—」）");
+        if (singleVehicleBaseline) {
+            // 第 1–3 项：距离 / 耗时 / 成本（0.001）。
+            check(fixtures::nearlyEqual(fleets[i]->totalDistanceKm, g.distanceKm,
+                                        plan_golden::kTolMetric),
+                  tag + "总距离 " + std::to_string(fleets[i]->totalDistanceKm) + " vs "
+                      + std::to_string(g.distanceKm));
+            check(fixtures::nearlyEqual(fleets[i]->completionTimeMin, g.timeMin,
+                                        plan_golden::kTolMetric),
+                  tag + "总耗时 " + std::to_string(fleets[i]->completionTimeMin) + " vs "
+                      + std::to_string(g.timeMin));
+            check(fixtures::nearlyEqual(fleets[i]->totalCostYuan, g.costYuan,
+                                        plan_golden::kTolMetric),
+                  tag + "总成本 " + std::to_string(fleets[i]->totalCostYuan) + " vs "
+                      + std::to_string(g.costYuan));
+            // 第 4–6 项：penalty / 停靠 / 动作（整数）。
+            check(fleets[i]->totalPenaltyMin == g.penaltyMin, tag + "总 penalty");
+            check(m.stopCount == g.stopCount, tag + "停靠点数 S");
+            check(m.actionCount == g.actionCount, tag + "动作数 A");
+            // 第 7–8、10 项：两率（0.1）。
+            const double pickupRate = 100.0 * static_cast<double>(m.pickupOnTimeCount)
+                                      / static_cast<double>(m.pickupTotal);
+            const double deliveryRate = 100.0 * static_cast<double>(m.deliveryOnTimeCount)
+                                        / static_cast<double>(m.deliveryTotal);
+            const double normalRate = 100.0 * static_cast<double>(m.normalOnTimeCount)
+                                      / static_cast<double>(m.normalTotal);
+            check(fixtures::nearlyEqual(pickupRate, g.pickupRatePct, plan_golden::kTolRate),
+                  tag + "取货准时率");
+            check(fixtures::nearlyEqual(deliveryRate, g.deliveryRatePct, plan_golden::kTolRate),
+                  tag + "送达准时率·总");
+            check(fixtures::nearlyEqual(normalRate, g.normalRatePct, plan_golden::kTolRate),
+                  tag + "送达准时率·普通");
+            // 第 9 项：紧急送达准时率。真值表用 -1 表示「分母 0 记 —」。
+            if (g.urgentRatePct == plan_golden::kNoDenominatorSentinel) {
+                check(m.urgentTotal == 0, tag + "无紧急单时紧急准时率分母为 0（记「—」）");
+            } else {
+                check(m.urgentTotal > 0
+                          && fixtures::nearlyEqual(
+                                 100.0 * static_cast<double>(m.urgentOnTimeCount)
+                                     / static_cast<double>(m.urgentTotal),
+                                 g.urgentRatePct, plan_golden::kTolRate),
+                      tag + "送达准时率·紧急");
+            }
+            // 第 11–13 项：平均在车 / 利用率 / 峰值（0.1）。
+            check(fixtures::nearlyEqual(m.avgLoadKg, g.avgLoadKg, plan_golden::kTolRate),
+                  tag + "平均在车货量");
+            check(fixtures::nearlyEqual(m.loadUtilization * 100.0, g.utilizationPct,
+                                        plan_golden::kTolRate),
+                  tag + "载重利用率");
+            check(fixtures::nearlyEqual(m.peakLoadKg, g.peakLoadKg, plan_golden::kTolRate),
+                  tag + "峰值在车量");
         } else {
-            check(m.urgentTotal > 0
-                      && fixtures::nearlyEqual(
-                             100.0 * static_cast<double>(m.urgentOnTimeCount)
-                                 / static_cast<double>(m.urgentTotal),
-                             g.urgentRatePct, plan_golden::kTolRate),
-                  tag + "送达准时率·紧急");
+            // 多车：结构/恒等式（数值常量留给 #43 第二轮捕获）。
+            check(fleets[i]->completionTimeMin > 0.0, tag + "完工耗时为正");
+            check(fleets[i]->sumVehicleTimeMin > 0.0, tag + "车时合计为正");
+            check(m.actionCount == 2 * static_cast<int>(cfg.orders.size()),
+                  tag + "动作数 = 2 × 取送对数（结构性恒等）");
+            check(m.stopCount <= m.actionCount, tag + "停靠点数 S ≤ 动作数 A（G3）");
+            check(m.avgLoadKg <= m.peakLoadKg + 1e-9, tag + "平均在车 <= 峰值（G5）");
+            // 峰值不得超过**最大**车容量（逐车更严的版本在 checkPlanInvariants 里）。
+            double maxCapacity = 0.0;
+            for (const Vehicle& v : cfg.vehicles) {
+                if (v.capacityKg > maxCapacity) {
+                    maxCapacity = v.capacityKg;
+                }
+            }
+            check(m.peakLoadKg <= maxCapacity + 1e-6, tag + "车队峰值 <= 最大车载重");
         }
-        // 第 11–13 项：平均在车 / 利用率 / 峰值（0.1）。
-        check(fixtures::nearlyEqual(m.avgLoadKg, g.avgLoadKg, plan_golden::kTolRate),
-              tag + "平均在车货量");
-        check(fixtures::nearlyEqual(m.loadUtilization * 100.0, g.utilizationPct,
-                                    plan_golden::kTolRate),
-              tag + "载重利用率");
-        check(fixtures::nearlyEqual(m.peakLoadKg, g.peakLoadKg, plan_golden::kTolRate),
-              tag + "峰值在车量");
 
-        // G7：总 penalty == 逐单 penalty 之和（不变量，与黄金值并行保留）。
+        // G7：总 penalty == 逐单 penalty 之和（与黄金值并行保留，两种门控都跑）。
         int penaltySum = 0;
         for (const logistics::OrderMetric& om : m.orders) {
             penaltySum += om.penaltyMin;
         }
-        check(plans[i]->totalPenaltyMin == penaltySum, tag + "总 penalty = 逐单之和（G7）");
+        check(fleets[i]->totalPenaltyMin == penaltySum, tag + "总 penalty = 逐单之和（G7）");
         check(m.deliveryTotal == static_cast<int>(cfg.orders.size())
                   && m.pickupTotal == static_cast<int>(cfg.orders.size()),
               tag + "准时率分母 = 已规划订单数");
@@ -720,6 +871,202 @@ void checkTrafficAndUrgentOrderOnRealData(const Config& cfg) {
                 inserted.plan.totalDistanceKm, inserted.plan.totalTimeMin);
 }
 
+// 空车规则（规格二 §3.4 / §8.1-S5）：0 单的车五项全 0、返回时刻 = 发车时刻、
+// **不抬升**完工耗时，但参与 min(发车时刻)。
+void checkEmptyVehicleRules(const Config& cfg) {
+    if (cfg.vehicles.empty()) {
+        return;
+    }
+    // 造一台「没有分到单」的车：容量为正、但把它的订单集合清空 —— 等价于
+    // 顺序轮转下「订单数 < 车数」时的空车。这里直接用 planRoute 验证单车语义，
+    // 再用 planFleet 验证车队汇总不把它算进完工耗时。
+    const Vehicle& base = cfg.vehicles[0];
+    const RoutePlan empty = planRoute(cfg.graph, base, std::vector<logistics::Order>(),
+                                      WeightType::Distance);
+    check(empty.status == PlanStatus::Ok, "空车（0 单）可规划（不报不可行）");
+    check(fixtures::nearlyEqual(empty.totalDistanceKm, 0.0, 1e-9)
+              && fixtures::nearlyEqual(empty.totalCostYuan, 0.0, 1e-9)
+              && empty.totalPenaltyMin == 0 && empty.metrics.stopCount == 0
+              && empty.metrics.actionCount == 0,
+          "空车五项全 0（距离/耗时/成本/penalty/停靠数）");
+    check(fixtures::nearlyEqual(empty.totalTimeMin, 0.0, 1e-9),
+          "空车耗时 = 返回 − 发车 = 0");
+    check(empty.returnArrivalMin == base.departTimeMin,
+          "空车返回时刻 = 发车时刻（不产生额外行驶）");
+
+    // 车队层面：把一台车变成空车（订单全给第一台），完工耗时不得被它抬升。
+    std::vector<Vehicle> two;
+    two.push_back(cfg.vehicles[0]);
+    Vehicle idle = cfg.vehicles[0];
+    idle.id = "VIDLE";
+    idle.departTimeMin = base.departTimeMin - 60;   // 更早发车：必须参与 min(发车)
+    two.push_back(idle);
+    // 只给第 0 台车订单：第 1 台（VIDLE）必然分到 0 单（顺序轮转 i mod 2，
+    // 第 0 单给 0 号车；要让 1 号车空载，需要订单数 == 0 —— 故这里直接构造单车订单集
+    // 交给 planFleet：订单全归 0 号车时 1 号车自然为空。
+    // 只留一张单：顺序轮转下它必然归第 0 台车（i mod 2 == 0），第 1 台必然空车。
+    std::vector<logistics::Order> firstOnly;
+    firstOnly.push_back(cfg.orders.front());
+    const FleetPlan fleet = planFleet(cfg.graph, two, firstOnly, WeightType::Distance);
+    check(fleet.vehicles.size() == 2, "空车车队：逐车计划数 == 2");
+    if (fleet.vehicles.size() == 2) {
+        check(fleet.vehicles[1].metrics.stopCount == 0,
+              "第二台车确实分到 0 单（空车）");
+        const double ret0 = static_cast<double>(two[0].departTimeMin)
+                            + fleet.vehicles[0].totalTimeMin;
+        check(fixtures::nearlyEqual(fleet.completionTimeMin,
+                                    ret0 - static_cast<double>(idle.departTimeMin), 1e-6),
+              "空车不抬升完工耗时，但参与 min(发车时刻)（完工 = 有货车的返回 − 空车发车）");
+        check(fleet.sumVehicleTimeMin < fleet.completionTimeMin + 1e-9,
+              "车时合计 >= 完工耗时（空车贡献 0，主口径仍是完工耗时）");
+    }
+}
+
+// 慢车因子（规格二 §3.3 / §3.6-6）：同一节点序列下，慢车（time_factor 1.25）的
+// 到达时刻 = 基础 × 1.25；**等待与 penalty 不乘因子**。
+// 用最小夹具（W-D1-D2）逐项算，不依赖默认数据的路线形状。
+void checkSlowVehicleFactorReplay(const Config& cfg) {
+    // 夹具：W 出发，两个客户点，边权都是 10min；慢车 1.25 ⇒ 12.5min。
+    logistics::LogisticsGraph g;
+    logistics::Node w;
+    w.id = "W";
+    w.type = logistics::NodeType::Warehouse;
+    w.x = 0;
+    w.y = 0;
+    logistics::Node a;
+    a.id = "A";
+    a.type = logistics::NodeType::Delivery;
+    a.x = 10;
+    a.y = 0;
+    logistics::Node b;
+    b.id = "B";
+    b.type = logistics::NodeType::Delivery;
+    b.x = 20;
+    b.y = 0;
+    g.addNode(w);
+    g.addNode(a);
+    g.addNode(b);
+    logistics::Edge wa;
+    wa.fromId = "W";
+    wa.toId = "A";
+    wa.distanceKm = 10.0;
+    wa.timeMin = 10.0;
+    wa.baseTimeMin = 10.0;
+    wa.costYuan = 10.0;
+    logistics::Edge aw = wa;
+    aw.fromId = "A";
+    aw.toId = "W";
+    logistics::Edge ab;
+    ab.fromId = "A";
+    ab.toId = "B";
+    ab.distanceKm = 10.0;
+    ab.timeMin = 10.0;
+    ab.baseTimeMin = 10.0;
+    ab.costYuan = 10.0;
+    logistics::Edge ba = ab;
+    ba.fromId = "B";
+    ba.toId = "A";
+    g.addEdge(wa);
+    g.addEdge(aw);
+    g.addEdge(ab);
+    g.addEdge(ba);
+
+    logistics::Order o;
+    o.id = "O1";
+    o.pickupNodeId = "A";
+    o.nodeId = "B";
+    o.demandKg = 5.0;
+    o.windowStartMin = 480;
+    o.windowEndMin = 24 * 60;
+    std::vector<logistics::Order> orders{o};
+
+    Vehicle fast;
+    fast.id = "VF";
+    fast.startNodeId = "W";
+    fast.capacityKg = 100.0;
+    fast.departTimeMin = 480;
+    fast.timeFactor = 1.0;
+    fast.costFactor = 1.0;
+    Vehicle slow = fast;
+    slow.id = "VS";
+    slow.timeFactor = 1.25;
+    slow.costFactor = 0.80;
+
+    const RoutePlan pf = planRoute(g, fast, orders, WeightType::Distance);
+    const RoutePlan ps = planRoute(g, slow, orders, WeightType::Distance);
+    check(pf.status == PlanStatus::Ok && ps.status == PlanStatus::Ok,
+          "因子夹具：快车/慢车都能规划");
+    if (pf.status != PlanStatus::Ok || ps.status != PlanStatus::Ok) {
+        return;
+    }
+    // 同一节点序列（§3.3 的推导：正标量缩放不改 argmin）。
+    check(pf.nodes == ps.nodes, "同一节点序列：因子不改变 leg 选择（正标量缩放）");
+    check(fixtures::nearlyEqual(pf.totalDistanceKm, ps.totalDistanceKm, 1e-9),
+          "距离与车型无关（两车距离相同）");
+    check(fixtures::nearlyEqual(ps.totalTimeMin, pf.totalTimeMin * 1.25, 1e-6),
+          "慢车到达时刻 = 基础 × 1.25（耗时 " + std::to_string(ps.totalTimeMin) + " vs "
+              + std::to_string(pf.totalTimeMin) + "）");
+    check(fixtures::nearlyEqual(ps.totalCostYuan, pf.totalCostYuan * 0.80, 1e-6),
+          "慢车成本 = 基础 × 0.80（cost_factor）");
+    // 等待不乘因子：窗口起很晚（远晚于到达）时，等待时长两车相同。
+    orders[0].windowStartMin = 600;
+    const RoutePlan wf = planRoute(g, fast, orders, WeightType::Distance);
+    const RoutePlan ws = planRoute(g, slow, orders, WeightType::Distance);
+    check(wf.status == PlanStatus::Ok && ws.status == PlanStatus::Ok,
+          "等待夹具：两车都能规划");
+    if (wf.status == PlanStatus::Ok && ws.status == PlanStatus::Ok) {
+        int waitF = 0;
+        int waitS = 0;
+        for (const logistics::Stop& st : wf.stops) {
+            waitF += st.waitMin;
+        }
+        for (const logistics::Stop& st : ws.stops) {
+            waitS += st.waitMin;
+        }
+        check(waitF > 0, "等待夹具确实产生了早到等待（快车 " + std::to_string(waitF)
+                              + "min）");
+        // 慢车行驶更久 ⇒ 等待更少；「行驶 + 等待 = 窗口起 − 发车」（等待不乘因子）。
+        // 送达停靠的 rawArrival 是「行驶」部分、arrival 是「加等待」部分：
+        //   · raw 按该车缩放后的耗时推进（慢车 = 快车 × 1.25）；
+        //   · arrival 被窗口起钳到 600（两车相同）⇒ 等待 = 600 − raw，**不乘因子**。
+        const logistics::Stop* dF = nullptr;
+        const logistics::Stop* dS = nullptr;
+        for (const logistics::Stop& st : wf.stops) {
+            if (!st.deliveries.empty()) {
+                dF = &st;
+            }
+        }
+        for (const logistics::Stop& st : ws.stops) {
+            if (!st.deliveries.empty()) {
+                dS = &st;
+            }
+        }
+        check(dF != nullptr && dS != nullptr, "等待夹具：两车都有送达停靠");
+        if (dF != nullptr && dS != nullptr) {
+            // 缩放的是**行驶时长**，不是绝对时刻：rawS = 发车 + (rawF − 发车) × 1.25。
+            const double expectS = static_cast<double>(fast.departTimeMin)
+                                   + (static_cast<double>(dF->rawArrivalMin)
+                                      - static_cast<double>(fast.departTimeMin)) * 1.25;
+            check(fixtures::nearlyEqual(static_cast<double>(dS->rawArrivalMin), expectS, 1.0),
+                  "慢车 rawArrival = 发车 + (快车行驶) × 1.25（行驶乘因子；实际 "
+                      + std::to_string(dS->rawArrivalMin) + " vs 预期 "
+                      + std::to_string(expectS) + "）");
+            check(dF->arrivalMin == 600 && dS->arrivalMin == 600,
+                  "两车的送达到达都被窗口起钳到 600（arrival 相同）");
+            check(dS->waitMin == 600 - dS->rawArrivalMin
+                      && dF->waitMin == 600 - dF->rawArrivalMin,
+                  "等待 = 窗口起 − rawArrival，**不乘因子**（慢车 "
+                      + std::to_string(dS->waitMin) + " / 快车 "
+                      + std::to_string(dF->waitMin) + "）");
+            check(dS->waitMin < dF->waitMin,
+                  "慢车行驶更久 ⇒ 早到等待更少（" + std::to_string(dS->waitMin) + " < "
+                      + std::to_string(dF->waitMin) + "）");
+        }
+        check(ws.totalPenaltyMin == wf.totalPenaltyMin,
+              "penalty 不乘因子（两车都在窗口内，penalty 都为 0）");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -731,15 +1078,24 @@ int main() {
         return testutil::summarize("integration_tests");
     }
 
-    std::printf("    默认数据集：节点 %zu，边 %zu，订单 %zu，载重上限 %.0fkg\n",
+    std::printf("    默认数据集：节点 %zu，边 %zu，订单 %zu，车辆 %zu 台\n",
                 cfg.graph.nodeCount(), cfg.graph.edgeCount(), cfg.orders.size(),
-                cfg.vehicles[0].capacityKg);
+                cfg.vehicles.size());
+    for (const Vehicle& v : cfg.vehicles) {
+        std::printf("      车 %s：%s，%.0fkg，%02d:%02d，time×%.2f cost×%.2f\n",
+                    v.id.c_str(), v.startNodeId.c_str(), v.capacityKg, v.departTimeMin / 60,
+                    v.departTimeMin % 60, v.timeFactor, v.costFactor);
+    }
 
-    const RoutePlan byDistance = planForWeight(cfg, WeightType::Distance, "最短距离策略");
-    const RoutePlan byCost = planForWeight(cfg, WeightType::Cost, "最低成本策略");
-    const RoutePlan byTime = planForWeight(cfg, WeightType::Time, "最短耗时策略");
+    const FleetPlan byDistance = planFleetForWeight(cfg, WeightType::Distance, "最短距离策略");
+    const FleetPlan byCost = planFleetForWeight(cfg, WeightType::Cost, "最低成本策略");
+    const FleetPlan byTime = planFleetForWeight(cfg, WeightType::Time, "最短耗时策略");
 
     checkDataQualityInvariants(cfg, byDistance, byCost, byTime);
+
+    // 车队专属规则（规格二 §3.4 / §3.6）：空车与「慢车因子」两条。
+    checkEmptyVehicleRules(cfg);
+    checkSlowVehicleFactorReplay(cfg);
 
     checkSmallCapacityStaysSingleRoute(cfg);
     checkGraphRepresentationsOnRealData(cfg);

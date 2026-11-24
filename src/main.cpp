@@ -186,6 +186,8 @@ int main(int argc, char** argv) {
     // 程序没有任何入口能让人看到，验收时无法展示。
     // 供命令行核对：把规划的汇总值打出来，
     // 这样数据集调整后向导的期望值不会过期
+    // 供命令行核对：车队口径的规划汇总（规格二 §7.4 的**前六行**）。
+    // 逐车指标行（第 3–5 行）归 #43；本票先把路线行按车铺开（#43 的 102 常量需要它）。
     if (!opt.planSummary.empty()) {
         logistics::WeightType planWeight = logistics::WeightType::Distance;
         if (!parseWeight(opt.planSummary, planWeight)) {
@@ -196,22 +198,21 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "配置中没有车辆\n");
             return 1;
         }
-        const logistics::Vehicle& vehicle = config.vehicles.front();
-        const logistics::RoutePlan plan =
-            logistics::planRoute(config.graph, vehicle, config.orders, planWeight);
-        if (plan.status != logistics::PlanStatus::Ok) {
-            std::printf("不可行：%s\n", plan.reason.c_str());
+        const logistics::FleetPlan fleet =
+            logistics::planFleet(config.graph, config.vehicles, config.orders, planWeight);
+        if (!fleet.allOk) {
+            std::printf("不可行：%s\n", fleet.reason.c_str());
             return 0;
         }
-        const logistics::RouteMetrics& m = plan.metrics;
+        const logistics::RouteMetrics& m = fleet.metrics;
 
-        // 第 1 行：五项汇总 + 停靠点数 · 动作数（规格一 §6.3）。
+        // 第 1 行：五项汇总（总耗时 = **完工耗时** max(返回) − min(发车)，§3.4 主口径）。
         std::printf("总距离 %.3f km | 总耗时 %.3f min | 总成本 %.3f 元 | "
                     "总 penalty %d min | 停靠 %d 站 · 动作 %d 次\n",
-                    plan.totalDistanceKm, plan.totalTimeMin, plan.totalCostYuan,
-                    plan.totalPenaltyMin, m.stopCount, m.actionCount);
+                    fleet.totalDistanceKm, fleet.completionTimeMin, fleet.totalCostYuan,
+                    fleet.totalPenaltyMin, m.stopCount, m.actionCount);
 
-        // 第 2 行：三项新指标。分母为 0 的率打印「—」（不是 0%/100%）。
+        // 第 2 行：三项新指标（车队口径 = Σ命中/Σ分母；在车/利用率按时间加权，峰值取 max）。
         const auto rateText = [](int hit, int total) -> std::string {
             if (total <= 0) {
                 return "—";
@@ -233,33 +234,45 @@ int main(int argc, char** argv) {
                     rateText(m.normalOnTimeCount, m.normalTotal).c_str(),
                     m.avgLoadKg, m.loadUtilization * 100.0, m.peakLoadKg);
 
-        // 第 3 行：**逐单**超时（一个停靠上可能一单一迟一早，按停靠列会掩盖）。
+        // 第 3 行：**逐单**超时 + **车辆**（规格二 §7.4：多车下"哪台车迟了"是必要信息）。
         std::string late;
-        for (const logistics::OrderMetric& om : m.orders) {
-            if (!om.late) {
-                continue;
+        for (std::size_t vi = 0; vi < fleet.vehicles.size(); ++vi) {
+            const logistics::RoutePlan& plan = fleet.vehicles[vi];
+            for (const logistics::OrderMetric& om : plan.metrics.orders) {
+                if (!om.late) {
+                    continue;
+                }
+                if (!late.empty()) {
+                    late += "、";
+                }
+                late += om.orderId + "@" + om.nodeId + "(车 "
+                        + config.vehicles[vi].id + ", +" + std::to_string(om.penaltyMin)
+                        + "min)";
             }
-            if (!late.empty()) {
-                late += "、";
-            }
-            late += om.orderId + "@" + om.nodeId + "(+" + std::to_string(om.penaltyMin) + "min)";
         }
         std::printf("超时订单：%s\n", late.empty() ? "（无）" : late.c_str());
 
-        // 第 4 行：完整节点序列（oracle 算术对拍需要；GUI 不显示这一行）。
-        std::printf("路线");
-        for (const std::string& id : plan.nodes) {
-            std::printf(" %s", id.c_str());
+        // 第 4–6 行：每车一条完整节点序列（oracle 逐车复算的输入；空车只有起点）。
+        for (std::size_t vi = 0; vi < fleet.vehicles.size(); ++vi) {
+            const logistics::RoutePlan& plan = fleet.vehicles[vi];
+            std::printf("路线 %s", config.vehicles[vi].id.c_str());
+            if (plan.nodes.empty()) {
+                std::printf(" %s", config.vehicles[vi].startNodeId.c_str());
+            } else {
+                for (const std::string& id : plan.nodes) {
+                    std::printf(" %s", id.c_str());
+                }
+            }
+            std::printf("\n");
         }
-        std::printf("\n");
         return 0;
     }
 
-    // --dump-plan：**仅开发/校验用，供 oracle 对拍**。输出停靠级的机器可读文本，
-    // 每停靠一行（含动作与时间），不含展示噪声。停靠是**真源**（RoutePlan::stops），
-    // phase / 动作集 / 逐单 penalty / 离站在车量都按规格一 §4.4 / MC-A03/A04 的口径。
+    // --dump-plan：**仅开发/校验用，供 oracle 对拍**。输出停靠级的机器可读文本：
+    // 每台车一段（PLAN <车辆ID> <start> <return> <depart> + 该车 STOP 行 + METRICS 自报值），
+    // 末尾一行 FLEET 车队自报值。oracle 按车复算再汇总，逐车 + 汇总都要与 app 一致。
     //
-    // 为什么需要它：--plan-summary 第 4 行是**节点序列（含途经节点）**，在含重访时
+    // 为什么需要它：--plan-summary 的路线行是**节点序列（含途经节点）**，在含重访时
     // oracle 无法由它唯一还原逐单动作归属（同一节点会被合并/重访）。oracle 不猜动作；
     // 由 app 直接吐停靠级真源，oracle 只对给定停靠序列复算算术。
     // **不改变 --plan-summary 的任何可见输出**（这是独立入口）。
@@ -273,53 +286,84 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "配置中没有车辆\n");
             return 1;
         }
-        const logistics::Vehicle& vehicle = config.vehicles.front();
-        const logistics::RoutePlan plan =
-            logistics::planRoute(config.graph, vehicle, config.orders, dumpWeight);
-        if (plan.status != logistics::PlanStatus::Ok) {
-            std::printf("不可行：%s\n", plan.reason.c_str());
-            return 0;
-        }
+        const logistics::FleetPlan fleet =
+            logistics::planFleet(config.graph, config.vehicles, config.orders, dumpWeight);
         // 订单窗口按单查（Stop 只存 orderId，窗口在订单表里）。
         std::map<std::string, const logistics::Order*> orderById;
         for (const logistics::Order& o : config.orders) {
             orderById[o.id] = &o;
         }
-        // PLAN <startNode> <returnNode> <departMin>
-        std::printf("PLAN %s %s %d\n", plan.nodes.front().c_str(),
-                    plan.nodes.back().c_str(), vehicle.departTimeMin);
-        // STOP <idx> <nodeId> <phase:U|N> <rawMin> <waitMin> <arrMin> \
-        //      <pickups:id,id..> <deliveries:id:ws:we:penalty,..> <remainingLoadKg>
-        for (std::size_t i = 0; i < plan.stops.size(); ++i) {
-            const logistics::Stop& s = plan.stops[i];
-            std::string pickups;
-            for (const std::string& id : s.pickups) {
-                if (!pickups.empty()) {
-                    pickups += ",";
-                }
-                pickups += id;
+        // 自报指标的一行（逐车 / 车队同形）：13 字段由计数与算术量组成，
+        // 两率在 oracle 侧用「命中/分母」重算，避免「—」与 100% 的口径歧义。
+        const auto printMetrics = [](const char* tag, const std::string& id,
+                                     const logistics::RoutePlan& plan,
+                                     double capacityKg) {
+            const logistics::RouteMetrics& m = plan.metrics;
+            std::printf("%s %s %.3f %.3f %.3f %d %d %d %d %d %d %d %d %d %d %d %.3f %.3f %.3f\n",
+                        tag, id.c_str(), plan.totalDistanceKm, plan.totalTimeMin,
+                        plan.totalCostYuan, plan.totalPenaltyMin, m.stopCount, m.actionCount,
+                        m.pickupOnTimeCount, m.pickupTotal, m.deliveryOnTimeCount,
+                        m.deliveryTotal, m.urgentOnTimeCount, m.urgentTotal,
+                        m.normalOnTimeCount, m.normalTotal, m.avgLoadKg,
+                        m.loadUtilization * 100.0, m.peakLoadKg);
+        };
+        for (std::size_t vi = 0; vi < fleet.vehicles.size(); ++vi) {
+            const logistics::Vehicle& vehicle = config.vehicles[vi];
+            const logistics::RoutePlan& plan = fleet.vehicles[vi];
+            if (plan.status != logistics::PlanStatus::Ok) {
+                std::printf("PLAN %s - - %d\n", vehicle.id.c_str(), vehicle.departTimeMin);
+                std::printf("INFEASIBLE %s %s\n", vehicle.id.c_str(), plan.reason.c_str());
+                continue;
             }
-            std::string deliveries;
-            for (const logistics::StopDelivery& d : s.deliveries) {
-                int ws = 0;
-                int we = 0;
-                const std::map<std::string, const logistics::Order*>::const_iterator it =
-                    orderById.find(d.orderId);
-                if (it != orderById.end()) {
-                    ws = it->second->windowStartMin;
-                    we = it->second->windowEndMin;
+            // PLAN <vehicleId> <startNode> <returnNode> <departMin>
+            std::printf("PLAN %s %s %s %d\n", vehicle.id.c_str(),
+                        plan.nodes.front().c_str(), plan.nodes.back().c_str(),
+                        vehicle.departTimeMin);
+            // STOP <idx> <nodeId> <phase:U|N> <rawMin> <waitMin> <arrMin> \
+            //      <pickups:id,id..> <deliveries:id:ws:we:penalty,..> <remainingLoadKg>
+            for (std::size_t i = 0; i < plan.stops.size(); ++i) {
+                const logistics::Stop& s = plan.stops[i];
+                std::string pickups;
+                for (const std::string& id : s.pickups) {
+                    if (!pickups.empty()) {
+                        pickups += ",";
+                    }
+                    pickups += id;
                 }
-                if (!deliveries.empty()) {
-                    deliveries += ",";
+                std::string deliveries;
+                for (const logistics::StopDelivery& d : s.deliveries) {
+                    int ws = 0;
+                    int we = 0;
+                    const std::map<std::string, const logistics::Order*>::const_iterator it =
+                        orderById.find(d.orderId);
+                    if (it != orderById.end()) {
+                        ws = it->second->windowStartMin;
+                        we = it->second->windowEndMin;
+                    }
+                    if (!deliveries.empty()) {
+                        deliveries += ",";
+                    }
+                    deliveries += d.orderId + ":" + std::to_string(ws) + ":"
+                                  + std::to_string(we) + ":" + std::to_string(d.penaltyMin);
                 }
-                deliveries += d.orderId + ":" + std::to_string(ws) + ":" + std::to_string(we)
-                              + ":" + std::to_string(d.penaltyMin);
+                std::printf("STOP %zu %s %c %d %d %d %s %s %.3f\n", i, s.nodeId.c_str(),
+                            (s.phase == logistics::StopPhase::Urgent) ? 'U' : 'N',
+                            s.rawArrivalMin, s.waitMin, s.arrivalMin,
+                            pickups.empty() ? "-" : pickups.c_str(),
+                            deliveries.empty() ? "-" : deliveries.c_str(), s.remainingLoadKg);
             }
-            std::printf("STOP %zu %s %c %d %d %d %s %s %.3f\n", i, s.nodeId.c_str(),
-                        (s.phase == logistics::StopPhase::Urgent) ? 'U' : 'N',
-                        s.rawArrivalMin, s.waitMin, s.arrivalMin,
-                        pickups.empty() ? "-" : pickups.c_str(),
-                        deliveries.empty() ? "-" : deliveries.c_str(), s.remainingLoadKg);
+            printMetrics("METRICS", vehicle.id, plan, vehicle.capacityKg);
+        }
+        // 车队自报值（与 --plan-summary 第 1–2 行同源）：13 字段 + 完工耗时口径。
+        {
+            const logistics::RouteMetrics& m = fleet.metrics;
+            std::printf("FLEET %.3f %.3f %.3f %d %d %d %d %d %d %d %d %d %d %d %.3f %.3f %.3f\n",
+                        fleet.totalDistanceKm, fleet.completionTimeMin, fleet.totalCostYuan,
+                        fleet.totalPenaltyMin, fleet.stopCount, fleet.actionCount,
+                        m.pickupOnTimeCount, m.pickupTotal, m.deliveryOnTimeCount,
+                        m.deliveryTotal, m.urgentOnTimeCount, m.urgentTotal,
+                        m.normalOnTimeCount, m.normalTotal, m.avgLoadKg,
+                        m.loadUtilization * 100.0, m.peakLoadKg);
         }
         return 0;
     }
@@ -559,6 +603,36 @@ int main(int argc, char** argv) {
                                  v.id.c_str(), seg.toUtf8().constData());
                     return 1;
                 }
+                // G13：运行状态**六项**齐备（§7.5②）。
+                {
+                    const char* need[] = {"当前位置：", "下一站：", "阶段：", "车上载重：",
+                                          "剩余待送", "已发生 penalty："};
+                    for (const char* key : need) {
+                        if (!seg.contains(QString::fromUtf8(key))) {
+                            std::fprintf(stderr,
+                                         "[ui-probe] 车辆 %s 运行状态缺少「%s」：\n%s\n",
+                                         v.id.c_str(), key, seg.toUtf8().constData());
+                            return 1;
+                        }
+                    }
+                    const QRegularExpression phaseRe(QStringLiteral("阶段：([^\n]+)"));
+                    const QRegularExpressionMatch pm = phaseRe.match(seg);
+                    const QString phase = pm.hasMatch() ? pm.captured(1).trimmed() : QString();
+                    if (phase != QStringLiteral("紧急") && phase != QStringLiteral("普通")
+                        && phase != QStringLiteral("已收工")) {
+                        std::fprintf(stderr, "[ui-probe] 车辆 %s 阶段列不是 紧急/普通/已收工：%s\n",
+                                     v.id.c_str(), phase.toUtf8().constData());
+                        return 1;
+                    }
+                    const QRegularExpression doneRe(
+                        QStringLiteral("已送达 ([0-9]+) 单 · 剩余待送 ([0-9.]+) kg"));
+                    if (!doneRe.match(seg).hasMatch()) {
+                        std::fprintf(stderr,
+                                     "[ui-probe] 车辆 %s 缺少「已送达 X 单 · 剩余待送 Y kg」：\n%s\n",
+                                     v.id.c_str(), seg.toUtf8().constData());
+                        return 1;
+                    }
+                }
                 // 逐车「车上载重 ≤ 该车容量」（**该车**的 capacity，不用 front()）
                 const QRegularExpression totalRe(
                     QStringLiteral("车上载重：([0-9.]+) kg"));
@@ -744,9 +818,34 @@ int main(int argc, char** argv) {
                              routePanel.toUtf8().constData());
                 return 1;
             }
-            std::printf("[ui-probe] 路线信息面板：停靠 %s 站 · 动作 %s 次（四片段齐备）\n",
+            // G9（规格二 §7.5①）：`── 逐车指标 ──` 小节 + **每车一行 7 项**。
+            if (!routePanel.contains(QStringLiteral("── 逐车指标 ──"))) {
+                std::fprintf(stderr, "[ui-probe] 路线信息面板缺少「── 逐车指标 ──」小节：\n%s\n",
+                             routePanel.toUtf8().constData());
+                return 1;
+            }
+            const QStringList routeLines =
+                routePanel.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+            int metricRows = 0;
+            const QRegularExpression vehicleLine(
+                QStringLiteral("^([A-Za-z0-9_]+)  距离 ([0-9.]+) km · 耗时 ([0-9.]+) min · "
+                               "成本 ([0-9.]+) 元 · penalty ([0-9]+) · 停靠 ([0-9]+) · "
+                               "利用率 ([0-9.]+)% · 取货 (.+) · 送达 (.+)$"));
+            for (const QString& line : routeLines) {
+                if (vehicleLine.match(line).hasMatch()) {
+                    ++metricRows;
+                }
+            }
+            if (metricRows != static_cast<int>(config.vehicles.size())) {
+                std::fprintf(stderr,
+                             "[ui-probe] 逐车指标行数 %d != 车辆数 %zu：\n%s\n", metricRows,
+                             config.vehicles.size(), routePanel.toUtf8().constData());
+                return 1;
+            }
+            std::printf("[ui-probe] 路线信息面板：停靠 %s 站 · 动作 %s 次（四片段齐备）；"
+                        "逐车指标 %d 行（每行 7 项）\n",
                         sam.captured(1).toUtf8().constData(),
-                        sam.captured(2).toUtf8().constData());
+                        sam.captured(2).toUtf8().constData(), metricRows);
         }
 
         // ---- G10：超时订单面板 **8 列**、逐单一行（MC-E02）----
@@ -822,6 +921,83 @@ int main(int argc, char** argv) {
             }
             std::printf("[ui-probe] 超时订单面板表头 8 列（含车辆/档位），%d 行 == 迟到订单数\n",
                         expectLateRows);
+        }
+
+        // ---- G15：画布三色归属快照（规格二 §7.5⑤）----
+        // 每条车路线边都要有归属；共享边归属 = 行序最前那台车；选中车加粗。
+        {
+            const QString ownership = window.canvasOwnershipSnapshot();
+            const QStringList rows =
+                ownership.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+            if (rows.isEmpty()) {
+                std::fprintf(stderr, "[ui-probe] 画布归属快照为空（没有任何车路线边）\n");
+                return 1;
+            }
+            const QRegularExpression rowRe(
+                QStringLiteral("^([A-Za-z0-9_]+)->([A-Za-z0-9_]+) owner=([A-Za-z0-9_]+) "
+                               "selected=([01]) all=([A-Za-z0-9_,]+)$"));
+            // 归属必须按行序最前：同一有向边若被多台车经过，owner 必须是行序最靠前的车。
+            std::vector<std::string> order;
+            for (const logistics::Vehicle& v : config.vehicles) {
+                order.push_back(v.id);
+            }
+            const auto rankOf = [&order](const QString& id) -> int {
+                for (std::size_t i = 0; i < order.size(); ++i) {
+                    if (QString::fromStdString(order[i]) == id) {
+                        return static_cast<int>(i);
+                    }
+                }
+                return -1;
+            };
+            int selectedRows = 0;
+            for (const QString& line : rows) {
+                const QRegularExpressionMatch m = rowRe.match(line);
+                if (!m.hasMatch()) {
+                    std::fprintf(stderr, "[ui-probe] 画布归属行格式不符：%s\n",
+                                 line.toUtf8().constData());
+                    return 1;
+                }
+                if (rankOf(m.captured(3)) < 0) {
+                    std::fprintf(stderr, "[ui-probe] 画布归属车不是配置里的车辆：%s\n",
+                                 line.toUtf8().constData());
+                    return 1;
+                }
+                if (m.captured(4) == QStringLiteral("1")) {
+                    ++selectedRows;
+                }
+                // 共享边归属 = **行序最前**那台车（R8 的反向验证点：改成最后行序必须红）
+                const QStringList owners = m.captured(5).split(QLatin1Char(','));
+                if (owners.isEmpty()) {
+                    std::fprintf(stderr, "[ui-probe] 画布归属行没有 all= 清单：%s\n",
+                                 line.toUtf8().constData());
+                    return 1;
+                }
+                int bestRank = -1;
+                for (const QString& oid : owners) {
+                    const int rank = rankOf(oid);
+                    if (rank < 0) {
+                        std::fprintf(stderr, "[ui-probe] 画布 all= 里有非配置车辆：%s\n",
+                                     line.toUtf8().constData());
+                        return 1;
+                    }
+                    if (bestRank < 0 || rank < bestRank) {
+                        bestRank = rank;
+                    }
+                }
+                if (rankOf(m.captured(3)) != bestRank) {
+                    std::fprintf(stderr,
+                                 "[ui-probe] 共享边归属不是行序最前那台车：%s（期望 rank %d）\n",
+                                 line.toUtf8().constData(), bestRank);
+                    return 1;
+                }
+            }
+            if (selectedRows == 0) {
+                std::fprintf(stderr,
+                             "[ui-probe] 画布没有任何「属于选中车」的边（选中加粗失效）\n");
+                return 1;
+            }
+            std::printf("[ui-probe] 画布归属 %zu 条边（归属按行序最前，选中车加粗 %d 条）\n",
+                        rows.size(), selectedRows);
         }
 
         std::printf("[ui-probe] 通过\n");
