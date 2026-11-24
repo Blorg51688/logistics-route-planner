@@ -5,19 +5,28 @@
 // 命令写在用到它的注释里；结构性判据（F1–F7、前缀载重、阶段、FIFO、停靠唯一性、
 // 确定性）直接断言，不依赖数字。
 //
-// 覆盖规格一 #18 §12 的 12 条不变量：
-//   ① 每单恰服务一次（A 一次取、一次送）      -> testInvariantEveryOrderServedExactlyOnce
-//   ② A 停靠索引 < B 停靠索引                 -> 同上 + testInvariantPickupBeforeDelivery
-//   ③ 前缀载重 0..C、先卸后装                 -> testInvariantPrefixLoad
-//   ④ 硬优先（普通停靠不先于紧急）            -> testInvariantHardPriority
-//   ⑤ 订单级 FIFO                            -> testUrgentFifoOrder / testInvariantFifo
-//   ⑥ 同刻至多一张紧急单在车                  -> testInvariantOneUrgentOnboard
-//   ⑦ 同阶段同节点至多一次停靠（FIFO 强制除外）-> testInvariantSingleStopPerNodePhase
-//   ⑧ 停靠零耗时 / 早到等待 / ==we 不迟到     -> testLateArrivalIsMarkedWithPenalty
-//   ⑨ penalty 逐单                            -> testMultipleOrdersOnSameNodeMergeIntoOneStop
-//   ⑩ 暂存守恒、期末 0、单堆锁站              -> testOffloadConservesAndReclaims
-//   ⑪ 取回先于送达                            -> 同上
-//   ⑫ 确定性                                  -> testDeterministicSameInput
+// 覆盖规格一 #18 §12 的 12 条不变量。**每条都有落点**，两种方式：
+//   (a) 通用守卫 checkStructuralInvariants（每个用例都调用一次，机械复核）；
+//   (b) 专门的用例（盯住某一条的边界形态）。
+//
+//  ① 每单恰好一次取货 + 一次送达      (a) + testFallbackProducesCompleteRoute
+//  ② A 停靠索引 < B 停靠索引          (a)
+//  ③ 前缀载重 ∈ [0,C]、先卸后装       (a) + testSingleOrderRouteIsFullyCorrect
+//  ④ 硬优先（普通停靠不先于紧急）      (a) + testUrgentOrderIsServedFirstDespiteBeingFarther
+//  ⑤ 订单级 FIFO                     testUrgentFifoOrder（索引 + 时刻双断言）
+//  ⑥ 同刻至多一张紧急单在车            (a)
+//  ⑦ 同阶段同节点至多一次停靠（强制重访例外）(a) + testFifoForcedRevisit
+//  ⑧ 停靠零耗时 / 早到等待 / ==we 不迟到  testLateArrivalIsMarkedWithPenalty + (a)
+//  ⑨ penalty 逐单                     testMultipleOrdersOnSameNodeMergeIntoOneStop
+// ⑩ 暂存守恒、期末 0、单堆锁站         testOffloadConservesAndReclaims +
+//                                      testTwoUrgentOffloadsMergeIntoSingleStashPile
+// ⑪ 取回先于送达                     testOffloadConservesAndReclaims + testReplanKeepsStash
+// ⑫ 输出确定性（字典序 + tieKey）       testDeterministicSameInput +
+//                                      testTieBreakIsDeterministicByNodeId
+//
+// 期望值纪律：**不手算**。具体数字一律由 tools/oracle.py 对该夹具的节点序列复算，
+// 命令写在用到它的注释里；结构性判据（F1–F7、前缀载重、阶段、FIFO、停靠唯一性、
+// 确定性）直接断言，不依赖数字。
 #include <cmath>
 #include <string>
 #include <vector>
