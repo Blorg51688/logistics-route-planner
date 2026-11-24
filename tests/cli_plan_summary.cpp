@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include "core/Config.h"
+#include "core/RoutePlanner.h"
 #include "io/ConfigLoader.h"
 #include "plan_golden.h"
 #include "test_util.h"
@@ -721,6 +722,102 @@ int main(int argc, char** argv) {
                   && parsedByStrategy["time"].time <= parsedByStrategy["cost"].time + tol,
               "G12 时间策略的完工耗时不劣于距离/成本策略");
         std::printf("    G12 三策略分配映射两两不同；自身目标各自最优（车端口径）\n");
+    }
+
+
+    // ---- G19（#42）：界面初始规划与 CLI 三阶段 ALLOC **逐单一致** ----
+    //
+    // 两条用户可见路径：
+    //   · 界面：`--ui-probe` 打印的「[ui-probe] 分配 O01=V01,…」（MainWindow 的初始规划）；
+    //   · CLI：`--dump-plan distance` 的 ALLOC 行（planFleet 的分配表）。
+    // 守卫盯的是 #41 关闭时定位的真缺陷：GUI 曾自己按「订单 ID 升序 + i % 车数」顺序轮转
+    // 分派、根本没走 #40 的三阶段分配；只有 CLI 走 planFleet ⇒ 界面与命令行是两套分配。
+    {
+        const auto pairsOf = [](const std::string& text) {
+            std::vector<std::pair<std::string, std::string> > out;
+            std::size_t pos = 0;
+            while (pos <= text.size()) {
+                const std::size_t comma = text.find(',', pos);
+                const std::string chunk =
+                    text.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                const std::size_t eq = chunk.find('=');
+                if (eq != std::string::npos && eq > 0) {
+                    out.push_back(std::make_pair(chunk.substr(0, eq), chunk.substr(eq + 1)));
+                }
+                if (comma == std::string::npos) {
+                    break;
+                }
+                pos = comma + 1;
+            }
+            return out;
+        };
+
+        const std::string probe = runCapture(
+            "QT_QPA_PLATFORM=offscreen '" + appPath + "' --ui-probe 2>/dev/null");
+        std::string guiAlloc;
+        for (const std::string& line : splitLines(probe)) {
+            const std::string prefix = "[ui-probe] 分配 ";
+            if (line.compare(0, prefix.size(), prefix) == 0) {
+                guiAlloc = line.substr(prefix.size());
+            }
+        }
+        check(!guiAlloc.empty(), "G19 --ui-probe 打印界面侧的分配快照（用户可见）");
+
+        const std::string dumpDistance =
+            runCapture("'" + appPath + "' --dump-plan distance 2>/dev/null");
+        const AllocDump ad = parseAllocDump(dumpDistance);
+        check(ad.hasAlloc, "G19 --dump-plan distance 含 ALLOC 行");
+
+        // ALLOC 行 -> "O01=V01,…" 的同一形状（订单 ID 升序），逐单比对
+        std::string cliAlloc;
+        for (std::size_t i = 0; i < ad.orderIds.size(); ++i) {
+            if (!cliAlloc.empty()) {
+                cliAlloc += ",";
+            }
+            cliAlloc += ad.orderIds[i] + "=" + ad.vehicleIds[i];
+        }
+        const std::vector<std::pair<std::string, std::string> > guiPairs = pairsOf(guiAlloc);
+        const std::vector<std::pair<std::string, std::string> > cliPairs = pairsOf(cliAlloc);
+        bool same = guiPairs.size() == cliPairs.size() && !guiPairs.empty();
+        std::string firstDiff;
+        if (same) {
+            for (std::size_t i = 0; i < guiPairs.size(); ++i) {
+                if (guiPairs[i].first != cliPairs[i].first
+                    || guiPairs[i].second != cliPairs[i].second) {
+                    same = false;
+                    if (firstDiff.empty()) {
+                        firstDiff = guiPairs[i].first + "=" + guiPairs[i].second + " / CLI "
+                                    + cliPairs[i].first + "=" + cliPairs[i].second;
+                    }
+                }
+            }
+        } else {
+            firstDiff = "单数 " + std::to_string(guiPairs.size()) + " vs "
+                        + std::to_string(cliPairs.size());
+        }
+        check(same, "G19 界面分配与 CLI 三阶段 ALLOC 逐单一致（" + std::to_string(guiPairs.size())
+                        + " 单" + (firstDiff.empty() ? std::string() : "，差异 " + firstDiff) + "）");
+
+        // 判别力：顺序轮转基线与三阶段分配**不同** —— 界面若退回轮转基线，这条必红。
+        const logistics::FleetPlan seq = logistics::planFleetSequentialBaseline(
+            cfg.graph, cfg.vehicles, cfg.orders, logistics::WeightType::Distance);
+        std::size_t seqDiff = 0;
+        for (std::size_t i = 0; i < seq.allocationOrderIds.size() && i < cliPairs.size(); ++i) {
+            if (seq.allocationOrderIds[i] != cliPairs[i].first) {
+                ++seqDiff;
+                continue;
+            }
+            const std::size_t v = seq.allocationVehicleIndex[i];
+            const std::string vid = (v < cfg.vehicles.size()) ? cfg.vehicles[v].id : "-";
+            if (vid != cliPairs[i].second) {
+                ++seqDiff;
+            }
+        }
+        check(seqDiff > 0,
+              "G19（判别力）顺序轮转基线与三阶段分配在 " + std::to_string(seqDiff)
+                  + " 单上不同 —— 界面若退回轮转基线，上面的逐单比对必红");
+        std::printf("    G19 界面分配 == CLI ALLOC（%d 单）；轮转基线与之相差 %d 单\n",
+                    static_cast<int>(guiPairs.size()), static_cast<int>(seqDiff));
     }
 
     return testutil::summarize("cli_plan_summary");
