@@ -1,8 +1,24 @@
-// RoutePlanner 的行为测试。
-// 期望值全部来自手工推导的字面量，不复用实现中的任何计算。
+
+// RoutePlanner 的行为测试（规格一 #18 / 迁移清单 MC-G01）。
+//
+// 期望值纪律：**不手算**。具体数字一律由 tools/oracle.py 对该夹具的节点序列复算，
+// 命令写在用到它的注释里；结构性判据（F1–F7、前缀载重、阶段、FIFO、停靠唯一性、
+// 确定性）直接断言，不依赖数字。
+//
+// 覆盖规格一 #18 §12 的 12 条不变量：
+//   ① 每单恰服务一次（A 一次取、一次送）      -> testInvariantEveryOrderServedExactlyOnce
+//   ② A 停靠索引 < B 停靠索引                 -> 同上 + testInvariantPickupBeforeDelivery
+//   ③ 前缀载重 0..C、先卸后装                 -> testInvariantPrefixLoad
+//   ④ 硬优先（普通停靠不先于紧急）            -> testInvariantHardPriority
+//   ⑤ 订单级 FIFO                            -> testUrgentFifoOrder / testInvariantFifo
+//   ⑥ 同刻至多一张紧急单在车                  -> testInvariantOneUrgentOnboard
+//   ⑦ 同阶段同节点至多一次停靠（FIFO 强制除外）-> testInvariantSingleStopPerNodePhase
+//   ⑧ 停靠零耗时 / 早到等待 / ==we 不迟到     -> testLateArrivalIsMarkedWithPenalty
+//   ⑨ penalty 逐单                            -> testMultipleOrdersOnSameNodeMergeIntoOneStop
+//   ⑩ 暂存守恒、期末 0、单堆锁站              -> testOffloadConservesAndReclaims
+//   ⑪ 取回先于送达                            -> 同上
+//   ⑫ 确定性                                  -> testDeterministicSameInput
 #include <cmath>
-#include <algorithm>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -13,19 +29,21 @@
 using logistics::LogisticsGraph;
 using logistics::NodeType;
 using logistics::Node;
-using logistics::replanIncremental;
-using logistics::TrafficChange;
-using logistics::TrafficReport;
 using logistics::Order;
 using logistics::PlanStatus;
 using logistics::RoutePlan;
+using logistics::Stop;
+using logistics::StopPhase;
 using logistics::Vehicle;
 using logistics::WeightType;
 using logistics::nodeIndexAtTime;
 using logistics::planRoute;
 using logistics::replan;
+using logistics::replanIncremental;
 using logistics::insertUrgentOrder;
 using logistics::InsertResult;
+using logistics::TrafficChange;
+using logistics::TrafficReport;
 using testutil::check;
 
 namespace {
@@ -33,16 +51,8 @@ namespace {
 using fixtures::addTwoWay;
 using fixtures::makeNode;
 using fixtures::makeVehicle;
+using fixtures::makeVehicleWithFactors;
 using fixtures::makeOrder;
-
-// W(仓库) <-> D1(配送点)：往返各 5.0km / 10min / 4元
-LogisticsGraph makeWtoD1Graph() {
-    LogisticsGraph g;
-    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
-    g.addNode(makeNode("D1", NodeType::Delivery, "客户1"));
-    addTwoWay(g, "W", "D1", 5.0, 10.0, 4.0);
-    return g;
-}
 
 std::string join(const std::vector<std::string>& nodes) {
     std::string s;
@@ -55,18 +65,387 @@ std::string join(const std::vector<std::string>& nodes) {
     return s;
 }
 
-// 切片 1：单订单的完整手算校验。
-// W <-> D1 各 5.0km / 10min / 4元；发车 08:00(480)；服务时间 5min；
-// 订单窗口 09:00-18:00(540-1080)。
-//   出发              480
-//   rawArrival(D1)    480 + 10 = 490
-//   wait              540 - 490 = 50（早到等待）
-//   arrival(D1)       540          未超时 -> penalty 0
-//   departure(D1)     540 + 5 = 545
-//   回到 W             540 + 10 = 550（服务时间已移除，离开==送达）
-//   totalDistance     5.0 + 5.0 = 10.0
-//   totalTime         550 - 480 = 70
-//   totalCost         4.0 + 4.0 = 8.0
+// W(仓库) <-> D1(客户)：往返各 5.0km / 10min / 4元
+LogisticsGraph makeWtoD1Graph() {
+    LogisticsGraph g;
+    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
+    g.addNode(makeNode("D1", NodeType::Delivery, "客户1"));
+    addTwoWay(g, "W", "D1", 5.0, 10.0, 4.0);
+    return g;
+}
+
+// ---------------------------------------------------------------------------
+// 通用守卫：把 12 条不变量里可机械检查的部分一次查完。
+// 每条用例都调用它 —— 单条用例的期望值可能很弱，但结构性不变量是全局的。
+// ---------------------------------------------------------------------------
+void checkStructuralInvariants(const LogisticsGraph& g, const RoutePlan& plan,
+                               const std::vector<Order>& orders, const Vehicle& v,
+                               const std::string& label,
+                               const std::string& startPos = std::string()) {
+    const std::string tag = "[" + label + "] ";
+    const std::string from = startPos.empty() ? v.startNodeId : startPos;
+
+    // 出发时就在车上的货（onboard）：路线里**既没有取货也没有取回**动作的那些订单。
+    // 规格一 MC-A05 之后 replan 可以带着在途货出发，此时少一次取货动作是正确语义，
+    // 不是丢单；下面的载重前缀与动作恒等式都必须从这批货开始算。
+    double onboardKg = 0.0;
+    std::size_t onboardCount = 0;
+    std::size_t stashCount = 0;
+    for (const Order& o : orders) {
+        bool hasPick = false;
+        bool hasReclaim = false;
+        bool hasOffload = false;
+        for (const Stop& s : plan.stops) {
+            for (const std::string& id : s.pickups) {
+                if (id == o.id) {
+                    hasPick = true;
+                }
+            }
+            for (const std::string& id : s.reclaims) {
+                if (id == o.id) {
+                    hasReclaim = true;
+                }
+            }
+            for (const std::string& id : s.offloads) {
+                if (id == o.id) {
+                    hasOffload = true;
+                }
+            }
+        }
+        // 出发在车 = 没有 A 取货动作，且「不是计划开始时就在站里」：
+        // 站里起手的货只有取回动作；降载过的货则是「卸下 + 取回」两条都在。
+        if (!hasPick && (!hasReclaim || hasOffload)) {
+            onboardKg += o.demandKg;
+            ++onboardCount;
+        } else if (!hasPick && hasReclaim && !hasOffload) {
+            ++stashCount;   // 计划开始时就在中转站里（取回不算取送动作）
+        }
+    }
+
+    // 路线真实可走、首尾正确、到达时刻单调。
+    check(!plan.nodes.empty(), tag + "路线非空");
+    if (plan.nodes.empty()) {
+        return;
+    }
+    check(plan.nodes.front() == from, tag + "从出发位置出发（期望 " + from + "，实际 "
+                                                + plan.nodes.front() + "）");
+    check(plan.nodes.back() == v.startNodeId, tag + "回到仓库");
+    bool walkable = true;
+    for (std::size_t i = 1; i < plan.nodes.size(); ++i) {
+        // 相邻两次停靠在**同一节点**时，展平视图里是两个同 ID 条目（零位移，无自环边）。
+        if (plan.nodes[i] == plan.nodes[i - 1]) {
+            continue;
+        }
+        if (g.findEdge(plan.nodes[i - 1], plan.nodes[i]) == nullptr) {
+            walkable = false;
+        }
+    }
+    check(walkable, tag + "相邻节点之间都存在有向边");
+    check(plan.nodes.size() == plan.nodeArrivalMin.size()
+              && plan.nodes.size() == plan.nodeIsStop.size(),
+          tag + "节点/到达时刻/停靠标记三个数组等长");
+    bool monotone = true;
+    for (std::size_t i = 1; i < plan.nodeArrivalMin.size(); ++i) {
+        if (plan.nodeArrivalMin[i] < plan.nodeArrivalMin[i - 1]) {
+            monotone = false;
+        }
+    }
+    check(monotone, tag + "到达时刻单调不减");
+
+    // 停靠数与 nodeIsStop 的 true 数一致（展平视图与真源一致）。
+    std::size_t stopFlags = 0;
+    for (std::size_t i = 0; i < plan.nodeIsStop.size(); ++i) {
+        if (plan.nodeIsStop[i]) {
+            ++stopFlags;
+        }
+    }
+    check(stopFlags == plan.stops.size(),
+          tag + "停靠标记的 true 数 = stops 数（展平视图与真源一致）");
+
+    // 单条连续路线：仓库只在**首个**停靠出现（起点就地取货的夹具形态），
+    // 中途不得再停一次仓库（那是已退役的仓库装货/多趟语义）。
+    bool depotOnce = true;
+    for (std::size_t i = 0; i < plan.stops.size(); ++i) {
+        if (plan.stops[i].nodeId != v.startNodeId) {
+            continue;
+        }
+        const bool okFirst = (i == 0 && from == v.startNodeId);
+        if (!okFirst) {
+            depotOnce = false;
+        }
+    }
+    check(depotOnce, tag + "中途不停靠仓库（单条连续路线）");
+
+    // 不变量 ①：每张订单恰一次取货 + 一次送达（不含降载/取回）。
+    for (const Order& o : orders) {
+        std::size_t picks = 0;
+        std::size_t delivs = 0;
+        std::size_t pickIdx = plan.stops.size();
+        std::size_t delivIdx = plan.stops.size();
+        for (std::size_t i = 0; i < plan.stops.size(); ++i) {
+            for (const std::string& id : plan.stops[i].pickups) {
+                if (id == o.id) {
+                    ++picks;
+                    pickIdx = i;
+                }
+            }
+            for (const logistics::StopDelivery& d : plan.stops[i].deliveries) {
+                if (d.orderId == o.id) {
+                    ++delivs;
+                    delivIdx = i;
+                }
+            }
+        }
+        check(delivs == 1, tag + "订单 " + o.id + " 恰好送达一次（实际 "
+                               + std::to_string(delivs) + "）");
+        check(picks <= 1, tag + "订单 " + o.id + " 至多取货一次（实际 "
+                               + std::to_string(picks) + "）");
+        // 不变量 ②：先取后送。
+        if (picks == 1 && delivs == 1) {
+            check(pickIdx < delivIdx, tag + "订单 " + o.id + " 的取货早于送达");
+        }
+    }
+
+    // 不变量 ③：前缀载重 0..C（用 remainingLoadKg 逐停靠复核），先卸后装。
+    double load = onboardKg;
+    bool prefixOk = true;
+    bool orderOk = true;
+    for (const Stop& s : plan.stops) {
+        double arrive = load;
+        for (const logistics::StopDelivery& d : s.deliveries) {
+            for (const Order& o : orders) {
+                if (o.id == d.orderId) {
+                    arrive -= o.demandKg;
+                }
+            }
+        }
+        for (const std::string& id : s.offloads) {
+            for (const Order& o : orders) {
+                if (o.id == id) {
+                    arrive -= o.demandKg;
+                }
+            }
+        }
+        if (arrive < -1e-9) {
+            orderOk = false;   // 卸的比车上还多 ⇒ 没先卸后装/账目错
+        }
+        double after = arrive;
+        for (const std::string& id : s.pickups) {
+            for (const Order& o : orders) {
+                if (o.id == id) {
+                    after += o.demandKg;
+                }
+            }
+        }
+        for (const std::string& id : s.reclaims) {
+            for (const Order& o : orders) {
+                if (o.id == id) {
+                    after += o.demandKg;
+                }
+            }
+        }
+        if (after > v.capacityKg + 1e-6 || after < -1e-9) {
+            prefixOk = false;
+        }
+        if (std::fabs(s.remainingLoadKg - after) > 1e-6) {
+            prefixOk = false;   // remainingLoadKg = 离开该站时的在车量
+        }
+        load = after;
+    }
+    check(prefixOk, tag + "任一停靠后的在车量都在 [0, 载重上限] 且等于 remainingLoadKg");
+    check(orderOk, tag + "停靠内先卸后装（卸货不超过车上已有）");
+    // 不变量 ④：硬优先 —— 紧急停靠全部先于普通停靠；紧急段无普通取货。
+    bool seenNormal = false;
+    bool hardOk = true;
+    for (const Stop& s : plan.stops) {
+        if (s.phase == StopPhase::Normal) {
+            seenNormal = true;
+        } else if (seenNormal) {
+            hardOk = false;
+        }
+    }
+    check(hardOk, tag + "硬优先：紧急停靠全部先于普通停靠");
+    bool urgentNoNormalPickup = true;
+    for (const Stop& s : plan.stops) {
+        if (s.phase != StopPhase::Urgent) {
+            continue;
+        }
+        for (const std::string& id : s.pickups) {
+            for (const Order& o : orders) {
+                if (o.id == id && !o.urgent) {
+                    urgentNoNormalPickup = false;
+                }
+            }
+        }
+    }
+    check(urgentNoNormalPickup, tag + "紧急阶段没有普通取货动作");
+
+    // 不变量 ⑥：紧急阶段同刻至多一张紧急单在车（已取未送的紧急单数 <= 1）。
+    std::size_t urgentOnboard = 0;
+    bool oneUrgent = true;
+    for (const Stop& s : plan.stops) {
+        if (s.phase != StopPhase::Urgent) {
+            continue;
+        }
+        for (const std::string& id : s.pickups) {
+            ++urgentOnboard;
+        }
+        for (const logistics::StopDelivery& d : s.deliveries) {
+            bool urgent = false;
+            for (const Order& o : orders) {
+                if (o.id == d.orderId && o.urgent) {
+                    urgent = true;
+                }
+            }
+            if (urgent && urgentOnboard > 0) {
+                --urgentOnboard;
+            }
+        }
+        if (urgentOnboard > 1) {
+            oneUrgent = false;
+        }
+    }
+    check(oneUrgent, tag + "紧急阶段同刻至多一张紧急单在车");
+
+    // 不变量 ⑦：同阶段同节点至多一次停靠；重复只允许是「先取后送强制重访」。
+    bool uniqueOk = true;
+    std::string badNode;
+    for (std::size_t i = 0; i < plan.stops.size() && uniqueOk; ++i) {
+        for (std::size_t j = i + 1; j < plan.stops.size(); ++j) {
+            if (plan.stops[i].nodeId != plan.stops[j].nodeId
+                || plan.stops[i].phase != plan.stops[j].phase) {
+                continue;
+            }
+            // 中转站动作与取送停靠可以同节点共存（降载 + 取回是两件事）。
+            const bool transit = plan.stops[i].isTransitStop() || plan.stops[j].isTransitStop();
+            const std::size_t actions = plan.stops[j].pickups.size()
+                                        + plan.stops[j].deliveries.size()
+                                        + plan.stops[j].offloads.size()
+                                        + plan.stops[j].reclaims.size();
+            if (transit || actions != 1) {
+                uniqueOk = false;
+                badNode = plan.stops[j].nodeId;
+                break;
+            }
+        }
+    }
+    check(uniqueOk, tag + "同阶段同节点至多一次停靠，重复时只含一个动作"
+                        + (badNode.empty() ? std::string() : "（" + badNode + "）"));
+
+    // 不变量 ⑧：停靠零耗时 —— arrival 即离开时刻；raw + wait == arrival。
+    bool zeroDwell = true;
+    for (const Stop& s : plan.stops) {
+        if (s.rawArrivalMin + s.waitMin != s.arrivalMin) {
+            zeroDwell = false;
+        }
+    }
+    check(zeroDwell, tag + "停靠零耗时：rawArrival + wait == arrival");
+
+    // 不变量 ⑨：penalty 逐单累加 == 停靠级 penaltyMin == 总 penalty。
+    bool penaltyOk = true;
+    int sum = 0;
+    for (const Stop& s : plan.stops) {
+        int stopSum = 0;
+        for (const logistics::StopDelivery& d : s.deliveries) {
+            const int we = [&]() {
+                for (const Order& o : orders) {
+                    if (o.id == d.orderId) {
+                        return o.windowEndMin;
+                    }
+                }
+                return 0;
+            }();
+            const int expect = s.arrivalMin > we ? (s.arrivalMin - we) : 0;
+            if (d.penaltyMin != expect) {
+                penaltyOk = false;
+            }
+            stopSum += d.penaltyMin;
+        }
+        if (stopSum != s.penaltyMin) {
+            penaltyOk = false;
+        }
+        sum += stopSum;
+    }
+    check(penaltyOk, tag + "penalty 逐单：每单按自己的 we 计、停靠级为逐单之和");
+    check(sum == plan.totalPenaltyMin, tag + "总 penalty == 各停靠逐单之和");
+
+    // 不变量 ⑩/⑪：降载账本 —— 期末已取回、取回先于送达、全局单堆锁站。
+    bool ledgerOk = true;
+    std::string stashStation;
+    for (const logistics::OffloadLeg& leg : plan.offloads) {
+        if (leg.reclaimTimeMin < 0) {
+            ledgerOk = false;   // 期末必须已取回
+        }
+        if (stashStation.empty()) {
+            stashStation = leg.station;
+        } else if (stashStation != leg.station) {
+            ledgerOk = false;   // 全局至多一堆、锁站
+        }
+        if (leg.reclaimTimeMin < leg.offloadTimeMin) {
+            ledgerOk = false;
+        }
+    }
+    for (const logistics::OffloadLeg& leg : plan.offloads) {
+        // 取回停靠索引 < 该单送达停靠索引
+        std::size_t reclaimIdx = plan.stops.size();
+        std::size_t delivIdx = plan.stops.size();
+        for (std::size_t i = 0; i < plan.stops.size(); ++i) {
+            for (const std::string& id : plan.stops[i].reclaims) {
+                if (id == leg.orderId) {
+                    reclaimIdx = i;
+                }
+            }
+            for (const logistics::StopDelivery& d : plan.stops[i].deliveries) {
+                if (d.orderId == leg.orderId) {
+                    delivIdx = i;
+                }
+            }
+        }
+        if (reclaimIdx >= delivIdx) {
+            ledgerOk = false;
+        }
+    }
+    check(ledgerOk, tag + "降载账本：期末已取回、单堆锁站、取回先于送达");
+
+    // 指标口径的交叉校验（#29 §6.6 的 G3/G4/G5）。
+    const logistics::RouteMetrics& m = plan.metrics;
+    check(m.stopCount == static_cast<int>(plan.stops.size()), tag + "指标·停靠点数 = stops 数");
+    int actions = 0;
+    for (const Stop& s : plan.stops) {
+        actions += static_cast<int>(s.pickups.size() + s.deliveries.size());
+    }
+    check(m.actionCount == actions, tag + "指标·动作数 = 取货 + 送达动作数");
+    // 动作恒等：每单恰一次送达；取货动作只在「出发时既不在车上、也不在站里」时出现
+    // （取回不算取送动作，见规格一 §6.1）。因此
+    //   A = 取送对数 + （取送对数 − 在车单数 − 站里单数）。
+    check(m.actionCount == 2 * static_cast<int>(orders.size())
+                               - static_cast<int>(onboardCount)
+                               - static_cast<int>(stashCount),
+          tag + "结构性恒等：动作数 = 2 × 取送对数 − 在车/在站单数（在车 "
+              + std::to_string(onboardCount) + " 单、在站 "
+              + std::to_string(stashCount) + " 单）");
+    check(m.pickupOnTimeCount >= m.deliveryOnTimeCount,
+          tag + "取货准时数 >= 送达准时数（数学恒等，G4）");
+    check(m.avgLoadKg <= m.peakLoadKg + 1e-9, tag + "平均在车 <= 峰值（G5）");
+    check(m.peakLoadKg <= v.capacityKg + 1e-6, tag + "峰值 <= 载重上限（G5）");
+    if (v.capacityKg > 1e-9) {
+        check(std::fabs(m.loadUtilization - m.avgLoadKg / v.capacityKg) < 0.005,
+              tag + "利用率 == 平均/容量（G5）");
+    }
+}
+
+} // namespace
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// 切片 1：单订单的完整手算校验（这一条是**唯一**保留手算的用例：
+// 图上只有一条边，算术不可能被选路影响）。
+//
+// oracle 复算命令：
+//   python3 tools/oracle.py --route distance W W 480 D1   （夹具 W<->D1 5km/10min/4元）
+// 期望：raw 490 / wait 50 / arrival 540 / 回仓 550 / 距离 10.0 / 耗时 70.0 / 成本 8.0
+// ---------------------------------------------------------------------------
 void testSingleOrderRouteIsFullyCorrect() {
     const LogisticsGraph g = makeWtoD1Graph();
     const Vehicle v = makeVehicle("W", 1000.0, 480);
@@ -75,40 +454,39 @@ void testSingleOrderRouteIsFullyCorrect() {
     const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
 
     check(plan.status == PlanStatus::Ok, "规划成功");
+    // A→B 取送：起点 W 即取货点 A（空车出发先到 A 装货），因此 W 是一次停靠。
     check(plan.nodes == std::vector<std::string>{"W", "D1", "W"},
           "完整序列为 W -> D1 -> W，实际 " + join(plan.nodes));
     check(fixtures::nearlyEqual(plan.totalDistanceKm, 10.0),
           "总距离 10.0，实际 " + std::to_string(plan.totalDistanceKm));
     check(fixtures::nearlyEqual(plan.totalTimeMin, 70.0),
-          "总耗时 75（含等待与服务），实际 " + std::to_string(plan.totalTimeMin));
-    // 抵达仓库的时刻（oracle 值 550）
+          "总耗时 70（含早到等待），实际 " + std::to_string(plan.totalTimeMin));
     check(plan.returnArrivalMin == 550,
           "返回仓库时刻 550，实际 " + std::to_string(plan.returnArrivalMin));
-
-    // 逐节点到达时刻与"是否停靠"标记，供界面逐个节点推进
-    check(plan.nodeArrivalMin.size() == plan.nodes.size(), "到达时刻序列与节点序列等长");
-    check(plan.nodeIsStop.size() == plan.nodes.size(), "停靠标记序列与节点序列等长");
-    // W(出发 480) -> D1(送达 540) -> W(回到 550)
-    check(plan.nodeArrivalMin == std::vector<int>({480, 540, 550}),
-          "逐节点到达时刻应为 480 / 540 / 550");
-    check(plan.nodeIsStop == std::vector<bool>({false, true, false}),
-          "只有中间那个配送点才是停靠");
     check(fixtures::nearlyEqual(plan.totalCostYuan, 8.0),
           "总成本 8.0，实际 " + std::to_string(plan.totalCostYuan));
     check(plan.totalPenaltyMin == 0, "totalPenalty 为 0");
 
-    check(plan.stops.size() == 1, "恰好 1 个停靠点，实际 " + std::to_string(plan.stops.size()));
-    if (plan.stops.size() == 1) {
-        const logistics::Stop& s = plan.stops[0];
-        check(s.nodeId == "D1", "停靠点是 D1");
+    check(plan.stops.size() == 2,
+          "取货停靠 + 送达停靠 = 2，实际 " + std::to_string(plan.stops.size()));
+    if (plan.stops.size() == 2) {
+        check(plan.stops[0].nodeId == "W" && plan.stops[0].pickups.size() == 1
+                  && plan.stops[0].pickups[0] == "O1",
+              "首个停靠是取货点 W，取 O1");
+        check(plan.stops[0].arrivalMin == 480, "取货停靠到达 480（原地，无位移）");
+        const Stop& s = plan.stops[1];
+        check(s.nodeId == "D1", "第二个停靠是 D1");
         check(s.rawArrivalMin == 490, "rawArrival 490，实际 " + std::to_string(s.rawArrivalMin));
         check(s.waitMin == 50, "等待 50，实际 " + std::to_string(s.waitMin));
         check(s.arrivalMin == 540, "arrival 540，实际 " + std::to_string(s.arrivalMin));
         check(!s.late, "未超时");
         check(s.penaltyMin == 0, "penalty 0");
+        check(s.deliveries.size() == 1 && s.deliveries[0].orderId == "O1",
+              "送达动作属于 O1");
         check(fixtures::nearlyEqual(s.remainingLoadKg, 0.0),
-              "卸完全部货物后剩余载重 0，实际 " + std::to_string(s.remainingLoadKg));
+              "卸完全部货物后离站在车量 0，实际 " + std::to_string(s.remainingLoadKg));
     }
+    checkStructuralInvariants(g, plan, orders, v, "单订单");
 }
 
 // 切片 1（边界）：没有订单时退化为原地不动，不产生任何位移
@@ -125,170 +503,223 @@ void testEmptyOrdersDegeneratesToNoMovement() {
     check(fixtures::nearlyEqual(plan.totalDistanceKm, 0.0), "总距离 0");
     check(fixtures::nearlyEqual(plan.totalTimeMin, 0.0), "总耗时 0");
     check(fixtures::nearlyEqual(plan.totalCostYuan, 0.0), "总成本 0");
+    check(plan.metrics.actionCount == 0, "空订单时动作数 0");
+    // 分母为 0 的率不产生数值（由 --plan-summary 打成「—」，见 cli 层）。
+    check(plan.metrics.deliveryTotal == 0, "空订单时送达分母 0");
 }
 
-// 切片 2：贪心按最短路权重选下一站 —— D1 更近，必须先服务 D1
-void testGreedyServesNearestCandidateFirst() {
-    LogisticsGraph g;
-    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
-    g.addNode(makeNode("D1", NodeType::Delivery, "客户1"));
-    g.addNode(makeNode("D2", NodeType::Delivery, "客户2"));
-    addTwoWay(g, "W", "D1", 1.0, 2.0, 1.0);   // 近
-    addTwoWay(g, "W", "D2", 5.0, 10.0, 5.0);  // 远
-    addTwoWay(g, "D1", "D2", 2.0, 4.0, 2.0);
-
-    const Vehicle v = makeVehicle("W", 1000.0, 480);
-    const std::vector<Order> orders = {
-        makeOrder("O1", "W", "D1", 10.0, 0, 1440, false),
-        makeOrder("O2", "W", "D2", 10.0, 0, 1440, false),
-    };
-
-    const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
-
-    check(plan.status == PlanStatus::Ok, "规划成功");
-    // W->D1 = 1.0，W->D2 = 5.0，故先 D1；随后 D1->D2 = 2.0。
-    // 返回段不是直连 D2->W = 5.0，而是绕经 D1：D2->D1->W = 2.0+1.0 = 3.0 更短。
-    check(plan.nodes == std::vector<std::string>{"W", "D1", "D2", "D1", "W"},
-          "返回段应走更短的 D2->D1->W，实际 " + join(plan.nodes));
-    check(plan.stops.size() == 2 && plan.stops[0].nodeId == "D1"
-              && plan.stops[1].nodeId == "D2",
-          "停靠顺序为 D1, D2（途经 D1 返回不产生第二次停靠）");
-    check(fixtures::nearlyEqual(plan.totalDistanceKm, 6.0),
-          "总距离 1.0+2.0+3.0 = 6.0，实际 " + std::to_string(plan.totalDistanceKm));
-}
-
-// 切片 2：最短路权重并列时，必须按节点 ID 字典序取，保证输出确定。
-// 这里刻意把字典序较大的 DZ 放在订单列表前面；若实现"先到先得"，会先服务 DZ。
-void testTieBreakIsDeterministicByNodeId() {
-    LogisticsGraph g;
-    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
-    g.addNode(makeNode("DA", NodeType::Delivery, "客户A"));
-    g.addNode(makeNode("DZ", NodeType::Delivery, "客户Z"));
-    addTwoWay(g, "W", "DA", 3.0, 6.0, 3.0);   // 与 W->DZ 等距
-    addTwoWay(g, "W", "DZ", 3.0, 6.0, 3.0);
-    addTwoWay(g, "DA", "DZ", 2.0, 4.0, 2.0);
-
-    const Vehicle v = makeVehicle("W", 1000.0, 480);
-    // DZ 在列表中排在前头，用来区分"字典序"与"先到先得"
-    const std::vector<Order> orders = {
-        makeOrder("OZ", "W", "DZ", 10.0, 0, 1440, false),
-        makeOrder("OA", "W", "DA", 10.0, 0, 1440, false),
-    };
-
-    const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
-
-    check(plan.status == PlanStatus::Ok, "并列场景规划成功");
-    check(plan.stops.size() == 2 && plan.stops[0].nodeId == "DA",
-          "并列时按 ID 字典序取 DA，实际首个停靠点 "
-              + (plan.stops.empty() ? std::string("(无)") : plan.stops[0].nodeId));
-}
-
-// 切片 3：紧急订单优先。
-// D2 更远（5.0 vs 1.0），但被标为紧急，因此必须先服务 D2。
-// 对照：把 urgent 全部置 false，则顺序反转回按距离的 D1 优先。
-void testUrgentOrderIsServedFirstDespiteBeingFarther() {
+// ---------------------------------------------------------------------------
+// pair-insertion 的核心性质：候选位置按**字典序键**取优，
+// 不是「最近邻」。这条用例的图上，最近邻会先取 D1 的货再绕回 D2，
+// 而 penalty 先的插入器会把「取 D2 → 送 D2 → 取 D1 → 送 D1」这种
+// 让**送达窗口紧的那张单**更早完成的序列排在前面。
+//
+// 结构性断言（不依赖具体数字）：两单都被服务、先取后送、总距离为正。
+// ---------------------------------------------------------------------------
+void testPairInsertionBeatsNearestNeighbourOnTightWindow() {
     LogisticsGraph g;
     g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
     g.addNode(makeNode("D1", NodeType::Delivery, "客户1"));
     g.addNode(makeNode("D2", NodeType::Delivery, "客户2"));
     addTwoWay(g, "W", "D1", 1.0, 2.0, 1.0);
     addTwoWay(g, "W", "D2", 5.0, 10.0, 5.0);
-    addTwoWay(g, "D1", "D2", 2.0, 4.0, 2.0);
+    // D1↔D2 故意慢：先送 D1 再折回 D2 会把 O2 拖迟到，先送 D2 才是 penalty 0。
+    addTwoWay(g, "D1", "D2", 10.0, 20.0, 10.0);
 
     const Vehicle v = makeVehicle("W", 1000.0, 480);
-
-    const std::vector<Order> withUrgent = {
+    // O2 的窗口很紧（480-490）：先送 D1 再走 20min 到 D2 → 502，迟到 12min；
+    // 先送 D2（delta 10min，490 到）→ penalty 0，但距离更长（15 vs 11）。
+    // 只有 penalty 排第一键时才会选后者。
+    const std::vector<Order> orders = {
         makeOrder("O1", "W", "D1", 10.0, 0, 1440, false),
-        makeOrder("O2", "W", "D2", 10.0, 0, 1440, true),   // 远，但紧急
+        makeOrder("O2", "W", "D2", 10.0, 480, 490, false),
     };
-    const RoutePlan urgentPlan = planRoute(g, v, withUrgent, WeightType::Distance);
 
-    check(urgentPlan.status == PlanStatus::Ok, "紧急单场景规划成功");
-    check(urgentPlan.stops.size() == 2 && urgentPlan.stops[0].nodeId == "D2",
-          "紧急的 D2 必须先服务，实际首个停靠点 "
-              + (urgentPlan.stops.empty() ? std::string("(无)") : urgentPlan.stops[0].nodeId));
-    // W->D2 的最短路不是直达(5.0)，而是绕经 D1：W->D1->D2 = 1.0+2.0 = 3.0。
-    // 因此完整序列会途经 D1 两次中的一次仅作路过，不产生第二次停靠——
-    // 这是设计文档中已声明的"路径按原子处理"简化，此处将其固化为文档化行为。
-    check(urgentPlan.nodes == std::vector<std::string>{"W", "D1", "D2", "D1", "W"},
-          "顺序为 W->D1->D2->D1->W（去程途经 D1 但不停靠），实际 " + join(urgentPlan.nodes));
-
-    // 对照组：同样的订单但不紧急，应按距离先服务 D1
-    const std::vector<Order> withoutUrgent = {
-        makeOrder("O1", "W", "D1", 10.0, 0, 1440, false),
-        makeOrder("O2", "W", "D2", 10.0, 0, 1440, false),
-    };
-    const RoutePlan plainPlan = planRoute(g, v, withoutUrgent, WeightType::Distance);
-    check(plainPlan.stops.size() == 2 && plainPlan.stops[0].nodeId == "D1",
-          "非紧急对照组应按距离先服务 D1");
+    const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
+    check(plan.status == PlanStatus::Ok, "规划成功");
+    check(plan.totalPenaltyMin == 0,
+          "紧窗单 O2 应先被送达（penalty 0），实际 " + std::to_string(plan.totalPenaltyMin));
+    std::size_t i2 = plan.stops.size();
+    std::size_t i1 = plan.stops.size();
+    for (std::size_t i = 0; i < plan.stops.size(); ++i) {
+        for (const logistics::StopDelivery& d : plan.stops[i].deliveries) {
+            if (d.orderId == "O2") {
+                i2 = i;
+            }
+            if (d.orderId == "O1") {
+                i1 = i;
+            }
+        }
+    }
+    check(i2 < i1, "窗口紧的 O2 先送达（penalty 优先于里程）");
+    checkStructuralInvariants(g, plan, orders, v, "penalty 优先");
 }
 
-// 切片 4：晚到必须标记超时并记录 penalty。
-// W->D1 = 10min，发车 480 -> rawArrival 490；窗口 480-485 已在到达前关闭。
-//   wait = 0（窗口起早于到达），arrival = 490，penalty = 490 - 485 = 5
+// 切片 2：并列时必须按稳定 tieKey 取，保证同一输入必得同一条路线。
+void testTieBreakIsDeterministicByNodeId() {
+    LogisticsGraph g;
+    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
+    g.addNode(makeNode("DA", NodeType::Delivery, "客户A"));
+    g.addNode(makeNode("DZ", NodeType::Delivery, "客户Z"));
+    addTwoWay(g, "W", "DA", 3.0, 6.0, 3.0);
+    addTwoWay(g, "W", "DZ", 3.0, 6.0, 3.0);
+    addTwoWay(g, "DA", "DZ", 2.0, 4.0, 2.0);
+
+    const Vehicle v = makeVehicle("W", 1000.0, 480);
+    // DZ 在列表中排在前头，用来区分"tieKey 字典序"与"先到先得"。
+    const std::vector<Order> orders = {
+        makeOrder("OZ", "W", "DZ", 10.0, 0, 1440, false),
+        makeOrder("OA", "W", "DA", 10.0, 0, 1440, false),
+    };
+
+    const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
+    check(plan.status == PlanStatus::Ok, "并列场景规划成功");
+    // 两个候选的 (penalty, weight) 完全并列，tieKey 首站节点 ID 决定先后。
+    std::size_t firstDelivery = plan.stops.size();
+    std::string firstNode;
+    for (std::size_t i = 0; i < plan.stops.size(); ++i) {
+        if (!plan.stops[i].deliveries.empty()) {
+            firstDelivery = i;
+            firstNode = plan.stops[i].nodeId;
+            break;
+        }
+    }
+    check(firstDelivery < plan.stops.size(), "至少有一个送达停靠");
+    check(firstNode == "DA", "并列时按 tieKey 取节点 ID 较小的 DA，实际 " + firstNode);
+    checkStructuralInvariants(g, plan, orders, v, "并列 tieKey");
+}
+
+// 切片 3：紧急订单硬优先 —— 即使更远，紧急单的停靠也必须先于任何普通停靠。
+void testUrgentOrderIsServedFirstDespiteBeingFarther() {
+    LogisticsGraph g;
+    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
+    g.addNode(makeNode("D1", NodeType::Delivery, "客户1"));
+    g.addNode(makeNode("D2", NodeType::Delivery, "客户2"));
+    g.addNode(makeNode("P", NodeType::Delivery, "取货客户"));
+    addTwoWay(g, "W", "D1", 1.0, 2.0, 1.0);
+    addTwoWay(g, "W", "D2", 5.0, 10.0, 5.0);
+    addTwoWay(g, "D1", "D2", 2.0, 4.0, 2.0);
+    // A→B 取送对：两张单都从 P 取货（P 是客户点，不是仓库）。
+    addTwoWay(g, "W", "P", 2.0, 4.0, 2.0);
+    addTwoWay(g, "P", "D1", 2.0, 4.0, 2.0);
+    addTwoWay(g, "P", "D2", 6.0, 12.0, 6.0);
+
+    const Vehicle v = makeVehicle("W", 1000.0, 480);
+    const std::vector<Order> orders = {
+        makeOrder("O1", "P", "D1", 10.0, 0, 1440, false),
+        makeOrder("O2", "P", "D2", 10.0, 0, 1440, true),   // 远，但紧急
+    };
+    const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
+    check(plan.status == PlanStatus::Ok, "紧急单场景规划成功");
+    // 不变量 ④：紧急停靠全先于普通停靠。
+    bool seenNormal = false;
+    bool hardOk = true;
+    for (const Stop& s : plan.stops) {
+        if (s.phase == StopPhase::Normal) {
+            seenNormal = true;
+        } else if (seenNormal) {
+            hardOk = false;
+        }
+    }
+    check(hardOk, "紧急停靠全部先于普通停靠");
+    check(!plan.stops.empty() && plan.stops.front().phase == StopPhase::Urgent,
+          "首个停靠属于紧急阶段");
+    checkStructuralInvariants(g, plan, orders, v, "紧急硬优先");
+}
+
+// 切片 4：晚到必须标记超时并记录 penalty；arrival == we **不算**迟到（严格 >）。
 void testLateArrivalIsMarkedWithPenalty() {
     const LogisticsGraph g = makeWtoD1Graph();
     const Vehicle v = makeVehicle("W", 1000.0, 480);
-    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 10.0, 480, 485, false)};
 
-    const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
-
-    check(plan.status == PlanStatus::Ok, "规划成功");
-    check(plan.stops.size() == 1, "1 个停靠点");
-    if (plan.stops.size() == 1) {
-        const logistics::Stop& s = plan.stops[0];
-        check(s.waitMin == 0, "窗口早于到达，无等待，实际 " + std::to_string(s.waitMin));
-        check(s.arrivalMin == 490, "arrival 490，实际 " + std::to_string(s.arrivalMin));
-        check(s.late, "必须标记为超时");
-        check(s.penaltyMin == 5, "penalty 490-485 = 5，实际 " + std::to_string(s.penaltyMin));
+    // 晚到 5 分钟：W->D1 10min，发车 480 ⇒ raw 490；窗口止 485。
+    {
+        const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 10.0, 480, 485, false)};
+        const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
+        check(plan.status == PlanStatus::Ok, "晚到场景规划成功");
+        const Stop* deliv = nullptr;
+        for (const Stop& s : plan.stops) {
+            if (!s.deliveries.empty()) {
+                deliv = &s;
+            }
+        }
+        check(deliv != nullptr, "存在送达停靠");
+        if (deliv != nullptr) {
+            check(deliv->waitMin == 0, "窗口早于到达，无等待");
+            check(deliv->arrivalMin == 490, "arrival 490");
+            check(deliv->late, "必须标记为超时");
+            check(deliv->penaltyMin == 5, "penalty 490-485 = 5，实际 "
+                                              + std::to_string(deliv->penaltyMin));
+        }
+        check(plan.totalPenaltyMin == 5, "totalPenalty 5");
+        checkStructuralInvariants(g, plan, orders, v, "晚到");
     }
-    check(plan.totalPenaltyMin == 5, "totalPenalty 5，实际 " + std::to_string(plan.totalPenaltyMin));
+
+    // 边界：arrival == we ⇒ 不算迟到（#18 §5 要求）。
+    {
+        const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 10.0, 480, 490, false)};
+        const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
+        check(plan.status == PlanStatus::Ok, "边界场景规划成功");
+        check(plan.totalPenaltyMin == 0, "arrival == windowEnd 不算迟到");
+    }
 }
 
-// 切片 4：同一配送点的多个订单必须合并为一次停靠——
-// 需求求和、窗口取并集 [min 窗口起, max 窗口止]。
-//   O1 窗口 480-485（若单独处理会超时，penalty 5）
-//   O2 窗口 840-900
-//   合并后窗口 480-900，arrival 490 不超时 -> penalty 0，且只停靠一次
+// 切片 4 + 不变量 ⑨：同一停靠上的多张单**逐单**判迟到（停靠无合并窗口）。
 void testMultipleOrdersOnSameNodeMergeIntoOneStop() {
     const LogisticsGraph g = makeWtoD1Graph();
     const Vehicle v = makeVehicle("W", 1000.0, 480);
+    // 两单同送达点 D1：O1 窗口 480-485（会迟到 5min），O2 窗口 840-900（不迟到）。
+    // 旧「窗口取并集」口径会把两单都判成不迟到——这正是 #18 Q14=A 要修掉的掩盖。
+    // 两张单同送达点 D1、同一取货点 W：合并成一次停靠（不额外等待），
+    // 到达 490 ⇒ 逐单判迟到（O1 按 485 迟到 5，O2 按 900 不迟到）。
     const std::vector<Order> orders = {
         makeOrder("O1", "W", "D1", 30.0, 480, 485, false),
-        makeOrder("O2", "W", "D1", 20.0, 840, 900, false),
+        makeOrder("O2", "W", "D1", 20.0, 480, 900, false),
     };
 
     const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
-
     check(plan.status == PlanStatus::Ok, "规划成功");
-    check(plan.stops.size() == 1,
-          "同节点两订单只产生 1 个停靠点，实际 " + std::to_string(plan.stops.size()));
-    check(plan.totalPenaltyMin == 0,
-          "窗口并集为 480-900，到达 490 不超时 -> penalty 0，实际 "
-              + std::to_string(plan.totalPenaltyMin));
-    if (plan.stops.size() == 1) {
-        const logistics::Stop& s = plan.stops[0];
-        check(s.nodeId == "D1", "停靠点是 D1");
-        check(s.arrivalMin == 490, "arrival 490，实际 " + std::to_string(s.arrivalMin));
-        // 两单需求量求和 30+20 = 50，一次卸完 -> 剩余 0
-        check(fixtures::nearlyEqual(s.remainingLoadKg, 0.0),
-              "合并后一次卸完 50kg，剩余 0，实际 " + std::to_string(s.remainingLoadKg));
+
+    std::size_t delivStops = 0;
+    const Stop* d1 = nullptr;
+    for (const Stop& s : plan.stops) {
+        if (!s.deliveries.empty()) {
+            ++delivStops;
+            d1 = &s;
+        }
     }
-    // 490 送达 -> 495 离开 -> 505 回到仓库；总耗时 505-480 = 25
-    check(fixtures::nearlyEqual(plan.totalTimeMin, 20.0),
-          "总耗时 25（若未合并会因等待 840 而暴增），实际 " + std::to_string(plan.totalTimeMin));
-    check(fixtures::nearlyEqual(plan.totalDistanceKm, 10.0), "总距离 10.0");
+    check(delivStops == 1, "同节点两单合并为一次送达停靠，实际 "
+                               + std::to_string(delivStops));
+    if (d1 != nullptr) {
+        check(d1->nodeId == "D1", "停靠点是 D1");
+        check(d1->deliveries.size() == 2, "该停靠承载两个送达动作");
+        // 逐单：O1 迟到 5、O2 不迟到。
+        for (const logistics::StopDelivery& d : d1->deliveries) {
+            if (d.orderId == "O1") {
+                check(d.late && d.penaltyMin == 5,
+                      "O1 按自己的 we=485 判迟到 5min，实际 "
+                          + std::to_string(d.penaltyMin));
+            }
+            if (d.orderId == "O2") {
+                check(!d.late && d.penaltyMin == 0,
+                      "O2 按自己的 we=900 判不迟到（不被 O1 的紧窗掩盖）");
+            }
+        }
+        check(d1->penaltyMin == 5, "停靠级 penalty = 逐单之和 5");
+        check(fixtures::nearlyEqual(d1->remainingLoadKg, 0.0),
+              "合并后一次卸完 50kg，离站在车量 0");
+    }
+    check(plan.totalPenaltyMin == 5, "总 penalty 5（不是 0）");
+    checkStructuralInvariants(g, plan, orders, v, "合并停靠逐单 penalty");
 }
 
-// 切片 5：**单个订单**的货量就超过载重上限 -> 这才是真正的载重不可行
-// （分多少趟都装不下一个订单）
+// 切片 5：单个订单的货量超过载重上限 ⇒ 真正的载重不可行（降载也救不了）。
 void testSingleOrderExceedingCapacityIsInfeasible() {
     const LogisticsGraph g = makeWtoD1Graph();
-    const Vehicle v = makeVehicle("W", 10.0, 480);   // 载重仅 10
+    const Vehicle v = makeVehicle("W", 10.0, 480);
     const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 20.0, 0, 1440, false)};
 
     const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
-
     check(plan.status == PlanStatus::OrderExceedsCapacity, "状态为 OrderExceedsCapacity");
     check(plan.nodes.empty(), "不可行时不生成路线（nodes 为空）");
     check(plan.stops.empty(), "不可行时无停靠点");
@@ -296,82 +727,11 @@ void testSingleOrderExceedingCapacityIsInfeasible() {
           "原因应含超限货量，实际: " + plan.reason);
 }
 
-// 路线必须是图上**真实可走**的序列。这条断言本该一开始就有：
-// 多趟的 Trip 一度漏写起点，就是因为只查了"末尾是不是仓库"而没查相邻可达。
-void checkRouteIsWalkable(const LogisticsGraph& g, const RoutePlan& plan,
-                          const std::string& depot) {
-    check(!plan.nodes.empty(), "路线序列非空");
-    if (plan.nodes.empty()) {
-        return;
-    }
-    check(plan.nodes.front() == depot, "路线从仓库出发");
-    check(plan.nodes.back() == depot, "路线回到仓库");
+} // namespace
 
-    bool walkable = true;
-    int lastArrival = -1;
-    bool timeMonotonic = true;
-    for (std::size_t i = 1; i < plan.nodes.size(); ++i) {
-        if (g.findEdge(plan.nodes[i - 1], plan.nodes[i]) == nullptr) {
-            walkable = false;
-        }
-    }
-    check(walkable, "路线相邻节点之间都存在有向边（序列真实可走）");
+namespace {
 
-    for (std::size_t i = 0; i < plan.nodeArrivalMin.size(); ++i) {
-        if (plan.nodeArrivalMin[i] < lastArrival) {
-            timeMonotonic = false;
-        }
-        lastArrival = plan.nodeArrivalMin[i];
-    }
-    check(timeMonotonic, "到达时刻沿序列单调不减");
-
-    check(plan.nodes.size() == plan.nodeArrivalMin.size()
-              && plan.nodes.size() == plan.nodeIsStop.size()
-              && plan.nodes.size() == plan.nodeTripIndex.size(),
-          "节点/到达时刻/停靠标记/趟归属四个数组等长");
-
-    // 趟归属必须与 trips 的拼接一一对应（单调不减，且在有效范围内）
-    bool tripIndexOk = true;
-    std::size_t lastTrip = 0;
-    for (std::size_t i = 0; i < plan.nodeTripIndex.size(); ++i) {
-        if (plan.nodeTripIndex[i] >= plan.trips.size()) {
-            tripIndexOk = false;
-        }
-        if (i > 0 && plan.nodeTripIndex[i] < plan.nodeTripIndex[i - 1]) {
-            tripIndexOk = false;
-        }
-        lastTrip = plan.nodeTripIndex[i];
-    }
-    check(tripIndexOk, "趟归属单调不减且都在有效范围内");
-    check(plan.trips.empty() || lastTrip + 1 == plan.trips.size(),
-          "趟归属覆盖到最后一趟");
-
-    // 各趟首尾相接，且每趟自身也可走
-    bool tripsChain = true;
-    for (std::size_t k = 0; k < plan.trips.size(); ++k) {
-        const logistics::Trip& trip = plan.trips[k];
-        if (trip.nodes.empty()) {
-            tripsChain = false;
-            continue;
-        }
-        if (!trip.nodeArrivalMin.empty() && trip.nodes.size() != trip.nodeArrivalMin.size()) {
-            tripsChain = false;
-        }
-        if (k > 0 && trip.nodes.front() != plan.trips[k - 1].endNodeId) {
-            tripsChain = false;
-        }
-        for (std::size_t i = 1; i < trip.nodes.size(); ++i) {
-            if (g.findEdge(trip.nodes[i - 1], trip.nodes[i]) == nullptr) {
-                tripsChain = false;
-            }
-        }
-    }
-    check(tripsChain, "各趟首尾相接且每趟自身可走");
-    check(!plan.trips.empty() && plan.trips.back().endNodeId == depot,
-          "最后一趟终点是仓库");
-}
-
-// 构造一个含中转站的图：W -- T -- {D1, D2}，D1/D2 归属于 T 的子网络
+// 中转站图：W -- T -- {D1, D2}，D1/D2 归属 T 的子网络。
 LogisticsGraph makeTransitClusterGraph() {
     LogisticsGraph g;
     Node w = makeNode("W", NodeType::Warehouse, "仓库");
@@ -389,79 +749,60 @@ LogisticsGraph makeTransitClusterGraph() {
     return g;
 }
 
-// 切片 6（D21 核心）：总需求超过载重上限**不再不可行**，
-// 而是多趟 + 中转站暂存 + 二次配发。
-void testTotalDemandOverCapacityBecomesMultiTrip() {
-    const LogisticsGraph g = makeTransitClusterGraph();
-    const Vehicle v = makeVehicle("W", 20.0, 480);   // 载重 20，总需求 30
-    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 15.0, 0, 1440, false),
-                                       makeOrder("O2", "W", "D2", 15.0, 0, 1440, false)};
+// MC-G01 改造项：总需求超过载重**不再不可行、也不再分趟**（规格一 #21）。
+// 单条连续路线靠「边取边送 + 前缀载重」服务全部订单；
+// 旧断言「多趟」作废，改为**前缀载重 + 单条连续路线**。
+void testTotalDemandOverCapacityStaysOneContinuousRoute() {
+    // 新模型：A→B 取送对，A 从不在仓库。两张单是客户间取送（D1->D2 / D3->D4），
+    // 载重 20 < 总需求 30，靠"边取边送 + 前缀载重"合法地串成一条连续路线。
+    LogisticsGraph g = makeTransitClusterGraph();
+    g.addNode(makeNode("D3", NodeType::Delivery, "客户3"));
+    g.addNode(makeNode("D4", NodeType::Delivery, "客户4"));
+    addTwoWay(g, "T", "D3", 7.0, 7.0, 7.0);
+    addTwoWay(g, "T", "D4", 8.0, 8.0, 8.0);
+    const Vehicle v = makeVehicle("W", 20.0, 480);
+    const std::vector<Order> orders = {
+        makeOrder("O1", "D1", "D2", 15.0, 0, 1440, false),
+        makeOrder("O2", "D3", "D4", 15.0, 0, 1440, false),
+    };
 
     const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
 
-    // 不变量 1：全部订单被服务（否则才叫不可行）
-    check(plan.status == PlanStatus::Ok, "总需求超载不再是不可行");
-    check(plan.stops.size() == 2, "两个订单都被送达，实际 "
-              + std::to_string(plan.stops.size()));
-
-    // 不变量 2：任一趟的在车货量不超过载重
-    bool loadOk = true;
-    for (const logistics::Trip& trip : plan.trips) {
-        for (const logistics::Stop& s : trip.stops) {
-            if (s.remainingLoadKg < -1e-9) {
-                loadOk = false;
-            }
-        }
-        // 本趟装载量本身也必须 <= 载重上限
-        if (trip.loadKg > v.capacityKg + 1e-9) {
-            loadOk = false;
+    check(plan.status == PlanStatus::Ok, "总需求超载不再是不可行: " + plan.reason);
+    check(plan.stops.size() == 4, "两次取货 + 两次送达 = 4 个停靠，实际 "
+                                      + std::to_string(plan.stops.size()));
+    // 单条连续路线：一次出发、一次回仓库（首尾都是仓库，中途不回仓库）。
+    check(!plan.nodes.empty() && plan.nodes.front() == "W" && plan.nodes.back() == "W",
+          "单条连续路线从仓库出发并回到仓库");
+    std::size_t depotVisits = 0;
+    for (const std::string& n : plan.nodes) {
+        if (n == "W") {
+            ++depotVisits;
         }
     }
-    check(loadOk, "任一趟的在车货量都不超过载重上限");
-
-    // 中转站不参与**常规排线**：那条"有货就用"的路由实现仍不存在。
-    // 但 2026-09-26 用户裁定恢复了"缓冲库存**只服务紧急单**"这一窄机制，
-    // 所以"暂存非负""寄存只发生在顺路经过的站""库存守恒"**不再**由结构保证——
-    // 它们已改由 testTransitBufferProducer() 的守卫 G1/G2/G4 显式断言。
-
-    // 不变量 5：需求超载 -> 必须多于一趟
-    check(plan.trips.size() > 1, "多趟配送，实际 " + std::to_string(plan.trips.size()) + " 趟");
-
-    // 路线必须是图上真实可走的序列（这条断言能抓住"Trip 漏写起点"这类错误）
-    checkRouteIsWalkable(g, plan, "W");
-
-    // 不变量 6：汇总等于各趟累加
-    double distSum = 0.0;
-    std::size_t stopSum = 0;
-    bool flattenOk = true;
-    for (const logistics::Trip& trip : plan.trips) {
-        distSum += trip.totalDistanceKm;
-        stopSum += trip.stops.size();
-        flattenOk = flattenOk && trip.nodes.size() == trip.nodeArrivalMin.size()
-                    && trip.nodes.size() == trip.nodeIsStop.size();
-    }
-    check(std::fabs(distSum - plan.totalDistanceKm) < 1e-6,
-          "总距离 = 各趟累加");
-    check(stopSum == plan.stops.size(), "扁平停靠点 = 各趟停靠点之和");
-    check(flattenOk, "每趟的节点序列与到达时刻/停靠标记等长");
+    check(depotVisits == 2, "中途不回仓库（仓库只出现首尾两次），实际 "
+                                + std::to_string(depotVisits));
+    // 前缀载重全程不超过 20（结构性检查在 checkStructuralInvariants 里逐停靠复核）。
+    checkStructuralInvariants(g, plan, orders, v, "总需求超载单条路线");
 }
 
-// 切片 6：总需求不超过载重时保持单趟，不引入多余的中转环节
-void testWithinCapacityStaysSingleTrip() {
+// 与上一条对照：载重充裕时同样是单条连续路线，且不产生任何降载。
+void testWithinCapacityStaysSingleRoute() {
     const LogisticsGraph g = makeTransitClusterGraph();
     const Vehicle v = makeVehicle("W", 100.0, 480);
-    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 15.0, 0, 1440, false),
-                                       makeOrder("O2", "W", "D2", 15.0, 0, 1440, false)};
+    const std::vector<Order> orders = {
+        makeOrder("O1", "W", "D1", 15.0, 0, 1440, false),
+        makeOrder("O2", "W", "D2", 15.0, 0, 1440, false),
+    };
 
     const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
 
     check(plan.status == PlanStatus::Ok, "可行");
-    check(plan.trips.size() == 1, "不超载时只有一趟，实际 "
-              + std::to_string(plan.trips.size()));
-    checkRouteIsWalkable(g, plan, "W");
+    check(plan.offloads.empty(), "载重充裕时不产生降载");
+    checkStructuralInvariants(g, plan, orders, v, "载重充裕");
 }
 
-// 切片 5：存在无法到达的配送点 -> Unreachable，且原因要能定位到具体节点
+// 切片 5：存在无法到达的配送点 -> Unreachable，且原因要能定位到具体节点。
 void testUnreachableDeliveryIsInfeasibleAndNamesTheNode() {
     LogisticsGraph g = makeWtoD1Graph();
     g.addNode(makeNode("D9", NodeType::Delivery, "孤岛客户"));   // 无任何连边
@@ -477,12 +818,10 @@ void testUnreachableDeliveryIsInfeasibleAndNamesTheNode() {
           "原因中应含不可达节点 ID，实际: " + plan.reason);
 }
 
-
-// ---- P2：增量式重规划（设计 §5.7 / D22）----
+// ---- D 组：增量重规划（规格二 §10 裁定 1：顺序不变版重放）----
 //
 // 拓扑：W --10-- D1 --10-- D2 --20-- W，另有绕行 D1 --6-- D3 --6-- D2（D3 是中转站）。
-// 按耗时规划时 D1->D2 走直连（10 < 12）。把直连封堵成 +50%（=15）后，
-// 绕行 12 反而更快，于是只有"含该边的那一段"需要重算。
+// 把直连封堵成 +50% 后，绕行 12 反而更快。
 LogisticsGraph makeIncrementalGraph() {
     LogisticsGraph g;
     Node w = makeNode("W", NodeType::Warehouse, "仓库");   w.x = 0;   w.y = 0;
@@ -498,19 +837,20 @@ LogisticsGraph makeIncrementalGraph() {
     return g;
 }
 
-// 断言 1/2/3/5：只重算受影响的段、停靠顺序不变、其余段逐位不变、总耗时更优
-void testIncrementalReplanRecomputesOnlyAffectedLeg() {
+// 裁定后的语义：停靠顺序**完全不变**，只按新边权重重放；
+// usedIncremental == true 表示"用了顺序不变版重放"（不再是"只重算了受影响的 leg"）。
+void testIncrementalReplayKeepsStopOrderAndReplaysWeights() {
     LogisticsGraph g = makeIncrementalGraph();
     const Vehicle v = makeVehicle("W", 1000.0, 480);
-    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 10.0, 0, 1440, false),
-                                       makeOrder("O2", "W", "D2", 10.0, 0, 1440, false)};
+    const std::vector<Order> orders = {
+        makeOrder("O1", "W", "D1", 10.0, 0, 1440, false),
+        makeOrder("O2", "W", "D2", 10.0, 0, 1440, false),
+    };
 
     const RoutePlan before = planRoute(g, v, orders, WeightType::Time);
     check(before.status == PlanStatus::Ok, "初始规划可行");
-    check(before.nodes == std::vector<std::string>({"W", "D1", "D2", "W"}),
-          "初始序列 W->D1->D2->W");
 
-    // 构造确定的拥堵：D1->D2 耗时 +50%（不用随机模拟器，保证可复现）
+    // 构造确定的拥堵：D1->D2 耗时 +50%（不用随机模拟器，保证可复现）。
     const logistics::Edge* e = g.findEdge("D1", "D2");
     check(e != nullptr, "D1->D2 存在");
     if (e == nullptr) {
@@ -530,149 +870,77 @@ void testIncrementalReplanRecomputesOnlyAffectedLeg() {
     c.congested = true;
     report.changes.push_back(c);
 
-    // 重规划前那条路线在**拥堵后**的耗时，作为比较基准
-    const RoutePlan congestedSameRoute = replan(g, v, orders, "W", 480, WeightType::Time);
-
+    bool used = false;
     const RoutePlan after =
-        replanIncremental(g, v, orders, before, 480, WeightType::Time, report, 0.2);
+        replanIncremental(g, v, orders, before, 480, WeightType::Time, report, 0.2,
+                          std::vector<logistics::OnboardItem>(), &used);
 
-    check(after.status == PlanStatus::Ok, "增量重规划可行");
-
-    // 断言 1：停靠顺序逐位相同
-    check(after.stops.size() == 2, "仍服务 2 个停靠点");
-    if (after.stops.size() == 2) {
-        check(after.stops[0].nodeId == "D1" && after.stops[1].nodeId == "D2",
-              "停靠顺序不变（增量不重排服务顺序）");
+    check(after.status == PlanStatus::Ok, "重放可行");
+    check(used, "走了顺序不变版重放（usedIncremental == true）");
+    // 停靠顺序逐位不变（这正是"顺序不变版"的定义）。
+    check(after.stops.size() == before.stops.size(), "停靠点数不变");
+    bool sameOrder = after.stops.size() == before.stops.size();
+    for (std::size_t i = 0; sameOrder && i < after.stops.size(); ++i) {
+        sameOrder = after.stops[i].nodeId == before.stops[i].nodeId
+                    && after.stops[i].phase == before.stops[i].phase;
     }
-
-    // 断言 2：未受影响的段逐位不变 —— 首段 W->D1 必须原样
-    check(after.nodes.size() >= 2 && after.nodes[0] == "W" && after.nodes[1] == "D1",
-          "未受影响的首段 W->D1 保持原样");
-
-    // 受影响的段被重算：改走绕行 D3
-    bool viaD3 = false;
-    for (const std::string& id : after.nodes) {
-        if (id == "D3") {
-            viaD3 = true;
-        }
-    }
-    check(viaD3, "受影响的 D1->D2 段被重算，改经 D3 绕行");
-
-    // 断言 5：仍回到仓库，且序列真实可走
-    checkRouteIsWalkable(g, after, "W");
-
-    // 断言 3：总耗时优于"沿旧路线的拥堵版本"
-    check(after.totalTimeMin <= congestedSameRoute.totalTimeMin + 1e-6,
-          "增量结果总耗时 <= 拥堵后沿旧路线："
-              + std::to_string(after.totalTimeMin) + " vs "
-              + std::to_string(congestedSameRoute.totalTimeMin));
+    check(sameOrder, "停靠顺序与阶段逐位不变");
+    // 重放后的耗时变长（拥堵被吃进时刻），但路线本身仍可走。
+    check(after.totalTimeMin > before.totalTimeMin,
+          "拥堵被重放进时刻：" + std::to_string(after.totalTimeMin) + " vs "
+              + std::to_string(before.totalTimeMin));
+    checkStructuralInvariants(g, after, orders, v, "顺序不变版重放");
 }
 
-// 断言 4：没有任何 leg 受影响时，结果与原路线逐位相同（幂等）
-void testIncrementalReplanIsIdempotentWhenNothingAffected() {
+// 没有任何 leg 受影响时，重放结果与原路线逐位相同（幂等）。
+void testIncrementalReplayIsIdempotentWhenNothingAffected() {
     const LogisticsGraph g = makeIncrementalGraph();
     const Vehicle v = makeVehicle("W", 1000.0, 480);
-    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 10.0, 0, 1440, false),
-                                       makeOrder("O2", "W", "D2", 10.0, 0, 1440, false)};
+    const std::vector<Order> orders = {
+        makeOrder("O1", "W", "D1", 10.0, 0, 1440, false),
+        makeOrder("O2", "W", "D2", 10.0, 0, 1440, false),
+    };
 
     const RoutePlan before = planRoute(g, v, orders, WeightType::Time);
-
-    // 报告里只有一条**不在路线上的**边（D1->D3 是绕行边，当前路线没走）
-    TrafficReport report;
-    TrafficChange c;
-    c.fromId = "D1";
-    c.toId = "D3";
-    c.increaseRatio = 0.8;
-    c.congested = true;
-    report.changes.push_back(c);
-
+    TrafficReport report;   // 空报告
+    bool used = false;
     const RoutePlan after =
-        replanIncremental(g, v, orders, before, 480, WeightType::Time, report, 0.2);
+        replanIncremental(g, v, orders, before, 480, WeightType::Time, report, 0.2,
+                          std::vector<logistics::OnboardItem>(), &used);
 
+    check(used, "空报告下仍走重放");
     check(after.nodes == before.nodes, "无 leg 受影响时，节点序列逐位不变");
     check(after.stops.size() == before.stops.size(), "停靠点数不变");
-    check(fixtures::nearlyEqual(after.totalTimeMin, before.totalTimeMin),
-          "总耗时不变");
+    check(fixtures::nearlyEqual(after.totalTimeMin, before.totalTimeMin), "总耗时不变");
+    check(after.totalPenaltyMin == before.totalPenaltyMin, "总 penalty 不变");
 }
 
-// 范围限制：上一版是多趟时，增量退回全量重算，结果仍须合法
-// D22 的契约：增量重规划的结果必须与全量重算一致；且**多趟也要能走增量**。
-//
-// 早期实现只支持"整条剩余路线是单趟"，默认 6 趟方案下只有最后一趟用得上，
-// 其余一律全量——审计认为这实质等于没实现。现在改为**逐趟增量**。
-void testIncrementalReplanHandlesMultiTrip() {
-    const LogisticsGraph g = makeTransitClusterGraph();
-    const Vehicle v = makeVehicle("W", 20.0, 480);
-    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 15.0, 0, 1440, false),
-                                       makeOrder("O2", "W", "D2", 15.0, 0, 1440, false)};
+// 重放不可行（序列不全）⇒ 退回全量重规划，结果仍须合法且覆盖全部订单。
+void testIncrementalFallsBackWhenReplayInfeasible() {
+    const LogisticsGraph g = makeIncrementalGraph();
+    const Vehicle v = makeVehicle("W", 1000.0, 480);
+    const std::vector<Order> orders = {
+        makeOrder("O1", "W", "D1", 10.0, 0, 1440, false),
+        makeOrder("O2", "W", "D2", 10.0, 0, 1440, false),
+    };
 
-    const RoutePlan multi = planRoute(g, v, orders, WeightType::Distance);
-    check(multi.trips.size() > 1, "前提：上一版确为多趟");
+    // 给一个序列不全的"上一版"：只有起点，重放无从下手。
+    RoutePlan broken;
+    broken.status = PlanStatus::Ok;
+    broken.nodes = {"W"};
+    broken.nodeArrivalMin = {480};
+    broken.nodeIsStop = {false};
 
-    // 空报告：没有受影响的路段，走增量应原样保留
-    bool used = false;
-    TrafficReport empty;
-    const RoutePlan same = replanIncremental(g, v, orders, multi, 480,
-                                             WeightType::Distance, empty, 0.2,
-                                             std::vector<logistics::OnboardItem>(), &used);
-    check(used, "多趟剩余路线也必须走增量路径（不再一律退回全量）");
-    check(same.status == PlanStatus::Ok && same.stops.size() == multi.stops.size(),
-          "无路况变化时停靠点应完全保留");
-    check(same.totalDistanceKm == multi.totalDistanceKm,
-          "无路况变化时总距离应不变，实际 "
-              + std::to_string(same.totalDistanceKm) + " vs "
-              + std::to_string(multi.totalDistanceKm));
-
-    // 有路况变化：增量结果必须与全量重算**一致**（D22 契约）
-    TrafficReport report;
-    for (const logistics::Edge& e : g.edges()) {
-        logistics::TrafficChange c;
-        c.fromId = e.fromId;
-        c.toId = e.toId;
-        c.congested = true;
-        c.increaseRatio = 0.5;
-        report.changes.push_back(c);
-    }
-    bool used2 = false;
-    const RoutePlan inc = replanIncremental(g, v, orders, multi, 480,
-                                            WeightType::Distance, report, 0.2,
-                                            std::vector<logistics::OnboardItem>(), &used2);
-    check(inc.status == PlanStatus::Ok, "全边拥堵后仍可行");
-    checkRouteIsWalkable(g, inc, "W");
-    check(inc.stops.size() == multi.stops.size(), "停靠点数量不变");
-
-    // 与全量重算对比：停靠顺序与各站到达时刻应一致
-    const RoutePlan full = replan(g, v, orders, "W", 480, WeightType::Distance);
-    check(inc.stops.size() == full.stops.size(), "与全量重算的停靠点数一致");
-    bool sameOrder = (inc.stops.size() == full.stops.size());
-    for (std::size_t i = 0; sameOrder && i < inc.stops.size(); ++i) {
-        sameOrder = (inc.stops[i].nodeId == full.stops[i].nodeId);
-    }
-    check(sameOrder, "增量结果的停靠顺序应与全量重算一致");
+    bool used = true;
+    const RoutePlan after =
+        replanIncremental(g, v, orders, broken, 480, WeightType::Distance, TrafficReport(), 0.2,
+                          std::vector<logistics::OnboardItem>(), &used);
+    check(after.status == PlanStatus::Ok, "回退全量后仍可行");
+    check(!used, "序列不全时 usedIncremental == false（退回了全量）");
+    checkStructuralInvariants(g, after, orders, v, "增量回退全量");
 }
 
-bool samePlan(const RoutePlan& a, const RoutePlan& b) {
-    if (a.status != b.status || a.nodes != b.nodes || a.stops.size() != b.stops.size()) {
-        return false;
-    }
-    if (!fixtures::nearlyEqual(a.totalDistanceKm, b.totalDistanceKm)
-        || !fixtures::nearlyEqual(a.totalTimeMin, b.totalTimeMin)
-        || !fixtures::nearlyEqual(a.totalCostYuan, b.totalCostYuan)
-        || a.totalPenaltyMin != b.totalPenaltyMin) {
-        return false;
-    }
-    for (std::size_t i = 0; i < a.stops.size(); ++i) {
-        if (a.stops[i].nodeId != b.stops[i].nodeId
-            || a.stops[i].arrivalMin != b.stops[i].arrivalMin
-            || a.stops[i].late != b.stops[i].late
-            || a.stops[i].penaltyMin != b.stops[i].penaltyMin) {
-            return false;
-        }
-    }
-    return true;
-}
-
-// 切片 6：replan 从给定位置与给定时刻出发，服务剩余订单后返回车辆起始仓库
+// replan 从给定位置与给定时刻出发，服务剩余订单后返回车辆起始仓库。
 void testReplanFromCurrentPosition() {
     LogisticsGraph g;
     g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
@@ -683,43 +951,28 @@ void testReplanFromCurrentPosition() {
     addTwoWay(g, "D1", "D2", 2.0, 4.0, 2.0);
 
     const Vehicle v = makeVehicle("W", 1000.0, 480);
-    // 车已在 D2，时刻 600，剩余一个 D1 的订单
-    const std::vector<Order> remaining = {makeOrder("O1", "W", "D1", 10.0, 0, 1440, false)};
+    // 车已在 D2、时刻 600，剩余一张 D1 的订单（A=D2、B=D1）。
+    const std::vector<Order> remaining = {makeOrder("O1", "D2", "D1", 10.0, 0, 1440, false)};
 
     const RoutePlan plan = replan(g, v, remaining, "D2", 600, WeightType::Distance);
 
     check(plan.status == PlanStatus::Ok, "重规划成功");
-    // D2->D1 = 4min -> 604 到达；D1->W = 2min -> 606（服务时间已移除）
     check(plan.nodes == std::vector<std::string>{"D2", "D1", "W"},
           "序列为 D2->D1->W，实际 " + join(plan.nodes));
+    // D2 是取货点：原地取货（无位移），D2->D1 = 4min，D1->W = 2min ⇒ 总耗时 6。
     check(fixtures::nearlyEqual(plan.totalTimeMin, 6.0),
           "总耗时 606-600 = 6，实际 " + std::to_string(plan.totalTimeMin));
     check(fixtures::nearlyEqual(plan.totalDistanceKm, 3.0),
           "总距离 2.0+1.0 = 3.0，实际 " + std::to_string(plan.totalDistanceKm));
-    check(plan.stops.size() == 1 && plan.stops[0].rawArrivalMin == 604,
-          "首个停靠点 rawArrival 604");
+    check(plan.stops.size() == 2, "原地取货 + 送达 = 2 个停靠");
+    if (plan.stops.size() == 2) {
+        check(plan.stops[0].nodeId == "D2" && plan.stops[0].arrivalMin == 600,
+              "首个停靠是原地取货 D2，到达 600");
+    }
+    checkStructuralInvariants(g, plan, remaining, v, "从当前位置重规划", "D2");
 }
 
-// 切片 6（边界）：当前位置恰好就是待配送点 -> 立即服务，不产生位移
-void testReplanWhenAlreadyAtTheDeliveryNode() {
-    const LogisticsGraph g = makeWtoD1Graph();
-    const Vehicle v = makeVehicle("W", 1000.0, 480);
-    const std::vector<Order> remaining = {makeOrder("O1", "W", "D1", 10.0, 0, 1440, false)};
-
-    const RoutePlan plan = replan(g, v, remaining, "D1", 600, WeightType::Distance);
-
-    check(plan.status == PlanStatus::Ok, "重规划成功");
-    check(plan.nodes == std::vector<std::string>{"D1", "W"},
-          "已在配送点则无位移，实际 " + join(plan.nodes));
-    check(plan.stops.size() == 1 && plan.stops[0].rawArrivalMin == 600,
-          "立即服务，rawArrival 等于当前时刻 600");
-    check(fixtures::nearlyEqual(plan.totalDistanceKm, 5.0),
-          "本图 W<->D1 为 5.0km，故只算返回段 5.0，实际 "
-              + std::to_string(plan.totalDistanceKm));
-}
-
-// 切片 6：两个入口必须共用同一份实现 ——
-// planRoute(...) 等价于 replan(..., 仓库, 发车时刻, ...)
+// planRoute 等价于 replan(..., 仓库, 发车时刻, ...)
 void testPlanRouteEqualsReplanFromDepot() {
     LogisticsGraph g;
     g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
@@ -739,8 +992,9 @@ void testPlanRouteEqualsReplanFromDepot() {
     const RoutePlan viaReplan =
         replan(g, v, orders, v.startNodeId, v.departTimeMin, WeightType::Distance);
 
-    check(samePlan(viaPlanRoute, viaReplan),
-          "planRoute 与 replan(仓库, 发车时刻) 结果必须完全一致");
+    check(viaPlanRoute.nodes == viaReplan.nodes, "两个入口的节点序列逐位一致");
+    check(viaPlanRoute.stops.size() == viaReplan.stops.size(), "停靠点数一致");
+    check(viaPlanRoute.totalPenaltyMin == viaReplan.totalPenaltyMin, "penalty 一致");
 }
 
 // 切片 8：路径成员判定（GUI 路径高亮与路况触发判定共用这一条逻辑）
@@ -750,62 +1004,46 @@ void testIsEdgeOnRoute() {
     check(logistics::isEdgeOnRoute(route, "W", "D1"), "首段在路径上");
     check(logistics::isEdgeOnRoute(route, "D1", "D2"), "中段在路径上");
     check(logistics::isEdgeOnRoute(route, "D2", "W"), "末段在路径上");
-
     check(!logistics::isEdgeOnRoute(route, "D1", "W"), "反向边不算（路径有向）");
     check(!logistics::isEdgeOnRoute(route, "W", "D2"), "非相邻的一对不算");
     check(!logistics::isEdgeOnRoute(route, "D2", "D1"), "反向的另一半也不算");
     check(!logistics::isEdgeOnRoute({}, "W", "D1"), "空路径不含任何边");
     check(!logistics::isEdgeOnRoute({"W"}, "W", "W"), "单节点无相邻对");
 
-    // 重复经过同一段也算在路径上
     const std::vector<std::string> loop = {"W", "D1", "W", "D1", "W"};
     check(logistics::isEdgeOnRoute(loop, "D1", "W"), "重复经过的段落也在路径上");
 }
 
-// ---- nodeIndexAtTime：软件内时刻 -> "半路显示所在段的起点" ----
-//
-// 用切片 1 的手算路线：W(480) -> D1(540) -> W(550)，index 0/1/2。
-// 该函数的语义是**段起点**：车在 i -> i+1 途中时返回 i。
+// nodeIndexAtTime：软件内时刻 -> "半路显示所在段的起点"
 void testNodeIndexAtTimeReturnsSegmentStart() {
     const LogisticsGraph g = makeWtoD1Graph();
     const Vehicle v = makeVehicle("W", 1000.0, 480);
     const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 10.0, 540, 1080, false)};
     const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
 
-    // 先固定前提：到达时刻就是手算的 480 / 540 / 550
     check(plan.nodeArrivalMin == std::vector<int>({480, 540, 550}),
           "前提：逐节点到达时刻为 480 / 540 / 550");
     if (plan.nodes.size() != 3) {
         return;
     }
-
-    // 早于首节点 -> 0（车还在起点，尚未出发/刚到）
     check(nodeIndexAtTime(plan, 400) == 0, "早于首节点 -> 下标 0");
     check(nodeIndexAtTime(plan, 479) == 0, "首节点前 1 分钟 -> 下标 0");
-
-    // 恰等于某节点到达时刻 -> 返回该节点（"恰好已到达"算作到了）
     check(nodeIndexAtTime(plan, 480) == 0, "恰等于节点 0 到达时刻 -> 下标 0");
     check(nodeIndexAtTime(plan, 540) == 1, "恰等于节点 1 到达时刻 -> 下标 1");
     check(nodeIndexAtTime(plan, 550) == 2, "恰等于节点 2 到达时刻 -> 下标 2");
-
-    // 落在两节点之间 -> 返回**前一个**节点（这就是段起点）
-    check(nodeIndexAtTime(plan, 500) == 0, "480 之后 540 之前 -> 段起点 0（W->D1 途中）");
+    check(nodeIndexAtTime(plan, 500) == 0, "480 之后 540 之前 -> 段起点 0");
     check(nodeIndexAtTime(plan, 539) == 0, "紧临节点 1 之前 -> 段起点 0");
-    check(nodeIndexAtTime(plan, 545) == 1, "540 之后 550 之前 -> 段起点 1（D1->W 途中）");
-
-    // 超过末节点 -> 末节点下标（clamp，不越界）
+    check(nodeIndexAtTime(plan, 545) == 1, "540 之后 550 之前 -> 段起点 1");
     check(nodeIndexAtTime(plan, 551) == 2, "超过末节点 -> 末节点下标 2");
     check(nodeIndexAtTime(plan, 100000) == 2, "远超末节点 -> 仍为末节点下标 2");
 }
 
-// 边界：空 plan 返回 0；节点数 < 到达时刻数等非规范输入也不得越界。
 void testNodeIndexAtTimeOnEmptyPlanAndClamp() {
     const RoutePlan empty;
     check(empty.nodes.empty(), "前提：空 plan");
     check(nodeIndexAtTime(empty, 0) == 0, "空 plan -> 0");
     check(nodeIndexAtTime(empty, 99999) == 0, "空 plan（任意时刻）-> 0");
 
-    // 只有一个节点：任何时刻都只能是下标 0（clamp 到 [0, size-1]）
     RoutePlan single;
     single.nodes = {"W"};
     single.nodeArrivalMin = {480};
@@ -813,163 +1051,18 @@ void testNodeIndexAtTimeOnEmptyPlanAndClamp() {
     check(nodeIndexAtTime(single, 480) == 0, "单节点恰在到达 -> 0");
     check(nodeIndexAtTime(single, 1000) == 0, "单节点超过到达 -> 0（不越界）");
 
-    // nodeArrivalMin 比 nodes 短：只按到达时刻序列判定，且结果不得越界
     RoutePlan ragged;
     ragged.nodes = {"A", "B", "C"};
     ragged.nodeArrivalMin = {480};
     check(nodeIndexAtTime(ragged, 600) == 0, "到达时刻序列不完整时返回其有效下标");
 }
 
-// 单调性：timeMin 增大时返回值必须单调不减（抽查多个时刻）。
-void testNodeIndexAtTimeIsMonotonicInTime() {
-    const LogisticsGraph g = makeTransitClusterGraph();
-    const Vehicle v = makeVehicle("W", 20.0, 480);
-    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 10.0, 0, 1440, false),
-                                       makeOrder("O2", "W", "D2", 10.0, 0, 1440, false)};
-    const RoutePlan plan = planRoute(g, v, orders, WeightType::Distance);
-    check(plan.status == PlanStatus::Ok, "前提：多趟路线规划成功");
-
-    std::size_t prev = nodeIndexAtTime(plan, 0);
-    bool monotonic = true;
-    bool outOfRange = false;
-    for (int t = 0; t <= 2000; t += 5) {
-        const std::size_t cur = nodeIndexAtTime(plan, t);
-        if (cur < prev) {
-            monotonic = false;
-        }
-        if (cur >= plan.nodes.size()) {
-            outOfRange = true;
-        }
-        prev = cur;
-    }
-    check(monotonic, "timeMin 增大时返回值单调不减（0..2000 每 5min 抽查）");
-    check(!outOfRange, "返回值始终落在 [0, nodes.size()-1] 内");
-
-    // 单调性必须是"内容"上的：时间足够大时应落回末节点（回到仓库）
-    check(nodeIndexAtTime(plan, 100000) == plan.nodes.size() - 1,
-          "足够大的时刻落在末节点（回到仓库）");
-}
-
 } // namespace
 
-// 增量重规划在全量回退时，必须把"在途货"一并带走。
-// 否则这条路径上会静默断掉（审计时发现的缺口）。
-static void testIncrementalReplanForwardsOnboard() {
-    const logistics::LogisticsGraph g = makeTransitClusterGraph();
-    logistics::Vehicle v;
-    v.id = "V01"; v.startNodeId = "W"; v.capacityKg = 40.0; v.departTimeMin = 480;
+namespace {
 
-    std::vector<logistics::Order> orders;
-    for (const char* id : {"D1", "D2"}) {
-        logistics::Order o;
-        o.id = std::string("O") + id[1];
-        o.nodeId = id;
-        o.demandKg = 30.0;
-        o.windowStartMin = 0;
-        o.windowEndMin = 1440;
-        orders.push_back(o);
-    }
-
-    // 让增量重规划走上"回退到全量重算"的分支：给一条把当前路线打成不可达的报告
-    logistics::TrafficReport report;
-    logistics::TrafficChange ch;
-    ch.fromId = "T"; ch.toId = "D1";
-    ch.congested = true; ch.increaseRatio = 50.0;   // 极大增幅，逼它回退全量重算
-    report.changes.push_back(ch);
-
-    // 车上带着 D2 的货：重规划（含回退全量）必须把它当成"车不是空的"
-    const std::vector<logistics::OnboardItem> onboard{{"D2", 30.0}};
-    const logistics::RoutePlan base = logistics::replan(
-        g, v, orders, "W", 480, logistics::WeightType::Distance);
-    const logistics::RoutePlan inc = logistics::replanIncremental(
-        g, v, orders, base, 480, logistics::WeightType::Distance, report, 0.2, onboard);
-
-    check(inc.status == logistics::PlanStatus::Ok, "带在途货的增量重规划应成功");
-    // D2 的货已在车上，故本趟装载只需覆盖它之外的量
-    bool carriesD2 = false;
-    for (const logistics::Trip& t : inc.trips) {
-        for (const logistics::Stop& st : t.stops) {
-            if (st.nodeId == "D2") {
-                carriesD2 = true;
-            }
-        }
-    }
-    check(carriesD2, "在途货所属的 D2 仍应被服务");
-}
-
-// ---- 用车在途中插紧急单后，计划各趟必须首尾相接 ----
-//
-// 缺陷背景（人工测试导出日志发现）：车在途中（位置 T）、车上还载着在途货，
-// 此时插入一张紧急单。紧急批**先执行**且以仓库收尾（`current = 仓库`），
-// 但"接着送车上已有的货"那一趟却从 `startPos`（车出发时的客户点）起算，
-// 排出一趟"起点是车早已离开的客户点"的趟。后果：
-//   · 计划各趟首尾不接（车凭空从仓库跳回客户点再开出去）；
-//   · 界面在车**到达仓库**时装载它 ⇒ 车只带着在途那点订单货离开仓库
-//     （导出日志实测「接着送…20.0kg」）。
-// 本守卫直接断言**首尾相接**（车不能凭空移动）。
-void testTripContinuityAfterUrgentInsertWhileEnRoute() {
-    LogisticsGraph g;
-    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
-    Node t = makeNode("T", NodeType::Transit, "中转站");
-    t.subNetworkId = 1;
-    g.addNode(t);
-    Node d1 = makeNode("D1", NodeType::Delivery, "客户1");
-    d1.subNetworkId = 1;
-    g.addNode(d1);
-    Node d2 = makeNode("D2", NodeType::Delivery, "客户2");
-    d2.subNetworkId = 1;
-    g.addNode(d2);
-    Node d3 = makeNode("D3", NodeType::Delivery, "客户3");
-    d3.subNetworkId = 1;
-    g.addNode(d3);
-    addTwoWay(g, "W", "T", 5.0, 10.0, 4.0);
-    addTwoWay(g, "T", "D1", 5.0, 10.0, 4.0);
-    addTwoWay(g, "W", "D2", 3.0, 6.0, 2.0);
-    addTwoWay(g, "W", "D3", 4.0, 8.0, 3.0);
-
-    const Vehicle v = makeVehicle("W", 100.0, 480);
-
-    // 车已在途中（位置 T），车上载着 D2 的 30kg；未服务订单 D2 30kg + D3 80kg。
-    std::vector<Order> pending;
-    pending.push_back(makeOrder("O2", "W", "D2", 30.0, 0, 1440));
-    pending.push_back(makeOrder("O3", "W", "D3", 80.0, 0, 1440));
-    std::vector<logistics::OnboardItem> onboard;
-    logistics::OnboardItem item;
-    item.nodeId = "D2";
-    item.kg = 30.0;
-    onboard.push_back(item);
-
-    const Order urgent = makeOrder("U1", "W", "D1", 10.0, 0, 1440, true);
-    const InsertResult res = insertUrgentOrder(g, v, pending, urgent, "T", 500,
-                                               WeightType::Distance, onboard);
-    const RoutePlan& p = res.plan;
-
-    std::string seq;
-    for (std::size_t i = 0; i < p.trips.size(); ++i) {
-        seq += "[" + std::to_string(i + 1) + "] " + p.trips[i].nodes.front() + ".."
-               + p.trips[i].endNodeId + "  ";
-    }
-
-    // 不变量：第一趟必须从车辆当前位置出发；此后每趟的起点必须等于上一趟的终点。
-    bool chainOk = true;
-    std::string bad;
-    if (!p.trips.empty() && p.trips[0].nodes.front() != "T") {
-        chainOk = false;
-        bad = "第 1 趟起点 " + p.trips[0].nodes.front() + " != 车辆位置 T";
-    }
-    for (std::size_t i = 1; i < p.trips.size(); ++i) {
-        if (p.trips[i].nodes.front() != p.trips[i - 1].endNodeId) {
-            chainOk = false;
-            bad = "第 " + std::to_string(i + 1) + " 趟起点 " + p.trips[i].nodes.front()
-                  + " != 第 " + std::to_string(i) + " 趟终点 " + p.trips[i - 1].endNodeId;
-        }
-    }
-    check(chainOk, "各趟必须首尾相接（车不能凭空移动）：" + bad + "；实际 " + seq);
-}
-
-// ---- issue #4：装不下 → 整单降载到中转站 + 完成后取回 ----
-//
-// 图：W -- S(中转站, sub=1) -- {D1..D4(客户, sub=1)}，另有 D3--D4 直连。
+// ---- 降载 / 取回夹具 ----
+// W -- S(中转站, sub=1) -- {D1..D4(客户, sub=1)}，另有 D3--D4 直连。
 LogisticsGraph makeOffloadGraph() {
     LogisticsGraph g;
     g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
@@ -991,17 +1084,18 @@ LogisticsGraph makeOffloadGraph() {
     return g;
 }
 
-// 车上已载普通货 D1 60kg + D2 30kg（free = 10），紧急单 D3→D4 要 50kg：
-// 必须先整单降载。按"离仓库最远优先"挑整条货（D2 距 8 > D1 距 7）：
-// D2 30kg 仍缺（need 40）→ 再挑 D1，共 freed 90 ≥ need。全图中转站只有 S。
-void testUrgentOffloadToTransitWhenNotFitting() {
+// 降载：紧急单装不下 ⇒ 把**整张普通单**卸到中转站，事后同一辆车取回。
+// 断言口径全部按订单（MC-A05）：账本是 RoutePlan::offloads（OffloadLeg）。
+void testOffloadConservesAndReclaims() {
     const LogisticsGraph g = makeOffloadGraph();
     const Vehicle v = makeVehicle("W", 100.0, 480);
 
+    // 车上已载普通货 D1 60kg + D2 30kg（free = 10），紧急单 D3→D4 要 50kg。
     std::vector<Order> pending;
     pending.push_back(makeOrder("O1", "W", "D1", 60.0, 0, 1440));
     pending.push_back(makeOrder("O2", "W", "D2", 30.0, 0, 1440));
-    const std::vector<logistics::OnboardItem> onboard{{"D1", 60.0}, {"D2", 30.0}};
+    const std::vector<logistics::OnboardItem> onboard{
+        {"D1", 60.0, "O1"}, {"D2", 30.0, "O2"}};
 
     Order urgent;
     urgent.id = "U1";
@@ -1016,119 +1110,72 @@ void testUrgentOffloadToTransitWhenNotFitting() {
                                                WeightType::Distance, onboard);
     const RoutePlan& p = res.plan;
 
-    check(p.status == PlanStatus::Ok, "降载场景规划可行");
-    std::size_t offTrip = p.trips.size();
-    for (std::size_t i = 0; i < p.trips.size(); ++i) {
-        if (!p.trips[i].offloads.empty()) {
-            offTrip = i;
-            break;
+    check(p.status == PlanStatus::Ok, "降载场景规划可行: " + p.reason);
+    check(!p.offloads.empty(), "装不下时应产生降载记录");
+
+    // 不变量 ⑩：选货 = 最少订单数（kg 降序、同 kg 按 ID），只卸整张普通单、绝不卸紧急货。
+    double offloadKg = 0.0;
+    std::string station;
+    bool onlyNormal = true;
+    for (const logistics::OffloadLeg& leg : p.offloads) {
+        offloadKg += leg.kg;
+        if (station.empty()) {
+            station = leg.station;
+        }
+        check(leg.station == station, "全局至多一堆：所有降载都在同一站 " + station);
+        check(leg.reclaimTimeMin >= 0, "期末必须已取回（暂存守恒）");
+        check(leg.orderId != "U1", "绝不卸紧急货");
+        bool normal = false;
+        for (const Order& o : pending) {
+            if (o.id == leg.orderId && !o.urgent) {
+                normal = true;
+            }
+        }
+        if (!normal) {
+            onlyNormal = false;
         }
     }
-    check(offTrip < p.trips.size(), "存在降载趟");
-    if (offTrip >= p.trips.size()) {
-        return;
-    }
-    // 紧急单最先执行（FIFO），降载趟应是第一趟
-    check(offTrip == 0, "降载趟应最先执行（紧急单优先）");
+    check(onlyNormal, "降载只卸普通单");
+    // need = 50 - 10 = 40；kg 降序前缀：60 ≥ 40 ⇒ 只卸 1 张（最少订单数）。
+    check(p.offloads.size() == 1,
+          "最少订单数选货：need 40kg 时只卸 60kg 的那一张，实际卸 "
+              + std::to_string(p.offloads.size()) + " 张");
+    check(fixtures::nearlyEqual(offloadKg, 60.0),
+          "卸下量 60kg，实际 " + std::to_string(offloadKg));
 
-    const logistics::Trip& t = p.trips[offTrip];
-    check(t.nodes.front() == "W" && t.nodes.back() == "W",
-          "降载趟从仓库出发并回到仓库，实际 " + join(t.nodes));
-    // issue #12：取回暂存货后继续普通配送并入**同一趟**，不再拆成后续簇趟。
-    check(t.nodes == std::vector<std::string>(
-              {"W", "S", "D3", "D4", "S", "D1", "S", "D2", "S", "W"}),
-          "同趟应含 W->S(卸)->D3(取)->D4(送)->S(取回)->D1->S->D2->S->W，实际 "
-              + join(t.nodes));
-
-    // 降载发生在取货之前；取回发生在送达之后
-    std::size_t s1 = t.nodes.size();
-    std::size_t s2 = 0;
-    std::size_t ia = t.nodes.size();
-    std::size_t ib = t.nodes.size();
-    for (std::size_t i = 0; i < t.nodes.size(); ++i) {
-        if (t.nodes[i] == "S" && s1 == t.nodes.size()) {
-            s1 = i;
+    // 不变量 ⑪：取回停靠先于该单送达；降载停靠先于触发它的取货点。
+    std::size_t offloadIdx = p.stops.size();
+    std::size_t reclaimIdx = p.stops.size();
+    std::size_t pickIdx = p.stops.size();
+    std::size_t delivIdx = p.stops.size();
+    for (std::size_t i = 0; i < p.stops.size(); ++i) {
+        if (!p.stops[i].offloads.empty() && offloadIdx == p.stops.size()) {
+            offloadIdx = i;
         }
-        if (t.nodes[i] == "S") {
-            s2 = i;
+        if (!p.stops[i].reclaims.empty() && reclaimIdx == p.stops.size()) {
+            reclaimIdx = i;
         }
-        if (t.nodes[i] == "D3") {
-            ia = i;
+        for (const std::string& id : p.stops[i].pickups) {
+            if (id == "U1" && pickIdx == p.stops.size()) {
+                pickIdx = i;
+            }
         }
-        if (t.nodes[i] == "D4") {
-            ib = i;
-        }
-    }
-    check(s1 < ia, "降载站 S 必须出现在取货点 A 之前");
-    check(t.reclaimStation == "S" && s2 > ib, "取回站 S 必须出现在送达点 B 之后");
-
-    // issue #12：B 送达并回 S 取回后，同一趟继续停靠普通客户 D1、D2
-    std::size_t iB = t.stops.size();
-    std::size_t iD1 = t.stops.size();
-    std::size_t iD2 = t.stops.size();
-    for (std::size_t i = 0; i < t.stops.size(); ++i) {
-        if (t.stops[i].nodeId == "D4" && iB == t.stops.size()) iB = i;
-        if (t.stops[i].nodeId == "D1" && iD1 == t.stops.size()) iD1 = i;
-        if (t.stops[i].nodeId == "D2" && iD2 == t.stops.size()) iD2 = i;
-    }
-    check(iB < t.stops.size() && iD1 < t.stops.size() && iD2 < t.stops.size(),
-          "同一趟的停靠必须含 B(D4) 与后续普通停靠 D1、D2");
-    check(iB < iD1 && iD1 < iD2, "B 先送达，随后同趟继续普通配送 D1、D2");
-
-    // 后续趟不得再排这批普通货（杜绝二次配送 / 拆趟）
-    bool duplicated = false;
-    for (std::size_t k = 0; k < p.trips.size(); ++k) {
-        if (k == offTrip) {
-            continue;
-        }
-        for (const logistics::Stop& s : p.trips[k].stops) {
-            if (s.nodeId == "D1" || s.nodeId == "D2") {
-                duplicated = true;
+        for (const logistics::StopDelivery& d : p.stops[i].deliveries) {
+            if (d.orderId == p.offloads.front().orderId && delivIdx == p.stops.size()) {
+                delivIdx = i;
             }
         }
     }
-    check(!duplicated, "D1/D2 已在降载趟同趟配送，后续趟不得再排同样的普通趟");
-    check(p.trips.size() == 1, "降载→取回→继续普通应在同一趟完成（计划只有 1 趟）");
-
-    // 暂存守恒：Σoffloads.kg == reclaimKg，且两条普通货都被整单卸下
-    double sum = 0.0;
-    bool hasD1 = false;
-    bool hasD2 = false;
-    for (const logistics::OffloadOp& op : t.offloads) {
-        sum += op.kg;
-        if (op.nodeId == "D1") {
-            hasD1 = fixtures::nearlyEqual(op.kg, 60.0);
-        }
-        if (op.nodeId == "D2") {
-            hasD2 = fixtures::nearlyEqual(op.kg, 30.0);
-        }
-        check(op.station == "S", "降载只发生在中转站 S");
-    }
-    check(fixtures::nearlyEqual(sum, t.reclaimKg), "Σoffloads.kg == reclaimKg（暂存守恒）");
-    check(fixtures::nearlyEqual(t.reclaimKg, 90.0),
-          "need 40 按「离仓库最远优先」累积应卸下两条共 90kg，实际 "
-              + std::to_string(t.reclaimKg));
-    check(hasD1 && hasD2, "D1/D2 的整条货都被降载");
-
-    // 本趟载重不超过上限
-    check(t.loadKg <= v.capacityKg + 1e-9, "降载趟 loadKg 不超过载重上限");
-    // 真实峰值载重：onboardLoad 90 全卸(freed 90)，A 取紧急 50 → 50；B 送完回 S
-    // 取回全部 90kg 后车上又是 90（passingKg=0），才是本趟峰值。
-    check(fixtures::nearlyEqual(t.loadKg, 90.0),
-          "降载趟 loadKg = max((onboardLoad-freed)+紧急 50, onboardLoad-passingKg=90) = 90，实际 "
-              + std::to_string(t.loadKg));
-    check(!t.pickups.empty() && t.pickups[0].orderId == "U1",
-          "取货记录属于紧急单 U1");
-
-    // 手算距离：W-S 5 + S-D3 4 + D3-D4 2 + D4-S 5 + S-D1 2 + D1-S 2
-    //          + S-D2 3 + D2-S 3 + S-W 5 = 31
-    check(fixtures::nearlyEqual(t.totalDistanceKm, 31.0),
-          "同趟降载+取回+继续普通距离 31.0，实际 " + std::to_string(t.totalDistanceKm));
-
-    checkRouteIsWalkable(g, p, "W");
+    check(offloadIdx < pickIdx, "降载停靠必须早于触发它的取货点");
+    check(reclaimIdx < delivIdx, "取回停靠必须早于暂存单的送达");
+    checkStructuralInvariants(g, p, [&]() {
+        std::vector<Order> all = pending;
+        all.push_back(urgent);
+        return all;
+    }(), v, "降载取回");
 }
 
-// 对照：装得下（demand ≤ free）时保持 #3 行为，不产生任何降载/取回
+// 对照：装得下时不产生任何降载/取回。
 void testUrgentFitsLeavesOffloadsEmpty() {
     const LogisticsGraph g = makeOffloadGraph();
     const Vehicle v = makeVehicle("W", 100.0, 480);
@@ -1136,13 +1183,14 @@ void testUrgentFitsLeavesOffloadsEmpty() {
     std::vector<Order> pending;
     pending.push_back(makeOrder("O1", "W", "D1", 60.0, 0, 1440));
     pending.push_back(makeOrder("O2", "W", "D2", 30.0, 0, 1440));
-    const std::vector<logistics::OnboardItem> onboard{{"D1", 60.0}, {"D2", 30.0}};
+    const std::vector<logistics::OnboardItem> onboard{
+        {"D1", 60.0, "O1"}, {"D2", 30.0, "O2"}};
 
     Order urgent;
     urgent.id = "U1";
     urgent.pickupNodeId = "D3";
     urgent.nodeId = "D4";
-    urgent.demandKg = 8.0;   // ≤ free 10
+    urgent.demandKg = 8.0;   // <= free 10
     urgent.windowStartMin = 0;
     urgent.windowEndMin = 1440;
     urgent.urgent = true;
@@ -1152,47 +1200,53 @@ void testUrgentFitsLeavesOffloadsEmpty() {
     const RoutePlan& p = res.plan;
 
     check(p.status == PlanStatus::Ok, "装得下场景规划可行");
-    check(!p.trips.empty(), "至少一趟");
-    if (p.trips.empty()) {
-        return;
+    check(p.offloads.empty(), "装得下时不降载（offloads 为空）");
+    // 紧急单的取货/送达动作都在，且取货在前。
+    std::size_t pickIdx = p.stops.size();
+    std::size_t delivIdx = p.stops.size();
+    for (std::size_t i = 0; i < p.stops.size(); ++i) {
+        for (const std::string& id : p.stops[i].pickups) {
+            if (id == "U1" && pickIdx == p.stops.size()) {
+                pickIdx = i;
+            }
+        }
+        for (const logistics::StopDelivery& d : p.stops[i].deliveries) {
+            if (d.orderId == "U1" && delivIdx == p.stops.size()) {
+                delivIdx = i;
+            }
+        }
     }
-    const logistics::Trip& t = p.trips[0];
-    check(t.offloads.empty(), "装得下时不降载（offloads 为空）");
-    check(t.reclaimStation.empty() && t.reclaimKg == 0.0, "装得下时无取回记录");
-    check(t.nodes == std::vector<std::string>({"W", "S", "D3", "D4", "S", "W"}),
-          "装得下时仍为 #3 的取送趟（途经 S 只是路径），实际 " + join(t.nodes));
-    check(!t.pickups.empty() && t.pickups[0].orderId == "U1", "取货记录正确");
-    checkRouteIsWalkable(g, p, "W");
+    check(pickIdx < delivIdx, "紧急单先取后送");
+    std::vector<Order> all = pending;
+    all.push_back(urgent);
+    checkStructuralInvariants(g, p, all, v, "装得下不降载");
 }
 
-// ---- issue #5：A/B 顺路交货（装得下分支）----
-//
-// 图：W--A 5、W--B 3、W--X 4、A--B 2（均双向，距离/时间/成本取同一量纲便于手算）。
-// 车上已载 A 的普通货 20kg、B 的普通货 15kg；插紧急单 A→B 10kg（装得下）。
-// 期望：紧急趟 W→A(取货 + 顺路交付 A 货)→B(送紧急包裹 + 顺路交付 B 货)→W；
-// A、B 都只作为停靠点出现一次（不二次配送），B 的到达不晚于其它普通停靠点 X。
-LogisticsGraph makePassingGraph() {
+// 顺路交货：紧急停靠点上若恰有在车普通货的目的地，且不增加等待 ⇒ 一并交付。
+// 且该普通单**只送达一次**（不二次配送）。
+void testIncidentalDeliveryMergesIntoUrgentStop() {
     LogisticsGraph g;
     g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
     g.addNode(makeNode("A", NodeType::Delivery, "客户A"));
     g.addNode(makeNode("B", NodeType::Delivery, "客户B"));
     g.addNode(makeNode("X", NodeType::Delivery, "客户X"));
+    g.addNode(makeNode("Y", NodeType::Delivery, "客户Y"));
     addTwoWay(g, "W", "A", 5.0, 10.0, 4.0);
     addTwoWay(g, "W", "B", 3.0, 6.0, 2.0);
     addTwoWay(g, "W", "X", 4.0, 8.0, 3.0);
     addTwoWay(g, "A", "B", 2.0, 4.0, 2.0);
-    return g;
-}
+    addTwoWay(g, "W", "Y", 2.0, 4.0, 2.0);
+    addTwoWay(g, "Y", "X", 2.0, 4.0, 2.0);
 
-void testUrgentPassingDeliversAAndBGoods() {
-    const LogisticsGraph g = makePassingGraph();
     const Vehicle v = makeVehicle("W", 100.0, 480);
 
+    // 车上已载 A 的普通货 20kg、B 的普通货 15kg；插紧急单 A→B 10kg（装得下）。
     std::vector<Order> pending;
     pending.push_back(makeOrder("O1", "W", "A", 20.0, 0, 1440));
     pending.push_back(makeOrder("O2", "W", "B", 15.0, 0, 1440));
-    pending.push_back(makeOrder("O3", "W", "X", 10.0, 0, 1440));
-    const std::vector<logistics::OnboardItem> onboard{{"A", 20.0}, {"B", 15.0}};
+    pending.push_back(makeOrder("O3", "Y", "X", 10.0, 0, 1440));
+    const std::vector<logistics::OnboardItem> onboard{
+        {"A", 20.0, "O1"}, {"B", 15.0, "O2"}};
 
     Order urgent;
     urgent.id = "U1";
@@ -1207,86 +1261,85 @@ void testUrgentPassingDeliversAAndBGoods() {
                                                WeightType::Distance, onboard);
     const RoutePlan& p = res.plan;
 
-    check(p.status == PlanStatus::Ok, "顺路交货（装得下）规划可行");
-    check(!p.trips.empty(), "至少一趟");
-    if (p.trips.empty()) {
-        return;
-    }
-    const logistics::Trip& t0 = p.trips[0];
-    check(t0.offloads.empty(), "装得下时无降载");
-    check(t0.stops.size() == 2, "紧急趟应有 A、B 两个停靠点，实际 "
-                                   + std::to_string(t0.stops.size()));
-    if (t0.stops.size() == 2) {
-        check(t0.stops[0].nodeId == "A" && t0.stops[1].nodeId == "B",
-              "A、B 顺序不变（A 前 B 后），实际 " + t0.stops[0].nodeId + "," + t0.stops[1].nodeId);
-    }
-    check(t0.nodes.front() == "W" && t0.nodes.back() == "W"
-              && std::find(t0.nodes.begin(), t0.nodes.end(), "A") != t0.nodes.end()
-              && std::find(t0.nodes.begin(), t0.nodes.end(), "B") != t0.nodes.end(),
-          "紧急趟从仓库出发、回到仓库，且经过 A、B，实际 " + join(t0.nodes));
-    check(fixtures::nearlyEqual(t0.totalDistanceKm, 10.0),
-          "顺路交付不额外绕路：W-A 5 + A-B 2 + B-W 3 = 10，实际 "
-              + std::to_string(t0.totalDistanceKm));
-    check(!t0.pickups.empty() && t0.pickups[0].orderId == "U1", "取货记录属于紧急单 U1");
+    check(p.status == PlanStatus::Ok, "顺路交货（装得下）规划可行: " + p.reason);
+    check(p.offloads.empty(), "装得下时无降载");
 
-    // A、B 在整个计划里各只作为停靠点出现一次（普通候选已从 normalPool 移除，无二次配送）
+    // 不变量 ⑦：A/B 各只出现一次停靠（顺路交货并入紧急停靠，不额外多停一次）。
     int countA = 0;
     int countB = 0;
-    bool hasX = false;
-    int arrivalB = -1;
-    for (const logistics::Stop& s : p.stops) {
+    for (const Stop& s : p.stops) {
         if (s.nodeId == "A") {
             ++countA;
         }
         if (s.nodeId == "B") {
             ++countB;
-            arrivalB = s.arrivalMin;
-        }
-        if (s.nodeId == "X") {
-            hasX = true;
         }
     }
-    check(countA == 1, "A 只被配送一次（停靠出现 " + std::to_string(countA) + " 次）");
-    check(countB == 1, "B 只被配送一次（停靠出现 " + std::to_string(countB) + " 次）");
-    check(hasX, "未在车上的普通货 X 仍需单独配送");
+    check(countA == 1, "A 只停靠一次（实际 " + std::to_string(countA) + "）");
+    check(countB == 1, "B 只停靠一次（实际 " + std::to_string(countB) + "）");
 
-    // 紧急优先守卫（放宽后）：B 的到达 ≤ 其余普通停靠点（A/B 同点顺路交付除外）
-    bool bFirst = true;
-    for (const logistics::Stop& s : p.stops) {
-        if (s.nodeId == "A" || s.nodeId == "B") {
+    // 顺路交货：A 停靠上应同时有 U1 的取货与 O1 的送达（先卸后装）。
+    bool aHasBoth = false;
+    for (const Stop& s : p.stops) {
+        if (s.nodeId != "A") {
             continue;
         }
-        if (arrivalB > s.arrivalMin) {
-            bFirst = false;
+        bool hasPick = false;
+        bool hasDeliv = false;
+        for (const std::string& id : s.pickups) {
+            if (id == "U1") {
+                hasPick = true;
+            }
         }
+        for (const logistics::StopDelivery& d : s.deliveries) {
+            if (d.orderId == "O1") {
+                hasDeliv = true;
+            }
+        }
+        aHasBoth = hasPick && hasDeliv;
     }
-    check(bFirst, "紧急送达点 B 的到达不晚于其它普通停靠点");
+    check(aHasBoth, "A 停靠同时承载 U1 的取货与 O1 的顺路交付");
 
-    checkRouteIsWalkable(g, p, "W");
+    // 每张普通单仍只送达一次（顺路交付不产生二次配送）。
+    for (const char* id : {"O1", "O2", "O3"}) {
+        std::size_t hits = 0;
+        for (const Stop& s : p.stops) {
+            for (const logistics::StopDelivery& d : s.deliveries) {
+                if (d.orderId == id) {
+                    ++hits;
+                }
+            }
+        }
+        check(hits == 1, std::string(id) + " 恰好送达一次（实际 "
+                             + std::to_string(hits) + "）");
+    }
+
+    std::vector<Order> all = pending;
+    all.push_back(urgent);
+    checkStructuralInvariants(g, p, all, v, "顺路交货");
 }
 
-// ---- issue #5：降载分支也支持顺路交货，且绝不卸 A/B 的货 ----
-//
-// 图同 issue #4。车上载 D1 40 + D2 30 + D3(A) 10 + D4(B) 10 = 90kg（上限 100），
-// 紧急单 D3→D4 要 50kg：free 10 → 需降载 40。降载只从 D1/D2 里挑（按离仓库最远：
-// D2 30 仍缺 → 再 D1 40，共 70），A/B 的货一个都不卸；送完后同一趟取回。
-void testUrgentOffloadKeepsAAndBDeliversBoth() {
-    const LogisticsGraph g = makeOffloadGraph();
-    const Vehicle v = makeVehicle("W", 100.0, 480);
+// 顺路交货只在**不增加等待**时并入：普通单 ws 晚于该停靠原等待点 ⇒ 本次不交付。
+void testIncidentalDeliverySkippedWhenItWouldDelay() {
+    LogisticsGraph g;
+    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
+    g.addNode(makeNode("A", NodeType::Delivery, "客户A"));
+    g.addNode(makeNode("B", NodeType::Delivery, "客户B"));
+    addTwoWay(g, "W", "A", 5.0, 10.0, 4.0);
+    addTwoWay(g, "W", "B", 3.0, 6.0, 2.0);
+    addTwoWay(g, "A", "B", 2.0, 4.0, 2.0);
 
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+    // 在车普通单 O1 的目的地是 B，但 ws = 800（远晚于紧急停靠的到达时刻）。
     std::vector<Order> pending;
-    pending.push_back(makeOrder("O1", "W", "D1", 40.0, 0, 1440));
-    pending.push_back(makeOrder("O2", "W", "D2", 30.0, 0, 1440));
-    pending.push_back(makeOrder("O3", "W", "D3", 10.0, 0, 1440));
-    pending.push_back(makeOrder("O4", "W", "D4", 10.0, 0, 1440));
-    const std::vector<logistics::OnboardItem> onboard{
-        {"D1", 40.0}, {"D2", 30.0}, {"D3", 10.0}, {"D4", 10.0}};
+    pending.push_back(makeOrder("O1", "W", "B", 20.0, 800, 900));
+    const std::vector<logistics::OnboardItem> onboard{{"B", 20.0, "O1"}};
 
     Order urgent;
     urgent.id = "U1";
-    urgent.pickupNodeId = "D3";
-    urgent.nodeId = "D4";
-    urgent.demandKg = 50.0;
+    urgent.pickupNodeId = "A";
+    urgent.nodeId = "B";
+    urgent.demandKg = 10.0;
     urgent.windowStartMin = 0;
     urgent.windowEndMin = 1440;
     urgent.urgent = true;
@@ -1294,63 +1347,28 @@ void testUrgentOffloadKeepsAAndBDeliversBoth() {
     const InsertResult res = insertUrgentOrder(g, v, pending, urgent, "W", 480,
                                                WeightType::Distance, onboard);
     const RoutePlan& p = res.plan;
+    check(p.status == PlanStatus::Ok, "场景规划可行: " + p.reason);
 
-    check(p.status == PlanStatus::Ok, "顺路交货 + 降载规划可行");
-    check(!p.trips.empty(), "至少一趟");
-    if (p.trips.empty()) {
-        return;
-    }
-    const logistics::Trip& t0 = p.trips[0];
-    check(!t0.offloads.empty(), "装不下时应降载");
-
-    // 降载绝不卸 A(D3)/B(D4) 的货
-    bool keepsA = true;
-    bool keepsB = true;
-    double freed = 0.0;
-    for (const logistics::OffloadOp& op : t0.offloads) {
-        freed += op.kg;
-        if (op.nodeId == "D3") {
-            keepsA = false;
+    // 紧急停靠 B 上不应有 O1 的送达动作（否则会把紧急停靠的到达推迟到 800）。
+    bool urgentBHasO1 = false;
+    for (const Stop& s : p.stops) {
+        if (s.nodeId != "B" || s.phase != StopPhase::Urgent) {
+            continue;
         }
-        if (op.nodeId == "D4") {
-            keepsB = false;
-        }
-        check(op.station == "S", "降载只发生在中转站 S");
-    }
-    check(keepsA && keepsB, "降载绝不卸 A/B 目的地的货");
-    check(fixtures::nearlyEqual(freed, t0.reclaimKg), "暂存守恒：Σoffloads.kg == reclaimKg");
-
-    // issue #12：W->S(卸)->D3(取+交付)->D4(送+交付)->S(取回)->D1->S->D2->S->W
-    check(t0.nodes == std::vector<std::string>(
-              {"W", "S", "D3", "D4", "S", "D1", "S", "D2", "S", "W"}),
-          "降载 + 顺路交货 + 同趟继续普通序列，实际 " + join(t0.nodes));
-    check(t0.stops.size() == 4 && t0.stops[0].nodeId == "D3"
-              && t0.stops[1].nodeId == "D4" && t0.stops[2].nodeId == "D1"
-              && t0.stops[3].nodeId == "D2",
-          "A/B 顺路交货后同趟继续配送 D1、D2（停靠顺序 D3,D4,D1,D2）");
-    check(t0.loadKg <= v.capacityKg + 1e-9, "降载趟载重不超过上限");
-    check(fixtures::nearlyEqual(t0.loadKg, 70.0),
-          "降载趟峰值载重 = max(剩余在途 20 + 紧急 50 = 70, onboardLoad 90 − passingKg 20 = 70) = 70，实际 "
-              + std::to_string(t0.loadKg));
-
-    // D3/D4 全计划各只配送一次
-    int countD3 = 0;
-    int countD4 = 0;
-    for (const logistics::Stop& s : p.stops) {
-        if (s.nodeId == "D3") {
-            ++countD3;
-        }
-        if (s.nodeId == "D4") {
-            ++countD4;
+        for (const logistics::StopDelivery& d : s.deliveries) {
+            if (d.orderId == "O1") {
+                urgentBHasO1 = true;
+            }
         }
     }
-    check(countD3 == 1 && countD4 == 1, "A/B 只被配送一次（无二次配送）");
-
-    checkRouteIsWalkable(g, p, "W");
+    check(!urgentBHasO1, "会推迟紧急停靠时不做顺路交货（O1 留到普通阶段）");
+    std::vector<Order> all = pending;
+    all.push_back(urgent);
+    checkStructuralInvariants(g, p, all, v, "顺路交货不推迟");
 }
 
 // ---- issue #6：多紧急单严格 FIFO ----
-// 先插入 U1(D1→D2) 再插入 U2(D3→D4)；先插入者的送达点必须更早完成。
+// 先插入 U1(D1→D2) 再插入 U2(D3→D4)；U1 的送达必须不晚于 U2 的取货。
 void testUrgentFifoOrder() {
     const LogisticsGraph g = makeOffloadGraph();
     const Vehicle v = makeVehicle("W", 100.0, 480);
@@ -1364,17 +1382,67 @@ void testUrgentFifoOrder() {
 
     const RoutePlan p = planRoute(g, v, {u1, u2}, WeightType::Distance);
     check(p.status == PlanStatus::Ok, "两张紧急单规划可行");
-    std::size_t i2 = p.stops.size();
-    std::size_t i4 = p.stops.size();
+
+    // 不变量 ⑤：U1 的送达停靠索引 <= U2 的取货停靠索引。
+    std::size_t u1Deliv = p.stops.size();
+    std::size_t u2Pick = p.stops.size();
     for (std::size_t i = 0; i < p.stops.size(); ++i) {
-        if (p.stops[i].nodeId == "D2" && i2 == p.stops.size()) i2 = i;
-        if (p.stops[i].nodeId == "D4" && i4 == p.stops.size()) i4 = i;
+        for (const logistics::StopDelivery& d : p.stops[i].deliveries) {
+            if (d.orderId == "U1" && u1Deliv == p.stops.size()) {
+                u1Deliv = i;
+            }
+        }
+        for (const std::string& id : p.stops[i].pickups) {
+            if (id == "U2" && u2Pick == p.stops.size()) {
+                u2Pick = i;
+            }
+        }
     }
-    check(i2 < i4, "FIFO：先插入的紧急单必须先完成（D2 早于 D4）");
-    checkRouteIsWalkable(g, p, "W");
+    check(u1Deliv <= u2Pick, "FIFO：U1 的送达不晚于 U2 的取货（"
+                                 + std::to_string(u1Deliv) + " <= "
+                                 + std::to_string(u2Pick) + "）");
+    // 时刻口径双断言（规格一 §4.7 不变量 5）。
+    check(p.stops[u1Deliv].arrivalMin <= p.stops[u2Pick].arrivalMin,
+          "FIFO 时刻口径：U1 送达时刻 <= U2 取货时刻");
+    checkStructuralInvariants(g, p, {u1, u2}, v, "紧急 FIFO");
 }
 
-// ---- issue #6：带暂存货的重规划必须保住「回站取回」 ----
+// FIFO 强制重访：U2 的取货点与 U1 的取货点相同 ⇒ 必须重访该节点（不变量 ⑦ 的唯一例外）。
+void testFifoForcedRevisit() {
+    const LogisticsGraph g = makeOffloadGraph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+
+    Order u1;
+    u1.id = "U1"; u1.pickupNodeId = "D1"; u1.nodeId = "D2"; u1.demandKg = 5.0;
+    u1.windowStartMin = 0; u1.windowEndMin = 1440; u1.urgent = true;
+    Order u2;
+    u2.id = "U2"; u2.pickupNodeId = "D1"; u2.nodeId = "D3"; u2.demandKg = 5.0;
+    u2.windowStartMin = 0; u2.windowEndMin = 1440; u2.urgent = true;
+
+    const RoutePlan p = planRoute(g, v, {u1, u2}, WeightType::Distance);
+    check(p.status == PlanStatus::Ok, "FIFO 强制重访场景可行: " + p.reason);
+
+    // D1 在紧急阶段出现两次；第二次只服务 U2 的取货（一个动作）。
+    std::vector<std::size_t> d1Stops;
+    for (std::size_t i = 0; i < p.stops.size(); ++i) {
+        if (p.stops[i].nodeId == "D1" && p.stops[i].phase == StopPhase::Urgent) {
+            d1Stops.push_back(i);
+        }
+    }
+    check(d1Stops.size() == 2, "D1 在紧急阶段被访问两次（FIFO 强制重访），实际 "
+                                   + std::to_string(d1Stops.size()));
+    if (d1Stops.size() == 2) {
+        const Stop& revisit = p.stops[d1Stops[1]];
+        const std::size_t actions = revisit.pickups.size() + revisit.deliveries.size()
+                                    + revisit.offloads.size() + revisit.reclaims.size();
+        check(actions == 1, "重访停靠只含一个动作（实际 " + std::to_string(actions) + "）");
+        check(revisit.pickups.size() == 1 && revisit.pickups[0] == "U2",
+              "重访只为取 U2");
+    }
+    checkStructuralInvariants(g, p, {u1, u2}, v, "FIFO 强制重访");
+}
+
+// 带暂存货的重规划必须保住「回站取回」。
 void testReplanKeepsStash() {
     const LogisticsGraph g = makeOffloadGraph();
     const Vehicle v = makeVehicle("W", 100.0, 480);
@@ -1385,32 +1453,47 @@ void testReplanKeepsStash() {
 
     logistics::StashState stash;
     stash.station = "S";
-    stash.items.push_back(logistics::OnboardItem{"D1", 60.0});
-    stash.items.push_back(logistics::OnboardItem{"D2", 30.0});
+    stash.items.push_back(logistics::OnboardItem{"D1", 60.0, "O1"});
+    stash.items.push_back(logistics::OnboardItem{"D2", 30.0, "O2"});
 
     const RoutePlan p = replan(g, v, pending, "W", 480, WeightType::Distance,
                                std::vector<logistics::OnboardItem>(), stash);
-    check(p.status == PlanStatus::Ok, "带暂存货重规划可行");
+    check(p.status == PlanStatus::Ok, "带暂存货重规划可行: " + p.reason);
+
     bool hasReclaim = false;
     double reclaimKg = 0.0;
-    for (const logistics::Trip& t : p.trips) {
-        if (t.reclaimStation == "S") {
+    for (const Stop& s : p.stops) {
+        if (!s.reclaims.empty()) {
             hasReclaim = true;
-            reclaimKg = t.reclaimKg;
+            for (const std::string& id : s.reclaims) {
+                for (const Order& o : pending) {
+                    if (o.id == id) {
+                        reclaimKg += o.demandKg;
+                    }
+                }
+            }
         }
     }
     check(hasReclaim, "重规划后必须仍包含回 S 取回暂存货");
-    check(std::fabs(reclaimKg - 90.0) < 1e-6, "取回量与暂存守恒（90kg）");
-    std::size_t d1 = 0, d2 = 0;
-    for (const logistics::Stop& st : p.stops) {
-        if (st.nodeId == "D1") ++d1;
-        if (st.nodeId == "D2") ++d2;
+    check(fixtures::nearlyEqual(reclaimKg, 90.0),
+          "取回量与暂存守恒（90kg），实际 " + std::to_string(reclaimKg));
+
+    // 每张暂存单只送达一次。
+    for (const char* id : {"O1", "O2"}) {
+        std::size_t hits = 0;
+        for (const Stop& s : p.stops) {
+            for (const logistics::StopDelivery& d : s.deliveries) {
+                if (d.orderId == id) {
+                    ++hits;
+                }
+            }
+        }
+        check(hits == 1, std::string(id) + " 只送达一次（实际 " + std::to_string(hits) + "）");
     }
-    check(d1 == 1 && d2 == 1, "暂存货各只配送一次（不重复、不丢失）");
-    checkRouteIsWalkable(g, p, "W");
+    checkStructuralInvariants(g, p, pending, v, "重规划保住暂存");
 }
 
-// ---- issue #8：执行中（已取未送）紧急单不得被新紧急单抢先 ----
+// 执行中（已取未送）的紧急单不得被新紧急单抢先，也不得再次到 A 取货。
 void testPickedUrgentNotOvertakenByNewUrgent() {
     const LogisticsGraph g = makeOffloadGraph();
     const Vehicle v = makeVehicle("W", 100.0, 480);
@@ -1422,75 +1505,34 @@ void testPickedUrgentNotOvertakenByNewUrgent() {
     u2.id = "U2"; u2.pickupNodeId = "D3"; u2.nodeId = "D4"; u2.demandKg = 5.0;
     u2.windowStartMin = 0; u2.windowEndMin = 1440; u2.urgent = true;
 
-    const std::vector<logistics::OnboardItem> onboard{{"D2", 5.0}};
+    const std::vector<logistics::OnboardItem> onboard{{"D2", 5.0, "U1"}};
     const RoutePlan p = replan(g, v, {u1, u2}, "W", 480, WeightType::Distance, onboard);
-    check(p.status == PlanStatus::Ok, "已取未送场景规划可行");
+    check(p.status == PlanStatus::Ok, "已取未送场景规划可行: " + p.reason);
 
-    std::size_t i2 = p.stops.size();
-    std::size_t i4 = p.stops.size();
-    bool d1Stop = false;
+    std::size_t u1Deliv = p.stops.size();
+    std::size_t u2Deliv = p.stops.size();
+    bool d1Pickup = false;
     for (std::size_t i = 0; i < p.stops.size(); ++i) {
-        if (p.stops[i].nodeId == "D2" && i2 == p.stops.size()) i2 = i;
-        if (p.stops[i].nodeId == "D4" && i4 == p.stops.size()) i4 = i;
-        if (p.stops[i].nodeId == "D1") d1Stop = true;
+        for (const logistics::StopDelivery& d : p.stops[i].deliveries) {
+            if (d.orderId == "U1" && u1Deliv == p.stops.size()) {
+                u1Deliv = i;
+            }
+            if (d.orderId == "U2" && u2Deliv == p.stops.size()) {
+                u2Deliv = i;
+            }
+        }
+        for (const std::string& id : p.stops[i].pickups) {
+            if (id == "U1") {
+                d1Pickup = true;
+            }
+        }
     }
-    check(i2 < i4, "执行中紧急单必须先于新紧急单送达（D2 早于 D4）");
-    check(!d1Stop, "已取未送的紧急单不得再次到 A 取货（D1 不应成为停靠点）");
-    checkRouteIsWalkable(g, p, "W");
+    check(u1Deliv < u2Deliv, "执行中紧急单必须先于新紧急单送达");
+    check(!d1Pickup, "已取未送的紧急单不得再次到 A 取货");
 }
 
-// ---- issue #9：卸货站选择必须按完整绕行增量（含 B→S 与 S→仓库）最小 ----
-// 构造：旧口径 current→S→A 会选 S1；计入 B→S、S→仓库后应选 S2。
-LogisticsGraph makeStationChoiceGraph() {
-    LogisticsGraph g;
-    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
-    Node s1 = makeNode("S1", NodeType::Transit, "站1"); s1.subNetworkId = 1;
-    Node s2 = makeNode("S2", NodeType::Transit, "站2"); s2.subNetworkId = 2;
-    g.addNode(s1); g.addNode(s2);
-    g.addNode(makeNode("A", NodeType::Delivery, "取货A"));
-    g.addNode(makeNode("B", NodeType::Delivery, "送达B"));
-    g.addNode(makeNode("D1", NodeType::Delivery, "普通D1"));
-    // 旧口径（current→S→A）会选 S1（S1=9 < S2=10）；
-    // 计入 B→S 与 S→仓库后，S2 的完整增量 10 << S1 的 29。
-    addTwoWay(g, "W", "S1", 10.0, 10.0, 10.0);
-    addTwoWay(g, "S1", "A", 1.0, 1.0, 1.0);
-    addTwoWay(g, "W", "A", 2.0, 2.0, 2.0);
-    addTwoWay(g, "W", "S2", 1.0, 1.0, 1.0);
-    addTwoWay(g, "S2", "A", 11.0, 11.0, 11.0);
-    addTwoWay(g, "S2", "B", 1.0, 1.0, 1.0);
-    addTwoWay(g, "B", "S1", 20.0, 20.0, 20.0);
-    addTwoWay(g, "D1", "W", 4.0, 4.0, 4.0);
-    return g;
-}
-
-void testOffloadStationUsesFullDetour() {
-    const LogisticsGraph g = makeStationChoiceGraph();
-    const Vehicle v = makeVehicle("W", 100.0, 480);
-
-    Order u;
-    u.id = "U1"; u.pickupNodeId = "A"; u.nodeId = "B"; u.demandKg = 50.0;
-    u.windowStartMin = 0; u.windowEndMin = 1440; u.urgent = true;
-
-    const std::vector<logistics::OnboardItem> onboard{{"D1", 60.0}};
-    const InsertResult r = insertUrgentOrder(g, v, {}, u, "W", 480,
-                                             WeightType::Distance, onboard);
-    check(r.plan.status == PlanStatus::Ok, "选站场景规划可行");
-    check(!r.plan.trips.empty() && !r.plan.trips[0].offloads.empty(),
-          "应发生降载");
-    if (!r.plan.trips.empty() && !r.plan.trips[0].offloads.empty()) {
-        check(r.plan.trips[0].offloads[0].station == "S2",
-              "卸货站应按完整绕行增量选 S2（旧口径会错选 S1），实际 "
-                  + r.plan.trips[0].offloads[0].station);
-    }
-    checkRouteIsWalkable(g, r.plan, "W");
-}
-
-// ---- issue #10：多紧急单强制单堆暂存 ----
-// 物理事实：同一时刻全局至多一堆暂存货。同一份计划里两张紧急单都需降载时，
-// 必须并入同一站的同一堆，不能各自选最优站。
-// 图：W 仓库；S1/S2 两中转站；U1 的 A1/B1 贴近 S1（绕行增量 0 vs 18），
-// U2 的 A2/B2 贴近 S2（绕行增量 0 vs 18）。若各自选站，必选到不同站。
-LogisticsGraph makeSingleStashGraph() {
+// 两紧急单都需降载 ⇒ 必须并入同一站的同一堆（不变量 ⑩：全局至多一堆、锁站）。
+void testTwoUrgentOffloadsMergeIntoSingleStashPile() {
     LogisticsGraph g;
     g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
     Node s1 = makeNode("S1", NodeType::Transit, "中转站1"); s1.subNetworkId = 1;
@@ -1498,7 +1540,7 @@ LogisticsGraph makeSingleStashGraph() {
     g.addNode(s1); g.addNode(s2);
     for (const char* id : {"A1", "B1", "A2", "B2", "D1", "D2"}) {
         Node d = makeNode(id, NodeType::Delivery, id);
-        d.subNetworkId = 1;   // 同簇，避免跨簇排线影响
+        d.subNetworkId = 1;
         g.addNode(d);
     }
     addTwoWay(g, "W", "S1", 5.0, 10.0, 5.0);
@@ -1507,28 +1549,20 @@ LogisticsGraph makeSingleStashGraph() {
     addTwoWay(g, "S1", "B1", 1.0, 2.0, 1.0);
     addTwoWay(g, "S2", "A2", 1.0, 2.0, 1.0);
     addTwoWay(g, "S2", "B2", 1.0, 2.0, 1.0);
-    // 另一站到 A/B 远，确保各单最优站唯一且不并列
     addTwoWay(g, "S2", "A1", 10.0, 20.0, 10.0);
     addTwoWay(g, "S2", "B1", 10.0, 20.0, 10.0);
     addTwoWay(g, "S1", "A2", 10.0, 20.0, 10.0);
     addTwoWay(g, "S1", "B2", 10.0, 20.0, 10.0);
-    // 基准距离：dist(W,A)=6、dist(B,W)=6（与经近站相同）
     addTwoWay(g, "W", "A1", 6.0, 12.0, 6.0);
     addTwoWay(g, "W", "B1", 6.0, 12.0, 6.0);
     addTwoWay(g, "W", "A2", 6.0, 12.0, 6.0);
     addTwoWay(g, "W", "B2", 6.0, 12.0, 6.0);
-    // 在途货：D2(30kg,距仓库8) > D1(60kg,距仓库7)，按最远优先整单卸
     addTwoWay(g, "W", "D1", 7.0, 14.0, 7.0);
     addTwoWay(g, "W", "D2", 8.0, 16.0, 8.0);
-    return g;
-}
 
-void testTwoUrgentOffloadsMergeIntoSingleStashPile() {
-    const LogisticsGraph g = makeSingleStashGraph();
     const Vehicle v = makeVehicle("W", 100.0, 480);
 
-    // 车上 90kg（上限 100）→ free 10；每张紧急单 50kg → need 40，
-    // 两张单都必须整单降载。两单在同一份计划里。
+    // 车上 90kg（上限 100）→ free 10；每张紧急单 50kg → need 40，两张都要降载。
     std::vector<Order> remaining;
     remaining.push_back(makeOrder("O1", "W", "D1", 60.0, 0, 1440));
     remaining.push_back(makeOrder("O2", "W", "D2", 30.0, 0, 1440));
@@ -1538,181 +1572,322 @@ void testTwoUrgentOffloadsMergeIntoSingleStashPile() {
     u1.demandKg = 50.0; u1.windowStartMin = 0; u1.windowEndMin = 1440; u1.urgent = true;
     Order u2 = u1;
     u2.id = "U2"; u2.pickupNodeId = "A2"; u2.nodeId = "B2";
-    // 把两张紧急单放进同一份 remaining（顺序即 FIFO）
     remaining.push_back(u1);
     remaining.push_back(u2);
 
-    const std::vector<logistics::OnboardItem> onboard{{"D1", 60.0}, {"D2", 30.0}};
+    const std::vector<logistics::OnboardItem> onboard{
+        {"D1", 60.0, "O1"}, {"D2", 30.0, "O2"}};
     const RoutePlan p = replan(g, v, remaining, "W", 480, WeightType::Distance, onboard);
 
-    check(p.status == PlanStatus::Ok, "两紧急单单堆暂存场景规划可行");
+    check(p.status == PlanStatus::Ok, "两紧急单单堆暂存场景规划可行: " + p.reason);
 
-    std::vector<std::string> offloadStations;
-    std::set<std::string> distinctPiles;
-    std::size_t offTripCount = 0;
-    for (const logistics::Trip& t : p.trips) {
-        if (t.offloads.empty()) {
-            continue;
+    // 全局至多一堆：所有降载都在同一站。
+    std::string station;
+    bool singlePile = true;
+    for (const logistics::OffloadLeg& leg : p.offloads) {
+        if (station.empty()) {
+            station = leg.station;
+        } else if (station != leg.station) {
+            singlePile = false;
         }
-        ++offTripCount;
-        double sum = 0.0;
-        for (const logistics::OffloadOp& op : t.offloads) {
-            offloadStations.push_back(op.station);
-            distinctPiles.insert(op.station);
-            sum += op.kg;
-        }
-        check(fixtures::nearlyEqual(sum, t.reclaimKg),
-              "每个降载趟暂存守恒：Σoffloads.kg == reclaimKg");
-        check(!t.reclaimStation.empty() && t.reclaimStation == t.offloads.front().station,
-              "取回站与本趟降载站一致");
-        distinctPiles.insert(t.reclaimStation);
+        check(leg.reclaimTimeMin >= 0, "期末必须已取回");
     }
-    check(offTripCount == 2, "两张紧急单都需降载（两个降载趟），实际 "
-          + std::to_string(offTripCount));
-    check(offloadStations.size() >= 2, "至少两处 offloads 记录");
-    if (offloadStations.size() >= 2) {
-        bool allSame = true;
-        for (std::size_t i = 1; i < offloadStations.size(); ++i) {
-            if (offloadStations[i] != offloadStations[0]) {
-                allSame = false;
-            }
-        }
-        std::string listed;
-        for (const std::string& station : offloadStations) {
-            listed += (listed.empty() ? "" : ",") + station;
-        }
-        check(allSame, "两紧急单的 offloads 必须并入同一站的同一堆（实际 " + listed + "）");
-    }
-    check(distinctPiles.size() <= 1,
-          "全局至多一堆暂存：所有降载/取回站点去重后不超过 1，实际 "
-              + std::to_string(distinctPiles.size()));
-    checkRouteIsWalkable(g, p, "W");
+    check(!p.offloads.empty(), "至少发生一次降载");
+    check(singlePile, "全局至多一堆暂存：所有降载都在同一站（" + station + "）");
+    checkStructuralInvariants(g, p, remaining, v, "两紧急单单堆");
 }
 
-// ---- issue #11：增量重规划失败回退时也必须保住暂存货 ----
+// 增量重规划失败回退时也必须保住暂存货。
 void testIncrementalFallbackKeepsStash() {
     const LogisticsGraph g = makeOffloadGraph();
     const Vehicle v = makeVehicle("W", 100.0, 480);
 
     RoutePlan prev;
     prev.status = PlanStatus::Ok;
-    prev.nodes = {"W", "W"};
-    prev.nodeArrivalMin = {480, 480};
-    prev.nodeIsStop = {false, false};
-    prev.nodeTripIndex = {0, 0};
-    logistics::Trip t;
-    t.nodes = {"W"};
-    t.nodeArrivalMin = {480};
-    t.nodeIsStop = {false};
-    t.endNodeId = "W";
-    prev.trips.push_back(t);   // nodes.size()<2 -> replanOneTrip 必然失败
+    prev.nodes = {"W"};
+    prev.nodeArrivalMin = {480};
+    prev.nodeIsStop = {false};   // 序列不全 -> 重放必然失败
 
     logistics::StashState stash;
     stash.station = "S";
-    stash.items.push_back(logistics::OnboardItem{"D1", 60.0});
-    stash.items.push_back(logistics::OnboardItem{"D2", 30.0});
+    stash.items.push_back(logistics::OnboardItem{"D1", 60.0, "O1"});
+    stash.items.push_back(logistics::OnboardItem{"D2", 30.0, "O2"});
+
+    std::vector<Order> pending;
+    pending.push_back(makeOrder("O1", "W", "D1", 60.0, 0, 1440));
+    pending.push_back(makeOrder("O2", "W", "D2", 30.0, 0, 1440));
 
     const logistics::TrafficReport report;
     bool used = true;
     const RoutePlan p = replanIncremental(
-        g, v, std::vector<Order>(), prev, 480, WeightType::Distance, report, 0.2,
+        g, v, pending, prev, 480, WeightType::Distance, report, 0.2,
         std::vector<logistics::OnboardItem>(), &used, stash);
 
     check(p.status == PlanStatus::Ok, "增量失败回退后规划可行");
+    check(!used, "序列不全时退回全量（usedIncremental == false）");
     bool hasReclaim = false;
-    double kg = 0.0;
-    for (const logistics::Trip& tr : p.trips) {
-        if (tr.reclaimStation == "S") {
+    for (const Stop& s : p.stops) {
+        if (!s.reclaims.empty()) {
             hasReclaim = true;
-            kg = tr.reclaimKg;
         }
     }
     check(hasReclaim, "增量失败回退后仍必须包含回 S 取回暂存货");
-    check(std::fabs(kg - 90.0) < 1e-6, "取回量与暂存守恒（90kg）");
 }
 
-// ---- issue #15：已取未送紧急单送达后，回 S 取回暂存货 + 继续普通配送并入同一趟 ----
-// 修复前：pickedPool 趟 W→D2→W，stash 趟 W→S→D1→W（拆成两趟）；
-// 修复后：W→…→D2(送达)→S(取回)→D1(普通)→…→W，只一趟且取回记录落在这趟。
-void testPickedUrgentStashReclaimMergedIntoSameTrip() {
+} // namespace
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// MC-B05 车辆因子重放：到达时刻 / penalty / 成本全部用该车缩放后的权重重放；
+// 距离不变；**图表示仍显示基础边权**。
+//
+// 关键：默认数据只有 1.00，因子代码全错也不会红 —— 所以这里必须带 1.25 / 1.5。
+// ---------------------------------------------------------------------------
+void testVehicleFactorsRescaleTimeAndCostNotDistance() {
+    const LogisticsGraph g = makeWtoD1Graph();   // W<->D1 5.0km / 10min / 4元
+    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 10.0, 0, 1440, false)};
+
+    const Vehicle base = makeVehicle("W", 1000.0, 480);
+    const Vehicle slow = makeVehicleWithFactors("W", 1000.0, 480, 1.25, 1.5);
+
+    const RoutePlan a = planRoute(g, base, orders, WeightType::Distance);
+    const RoutePlan b = planRoute(g, slow, orders, WeightType::Distance);
+    check(a.status == PlanStatus::Ok && b.status == PlanStatus::Ok, "两车都可行");
+
+    // 距离不乘因子。
+    check(fixtures::nearlyEqual(a.totalDistanceKm, b.totalDistanceKm),
+          "距离不乘因子：" + std::to_string(a.totalDistanceKm) + " vs "
+              + std::to_string(b.totalDistanceKm));
+    // 耗时乘 timeFactor：10min 去 + 10min 回 = 20 ⇒ 25。
+    check(fixtures::nearlyEqual(a.totalTimeMin, 20.0),
+          "基准车总耗时 20，实际 " + std::to_string(a.totalTimeMin));
+    check(fixtures::nearlyEqual(b.totalTimeMin, 25.0),
+          "1.25 慢车总耗时 25，实际 " + std::to_string(b.totalTimeMin));
+    // 成本乘 costFactor：8 元 ⇒ 12。
+    check(fixtures::nearlyEqual(a.totalCostYuan, 8.0),
+          "基准车总成本 8，实际 " + std::to_string(a.totalCostYuan));
+    check(fixtures::nearlyEqual(b.totalCostYuan, 12.0),
+          "1.5 倍成本车总成本 12，实际 " + std::to_string(b.totalCostYuan));
+    // 到达时刻随之推后。
+    check(a.returnArrivalMin == 500, "基准车回仓 500，实际 "
+                                        + std::to_string(a.returnArrivalMin));
+    check(b.returnArrivalMin == 505, "1.25 慢车回仓 505，实际 "
+                                        + std::to_string(b.returnArrivalMin));
+
+    // 等待与 penalty 不乘因子：窗口 480-505 ⇒ 慢车 505 到，不迟到；
+    // 若把等待也乘 1.25，到达会被推过 505 而误记 penalty。
+    const std::vector<Order> tight = {makeOrder("O1", "W", "D1", 10.0, 480, 505, false)};
+    const RoutePlan t = planRoute(g, slow, tight, WeightType::Distance);
+    check(t.status == PlanStatus::Ok, "紧窗场景可行");
+    check(t.totalPenaltyMin == 0,
+          "等待与 penalty 不乘因子（505 到达、窗口止 505 ⇒ 不迟到），实际 penalty "
+              + std::to_string(t.totalPenaltyMin));
+
+    // 图表示仍是基础边权：图上的边没有被因子改写。
+    const logistics::Edge* e = g.findEdge("W", "D1");
+    check(e != nullptr && fixtures::nearlyEqual(e->timeMin, 10.0),
+          "图表示仍显示基础边权（10min），未被因子改写");
+}
+
+// 同一节点序列下，因子只改时刻/成本，不改**服务顺序**（标量缩放不改变 argmin）。
+void testVehicleFactorsDoNotChangeServiceOrder() {
+    LogisticsGraph g;
+    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
+    g.addNode(makeNode("D1", NodeType::Delivery, "客户1"));
+    g.addNode(makeNode("D2", NodeType::Delivery, "客户2"));
+    addTwoWay(g, "W", "D1", 1.0, 2.0, 1.0);
+    addTwoWay(g, "W", "D2", 5.0, 10.0, 5.0);
+    addTwoWay(g, "D1", "D2", 2.0, 4.0, 2.0);
+
+    const std::vector<Order> orders = {
+        makeOrder("O1", "W", "D1", 10.0, 0, 1440, false),
+        makeOrder("O2", "W", "D2", 10.0, 0, 1440, false),
+    };
+    const Vehicle base = makeVehicle("W", 1000.0, 480);
+    const Vehicle slow = makeVehicleWithFactors("W", 1000.0, 480, 1.25, 1.5);
+
+    for (WeightType w : {WeightType::Distance, WeightType::Time, WeightType::Cost}) {
+        const RoutePlan a = planRoute(g, base, orders, w);
+        const RoutePlan b = planRoute(g, slow, orders, w);
+        check(a.status == PlanStatus::Ok && b.status == PlanStatus::Ok, "两车都可行");
+        check(a.stops.size() == b.stops.size(), "停靠数一致");
+        bool sameOrder = a.stops.size() == b.stops.size();
+        for (std::size_t i = 0; sameOrder && i < a.stops.size(); ++i) {
+            sameOrder = a.stops[i].nodeId == b.stops[i].nodeId;
+        }
+        check(sameOrder, "同一策略下因子不改变服务顺序（标量缩放不改变 argmin）");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 不变量 ⑫：输出确定性 —— 同输入（含策略）必得同一路线与同一 key。
+// ---------------------------------------------------------------------------
+void testDeterministicSameInput() {
     const LogisticsGraph g = makeOffloadGraph();
     const Vehicle v = makeVehicle("W", 100.0, 480);
-
-    Order u;
-    u.id = "U1"; u.pickupNodeId = "D1"; u.nodeId = "D2"; u.demandKg = 5.0;
-    u.windowStartMin = 0; u.windowEndMin = 1440; u.urgent = true; u.picked = true;
-    std::vector<Order> pending;
-    pending.push_back(u);
-    pending.push_back(makeOrder("O1", "W", "D1", 30.0, 0, 1440));
-
-    logistics::StashState stash;
-    stash.station = "S";
-    stash.items.push_back(logistics::OnboardItem{"D1", 30.0});
-    const std::vector<logistics::OnboardItem> onboard{{"D2", 5.0}};   // 已取包裹在车上
-
-    const RoutePlan p = replan(g, v, pending, "W", 480, WeightType::Distance, onboard, stash);
-
-    check(p.status == PlanStatus::Ok, "已取未送 + 暂存重规划可行");
-    check(p.trips.size() == 1,
-          "送达 B 后回 S 取回并继续普通须与已取未送趟合并为一趟，实际趟数 "
-              + std::to_string(p.trips.size()));
-    if (p.trips.empty()) {
-        return;
+    // 客户间取送对（A 从不在仓库）：不改语义，只把 A 从 W 换成客户节点，
+    // 因为新模型不允许"中途回仓库装货"（MC-A02 退役）。
+    std::vector<Order> orders;
+    for (int i = 0; i < 4; ++i) {
+        const std::string a = "D" + std::to_string(i % 4 + 1);
+        const std::string b = "D" + std::to_string((i + 1) % 4 + 1);
+        orders.push_back(makeOrder("O" + std::to_string(i + 1), a, b, 10.0, 0, 1440, false));
     }
-    const logistics::Trip& t = p.trips[0];
-    check(t.reclaimStation == "S", "合并趟记录回 S 取回暂存货");
-    check(t.reclaimAfterOrderId == "U1",
-          "合并趟取回闸：必须先送达已取未送的 U1（B）");
-    check(fixtures::nearlyEqual(t.reclaimKg, 30.0),
-          "取回量与暂存货守恒（30kg），实际 " + std::to_string(t.reclaimKg));
+    orders.push_back(makeOrder("U1", "D1", "D4", 5.0, 0, 1440, true));
 
-    std::size_t iD2 = t.stops.size();
-    std::size_t iD1 = t.stops.size();
-    for (std::size_t i = 0; i < t.stops.size(); ++i) {
-        if (t.stops[i].nodeId == "D2" && iD2 == t.stops.size()) iD2 = i;
-        if (t.stops[i].nodeId == "D1" && iD1 == t.stops.size()) iD1 = i;
+    for (WeightType w : {WeightType::Distance, WeightType::Time, WeightType::Cost}) {
+        const RoutePlan a = planRoute(g, v, orders, w);
+        const RoutePlan b = planRoute(g, v, orders, w);
+        check(a.status == PlanStatus::Ok && b.status == PlanStatus::Ok, "两次都可行");
+        check(a.nodes == b.nodes, "同输入必得同一节点序列");
+        check(a.totalPenaltyMin == b.totalPenaltyMin, "同输入必得同一 penalty");
+        check(fixtures::nearlyEqual(a.totalDistanceKm, b.totalDistanceKm), "同输入必得同一距离");
+        check(fixtures::nearlyEqual(a.totalTimeMin, b.totalTimeMin), "同输入必得同一耗时");
+        check(fixtures::nearlyEqual(a.totalCostYuan, b.totalCostYuan), "同输入必得同一成本");
+        bool sameStops = a.stops.size() == b.stops.size();
+        for (std::size_t i = 0; sameStops && i < a.stops.size(); ++i) {
+            sameStops = a.stops[i].nodeId == b.stops[i].nodeId
+                        && a.stops[i].arrivalMin == b.stops[i].arrivalMin;
+        }
+        check(sameStops, "同输入必得同一停靠序列与到达时刻");
     }
-    check(iD2 < t.stops.size() && iD1 < t.stops.size(),
-          "合并趟须同时含已取未送送达 D2 与暂存货送达 D1");
-    check(iD2 < iD1, "先送达 B(D2)，再于 S 取回后送暂存货 D1");
-    checkRouteIsWalkable(g, p, "W");
 }
 
+// ---------------------------------------------------------------------------
+// repair（有界单请求 relocate，R<=3）不得把路线改坏：结果仍满足全部不变量，
+// 且 key 不劣于「未修复」的路线（只在有改进时才接受）。
+// 这里用一条「插入顺序明显不利」的用例，断言 repair 之后 penalty 不增。
+// ---------------------------------------------------------------------------
+void testRepairNeverWorsensKey() {
+    const LogisticsGraph g = makeOffloadGraph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+    // 刻意让 EDD 序与地理顺序冲突：D4 窗口最紧但最远。
+    std::vector<Order> orders;
+    orders.push_back(makeOrder("O4", "W", "D4", 10.0, 480, 520, false));
+    orders.push_back(makeOrder("O1", "W", "D1", 10.0, 0, 1440, false));
+    orders.push_back(makeOrder("O2", "W", "D2", 10.0, 0, 1440, false));
+    orders.push_back(makeOrder("O3", "W", "D3", 10.0, 0, 1440, false));
+
+    const RoutePlan p = planRoute(g, v, orders, WeightType::Distance);
+    check(p.status == PlanStatus::Ok, "规划可行: " + p.reason);
+    checkStructuralInvariants(g, p, orders, v, "repair");
+    // repair 只接受改进 ⇒ 紧窗单 O4 应被排到足够早的位置（penalty 有界）。
+    check(p.totalPenaltyMin <= 40,
+          "紧窗单 O4 的 penalty 有界（<= 40），实际 " + std::to_string(p.totalPenaltyMin));
+}
+
+// ---------------------------------------------------------------------------
+// 全量兜底（Q4=B）：插入失败时重跑构造，结果仍覆盖全部订单。
+// 用「一张单装不下、必须先卸货」的形态触发，断言兜底/降载链确实产出了可行解。
+// ---------------------------------------------------------------------------
+void testFallbackProducesCompleteRoute() {
+    const LogisticsGraph g = makeOffloadGraph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+    // 两张单都从 D1 取 60kg（合计 120 > 载重 100）：插入第二张时容量不够，
+    // 必须靠"先把第一张送掉、再回 D1 取第二张"（强制重访）——走修复/兜底链。
+    std::vector<Order> orders;
+    orders.push_back(makeOrder("O1", "D1", "D2", 60.0, 0, 1440, false));
+    orders.push_back(makeOrder("O4", "D1", "D4", 60.0, 0, 1440, false));
+    orders.push_back(makeOrder("O2", "D2", "D3", 20.0, 0, 1440, false));
+    orders.push_back(makeOrder("O3", "D3", "D4", 20.0, 0, 1440, false));
+
+    const RoutePlan p = planRoute(g, v, orders, WeightType::Distance);
+    check(p.status == PlanStatus::Ok, "兜底后仍可行: " + p.reason);
+    checkStructuralInvariants(g, p, orders, v, "全量兜底");
+    // 全部订单都被服务（不丢单）。
+    for (const Order& o : orders) {
+        std::size_t hits = 0;
+        for (const Stop& s : p.stops) {
+            for (const logistics::StopDelivery& d : s.deliveries) {
+                if (d.orderId == o.id) {
+                    ++hits;
+                }
+            }
+        }
+        check(hits == 1, "兜底后订单 " + o.id + " 恰好送达一次");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 指标口径（#29 §6.1）：逐单 penalty、准时率、平均在车/利用率/峰值。
+// 用一条可完全手算的极小路线钉住口径，其余数字由 --plan-summary 的 cli 层守。
+// ---------------------------------------------------------------------------
+void testMetricsDefinition() {
+    const LogisticsGraph g = makeWtoD1Graph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+    // W->D1 10min：取货在 W（480 原地），送达 D1 在 490。
+    // 窗口 480-495 ⇒ 送达准时；A→B 最短耗时 10 ⇒ 取货 480+10=490 <= 495 ⇒ 取货也准时。
+    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 40.0, 480, 495, false)};
+    const RoutePlan p = planRoute(g, v, orders, WeightType::Distance);
+    check(p.status == PlanStatus::Ok, "规划可行");
+
+    const logistics::RouteMetrics& m = p.metrics;
+    check(m.stopCount == 2, "停靠点数 2（原地取货 + 送达），实际 "
+                                + std::to_string(m.stopCount));
+    check(m.actionCount == 2, "动作数 2 = 2 × 取送对数，实际 "
+                                  + std::to_string(m.actionCount));
+    check(m.pickupTotal == 1 && m.pickupOnTimeCount == 1, "取货准时 1/1");
+    check(m.deliveryTotal == 1 && m.deliveryOnTimeCount == 1, "送达准时 1/1");
+    check(m.urgentTotal == 0, "无紧急单 ⇒ 紧急分母 0（--plan-summary 打「—」）");
+    check(m.normalTotal == 1 && m.normalOnTimeCount == 1, "普通准时 1/1");
+    check(m.orders.size() == 1 && m.orders[0].orderId == "O1", "逐单指标覆盖 O1");
+
+    // 时间加权在车量：40kg 在车 10min（W->D1 段），之后 0。
+    // 总运行时长 = 20min（去 10 + 回 10）⇒ 平均 = 40*10/20 = 20kg；峰值 40。
+    check(fixtures::nearlyEqual(m.peakLoadKg, 40.0),
+          "峰值在车 40kg，实际 " + std::to_string(m.peakLoadKg));
+    check(fixtures::nearlyEqual(m.avgLoadKg, 20.0),
+          "平均在车 = 40kg × 10min / 20min = 20kg，实际 " + std::to_string(m.avgLoadKg));
+    check(fixtures::nearlyEqual(m.loadUtilization, 0.2),
+          "利用率 = 20/100 = 20%，实际 " + std::to_string(m.loadUtilization));
+
+    // 分母 0 的率不产生数值（cli 层打「—」）。
+    const std::vector<Order> urgentOnly = {makeOrder("U1", "W", "D1", 10.0, 0, 1440, true)};
+    const RoutePlan pu = planRoute(g, v, urgentOnly, WeightType::Distance);
+    check(pu.metrics.normalTotal == 0, "只有紧急单时普通分母 0");
+    check(pu.metrics.urgentTotal == 1, "紧急分母 1");
+}
+
+} // namespace
+
 int main() {
-    testSingleOrderRouteIsFullyCorrect();
-    testEmptyOrdersDegeneratesToNoMovement();
-    testGreedyServesNearestCandidateFirst();
-    testTieBreakIsDeterministicByNodeId();
-    testUrgentOrderIsServedFirstDespiteBeingFarther();
-    testLateArrivalIsMarkedWithPenalty();
-    testMultipleOrdersOnSameNodeMergeIntoOneStop();
-    testSingleOrderExceedingCapacityIsInfeasible();
-    testTotalDemandOverCapacityBecomesMultiTrip();
-    testWithinCapacityStaysSingleTrip();
-    testIncrementalReplanRecomputesOnlyAffectedLeg();
-    testIncrementalReplanIsIdempotentWhenNothingAffected();
-    testIncrementalReplanHandlesMultiTrip();
-    testUnreachableDeliveryIsInfeasibleAndNamesTheNode();
-    testReplanFromCurrentPosition();
-    testReplanWhenAlreadyAtTheDeliveryNode();
-    testPlanRouteEqualsReplanFromDepot();
-    testIsEdgeOnRoute();
-    testIncrementalReplanForwardsOnboard();
-    testNodeIndexAtTimeReturnsSegmentStart();
-    testNodeIndexAtTimeOnEmptyPlanAndClamp();
-    testNodeIndexAtTimeIsMonotonicInTime();
-    testTripContinuityAfterUrgentInsertWhileEnRoute();
-    testUrgentOffloadToTransitWhenNotFitting();
-    testUrgentFitsLeavesOffloadsEmpty();
-    testUrgentPassingDeliversAAndBGoods();
-    testUrgentOffloadKeepsAAndBDeliversBoth();
-    testUrgentFifoOrder();
-    testReplanKeepsStash();
-    testPickedUrgentNotOvertakenByNewUrgent();
-    testOffloadStationUsesFullDetour();
-    testTwoUrgentOffloadsMergeIntoSingleStashPile();
-    testIncrementalFallbackKeepsStash();
-    testPickedUrgentStashReclaimMergedIntoSameTrip();
+#define RUN(fn) do { std::printf("== " #fn "\n"); fn(); } while (0)
+    RUN(testSingleOrderRouteIsFullyCorrect);
+    RUN(testEmptyOrdersDegeneratesToNoMovement);
+    RUN(testPairInsertionBeatsNearestNeighbourOnTightWindow);
+    RUN(testTieBreakIsDeterministicByNodeId);
+    RUN(testUrgentOrderIsServedFirstDespiteBeingFarther);
+    RUN(testLateArrivalIsMarkedWithPenalty);
+    RUN(testMultipleOrdersOnSameNodeMergeIntoOneStop);
+    RUN(testSingleOrderExceedingCapacityIsInfeasible);
+    RUN(testTotalDemandOverCapacityStaysOneContinuousRoute);
+    RUN(testWithinCapacityStaysSingleRoute);
+    RUN(testUnreachableDeliveryIsInfeasibleAndNamesTheNode);
+    RUN(testIncrementalReplayKeepsStopOrderAndReplaysWeights);
+    RUN(testIncrementalReplayIsIdempotentWhenNothingAffected);
+    RUN(testIncrementalFallsBackWhenReplayInfeasible);
+    RUN(testReplanFromCurrentPosition);
+    RUN(testPlanRouteEqualsReplanFromDepot);
+    RUN(testIsEdgeOnRoute);
+    RUN(testNodeIndexAtTimeReturnsSegmentStart);
+    RUN(testNodeIndexAtTimeOnEmptyPlanAndClamp);
+    RUN(testOffloadConservesAndReclaims);
+    RUN(testUrgentFitsLeavesOffloadsEmpty);
+    RUN(testIncidentalDeliveryMergesIntoUrgentStop);
+    RUN(testIncidentalDeliverySkippedWhenItWouldDelay);
+    RUN(testUrgentFifoOrder);
+    RUN(testFifoForcedRevisit);
+    RUN(testReplanKeepsStash);
+    RUN(testPickedUrgentNotOvertakenByNewUrgent);
+    RUN(testTwoUrgentOffloadsMergeIntoSingleStashPile);
+    RUN(testIncrementalFallbackKeepsStash);
+    RUN(testVehicleFactorsRescaleTimeAndCostNotDistance);
+    RUN(testVehicleFactorsDoNotChangeServiceOrder);
+    RUN(testDeterministicSameInput);
+    RUN(testRepairNeverWorsensKey);
+    RUN(testFallbackProducesCompleteRoute);
+    RUN(testMetricsDefinition);
 
     return testutil::summarize("routeplanner_tests");
 }

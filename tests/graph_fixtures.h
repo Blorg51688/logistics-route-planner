@@ -51,9 +51,19 @@ inline logistics::Vehicle makeVehicle(const std::string& startId, double capacit
     return v;
 }
 
+// 带因子的车（规格一 MC-B05 / #19 §2）：因子只改**缩放后的耗时与成本**，
+// 距离、等待、penalty 都不乘。默认数据只有 1.00，因子代码全错也不会红——
+// 所以必须有一条带 1.25 / 1.5 的夹具断言。
+inline logistics::Vehicle makeVehicleWithFactors(const std::string& startId, double capacityKg,
+                                                int departMin, double timeFactor,
+                                                double costFactor) {
+    logistics::Vehicle v = makeVehicle(startId, capacityKg, departMin);
+    v.timeFactor = timeFactor;
+    v.costFactor = costFactor;
+    return v;
+}
+
 // 订单夹具：全部订单统一 A→B 取送（规格一 #23）。pickup 必填，调用方需显式给出取货点。
-// 注：本票（#32）只把签名与调用点迁到七列口径，各用例的期望值仍按旧语义书写，
-// 重算归 #33（构造器重写）——因此 routeplanner_tests 暂时允许红。
 inline logistics::Order makeOrder(const std::string& id, const std::string& pickupNodeId,
                                  const std::string& nodeId, double demandKg,
                                  int windowStartMin, int windowEndMin,
