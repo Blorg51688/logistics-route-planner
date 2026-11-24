@@ -348,16 +348,10 @@ struct Ctx {
 // 前两键完全并列时才需要。因此这里**不物化 tie**：并列时由 compareRoutes
 // 直接比较两份停靠序列（见下）。这样每次候选评价不再构造 O(n) 个 KeyStop
 // 与同样多的 vector —— 那是 34 万次候选评价里最大的一笔分配开销。
-// 字典序键。规格 §5 原文是 (Σpenalty, Σ该策略权重, tieKey)；实现里在 penalty
-// 与权重之间多插了一档**载重峰值**（penalty 并列时优先选不把车塞满的排法）。
-//
-// 为什么（实测，默认数据）：容量压力是"强制重访"的唯一来源；把峰值放进键里
-// 直接消掉那些重访（停靠 31/31/33 → 29/28/29），也让三策略重新满足
-// 「各自在自身目标上不劣于另两条」。纯三键下 cost 策略会被距离策略在**成本**上
-// 反超（168.5 vs 145.3），验收②不成立。这是对键序的有意偏离，已在交付说明里点名。
+// 字典序键（规格 §5 字面）：(Σ逐单 penalty, Σ该策略权重, tieKey)。
+// 载重峰值**不进键**——它是报告指标（RouteMetrics::peakLoadKg），不是决策依据。
 struct Key {
     int    penalty = 0;
-    double peak = 0.0;     // 载重峰值 kg（偏离项，见上）
     double weight = 0.0;
 };
 
@@ -365,9 +359,6 @@ struct Key {
 int compareKey(const Key& a, const Key& b) {
     if (a.penalty != b.penalty) {
         return a.penalty < b.penalty ? -1 : 1;
-    }
-    if (!nearlyEq(a.peak, b.peak)) {
-        return a.peak < b.peak ? -1 : 1;
     }
     if (!nearlyEq(a.weight, b.weight)) {
         return a.weight < b.weight ? -1 : 1;
@@ -598,7 +589,6 @@ bool replay(const Ctx& ctx, const std::vector<StopSpec>& specs, bool detail, Eva
         return false;
     }
 
-    out.key.peak = peak;
     out.ok = true;
     out.penalty = out.key.penalty;
     // 总耗时 = 返回仓库时刻 − 出发时刻（**含早到等待**，规格一 §6.1）。
@@ -2133,17 +2123,122 @@ bool buildWithOrder(const Ctx& ctx, const std::vector<Request>& normalOrder,
     return true;
 }
 
+// 普通段插入序的**起点版本**（规格内「两版按 key 取优」的推广，只用规格的
+// 构造器与键，不改键序、不加启发式阈值）。
+//
+//   版 1：EDD（窗口止升序，同窗止按订单 ID）—— 规格 §4.5 的默认序。
+//   版 2：**按取货点 A 聚簇**（簇按 A 的 ID 升序，簇内仍是 EDD）。
+//         默认数据的天然结构就是三簇（D08 8 单 / D14 6 单 / D20 8 单）+ 若干
+//         回程单（D01/D23 取货），EDD 会把同一取货点的单打散到不同时刻，
+//         从而在容量上互相挤占；聚簇序让"整簇一起取、边取边送"成为可能。
+//   版 3：**按送达点 B 聚簇**（B 的 ID 升序，簇内 EDD）—— 相近送达点一起插，
+//         减少绕远端来回跑的里程/成本。（实测这一版是 ② 成本项的胜负手；
+//         「簇内 kg 降序」也试过，在所有策略上都没赢过上述三版，故不留。）
+//
+// 每一版都跑满同一条链（构造 + repair R≤3 + 结构校验），可行者按**规格三键**
+// (Σ逐单 penalty, Σ该策略权重, tieKey) 取优 —— 键序不变、策略语义不变。
+// 单起点贪心会陷局部最优（实测纯 EDD 下成本策略被距离策略在成本上反超 23 元），
+// 多起点是规格 §4.5「两版按 key 取优」的自然推广。
+std::vector<std::vector<Request> > insertionStarts(const Ctx& ctx, bool multiStart) {
+    std::vector<std::vector<Request> > starts;
+    starts.push_back(ctx.normal);   // 版 1：EDD
+
+    if (multiStart && ctx.normal.size() > 1) {
+        // 取货点 A 的升序清单（手写插入排序，去重）
+        std::vector<std::string> pickups;
+        for (const Request& r : ctx.normal) {
+            if (!contains(pickups, r.pickup)) {
+                pickups.push_back(r.pickup);
+            }
+        }
+        for (std::size_t i = 1; i < pickups.size(); ++i) {
+            const std::string key = pickups[i];
+            std::size_t j = i;
+            while (j > 0 && key < pickups[j - 1]) {
+                pickups[j] = pickups[j - 1];
+                --j;
+            }
+            pickups[j] = key;
+        }
+        std::vector<Request> clustered;
+        clustered.reserve(ctx.normal.size());
+        for (const std::string& p : pickups) {
+            for (const Request& r : ctx.normal) {
+                if (r.pickup == p) {
+                    clustered.push_back(r);   // 簇内保持 EDD 序
+                }
+            }
+        }
+        starts.push_back(clustered);
+
+        // 版 5：**按送达点 B 聚簇**（B 的 ID 升序，簇内 EDD）—— 同一送达点附近
+        // 的单一起插，减少"绕着远端来回跑"的里程/成本。
+        std::vector<std::string> deliveries;
+        for (const Request& r : ctx.normal) {
+            if (!contains(deliveries, r.delivery)) {
+                deliveries.push_back(r.delivery);
+            }
+        }
+        for (std::size_t i = 1; i < deliveries.size(); ++i) {
+            const std::string key = deliveries[i];
+            std::size_t j = i;
+            while (j > 0 && key < deliveries[j - 1]) {
+                deliveries[j] = deliveries[j - 1];
+                --j;
+            }
+            deliveries[j] = key;
+        }
+        std::vector<Request> byDelivery;
+        byDelivery.reserve(ctx.normal.size());
+        for (const std::string& b : deliveries) {
+            for (const Request& r : ctx.normal) {
+                if (r.delivery == b) {
+                    byDelivery.push_back(r);
+                }
+            }
+        }
+        starts.push_back(byDelivery);
+    }
+    return starts;
+}
+
 // 主构造 + 全量兜底（#18 Q4=B）：
 //   ① 按 EDD 序构造；
 //   ② 失败时把「插不进去的那张单」提到最前再整体构造一次；
 //   两版都可行则按 key 取优（penalty 是第一键，等价于「penalty 一票否决」）。
 // 不做周期性全量重算：只有插入失败这一个触发点。
-bool buildAll(const Ctx& ctx, Outcome& out) {
-    // ① 主构造：EDD 序，不降载。
-    Outcome first;
-    if (buildWithOrder(ctx, std::vector<Request>(), false, first)) {
-        out = first;
+bool buildAll(const Ctx& ctx, Outcome& out, bool multiStart) {
+    // ① 多起点构造：每版都跑满同一条链（构造 + repair R≤3），可行者按规格三键取优。
+    const std::vector<std::vector<Request> > starts = insertionStarts(ctx, multiStart);
+    Outcome first;            // 版 1（EDD）的结果：兜底链要用它的失败原因
+    bool haveFirst = false;
+    bool have = false;
+    Key bestKey;
+    for (std::size_t k = 0; k < starts.size(); ++k) {
+        Outcome o;
+        const bool ok = buildWithOrder(ctx, starts[k], false, o);
+        if (k == 0) {
+            first = o;
+            haveFirst = true;
+        }
+        if (!ok) {
+            continue;
+        }
+        Eval ev;
+        if (!replay(ctx, o.route, false, ev)) {
+            continue;
+        }
+        if (!have || compareRoutes(o.route, ev.key, out.route, bestKey) < 0) {
+            out = o;
+            bestKey = ev.key;
+            have = true;
+        }
+    }
+    if (have) {
         return true;
+    }
+    if (!haveFirst) {
+        first.reason = "构造未产生候选";
     }
 
     // ② 全量兜底（#18 Q4=B）：把插不进去的那张单提到普通序最前，整体重跑构造
@@ -2537,8 +2632,15 @@ RoutePlan replan(const LogisticsGraph& graph,
         plan.reason = reason;
         return plan;
     }
+    // 多起点只用于「从基地、空车、发车时刻」的**整批构造**（planRoute 语义）。
+    // 中途重规划（事件/手动动作后的 replan）沿用 EDD 单起点：那条路径上决策次数多，
+    // 多起点会把每次重规划的构造翻倍（--self-check-actions 的时间预算不允许），
+    // 而且中途重规划的起点已被已执行前缀约束，聚簇序的收益很小。
+    const bool multiStart = (currentPositionId == vehicle.startNodeId)
+                            && (currentTimeMin == vehicle.departTimeMin)
+                            && onboard.empty() && stash.station.empty();
     Outcome out;
-    if (!buildAll(ctx, out)) {
+    if (!buildAll(ctx, out, multiStart)) {
         plan.status = (out.reason.find("超过载重上限") != std::string::npos)
                           ? PlanStatus::OrderExceedsCapacity
                           : PlanStatus::Unreachable;
