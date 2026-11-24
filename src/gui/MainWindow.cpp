@@ -991,7 +991,13 @@ void MainWindow::onInsertUrgentOrder() {
     aCombo->addItems(customers);
     auto* bCombo = new QComboBox(&dialog);
 
-    const double cap = config_.vehicles.empty() ? 0.0 : config_.vehicles.front().capacityKg;
+    // 上限取**最小**车容量（与 insertOrderAt 的校验同口径：任何一台车都要装得下）。
+    double cap = 0.0;
+    for (const logistics::Vehicle& v : config_.vehicles) {
+        if (cap <= 0.0 || v.capacityKg < cap) {
+            cap = v.capacityKg;
+        }
+    }
     auto* demand = new QDoubleSpinBox(&dialog);
     demand->setDecimals(0);
     demand->setRange(1.0, cap > 1.0 ? cap : 1.0);
@@ -2322,9 +2328,9 @@ QString MainWindow::runLogText() const {
     out += QStringLiteral("用途：把「确实出现过的问题」作为证据带出界面。\n");
     out += QStringLiteral("内容：每次事件触发、每次到达配送点时的车辆载重明细、"
                           "每次出仓装车、以及紧急单的处置方式。\n");
-    out += QStringLiteral("策略：%1    载重上限：%2 kg    事件间隔：每 %3 min（软件内时间）\n")
+    out += QStringLiteral("策略：%1    车队：%2 台车    事件间隔：每 %3 min（软件内时间）\n")
                .arg(strategyBox_ != nullptr ? strategyBox_->currentText() : QString())
-               .arg(config_.vehicles.empty() ? 0.0 : config_.vehicles.front().capacityKg, 0, 'f', 0)
+               .arg(config_.vehicles.size())
                .arg(config_.general.eventIntervalMin);
     out += QString(72, QLatin1Char('=')) + QStringLiteral("\n");
     for (const QString& line : runLog_) {
@@ -2845,7 +2851,12 @@ int MainWindow::runActionSelfCheck() {
         const std::size_t before = config_.orders.size();
         const std::string bad1 = insertOrderAt("D01", "D01", 5.0, true,
                                               logistics::OrderSource::ManualUrgent, currentTimeMin());
-        const double cap = config_.vehicles.empty() ? 0.0 : config_.vehicles.front().capacityKg;
+        double cap = 0.0;   // 最小车容量（= insertOrderAt 的合法上界）
+        for (const logistics::Vehicle& v : config_.vehicles) {
+            if (cap <= 0.0 || v.capacityKg < cap) {
+                cap = v.capacityKg;
+            }
+        }
         const std::string bad2 = insertOrderAt("D01", "D02", cap + 100.0, true,
                                               logistics::OrderSource::ManualUrgent, currentTimeMin());
         expect(bad1.empty() && bad2.empty(),

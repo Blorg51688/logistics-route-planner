@@ -404,17 +404,25 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "配置中没有车辆，无法规划\n");
                 return 1;
             }
-            const logistics::RoutePlan plan =
-                logistics::planRoute(config.graph, config.vehicles.front(), config.orders,
-                                     planWeight);
-            if (plan.status == logistics::PlanStatus::Ok) {
-                scene.highlightRoute(plan.nodes);
-                std::printf("规划（%s）：距离 %.1fkm  耗时 %.1fmin  成本 %.1f元  "
-                            "penalty %dmin  停靠 %zu 站\n",
-                            weightLabel(planWeight), plan.totalDistanceKm, plan.totalTimeMin,
-                            plan.totalCostYuan, plan.totalPenaltyMin, plan.stops.size());
+            // 车队口径（#39）：离屏渲染也走 planFleet，三色路线与界面一致。
+            const logistics::FleetPlan fleet =
+                logistics::planFleet(config.graph, config.vehicles, config.orders, planWeight);
+            std::vector<std::vector<std::string> > routes;
+            for (const logistics::RoutePlan& plan : fleet.vehicles) {
+                routes.push_back(plan.status == logistics::PlanStatus::Ok
+                                     ? plan.nodes
+                                     : std::vector<std::string>());
+            }
+            scene.setFleetRoutes(routes, 0);
+            if (fleet.allOk) {
+                std::printf("规划（%s）：距离 %.1fkm  完工耗时 %.1fmin（车时合计 %.1fmin）  "
+                            "成本 %.1f元  penalty %dmin  停靠 %d 站  车 %zu 台\n",
+                            weightLabel(planWeight), fleet.totalDistanceKm,
+                            fleet.completionTimeMin, fleet.sumVehicleTimeMin,
+                            fleet.totalCostYuan, fleet.totalPenaltyMin, fleet.stopCount,
+                            fleet.vehicles.size());
             } else {
-                std::fprintf(stderr, "规划不可行: %s\n", plan.reason.c_str());
+                std::fprintf(stderr, "规划不可行: %s\n", fleet.reason.c_str());
             }
         }
 
