@@ -13,6 +13,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <string>
 
 #include "core/Config.h"
@@ -35,6 +36,7 @@ struct Options {
     bool                   uiProbe = false;
     bool                   selfCheckActions = false;
     std::string            planSummary;      // "" / "distance" / "cost"
+    std::string            dumpPlan;         // "" / "distance" / "cost" / "time"（仅开发/校验用）
     int                    demoRounds = 0;
     std::string            exportLogPath;   // 空表示不导出
     std::string            planStrategy;   // 空表示不高亮任何路线
@@ -86,6 +88,7 @@ void usage() {
         "  --self-check-actions       自动验证插单不丢单 / 新客户会被配送 / 事件刷单规则 /\n"
         "                             事件刻结算的等价性（A1–A7）后退出\n"
         "  --plan-summary distance|time|cost  打印该策略的规划汇总后退出（供命令行核对）\n"
+        "  --dump-plan distance|time|cost  仅开发/校验用，供 oracle 对拍：输出停靠级计划转储后退出\n"
         "  --width N --height N       窗口/图像尺寸\n");
 }
 
@@ -115,6 +118,8 @@ int main(int argc, char** argv) {
             opt.selfCheckActions = true;
         } else if (flag == "--plan-summary") {
             takeNext(opt.planSummary);
+        } else if (flag == "--dump-plan") {
+            takeNext(opt.dumpPlan);
         } else if (flag == "--dump-graph") {
             // 值可省略；省略时取 both
             if (i + 1 < args.size() && !args[i + 1].startsWith(QStringLiteral("--"))) {
@@ -247,6 +252,75 @@ int main(int argc, char** argv) {
             std::printf(" %s", id.c_str());
         }
         std::printf("\n");
+        return 0;
+    }
+
+    // --dump-plan：**仅开发/校验用，供 oracle 对拍**。输出停靠级的机器可读文本，
+    // 每停靠一行（含动作与时间），不含展示噪声。停靠是**真源**（RoutePlan::stops），
+    // phase / 动作集 / 逐单 penalty / 离站在车量都按规格一 §4.4 / MC-A03/A04 的口径。
+    //
+    // 为什么需要它：--plan-summary 第 4 行是**节点序列（含途经节点）**，在含重访时
+    // oracle 无法由它唯一还原逐单动作归属（同一节点会被合并/重访）。oracle 不猜动作；
+    // 由 app 直接吐停靠级真源，oracle 只对给定停靠序列复算算术。
+    // **不改变 --plan-summary 的任何可见输出**（这是独立入口）。
+    if (!opt.dumpPlan.empty()) {
+        logistics::WeightType dumpWeight = logistics::WeightType::Distance;
+        if (!parseWeight(opt.dumpPlan, dumpWeight)) {
+            std::fprintf(stderr, "未知策略: %s\n", opt.dumpPlan.c_str());
+            return 2;
+        }
+        if (config.vehicles.empty()) {
+            std::fprintf(stderr, "配置中没有车辆\n");
+            return 1;
+        }
+        const logistics::Vehicle& vehicle = config.vehicles.front();
+        const logistics::RoutePlan plan =
+            logistics::planRoute(config.graph, vehicle, config.orders, dumpWeight);
+        if (plan.status != logistics::PlanStatus::Ok) {
+            std::printf("不可行：%s\n", plan.reason.c_str());
+            return 0;
+        }
+        // 订单窗口按单查（Stop 只存 orderId，窗口在订单表里）。
+        std::map<std::string, const logistics::Order*> orderById;
+        for (const logistics::Order& o : config.orders) {
+            orderById[o.id] = &o;
+        }
+        // PLAN <startNode> <returnNode> <departMin>
+        std::printf("PLAN %s %s %d\n", plan.nodes.front().c_str(),
+                    plan.nodes.back().c_str(), vehicle.departTimeMin);
+        // STOP <idx> <nodeId> <phase:U|N> <rawMin> <waitMin> <arrMin> \
+        //      <pickups:id,id..> <deliveries:id:ws:we:penalty,..> <remainingLoadKg>
+        for (std::size_t i = 0; i < plan.stops.size(); ++i) {
+            const logistics::Stop& s = plan.stops[i];
+            std::string pickups;
+            for (const std::string& id : s.pickups) {
+                if (!pickups.empty()) {
+                    pickups += ",";
+                }
+                pickups += id;
+            }
+            std::string deliveries;
+            for (const logistics::StopDelivery& d : s.deliveries) {
+                int ws = 0;
+                int we = 0;
+                const std::map<std::string, const logistics::Order*>::const_iterator it =
+                    orderById.find(d.orderId);
+                if (it != orderById.end()) {
+                    ws = it->second->windowStartMin;
+                    we = it->second->windowEndMin;
+                }
+                if (!deliveries.empty()) {
+                    deliveries += ",";
+                }
+                deliveries += d.orderId + ":" + std::to_string(ws) + ":" + std::to_string(we)
+                              + ":" + std::to_string(d.penaltyMin);
+            }
+            std::printf("STOP %zu %s %c %d %d %d %s %s %.3f\n", i, s.nodeId.c_str(),
+                        (s.phase == logistics::StopPhase::Urgent) ? 'U' : 'N',
+                        s.rawArrivalMin, s.waitMin, s.arrivalMin,
+                        pickups.empty() ? "-" : pickups.c_str(),
+                        deliveries.empty() ? "-" : deliveries.c_str(), s.remainingLoadKg);
+        }
         return 0;
     }
 

@@ -11,6 +11,7 @@
 #include "core/Traffic.h"
 #include "graph_fixtures.h"
 #include "io/ConfigLoader.h"
+#include "plan_golden.h"
 #include "test_util.h"
 
 using logistics::Config;
@@ -372,26 +373,71 @@ void checkDataQualityInvariants(const Config& cfg, const RoutePlan& byDistance,
                   + std::to_string(lateOrders) + " / " + std::to_string(cfg.orders.size()));
     }
 
-    // ⑤ 三策略 × 13 字段的黄金值**本票不落**（由 #35 捕获并写进 tests/plan_golden.h）。
-    //    这里只保留"当前实现自洽"的占位断言，等 #35 把真值表接过来之后删掉。
-    // TODO(#35): 用 tests/plan_golden.h 的单一真值表替换下面这段自洽性检查。
+    // ⑤ 三策略 × 13 字段的黄金值：**单一真值表** tests/plan_golden.h（#35 捕获）。
+    //    L1 数值断言只消费真值表，不各写一份（§6.4 / §10 裁定 4）；容差同 §6.4。
+    //    第 9 项（紧急送达准时率）在无紧急单时是哨兵 -1 ⇒ 断言分母为 0。
     for (int i = 0; i < 3; ++i) {
         const logistics::RouteMetrics& m = plans[i]->metrics;
-        check(m.stopCount > 0 && m.actionCount == 2 * static_cast<int>(cfg.orders.size()),
-              std::string(labels[i]) + "：停靠数与动作数自洽（#35 前占位）");
+        const plan_golden::StrategyGolden& g = plan_golden::kAll[i];
+        const std::string tag = std::string(labels[i]) + "·黄金[" + g.name + "]：";
+
+        // 第 1–3 项：距离 / 耗时 / 成本（0.001）。
+        check(fixtures::nearlyEqual(plans[i]->totalDistanceKm, g.distanceKm,
+                                    plan_golden::kTolMetric),
+              tag + "总距离 " + std::to_string(plans[i]->totalDistanceKm) + " vs "
+                  + std::to_string(g.distanceKm));
+        check(fixtures::nearlyEqual(plans[i]->totalTimeMin, g.timeMin, plan_golden::kTolMetric),
+              tag + "总耗时 " + std::to_string(plans[i]->totalTimeMin) + " vs "
+                  + std::to_string(g.timeMin));
+        check(fixtures::nearlyEqual(plans[i]->totalCostYuan, g.costYuan, plan_golden::kTolMetric),
+              tag + "总成本 " + std::to_string(plans[i]->totalCostYuan) + " vs "
+                  + std::to_string(g.costYuan));
+        // 第 4–6 项：penalty / 停靠 / 动作（整数）。
+        check(plans[i]->totalPenaltyMin == g.penaltyMin, tag + "总 penalty");
+        check(m.stopCount == g.stopCount, tag + "停靠点数 S");
+        check(m.actionCount == g.actionCount, tag + "动作数 A");
+        // 第 7–8、10 项：两率（0.1）。
+        const double pickupRate =
+            100.0 * static_cast<double>(m.pickupOnTimeCount) / static_cast<double>(m.pickupTotal);
+        const double deliveryRate = 100.0 * static_cast<double>(m.deliveryOnTimeCount)
+                                    / static_cast<double>(m.deliveryTotal);
+        const double normalRate = 100.0 * static_cast<double>(m.normalOnTimeCount)
+                                  / static_cast<double>(m.normalTotal);
+        check(fixtures::nearlyEqual(pickupRate, g.pickupRatePct, plan_golden::kTolRate),
+              tag + "取货准时率");
+        check(fixtures::nearlyEqual(deliveryRate, g.deliveryRatePct, plan_golden::kTolRate),
+              tag + "送达准时率·总");
+        check(fixtures::nearlyEqual(normalRate, g.normalRatePct, plan_golden::kTolRate),
+              tag + "送达准时率·普通");
+        // 第 9 项：紧急送达准时率。真值表用 -1 表示「分母 0 记 —」。
+        if (g.urgentRatePct == plan_golden::kNoDenominatorSentinel) {
+            check(m.urgentTotal == 0, tag + "无紧急单时紧急准时率分母为 0（记「—」）");
+        } else {
+            check(m.urgentTotal > 0
+                      && fixtures::nearlyEqual(
+                             100.0 * static_cast<double>(m.urgentOnTimeCount)
+                                 / static_cast<double>(m.urgentTotal),
+                             g.urgentRatePct, plan_golden::kTolRate),
+                  tag + "送达准时率·紧急");
+        }
+        // 第 11–13 项：平均在车 / 利用率 / 峰值（0.1）。
+        check(fixtures::nearlyEqual(m.avgLoadKg, g.avgLoadKg, plan_golden::kTolRate),
+              tag + "平均在车货量");
+        check(fixtures::nearlyEqual(m.loadUtilization * 100.0, g.utilizationPct,
+                                    plan_golden::kTolRate),
+              tag + "载重利用率");
+        check(fixtures::nearlyEqual(m.peakLoadKg, g.peakLoadKg, plan_golden::kTolRate),
+              tag + "峰值在车量");
+
+        // G7：总 penalty == 逐单 penalty 之和（不变量，与黄金值并行保留）。
+        int penaltySum = 0;
+        for (const logistics::OrderMetric& om : m.orders) {
+            penaltySum += om.penaltyMin;
+        }
+        check(plans[i]->totalPenaltyMin == penaltySum, tag + "总 penalty = 逐单之和（G7）");
         check(m.deliveryTotal == static_cast<int>(cfg.orders.size())
                   && m.pickupTotal == static_cast<int>(cfg.orders.size()),
-              std::string(labels[i]) + "：准时率分母自洽（#35 前占位）");
-        check(fixtures::nearlyEqual(plans[i]->totalPenaltyMin,
-                                    [&]() {
-                                        int sum = 0;
-                                        for (const logistics::OrderMetric& om : m.orders) {
-                                            sum += om.penaltyMin;
-                                        }
-                                        return static_cast<double>(sum);
-                                    }(),
-                                    0.001),
-              std::string(labels[i]) + "：总 penalty = 逐单 penalty 之和（G7 占位）");
+              tag + "准时率分母 = 已规划订单数");
     }
 }
 

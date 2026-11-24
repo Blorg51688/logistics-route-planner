@@ -364,7 +364,7 @@ def _cli_route(argv):
         parts = [x.strip() for x in line.split(",")]
         if len(parts) < 5:
             continue
-        g.two_way(parts[0], parts[1], float(parts[2]), float(parts[3]), float(parts[4]))
+        g.add_edge(parts[0], parts[1], float(parts[2]), float(parts[3]), float(parts[4]))
     stops = stops_from_route_nodes(route_nodes, orders)
     res = route_metrics(g, start, ret, start_time, stops, kind)
     if res is None:
@@ -561,6 +561,10 @@ def self_check():
         print(f"[FAIL] 自检紧急优先: {r}")
         ok = False
 
+    # 停靠级转储对拍（用真实 app 二进制；找不到 app 时跳过）
+    if not _dump_selfcheck():
+        ok = False
+
     if ok:
         print("[oracle] 自检通过")
     return 0 if ok else 1
@@ -581,12 +585,367 @@ def fixture_w_d1_congested(increase):
     return g
 
 
+
+# ---------------------------------------------------------------- 停靠级转储对拍
+# 背景：--plan-summary 第 4 行是**节点序列（含途经节点）**。含重访时该序列无法唯一
+# 还原逐单动作归属（同一节点会被合并/重访），因此 oracle **不猜动作**。
+# app 的 --dump-plan 直接吐**停靠级真源**（RoutePlan::stops）：每停靠一行，含
+# phase / 动作集 / 逐单 penalty / 离站在车量。oracle 只对给定停靠序列独立复算算术。
+#
+# 转储格式（--dump-plan <kind>）：
+#   PLAN <startNode> <returnNode> <departMin>
+#   STOP <idx> <nodeId> <phase:U|N> <rawMin> <waitMin> <arrMin> \
+#        <pickups:id,id..> <deliveries:id:ws:we:penalty,..> <remainingLoadKg>
+# 空动作集写作 "-"。
+
+
+def _parse_dump_text(text):
+    """把 --dump-plan 的文本解析成 {start, ret, depart, stops[]}。"""
+    plan = {"start": None, "ret": None, "depart": None, "stops": []}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        tok = line.split()
+        if tok[0] == "PLAN":
+            plan["start"] = tok[1]
+            plan["ret"] = tok[2]
+            plan["depart"] = int(tok[3])
+        elif tok[0] == "STOP":
+            # STOP idx node phase raw wait arr pickups deliveries remaining
+            pickups = [] if tok[7] == "-" else tok[7].split(",")
+            deliveries = []
+            if tok[8] != "-":
+                for spec in tok[8].split(","):
+                    oid, ws, we, pen = spec.split(":")
+                    deliveries.append({"id": oid, "ws": int(ws), "we": int(we),
+                                       "penalty": int(pen)})
+            plan["stops"].append({
+                "idx": int(tok[1]), "node": tok[2], "phase": tok[3],
+                "raw": int(tok[4]), "wait": int(tok[5]), "arrival": int(tok[6]),
+                "pickups": pickups, "deliveries": deliveries,
+                "remaining": float(tok[9]),
+            })
+    return plan
+
+
+def _parse_dump_file(path):
+    with open(path, encoding="utf-8") as f:
+        return _parse_dump_text(f.read())
+
+
+def recompute_plan(g, plan, kind, time_factor=1.0, cost_factor=1.0, capacity=0.0,
+                   urgent_ids=None):
+    """从**停靠级转储**独立复算 13 字段（不实现选路，只按给定停靠序列算算术）。
+
+    - 相邻停靠之间用 default.ini 边表的最短路（按 kind 维度），距离/耗时/成本从
+      **同一条最短路**上读；耗时乘 time_factor、成本乘 cost_factor、距离不乘。
+    - 逐单 penalty：arrival > we 才迟到（严格 >，arrival == we 不算）；早到等待只在
+      有送达单的停靠发生，等全部送达单窗口起的最大值；停靠零耗时。
+    - 平均在车用**分段积分**（首末空驶段计入分母）：段内在车量 = 上一停靠离站在车量。
+    - 峰值 = max(各停靠离站在车量)（停靠内「先卸后装」，卸后 <= 卸前，故峰值必在装后）。
+    """
+    if urgent_ids is None:
+        urgent_ids = set()
+    elapsed = float(plan["depart"])
+    pos = plan["start"]
+    total_dist = 0.0
+    total_cost = 0.0
+    penalty = 0
+    integral = 0.0
+    cur_load = 0.0          # 上一停靠离站在车量（首段空驶 = 0）
+    peak = 0.0
+    order_pickup = {}       # oid -> (arrival, pickupNode)
+    order_deliv = {}        # oid -> (arrival, we, late, penalty, deliveryNode)
+
+    def travel(to):
+        nonlocal pos, elapsed, total_dist, total_cost, integral
+        path, _w = shortest(g, pos, to, kind)
+        if path is None:
+            return None
+        leg_t = 0.0
+        for i in range(1, len(path)):
+            e = g.edges[(path[i - 1], path[i])]
+            total_dist += e["dist"]
+            total_cost += e["cost"]
+            leg_t += e["time"]
+        leg_t *= time_factor
+        integral += cur_load * leg_t     # 该段在车量恒定（停靠零耗时）
+        elapsed += leg_t
+        pos = to
+        return True
+
+    for st in plan["stops"]:
+        if pos != st["node"]:
+            if not travel(st["node"]):
+                return None
+        raw = elapsed
+        if st["deliveries"]:
+            max_ws = max(d["ws"] for d in st["deliveries"])
+            wait = max(0.0, max_ws - raw)
+        else:
+            wait = 0.0
+        arrival = raw + wait
+        elapsed = arrival
+        for d in st["deliveries"]:
+            late = arrival > d["we"] + EPS
+            p = round(arrival - d["we"]) if late else 0
+            penalty += p
+            order_deliv[d["id"]] = (arrival, d["we"], late, p, st["node"])
+        for oid in st["pickups"]:
+            order_pickup[oid] = (arrival, st["node"])
+        cur_load = st["remaining"]
+        if cur_load > peak:
+            peak = cur_load
+
+    if pos != plan["ret"]:
+        if not travel(plan["ret"]):
+            return None
+
+    total_time = elapsed - float(plan["depart"])
+
+    pickup_total = pickup_ok = 0
+    deliv_total = deliv_ok = 0
+    urg_total = urg_ok = 0
+    norm_total = norm_ok = 0
+    for oid, (parr, pnode) in order_pickup.items():
+        pickup_total += 1
+        rec = order_deliv.get(oid)
+        if rec is None:
+            continue
+        _darr, we, late, _p, dnode = rec
+        _path, stime = shortest(g, pnode, dnode, "time")
+        scaled = (0.0 if stime == INF else stime * time_factor)
+        if parr + scaled <= we + EPS:
+            pickup_ok += 1
+        deliv_total += 1
+        if not late:
+            deliv_ok += 1
+        if oid in urgent_ids:
+            urg_total += 1
+            if not late:
+                urg_ok += 1
+        else:
+            norm_total += 1
+            if not late:
+                norm_ok += 1
+
+    def rate(hit, total):
+        return None if total <= 0 else 100.0 * hit / total
+
+    return {
+        "distance": total_dist,
+        "time": total_time,
+        "cost": total_cost,
+        "penalty": penalty,
+        "stops": len(plan["stops"]),
+        "actions": sum(len(st["pickups"]) + len(st["deliveries"]) for st in plan["stops"]),
+        "pickup_rate": rate(pickup_ok, pickup_total),
+        "delivery_rate": rate(deliv_ok, deliv_total),
+        "urgent_rate": rate(urg_ok, urg_total),
+        "normal_rate": rate(norm_ok, norm_total),
+        "avg_load": (integral / total_time) if total_time > EPS else 0.0,
+        "utilization": ((integral / total_time) / capacity * 100.0)
+                       if (total_time > EPS and capacity > EPS) else 0.0,
+        "peak": peak,
+    }
+
+
+def _load_dataset():
+    """从仓库 config/default.ini 读 orders / edges / vehicles（独立于被测代码）。"""
+    import os
+    ini = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "config", "default.ini")
+    sections = _read_ini_sections(ini)
+    orders = []
+    for raw in sections.get("orders", "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) < 7:
+            continue
+        orders.append({"id": parts[0], "pickup": parts[1], "delivery": parts[2],
+                       "kg": float(parts[3]), "ws": _clock_minutes(parts[4]),
+                       "we": _clock_minutes(parts[5]), "urgent": int(parts[6]) != 0})
+    g = Graph()
+    for raw in sections.get("edges", "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) < 5:
+            continue
+        # [edges] 每行就是**一条有向边**（双向路发两条、单向路只发一条），
+        # 不能 here 用 two_way——那会给 6 条单向路凭空补上反向边。
+        g.add_edge(parts[0], parts[1], float(parts[2]), float(parts[3]), float(parts[4]))
+    veh = None
+    for raw in sections.get("vehicles", "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) < 6:
+            continue
+        veh = {"id": parts[0], "start": parts[1], "capacity": float(parts[2]),
+               "depart": _clock_minutes(parts[3]), "time_factor": float(parts[4]),
+               "cost_factor": float(parts[5])}
+        break
+    return g, orders, veh
+
+
+def _print_plan_metrics(m):
+    def rat(v):
+        return "—" if v is None else "%.1f" % v
+    print("distance      = %.3f" % m["distance"])
+    print("time          = %.3f" % m["time"])
+    print("cost          = %.3f" % m["cost"])
+    print("penalty       = %d" % m["penalty"])
+    print("stops         = %d" % m["stops"])
+    print("actions       = %d" % m["actions"])
+    print("pickup_rate   = %s" % rat(m["pickup_rate"]))
+    print("delivery_rate = %s" % rat(m["delivery_rate"]))
+    print("urgent_rate   = %s" % rat(m["urgent_rate"]))
+    print("normal_rate   = %s" % rat(m["normal_rate"]))
+    print("avg_load      = %.1f" % m["avg_load"])
+    print("utilization   = %.1f" % m["utilization"])
+    print("peak          = %.1f" % m["peak"])
+
+
+def _cli_plan(argv):
+    """oracle 的停靠级对拍入口：
+
+        python3 tools/oracle.py --plan <dumpfile> <kind>
+
+    读 app 的 --dump-plan 输出，独立复算 13 字段并打印。oracle 不实现选路。
+    """
+    if len(argv) < 2:
+        print("用法: oracle.py --plan <dumpfile> <kind>")
+        return 2
+    dumpfile, kind = argv[0], argv[1]
+    plan = _parse_dump_file(dumpfile)
+    g, orders, veh = _load_dataset()
+    urgent_ids = {o["id"] for o in orders if o["urgent"]}
+    tf = veh["time_factor"] if veh else 1.0
+    cf = veh["cost_factor"] if veh else 1.0
+    cap = veh["capacity"] if veh else 0.0
+    m = recompute_plan(g, plan, kind, time_factor=tf, cost_factor=cf, capacity=cap,
+                       urgent_ids=urgent_ids)
+    if m is None:
+        print("不可达")
+        return 1
+    _print_plan_metrics(m)
+    return 0
+
+
+def _parse_summary(text):
+    """解析 --plan-summary 的 stdout（四行），返回 13 字段（与 recompute_plan 同键名）。"""
+    import re
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    m = {}
+    l1 = lines[0]
+    mm = re.search(r"总距离 ([\d.]+) km .* 总耗时 ([\d.]+) min .* 总成本 ([\d.]+) 元 .* "
+                   r"总 penalty (\d+) min .* 停靠 (\d+) 站 .* 动作 (\d+) 次", l1)
+    m["distance"] = float(mm.group(1))
+    m["time"] = float(mm.group(2))
+    m["cost"] = float(mm.group(3))
+    m["penalty"] = int(mm.group(4))
+    m["stops"] = int(mm.group(5))
+    m["actions"] = int(mm.group(6))
+    l2 = lines[1]
+    # 取货准时率 <v>%（x/y） | 送达准时率 <v>%（x/y；紧急 <u> · 普通 <n>） | 平均在车 ...
+    mp = re.search(r"取货准时率 ([\d.—]+)%", l2)
+    md = re.search(r"送达准时率 ([\d.—]+)%", l2)
+    mu = re.search(r"紧急 ([\d.—]+)", l2)
+    mn = re.search(r"普通 ([\d.—]+)", l2)
+    ml = re.search(r"平均在车 ([\d.]+) kg", l2)
+    mut = re.search(r"利用率 ([\d.]+)%", l2)
+    mpk = re.search(r"峰值 ([\d.]+) kg", l2)
+
+    def gv(x):
+        return None if (x is None or x.group(1) == "—") else float(x.group(1))
+    m["pickup_rate"] = gv(mp)
+    m["delivery_rate"] = gv(md)
+    m["urgent_rate"] = gv(mu)
+    m["normal_rate"] = gv(mn)
+    m["avg_load"] = float(ml.group(1))
+    m["utilization"] = float(mut.group(1))
+    m["peak"] = float(mpk.group(1))
+    return m
+
+
+def _compare_13(appvals, oraclevals, tag):
+    """把 app 自报的 13 字段与 oracle 复算值比对（容差按 §6.4）。"""
+    ok = True
+    tol3 = ["distance", "time", "cost"]
+    tolint = ["penalty", "stops", "actions"]
+    tol1 = ["pickup_rate", "delivery_rate", "urgent_rate", "normal_rate",
+            "avg_load", "utilization", "peak"]
+    for k in tol3 + tolint + tol1:
+        a, b = appvals[k], oraclevals[k]
+        if a is None or b is None:
+            good = (a is None and b is None)
+        elif k in tolint:
+            good = int(a) == int(b)
+        elif k in tol3:
+            good = abs(float(a) - float(b)) <= 1e-3 + 1e-9
+        else:
+            good = abs(float(a) - float(b)) <= 0.1 + 1e-9
+        if not good:
+            print("[FAIL] %s: %s app=%s oracle=%s" % (tag, k, a, b))
+            ok = False
+    return ok
+
+
+def _dump_selfcheck():
+    """用真实 app 二进制生成的 --dump-plan 跑一遍复算，与 app 自报值比对。
+
+    纪律：不一致先查实现、不改数据（若这里红，是实现/口径分叉，不是允许改数据）。
+    找不到 app 二进制时跳过（Qt 缺失的环境里 --dump-plan 无法运行）。
+    """
+    import os
+    import subprocess
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    app = os.path.join(repo, "build", "app")
+    if not os.path.exists(app):
+        print("[oracle] 未找到 app 二进制，跳过 --dump-plan 对拍")
+        return True
+    env = dict(os.environ)
+    env.setdefault("QT_QPA_PLATFORM", "offscreen")
+    ok = True
+    for kind in ("distance", "cost", "time"):
+        dump = subprocess.run([app, "--dump-plan", kind], capture_output=True, text=True,
+                              env=env).stdout
+        summary = subprocess.run([app, "--plan-summary", kind], capture_output=True,
+                                 text=True, env=env).stdout
+        plan = _parse_dump_text(dump)
+        g, orders, veh = _load_dataset()
+        urgent_ids = {o["id"] for o in orders if o["urgent"]}
+        tf = veh["time_factor"] if veh else 1.0
+        cf = veh["cost_factor"] if veh else 1.0
+        cap = veh["capacity"] if veh else 0.0
+        oraclevals = recompute_plan(g, plan, kind, time_factor=tf, cost_factor=cf,
+                                    capacity=cap, urgent_ids=urgent_ids)
+        appvals = _parse_summary(summary)
+        if oraclevals is None:
+            print("[FAIL] %s: dump 复算不可达" % kind)
+            ok = False
+            continue
+        if not _compare_13(appvals, oraclevals, "dump-%s" % kind):
+            ok = False
+        else:
+            print("[oracle] dump 对拍通过（%s）" % kind)
+    return ok
+
 def main():
     if "--check" in sys.argv:
         return self_check()
     if "--route" in sys.argv:
         i = sys.argv.index("--route")
         return _cli_route(sys.argv[i + 1:])
+    if "--plan" in sys.argv:
+        i = sys.argv.index("--plan")
+        return _cli_plan(sys.argv[i + 1:])
 
     print("=" * 72)
     print("Dijkstra 夹具（tests/dijkstra_tests.cpp）")

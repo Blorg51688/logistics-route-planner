@@ -87,6 +87,15 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME doc_links_lint
              COMMAND ${Python3_EXECUTABLE}
                      ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_doc_links.py)
+
+    # L2 文本守卫：跑真二进制读 --plan-summary 四行 + --dump-plan/oracle 对拍（#35）。
+    # 依赖 app 可执行文件与 python/oracle；实际 add_test 放在 Qt6 块内（需 $<TARGET_FILE:app>）。
+    add_executable(cli_plan_summary tests/cli_plan_summary.cpp)
+    target_link_libraries(cli_plan_summary PRIVATE io)
+    target_compile_definitions(cli_plan_summary PRIVATE
+        DEFAULT_CONFIG_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/default.ini"
+        PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
+        ORACLE_PY_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tools/oracle.py")
 else()
     message(STATUS "未找到 python3，跳过 oracle_selfcheck 测试")
 endif()
@@ -119,6 +128,12 @@ if(Qt6_FOUND)
     add_test(NAME cli_ui_probe
              COMMAND ${CMAKE_COMMAND} -E env QT_QPA_PLATFORM=offscreen
                      $<TARGET_FILE:app> --ui-probe)
+    # L2 文本守卫（#35）：跑真二进制读 --plan-summary，三策略全过（16 个 ctest 目标之一）。
+    if(TARGET cli_plan_summary)
+        add_test(NAME cli_plan_summary
+                 COMMAND ${CMAKE_COMMAND} -E env QT_QPA_PLATFORM=offscreen
+                         $<TARGET_FILE:cli_plan_summary> $<TARGET_FILE:app> all)
+    endif()
 else()
     message(STATUS "未找到 Qt6 Widgets，跳过 GUI 目标（app）")
 endif()
