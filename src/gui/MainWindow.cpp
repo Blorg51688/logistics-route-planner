@@ -2121,6 +2121,18 @@ QString MainWindow::equivalenceSnapshot() const {
                    .arg(id)
                    .arg(QString::fromStdString(rt.state.atNodeId))
                    .arg(minutesToClock(rt.state.atTimeMin));
+        // A6 的另一半（路线面板的数据源）：该车当前计划的节点序列。
+        // 终态"全部都到家、全部送达"会让位置/时刻收敛，光看这两项区分不出
+        // 「同刻并列时先推进哪一台」——把路线也纳入快照，等价性才是逐字的。
+        QStringList routeNodes;
+        for (std::size_t i = 0; i < rt.plan.nodes.size(); ++i) {
+            routeNodes << QString::fromStdString(rt.plan.nodes[i]);
+        }
+        out += QStringLiteral("A6 %1 路线: %2（停靠 %3 ｜ 剩余 %4）\n")
+                   .arg(id)
+                   .arg(routeNodes.join(QLatin1Char('>')))
+                   .arg(rt.plan.stops.size())
+                   .arg(rt.stopCursor);
     }
     // A5（站内已执行账本）：只含**已实际执行**的卸入（计划期候选不在其中）——
     // 订单 / 站 / kg / 卸入车 / 卸入时刻 / 取走车 / 取走时刻（规格二 §6.10 的 A5）。
@@ -4046,6 +4058,168 @@ int MainWindow::runActionSelfCheck() {
         std::printf("[self-check] 等价性终态（两条路径一致）：\n%s", snapA.toUtf8().constData());
     }
 
+    // ---- 8b. 同刻多车（Tnext 并列）也必须等价 —— A6 的反向验证载体 ----
+    //
+    // 规格二 §6.10 的反向验证对象：把 advanceFleetTo 的并列分支改成「只推进第一台」，
+    // A6（各车位置与时刻）必须红。默认数据上三台车的到达时刻几乎不并列，这条验证
+    // 在默认数据上会空跑 —— 因此用一个**两台车共用首段**的夹具保证每一步都并列：
+    //   V01: W→H→A→B→W、V02: W→H→C→D→W，每段 15min ⇒ 到达时刻逐位相同，
+    //   且 495/510/525/540 恰好都是事件刻（同刻并列 + 事件刻重合的形态）。
+    {
+        logistics::Config mirror = reloadInitialConfig();
+        mirror.general.eventIntervalMin = 15;
+        // 事件权重偏向"路况"（27/30）：路况会**立刻重规划受影响车**，而"谁受影响"
+        // 取决于结算时各车的位置/路线 —— 正是并列顺序能被观测到的地方。
+        // （订单类事件的落点常常恒定在 Δkey 最小的那台车上，反而测不出差异。）
+        mirror.general.eventLevelTraffic = logistics::EventLevel::High;
+        mirror.general.eventLevelClosure = logistics::EventLevel::ExtraLow;
+        mirror.general.eventLevelCustomer = logistics::EventLevel::ExtraLow;
+        mirror.general.eventLevelUrgent = logistics::EventLevel::High;
+        mirror.graph = logistics::LogisticsGraph();
+        const auto node = [&mirror](const std::string& id, logistics::NodeType type,
+                                    const std::string& name, int sub) {
+            logistics::Node n;
+            n.id = id;
+            n.type = type;
+            n.name = name;
+            n.subNetworkId = sub;
+            mirror.graph.addNode(n);
+        };
+        const auto two = [&mirror](const std::string& a, const std::string& b, double km) {
+            logistics::Edge e;
+            e.fromId = a;
+            e.toId = b;
+            e.distanceKm = km;
+            e.timeMin = km;
+            e.costYuan = km;
+            mirror.graph.addEdge(e);
+            logistics::Edge back = e;
+            back.fromId = b;
+            back.toId = a;
+            mirror.graph.addEdge(back);
+        };
+        // 两台车共用一段 W->H（同一时刻并列），之后各走各的：
+        //   V01: W→H→A→B→W、V02: W→H→C→D→W，每段 15min ⇒ 到达时刻逐位相同，
+        //   且 495/510/525/540 恰好都是事件刻（同刻并列 + 事件刻重合）。
+        node("W", logistics::NodeType::Warehouse, "仓库", 0);
+        node("H", logistics::NodeType::Delivery, "客户H", 9);
+        node("A", logistics::NodeType::Delivery, "客户A", 1);
+        node("B", logistics::NodeType::Delivery, "客户B", 1);
+        node("C", logistics::NodeType::Delivery, "客户C", 2);
+        node("D", logistics::NodeType::Delivery, "客户D", 2);
+        two("W", "H", 15.0);
+        two("H", "A", 15.0);
+        two("A", "B", 15.0);
+        two("B", "W", 15.0);
+        two("H", "C", 15.0);
+        two("C", "D", 15.0);
+        two("D", "W", 15.0);
+        mirror.vehicles.clear();
+        for (const char* id : {"V01", "V02"}) {
+            logistics::Vehicle v;
+            v.id = id;
+            v.startNodeId = "W";
+            v.capacityKg = 100.0;
+            v.departTimeMin = 480;
+            mirror.vehicles.push_back(v);
+        }
+        mirror.orders.clear();
+        const auto order = [&mirror](const std::string& id, const std::string& a,
+                                     const std::string& b) {
+            logistics::Order o;
+            o.id = id;
+            o.pickupNodeId = a;
+            o.nodeId = b;
+            o.demandKg = 10.0;
+            o.windowStartMin = 0;
+            o.windowEndMin = 1440;
+            o.source = logistics::OrderSource::Initial;
+            mirror.orders.push_back(o);
+        };
+        order("O1", "A", "B");
+        order("O2", "C", "D");
+
+        MainWindow tieA(mirror, configPath_);
+        MainWindow tieB(mirror, configPath_);
+        // （前置）两台车每一步都并列：到达时刻数组逐位相同
+        bool tiePremise = tieA.fleet().size() == 2
+                          && tieA.fleet()[0].plan.nodeArrivalMin
+                                 == tieA.fleet()[1].plan.nodeArrivalMin
+                          && tieA.fleet()[0].plan.nodeArrivalMin.size() >= 4;
+        expect(tiePremise,
+               QStringLiteral("G22（前置）镜像夹具：两台车每一步的到达时刻都并列"));
+        int stepsTieA = 0;
+        while (!tieA.atRouteEnd() && stepsTieA < 400) {
+            tieA.onAdvanceMoment();   // 路径 A：推进一刻
+            ++stepsTieA;
+        }
+        int stepsTieB = 0;
+        while (!tieB.atRouteEnd() && stepsTieB < 400) {
+            tieB.onAdvanceStop();     // 路径 B：推进一站（并列时同刻一起推进）
+            ++stepsTieB;
+        }
+        expect(tieA.atRouteEnd() && tieB.atRouteEnd(),
+               QStringLiteral("G22：两条路径都走完（推进一刻 %1 步 / 推进一站 %2 步）")
+                   .arg(stepsTieA)
+                   .arg(stepsTieB));
+        const QString tieSnapA = tieA.equivalenceSnapshot();
+        const QString tieSnapB = tieB.equivalenceSnapshot();
+        QString tieDiff;
+        {
+            const QStringList la = tieSnapA.split(QLatin1Char('\n'));
+            const QStringList lb = tieSnapB.split(QLatin1Char('\n'));
+            const int n = static_cast<int>(la.size() < lb.size() ? la.size() : lb.size());
+            for (int i = 0; i < n; ++i) {
+                if (la[i] != lb[i]) {
+                    tieDiff = QStringLiteral("第 %1 行 A=「%2」 / B=「%3」").arg(i + 1).arg(la[i], lb[i]);
+                    break;
+                }
+            }
+            if (tieDiff.isEmpty() && la.size() != lb.size()) {
+                tieDiff = QStringLiteral("行数 A=%1 / B=%2").arg(la.size()).arg(lb.size());
+            }
+        }
+        expect(tieSnapA == tieSnapB,
+               QStringLiteral("G22 A1–A7（并列场景）逐字一致（差异：%1）").arg(tieDiff));
+        // 事件日志也逐字一致（同刻抽签次数与顺序不被推进粒度改变）
+        expect(tieA.eventLogLines() == tieB.eventLogLines(),
+               QStringLiteral("G22 A1（并列场景）事件日志逐字一致（%1 / %2 行）")
+                   .arg(tieA.eventLogLines().size())
+                   .arg(tieB.eventLogLines().size()));
+
+        // ---- G23（§6.1「同刻多车一起推进」的结构守卫）----
+        //
+        // 这是 A6 那条反向验证（把并列分支改成「只推进第一台」）的**可观测载体**：
+        // 双跑在终态会收敛（都到家、都送达），单看终态吃不掉这条反向补丁；
+        // 而「一次推进一站必须让并列的两台车都前进」是用户能直接看到的结构事实
+        //（车辆页签/状态栏的位置与时刻）。
+        MainWindow tieOne(mirror, configPath_);
+        // 期望值从**推进前**的计划里读（推进可能触发事件重规划，事后读会变）
+        const int expectedArrival =
+            (tieOne.fleet().size() > 0 && tieOne.fleet()[0].plan.nodeArrivalMin.size() > 1)
+                ? tieOne.fleet()[0].plan.nodeArrivalMin[1]
+                : -1;
+        tieOne.onAdvanceStop();   // 全队下一到达时刻 = 两台车并列的那个时刻
+        const int t1 = tieOne.fleet().size() > 0 ? tieOne.fleet()[0].state.atTimeMin : -1;
+        const int t2 = tieOne.fleet().size() > 1 ? tieOne.fleet()[1].state.atTimeMin : -1;
+        expect(tieOne.fleet().size() == 2 && t1 == expectedArrival && t2 == expectedArrival,
+               QStringLiteral("G23 并列到达：一次「推进一站」把**两台车**都推到同一时刻 %1"
+                              "（实际 V01 %2 / V02 %3）")
+                   .arg(expectedArrival)
+                   .arg(t1)
+                   .arg(t2));
+        // 夹具里两台车的第一站都是共用的 H（同刻并列）——断言"两台车都真的前进了一站"。
+        expect(tieOne.fleet().size() == 2 && tieOne.fleet()[0].nodeIndex == 1
+                   && tieOne.fleet()[1].nodeIndex == 1
+                   && tieOne.fleet()[0].state.atNodeId == tieOne.fleet()[1].state.atNodeId,
+               QStringLiteral("G23 并列到达：两台车都真的前进了一站（实际下标 %1 / %2）")
+                   .arg(tieOne.fleet().size() > 0
+                            ? static_cast<long long>(tieOne.fleet()[0].nodeIndex)
+                            : -1)
+                   .arg(tieOne.fleet().size() > 1
+                            ? static_cast<long long>(tieOne.fleet()[1].nodeIndex)
+                            : -1));
+    }
 
     // ---- 9. 跨车转运（规格二 §5 / #28）：三阶段规划启用 → 执行 → 账本面板可读 ----
     //
