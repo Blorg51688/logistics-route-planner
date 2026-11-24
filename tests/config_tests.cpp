@@ -234,17 +234,55 @@ void testLoadDefaultConfig() {
     check(countType(cfg, NodeType::Transit) >= 3, "中转站 ≥ 3");
     check(cfg.graph.edgeCount() >= 50, "路径总数 ≥ 50");
 
-    // 车辆：规格一阶段保持单车主 V01，六列（含两因子）
-    check(cfg.vehicles.size() == 1, "规格一默认车队恰有 1 辆车");
-    if (!cfg.vehicles.empty()) {
-        const logistics::Vehicle& v = cfg.vehicles[0];
-        check(v.id == "V01", "默认车辆 ID 为 V01");
-        check(v.capacityKg == 200.0, "默认载重 200kg");
-        check(v.departTimeMin == 8 * 60, "发车时刻 08:00 解析为 480 分钟");
-        check(v.timeFactor == 1.0, "默认耗时倍率 1.00");
-        check(v.costFactor == 1.0, "默认成本倍率 1.00");
-        const logistics::Node* start = cfg.graph.findNode(v.startNodeId);
-        check(start != nullptr && start->type == NodeType::Warehouse, "起始节点是仓库");
+    // 车辆：规格二 §3.2 的**默认三车异构车队**（六列，含两因子），行序即车辆序。
+    check(cfg.vehicles.size() == 3, "默认车队恰有 3 辆车（V01/V02/V03）");
+    if (cfg.vehicles.size() == 3) {
+        struct ExpectVehicle {
+            const char* id;
+            double      capacityKg;
+            double      timeFactor;
+            double      costFactor;
+        };
+        const ExpectVehicle expect[3] = {{"V01", 400.0, 1.00, 1.50},
+                                         {"V02", 160.0, 1.25, 0.80},
+                                         {"V03", 160.0, 1.25, 0.80}};
+        for (int i = 0; i < 3; ++i) {
+            const logistics::Vehicle& v = cfg.vehicles[static_cast<std::size_t>(i)];
+            const std::string tag = std::string("默认车辆 ") + expect[i].id + "：";
+            check(v.id == expect[i].id, tag + "行序与 ID 一致");
+            check(v.capacityKg == expect[i].capacityKg, tag + "载重");
+            check(v.departTimeMin == 8 * 60, tag + "发车时刻 08:00 解析为 480 分钟");
+            check(v.timeFactor == expect[i].timeFactor, tag + "耗时倍率");
+            check(v.costFactor == expect[i].costFactor, tag + "成本倍率");
+            check(v.startNodeId == "W01", tag + "起始仓库 W01");
+            const logistics::Node* start = cfg.graph.findNode(v.startNodeId);
+            check(start != nullptr && start->type == NodeType::Warehouse, tag + "起始节点是仓库");
+        }
+        // §3.1 生成器自检在数据上的**结果**（契约层不强制，但默认数据集必须满足）：
+        // 两型车真的分化；快车容量 >= 2 × 最小容量。
+        bool hasSlower = false;
+        bool hasCheaper = false;
+        double minCap = cfg.vehicles[0].capacityKg;
+        bool hasBig = false;
+        for (const logistics::Vehicle& v : cfg.vehicles) {
+            if (v.timeFactor > 1.0) {
+                hasSlower = true;
+            }
+            if (v.costFactor < 1.0) {
+                hasCheaper = true;
+            }
+            if (v.capacityKg < minCap) {
+                minCap = v.capacityKg;
+            }
+        }
+        for (const logistics::Vehicle& v : cfg.vehicles) {
+            if (v.capacityKg >= 2.0 * minCap) {
+                hasBig = true;
+            }
+        }
+        check(hasSlower, "默认车队存在 time_factor > 1 的慢车");
+        check(hasCheaper, "默认车队存在 cost_factor < 1 的低成本车");
+        check(hasBig, "默认车队存在容量 >= 2 × 最小容量的快车（400 >= 2×160）");
     }
 
     // 订单：25 单 A→B 取送，七列口径
@@ -309,6 +347,46 @@ void testLoadDefaultConfig() {
     check(logistics::eventLevelWeight(cfg.general.eventLevelCustomer) == 9, "medium -> 9");
     check(logistics::eventLevelWeight(cfg.general.eventLevelUrgent) == 3, "low -> 3");
     check(logistics::eventLevelWeight(cfg.general.eventLevelClosure) == 1, "extra_low -> 1");
+}
+
+// [vehicles] 三车夹具（规格二 §3.1 的六列 + 八条校验在多行下的行为）。
+void testThreeVehicleFixture() {
+    const std::string rows =
+        "V01, W01, 400, 08:00, 1.00, 1.50\n"
+        "V02, W01, 160, 08:00, 1.25, 0.80\n"
+        "V03, W01, 160, 08:00, 1.25, 0.80\n";
+    Config cfg;
+    std::string error;
+    const bool ok = ConfigLoader::parse(
+        std::string(kNodesBase) + kEdgesBase + "[vehicles]\n" + rows +
+            "[orders]\nO01, D01, D02, 10, 09:00, 18:00, 0\n",
+        cfg, error);
+    check(ok, "三车夹具可加载（错误: " + error + "）");
+    if (ok) {
+        check(cfg.vehicles.size() == 3, "三车夹具恰有 3 台车");
+        check(cfg.vehicles[0].id == "V01" && cfg.vehicles[1].id == "V02"
+                  && cfg.vehicles[2].id == "V03",
+              "车辆序 = [vehicles] 行序");
+        check(cfg.vehicles[0].capacityKg == 400.0, "V01 400kg");
+        check(cfg.vehicles[1].capacityKg == 160.0, "V02 160kg");
+        check(cfg.vehicles[2].timeFactor == 1.25, "V03 耗时倍率 1.25");
+        check(cfg.vehicles[0].costFactor == 1.50, "V01 成本倍率 1.50");
+    }
+    // 跨节校验随车队变：min(capacity) = 160 ⇒ 单笔 160kg 必须报错、159.9 合法。
+    {
+        Config big;
+        std::string err;
+        const bool bad = ConfigLoader::parse(
+            std::string(kNodesBase) + kEdgesBase + "[vehicles]\n" + rows +
+                "[orders]\nO01, D01, D02, 160, 09:00, 18:00, 0\n",
+            big, err);
+        check(!bad, "单笔 160kg == min(容量) 时按严格小于报错");
+        const bool good = ConfigLoader::parse(
+            std::string(kNodesBase) + kEdgesBase + "[vehicles]\n" + rows +
+                "[orders]\nO01, D01, D02, 159.9, 09:00, 18:00, 0\n",
+            big, err);
+        check(good, "单笔 159.9kg < min(容量) 时合法（错误: " + err + "）");
+    }
 }
 
 void testDefaultConfigRoutingPreconditions() {
@@ -766,6 +844,7 @@ void testBoundaryCases() {
 
 int main() {
     testLoadDefaultConfig();
+    testThreeVehicleFixture();
     testDefaultConfigRoutingPreconditions();
     testOrderSourcePrefixes();
     testDynamicAddRemove();

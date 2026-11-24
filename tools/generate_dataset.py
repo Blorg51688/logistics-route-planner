@@ -58,8 +58,15 @@ EVENT_LEVELS = [
     ("event_level_closure", "extra_low"),
 ]
 
-CAPACITY_KG = 200
-DEPART_TIME = "08:00"
+# 默认车队（规格二 §3.2 数据集事实，**权威**）：
+#   快车 V01 400kg / 1.00 / 1.50；慢车 V02、V03 160kg / 1.25 / 0.80；全部 W01、08:00 同刻发车。
+# 三车 / 三枢纽批次（160 / 144 / 152kg）天然一一对应；"慢车 160kg 零余量"是例外非常态
+# （规格二 §3.8），只有分配把两批压到同一台慢车时才会走降载/兜底。
+VEHICLES = [
+    ("V01", "W01", 400, "08:00", 1.00, 1.50),
+    ("V02", "W01", 160, "08:00", 1.25, 0.80),
+    ("V03", "W01", 160, "08:00", 1.25, 0.80),
+]
 
 # 初始数据集（规格一 #23「四、订单表（权威版，25 行）」**逐字照抄**）。
 # 纪律：kg 与窗口一律照抄，不在生成器里做任何算术或"顺手调整"；
@@ -234,9 +241,10 @@ def build_text():
         out.append("%s, %s, %s, %s, %s" % (a, b, d, t, c))
 
     out += ["", "[vehicles]",
-            "# ID, start_node, capacity_kg, depart_time, time_factor, cost_factor",
-            "V01, W01, %d, %s, 1.00, 1.00" % (CAPACITY_KG, DEPART_TIME),
-            "", "[orders]",
+            "# ID, start_node, capacity_kg, depart_time, time_factor, cost_factor"]
+    for vid, start, cap, depart, tf, cf in VEHICLES:
+        out.append("%s, %s, %d, %s, %.2f, %.2f" % (vid, start, cap, depart, tf, cf))
+    out += ["", "[orders]",
             "# ID, pickup, delivery, demand_kg, window_start, window_end, is_urgent"]
     out += ORDER_ROWS
 
@@ -430,6 +438,27 @@ def self_check(text):
         if time_factor <= 0 or cost_factor <= 0:
             problems.append("车辆因子必须为正: %s" % row)
         vehicles.append((f[0], f[1], cap, f[3], time_factor, cost_factor))
+
+    # 生成器自检另加（规格二 §3.1，比解析层严，只约束**默认数据集**）：
+    #   · 因子 ∈ [0.5, 2]
+    #   · 至少一台 capacity_kg ≥ 2 × min(capacity_kg)
+    #   · 存在 time_factor > 1 与 cost_factor < 1 的车（两型车真的分化）
+    # 注意（规格自相矛盾，已按权威事实处理）：§3.1 还要求「至少 1 台
+    # time_factor = 1 且 cost_factor = 1 的基准车」，但 §3.2 的默认车队
+    # V01 是 1.00 / 1.50 —— **没有这种车**。§3.2 是数据集事实（权威），
+    # 故该条**跳过不检**，也不为了凑它改数据。
+    for vid, _start, cap, _depart, tf, cf in vehicles:
+        if tf < 0.5 or tf > 2.0 or cf < 0.5 or cf > 2.0:
+            problems.append("[vehicles] 因子不在 [0.5, 2]: %s (%.2f/%.2f)" % (vid, tf, cf))
+    if vehicles:
+        caps = [v[2] for v in vehicles]
+        min_cap = min(caps)
+        if not any(c >= 2.0 * min_cap for c in caps):
+            problems.append("[vehicles] 没有一台车的容量 >= 2 × 最小容量（快车大容量不成立）")
+        if not any(v[4] > 1.0 for v in vehicles):
+            problems.append("[vehicles] 不存在 time_factor > 1 的慢车")
+        if not any(v[5] < 1.0 for v in vehicles):
+            problems.append("[vehicles] 不存在 cost_factor < 1 的车")
 
     # ---- [orders]：七列 + 规格一 §3.5/§3.8 的全部结构事实 ----
     delivery_ids = {nid for nid, t in nodes.items() if t == "delivery"}
