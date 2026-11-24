@@ -376,6 +376,33 @@ void checkFleetInvariants(const Config& cfg, const FleetPlan& fleet, const std::
           tag + "车队峰值 == max(各车峰值)");
     check(fleet.metrics.avgLoadKg <= fleet.metrics.peakLoadKg + 1e-9,
           tag + "车队平均在车 <= 车队峰值（G5）");
+
+    // ⑤b 车队级第 12 项（载重利用率）的口径（评审修复 B）：它是**派生时间加权聚合**
+    //     Σ(在车量×段时长) / Σ(该车 capacity×该车运行时长)。G5 只钉逐车「平均÷该车容量」，
+    //     规格没有给车队级公式 ⇒ 这里从逐车指标反算，把口径钉成可核验（容差 0.1）。
+    {
+        double loadInt = 0.0;
+        double capTime = 0.0;
+        double timeSum = 0.0;
+        for (std::size_t v = 0; v < fleet.vehicles.size() && v < cfg.vehicles.size(); ++v) {
+            const double t = fleet.vehicles[v].totalTimeMin;
+            if (t <= 0.0) {
+                continue;
+            }
+            loadInt += fleet.vehicles[v].metrics.avgLoadKg * t;
+            capTime += cfg.vehicles[v].capacityKg * t;
+            timeSum += t;
+        }
+        check(timeSum > 0.0 && capTime > 0.0, tag + "逐车有正耗时（利用率反算前提）");
+        if (timeSum > 0.0 && capTime > 0.0) {
+            check(fixtures::nearlyEqual(fleet.metrics.avgLoadKg, loadInt / timeSum, 1e-6),
+                  tag + "车队平均在车 = Σ(逐车平均×该车耗时)/Σ耗时（时间加权）");
+            check(fixtures::nearlyEqual(fleet.metrics.loadUtilization * 100.0,
+                                        100.0 * loadInt / capTime, plan_golden::kTolRate),
+                  tag + "车队第 12 项利用率 = 时间加权 Σ(在车量×段时长)/Σ(capacity×运行时长)"
+                        "（容差 0.1）");
+        }
+    }
 }
 
 // 分配表 -> 每车订单集合。**只读 FleetPlan 的公开分配产物**（不重算分配），

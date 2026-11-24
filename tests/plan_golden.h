@@ -84,7 +84,9 @@ struct StrategyGolden {
     double urgentRatePct;      // 9  送达准时率·紧急 (%)  -1 = 分母 0（「—」）
     double normalRatePct;      // 10 送达准时率·普通 (%)
     double avgLoadKg;          // 11 平均在车货量 (kg)
-    double utilizationPct;     // 12 载重利用率 (%)
+    double utilizationPct;     // 12 载重利用率 (%) —— 逐车 = 平均÷该车 capacity；
+                               //    车队级为**派生时间加权** Σ(在车量×段时长)/Σ(capacity×该车运行时长)
+                               //    （规格未单独定义，口径见 docs/设计.md §4.7）
     double peakLoadKg;         // 13 峰值在车量 (kg)
     // ---- 每车 7 字段 × 3 车（本票新增）----
     VehicleGolden vehicles[kVehicleCount];

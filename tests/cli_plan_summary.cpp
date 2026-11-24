@@ -299,6 +299,13 @@ bool near(double a, double b, double tol) {
 //
 // 这是**分配的可核对视图**：ALLOC 给逐单归属，ASSIGN 给逐车汇总。
 // 守卫读这两行 + 既有的 PLAN/STOP 行，不读规划器内部状态。
+struct MetricRow {
+    double distance = 0.0, time = 0.0, cost = 0.0, avgLoad = 0.0, utilization = 0.0,
+           peak = 0.0;
+    int penalty = 0, stopCount = 0, actionCount = 0, pickupHit = 0, pickupTotal = 0,
+        deliveryHit = 0, deliveryTotal = 0;
+};
+
 struct AllocDump {
     bool hasAlloc = false;
     bool hasAssign = false;
@@ -309,6 +316,8 @@ struct AllocDump {
     std::vector<int> assignCount;           // 该行订单数
     // 每台车**送达**的订单 ID（STOP 行的 deliveries 列），用于与 ALLOC 双向对拍。
     std::map<std::string, std::vector<std::string> > deliveredByVehicle;
+    // 每车 METRICS 自报值（--dump-plan 的「用户可见」逐车指标行）。
+    std::map<std::string, MetricRow> metricsByVehicle;
 };
 
 std::vector<std::string> splitSpaces(const std::string& line) {
@@ -359,6 +368,22 @@ AllocDump parseAllocDump(const std::string& text) {
                         colon == std::string::npos ? item : item.substr(0, colon));
                 }
             }
+        } else if (tok[0] == "METRICS" && tok.size() >= 19) {
+            MetricRow m;
+            m.distance = std::strtod(tok[2].c_str(), nullptr);
+            m.time = std::strtod(tok[3].c_str(), nullptr);
+            m.cost = std::strtod(tok[4].c_str(), nullptr);
+            m.penalty = std::atoi(tok[5].c_str());
+            m.stopCount = std::atoi(tok[6].c_str());
+            m.actionCount = std::atoi(tok[7].c_str());
+            m.pickupHit = std::atoi(tok[8].c_str());
+            m.pickupTotal = std::atoi(tok[9].c_str());
+            m.deliveryHit = std::atoi(tok[10].c_str());
+            m.deliveryTotal = std::atoi(tok[11].c_str());
+            m.avgLoad = std::strtod(tok[16].c_str(), nullptr);
+            m.utilization = std::strtod(tok[17].c_str(), nullptr);
+            m.peak = std::strtod(tok[18].c_str(), nullptr);
+            d.metricsByVehicle[tok[1]] = m;
         } else if (tok[0] == "ALLOC" && tok.size() >= 2) {
             d.hasAlloc = true;
             std::string item;
@@ -756,6 +781,65 @@ int main(int argc, char** argv) {
                   vtag + " 取货准时率对拍");
             check(near(ovNum(pre + "delivery_rate"), pv.delivery, plan_golden::kTolRate),
                   vtag + " 送达准时率对拍");
+        }
+
+        // ---- B/C（评审修复）：逐车 METRICS 反过来核验车队级第 12 项与每车停靠/动作数 ----
+        //
+        // B：车队级「载重利用率」是**派生聚合**：Σ(在车量×段时长) / Σ(该车 capacity×该车运行时长)。
+        //    用 --dump-plan 的逐车 METRICS（平均在车 kg × 该车耗时）反算，与 --plan-summary
+        //    车队第 12 项比对（容差 0.1）。G5 只钉逐车，这条守住车队级口径。
+        // C：每车行打印的「停靠 s」必须等于该车 METRICS 的 stopCount；Σ每车停靠 == 车队第 5 项、
+        //    Σ每车动作 == 车队第 6 项。路线行打的是 plan.nodes（含途经节点），不能代替停靠数。
+        {
+            const AllocDump md = parseAllocDump(dumpText);
+            double loadIntegral = 0.0;
+            double capacityTime = 0.0;
+            double timeSum = 0.0;
+            int sumStops = 0;
+            int sumActions = 0;
+            bool allMetrics = true;
+            for (int vi = 0; vi < vehicleCount; ++vi) {
+                const ParsedVehicle& pv = p.vehicles[static_cast<std::size_t>(vi)];
+                const std::map<std::string, MetricRow>::const_iterator mit =
+                    md.metricsByVehicle.find(pv.id);
+                if (mit == md.metricsByVehicle.end()) {
+                    allMetrics = false;
+                    continue;
+                }
+                const MetricRow& mr = mit->second;
+                check(pv.stops == mr.stopCount,
+                      tag + "·C 车 " + pv.id + " 停靠数 == --dump-plan METRICS stopCount（"
+                          + std::to_string(pv.stops) + " vs "
+                          + std::to_string(mr.stopCount) + "）");
+                sumStops += mr.stopCount;
+                sumActions += mr.actionCount;
+                if (mr.time > 0.0) {
+                    loadIntegral += mr.avgLoad * mr.time;
+                    capacityTime +=
+                        cfg.vehicles[static_cast<std::size_t>(vi)].capacityKg * mr.time;
+                    timeSum += mr.time;
+                }
+            }
+            check(allMetrics, tag + "·C 每车都有 --dump-plan METRICS 行");
+            check(sumStops == p.stops,
+                  tag + "·C Σ每车停靠 == 车队第 5 项（" + std::to_string(sumStops) + " vs "
+                      + std::to_string(p.stops) + "）");
+            check(sumActions == p.actions,
+                  tag + "·C Σ每车动作 == 车队第 6 项（" + std::to_string(sumActions) + " vs "
+                      + std::to_string(p.actions) + "）");
+            check(timeSum > 0.0 && capacityTime > 0.0, tag + "·B 逐车 METRICS 有正耗时");
+            if (timeSum > 0.0 && capacityTime > 0.0) {
+                const double fleetAvgFromVehicles = loadIntegral / timeSum;
+                const double fleetUtilFromVehicles = 100.0 * loadIntegral / capacityTime;
+                check(near(fleetAvgFromVehicles, p.avgLoad, plan_golden::kTolRate),
+                      tag + "·B 车队平均在车 = Σ(逐车平均×该车耗时)/Σ耗时（时间加权，容差 0.1）："
+                          + std::to_string(fleetAvgFromVehicles) + " vs "
+                          + std::to_string(p.avgLoad));
+                check(near(fleetUtilFromVehicles, p.utilization, plan_golden::kTolRate),
+                      tag + "·B 车队第 12 项利用率 = 时间加权 Σ(在车量×段时长)/Σ(capacity×运行时长)"
+                          "（容差 0.1）：" + std::to_string(fleetUtilFromVehicles) + " vs "
+                          + std::to_string(p.utilization));
+            }
         }
 
         // ---- G11（#40）：--dump-plan 的 ALLOC / ASSIGN 让分配可核对 ----
