@@ -3732,6 +3732,90 @@ void testRescheduleLevel4OffloadBeforeTransit() {
     }
 }
 
+
+// ---- 第 ④ 级的转运半边：降载与转运**同时**被构造，播报顺序固定 ----
+//
+// 夹具与 routeplanner_tests 的转运夹具同一套几何（W / 中转站 T / A1,A2 子网络1 /
+// B1 子网络2 / B2 子网络1）。两台车各载 8kg、容量 10kg；新紧急单 5kg 在 A1 取货，
+// 与在车货叠加必然溢出 ⇒ ①②③ 全失败，第 ④ 级同时构造降载版与转运版。
+void testRescheduleLevel4TransitLine() {
+    LogisticsGraph g;
+    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
+    g.addNode(makeSubNode("T", NodeType::Transit, "中转站T", 1));
+    g.addNode(makeSubNode("A1", NodeType::Delivery, "客户A1", 1));
+    g.addNode(makeSubNode("A2", NodeType::Delivery, "客户A2", 1));
+    g.addNode(makeSubNode("B1", NodeType::Delivery, "客户B1", 2));
+    g.addNode(makeSubNode("B2", NodeType::Delivery, "客户B2", 1));
+    addTwoWay(g, "W", "T", 1.0, 1.0, 1.0);
+    addTwoWay(g, "W", "A1", 1.0, 1.0, 1.0);
+    addTwoWay(g, "A1", "T", 1.0, 1.0, 1.0);
+    addTwoWay(g, "W", "A2", 1.0, 1.0, 1.0);
+    addTwoWay(g, "A2", "T", 2.0, 2.0, 2.0);
+    addTwoWay(g, "T", "B1", 1.0, 1.0, 1.0);
+    addTwoWay(g, "B1", "B2", 1.0, 1.0, 1.0);
+    Vehicle fast = makeVehicleWithFactors("W", 10.0, 480, 1.00, 1.50);
+    fast.id = "V01";
+    Vehicle slow = makeVehicleWithFactors("W", 10.0, 480, 1.25, 0.80);
+    slow.id = "V02";
+    const std::vector<Vehicle> vehicles{fast, slow};
+    const Order o1 = makeOrder("O1", "A1", "B1", 8.0, 0, 1440);
+    const Order o2 = makeOrder("O2", "A2", "B2", 8.0, 0, 1440);
+    const Order u1 = makeOrder("U1", "A1", "B1", 5.0, 480, 600, true);
+    FleetRescheduleInput in;
+    in.starts.resize(2);
+    for (std::size_t v = 0; v < 2; ++v) {
+        in.starts[v].startNodeId = "W";
+        in.starts[v].startTimeMin = 480;
+    }
+    OnboardItem item1;
+    item1.orderId = "O1";
+    item1.nodeId = "B1";
+    item1.kg = 8.0;
+    in.starts[0].onboard.push_back(item1);
+    OnboardItem item2;
+    item2.orderId = "O2";
+    item2.nodeId = "B2";
+    item2.kg = 8.0;
+    in.starts[1].onboard.push_back(item2);
+    in.vehicleOrders = {{o1}, {o2}};
+    in.remainingPlans = {planRoute(g, fast, {o1}, WeightType::Time),
+                         planRoute(g, slow, {o2}, WeightType::Time)};
+    in.allRemainingOrders = {o1, o2, u1};
+    RescheduleEvent ev;
+    ev.trigger = RescheduleTrigger::NewOrder;
+    ev.newOrder = u1;
+    const FleetRescheduleResult res = rescheduleFleet(g, vehicles, WeightType::Time, in, ev);
+    check(res.level == 4 && !res.rejected,
+          "第 ④ 级：紧急单与在车货叠加溢出 ⇒ 降载 / 转运并列（实际第 "
+              + std::to_string(res.level) + " 级）");
+    std::size_t iOffload = res.log.size();
+    std::size_t iTransit = res.log.size();
+    for (std::size_t i = 0; i < res.log.size(); ++i) {
+        if (res.log[i].find("[复调度] 降载（") == 0 && iOffload > i) {
+            iOffload = i;
+        }
+        if (res.log[i].find("[复调度] 转运（") == 0 && iTransit > i) {
+            iTransit = i;
+        }
+    }
+    check(iOffload < res.log.size(), "分级播报：降载（站，N 张单）");
+    check(iTransit < res.log.size(), "分级播报：转运（站，卸入车→取走车）");
+    check(iOffload < iTransit, "§6.8：转运的播报行在降载之后（顺序固定：先降载后转运）");
+    // 采纳的计划里，站内账本两端齐全、in≠out、dwell ≤ 60（转运版真的落地了）
+    if (iTransit < res.log.size()) {
+        const std::vector<TransitLeg> ledger = buildTransitLedger(vehicles, res.plans);
+        bool twoEnds = !ledger.empty();
+        for (const TransitLeg& leg : ledger) {
+            if (leg.inVehicleId.empty() || leg.outVehicleId.empty()
+                || leg.inVehicleId == leg.outVehicleId || leg.outTimeMin < leg.inTimeMin
+                || leg.outTimeMin - leg.inTimeMin > logistics::kTransferMaxDwellMin) {
+                twoEnds = false;
+            }
+        }
+        check(twoEnds, "第 ④ 级：转运版账本两端齐全 / in≠out / dwell ≤ 60");
+    }
+}
+
 // ---- 第 ⑤ 级：排不出解就拒绝并报原因（不丢单、不凑解）----
 void testRescheduleLevel5Rejects() {
     LogisticsGraph g = makeRescheduleGraph();
@@ -4069,6 +4153,7 @@ int main() {
     RUN(testRescheduleLevel2CrossVehicleReassignment);
     RUN(testRescheduleLevel3FullFleet);
     RUN(testRescheduleLevel4OffloadBeforeTransit);
+    RUN(testRescheduleLevel4TransitLine);
     RUN(testRescheduleLevel5Rejects);
     RUN(testRescheduleNewOrderVehicleChoice);
     RUN(testRescheduleUrgentPerVehicleFifo);
