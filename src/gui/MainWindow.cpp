@@ -4175,7 +4175,7 @@ int MainWindow::runActionSelfCheck() {
                                  == tieA.fleet()[1].plan.nodeArrivalMin
                           && tieA.fleet()[0].plan.nodeArrivalMin.size() >= 4;
         expect(tiePremise,
-               QStringLiteral("G22（前置）镜像夹具：两台车每一步的到达时刻都并列"));
+               QStringLiteral("X6（前置）镜像夹具：两台车每一步的到达时刻都并列"));
         int stepsTieA = 0;
         while (!tieA.atRouteEnd() && stepsTieA < 400) {
             tieA.onAdvanceMoment();   // 路径 A：推进一刻
@@ -4187,7 +4187,7 @@ int MainWindow::runActionSelfCheck() {
             ++stepsTieB;
         }
         expect(tieA.atRouteEnd() && tieB.atRouteEnd(),
-               QStringLiteral("G22：两条路径都走完（推进一刻 %1 步 / 推进一站 %2 步）")
+               QStringLiteral("X6：两条路径都走完（推进一刻 %1 步 / 推进一站 %2 步）")
                    .arg(stepsTieA)
                    .arg(stepsTieB));
         const QString tieSnapA = tieA.equivalenceSnapshot();
@@ -4208,14 +4208,14 @@ int MainWindow::runActionSelfCheck() {
             }
         }
         expect(tieSnapA == tieSnapB,
-               QStringLiteral("G22 A1–A7（并列场景）逐字一致（差异：%1）").arg(tieDiff));
+               QStringLiteral("X6 A1–A7（并列场景）逐字一致（差异：%1）").arg(tieDiff));
         // 事件日志也逐字一致（同刻抽签次数与顺序不被推进粒度改变）
         expect(tieA.eventLogLines() == tieB.eventLogLines(),
-               QStringLiteral("G22 A1（并列场景）事件日志逐字一致（%1 / %2 行）")
+               QStringLiteral("X6 A1（并列场景）事件日志逐字一致（%1 / %2 行）")
                    .arg(tieA.eventLogLines().size())
                    .arg(tieB.eventLogLines().size()));
 
-        // ---- G23（§6.1「同刻多车一起推进」的结构守卫）----
+        // ---- X7（§6.1「同刻多车一起推进」的结构守卫）----
         //
         // 这是 A6 那条反向验证（把并列分支改成「只推进第一台」）的**可观测载体**：
         // 双跑在终态会收敛（都到家、都送达），单看终态吃不掉这条反向补丁；
@@ -4231,7 +4231,7 @@ int MainWindow::runActionSelfCheck() {
         const int t1 = tieOne.fleet().size() > 0 ? tieOne.fleet()[0].state.atTimeMin : -1;
         const int t2 = tieOne.fleet().size() > 1 ? tieOne.fleet()[1].state.atTimeMin : -1;
         expect(tieOne.fleet().size() == 2 && t1 == expectedArrival && t2 == expectedArrival,
-               QStringLiteral("G23 并列到达：一次「推进一站」把**两台车**都推到同一时刻 %1"
+               QStringLiteral("X7 并列到达：一次「推进一站」把**两台车**都推到同一时刻 %1"
                               "（实际 V01 %2 / V02 %3）")
                    .arg(expectedArrival)
                    .arg(t1)
@@ -4240,7 +4240,7 @@ int MainWindow::runActionSelfCheck() {
         expect(tieOne.fleet().size() == 2 && tieOne.fleet()[0].nodeIndex == 1
                    && tieOne.fleet()[1].nodeIndex == 1
                    && tieOne.fleet()[0].state.atNodeId == tieOne.fleet()[1].state.atNodeId,
-               QStringLiteral("G23 并列到达：两台车都真的前进了一站（实际下标 %1 / %2）")
+               QStringLiteral("X7 并列到达：两台车都真的前进了一站（实际下标 %1 / %2）")
                    .arg(tieOne.fleet().size() > 0
                             ? static_cast<long long>(tieOne.fleet()[0].nodeIndex)
                             : -1)
@@ -4438,11 +4438,11 @@ int MainWindow::runActionSelfCheck() {
         MainWindow fresh(reloadInitialConfig(), configPath_);
         const QString guiAlloc = fresh.allocationSnapshot();
         expect(!guiAlloc.isEmpty(),
-               QStringLiteral("G19（前置）界面初始规划必须产生三阶段分配快照"));
+               QStringLiteral("X3（前置）界面初始规划必须产生三阶段分配快照"));
         expect(fresh.runLogText().contains(QStringLiteral("[分配] 三阶段分配")),
-               QStringLiteral("G19：三阶段分配必须出现在运行日志里（用户可见）"));
+               QStringLiteral("X3：三阶段分配必须出现在运行日志里（用户可见）"));
         expect(fresh.runLogText().contains(guiAlloc),
-               QStringLiteral("G19：运行日志里的分配串与界面快照逐字相同"));
+               QStringLiteral("X3：运行日志里的分配串与界面快照逐字相同"));
 
         const logistics::FleetPlan fp =
             logistics::planFleet(fresh.config_.graph, fresh.config_.vehicles,
@@ -4483,7 +4483,7 @@ int MainWindow::runActionSelfCheck() {
             }
         }
         expect(!guiPairs.empty() && allocDiff == 0,
-               QStringLiteral("G19：界面分配与 CLI 三阶段 ALLOC 逐单一致（%1 单；差异 %2 处%3）")
+               QStringLiteral("X3：界面分配与 CLI 三阶段 ALLOC 逐单一致（%1 单；差异 %2 处%3）")
                    .arg(guiPairs.size())
                    .arg(allocDiff)
                    .arg(firstAllocDiff.empty()
@@ -4505,7 +4505,7 @@ int MainWindow::runActionSelfCheck() {
             }
         }
         expect(seqDiff > 0,
-               QStringLiteral("G19（判别力）：顺序轮转基线与三阶段分配在 %1 单上不同 —— "
+               QStringLiteral("X3（判别力）：顺序轮转基线与三阶段分配在 %1 单上不同 —— "
                               "界面若退回轮转基线，上面的逐单比对必红")
                    .arg(seqDiff));
     }
@@ -4547,7 +4547,7 @@ int MainWindow::runActionSelfCheck() {
             }
         }
         expect(hit < win.fleet().size(),
-               QStringLiteral("G20（前置）存在只属于一台车剩余路线的边（%1->%2）")
+               QStringLiteral("X4（前置）存在只属于一台车剩余路线的边（%1->%2）")
                    .arg(QString::fromStdString(from))
                    .arg(QString::fromStdString(to)));
 
@@ -4573,10 +4573,10 @@ int MainWindow::runActionSelfCheck() {
             event.thresholdRatio = 0.2;
             const logistics::FleetRescheduleResult res = win.runReschedule(event);
             expect(res.level == 1 && !res.rejected,
-                   QStringLiteral("G20：只影响一台车 ⇒ 第 ① 级局部重排（实际第 %1 级）")
+                   QStringLiteral("X4：只影响一台车 ⇒ 第 ① 级局部重排（实际第 %1 级）")
                        .arg(res.level));
             expect(win.runLogText().contains(QStringLiteral("[复调度] 局部重排（1 台车）")),
-                   QStringLiteral("G20：分级播报行「[复调度] 局部重排（1 台车）」可见"));
+                   QStringLiteral("X4：分级播报行「[复调度] 局部重排（1 台车）」可见"));
             // 受影响集合正确 + **未受影响车路线逐字不变**（不变量 5）
             std::size_t changedOthers = 0;
             QString firstChanged;
@@ -4592,12 +4592,12 @@ int MainWindow::runActionSelfCheck() {
                 }
             }
             expect(changedOthers == 0,
-                   QStringLiteral("G20：未受影响车的路线逐字不变（被改动 %1 台%2）")
+                   QStringLiteral("X4：未受影响车的路线逐字不变（被改动 %1 台%2）")
                        .arg(changedOthers)
                        .arg(firstChanged.isEmpty() ? QString()
                                                    : QString(QStringLiteral("，首个 ") + firstChanged)));
             expect(win.fleet()[hit].plan.status == logistics::PlanStatus::Ok,
-                   QStringLiteral("G20：受影响车重算后计划仍可行"));
+                   QStringLiteral("X4：受影响车重算后计划仍可行"));
             // 确定性：同样输入（重新加载配置 + 同一事件）必得同一计划与同一播报
             MainWindow again(quiet, configPath_);
             const logistics::Edge* edge2 = again.config_.graph.findEdge(from, to);
@@ -4612,7 +4612,7 @@ int MainWindow::runActionSelfCheck() {
                 }
             }
             expect(samePlans,
-                   QStringLiteral("G20：确定性 —— 同输入两次运行的分级、播报与逐车路线完全一致"));
+                   QStringLiteral("X4：确定性 —— 同输入两次运行的分级、播报与逐车路线完全一致"));
         }
     }
 
@@ -4637,13 +4637,13 @@ int MainWindow::runActionSelfCheck() {
         event.newOrder = ghost;
         const logistics::FleetRescheduleResult res = win.runReschedule(event);
         expect(res.rejected && res.level == 5,
-               QStringLiteral("G21：不可执行的单必须被拒绝（第 ⑤ 级，实际第 %1 级）")
+               QStringLiteral("X5：不可执行的单必须被拒绝（第 ⑤ 级，实际第 %1 级）")
                    .arg(res.level));
         expect(win.runLogText().contains(QStringLiteral("[复调度] 拒绝：")),
-               QStringLiteral("G21：拒绝必须如实播报（分级播报行「[复调度] 拒绝：...」可见）"));
+               QStringLiteral("X5：拒绝必须如实播报（分级播报行「[复调度] 拒绝：...」可见）"));
         const Order* still = win.findOrderById(ghost.id);
         expect(still != nullptr && !still->served,
-               QStringLiteral("G21：被拒绝的单不得从订单集合里消失（不丢单）"));
+               QStringLiteral("X5：被拒绝的单不得从订单集合里消失（不丢单）"));
     }
 
     return failures;

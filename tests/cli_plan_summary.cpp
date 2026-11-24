@@ -842,16 +842,16 @@ int main(int argc, char** argv) {
             }
         }
 
-        // ---- G11（#40）：--dump-plan 的 ALLOC / ASSIGN 让分配可核对 ----
+        // ---- X1（#40）：--dump-plan 的 ALLOC / ASSIGN 让分配可核对 ----
         //
         // ALLOC 给逐单归属（按订单 ID 升序），ASSIGN 给逐车汇总；两者都要与
         // 逐车 STOP 的送达动作**双向对拍**。守卫读的是用户可见输出，不读规划器内部。
         {
             const AllocDump ad = parseAllocDump(dumpText);
-            check(ad.hasAlloc, tag + "·G11 转储含 ALLOC 行");
-            check(ad.hasAssign, tag + "·G11 转储含 ASSIGN 行");
+            check(ad.hasAlloc, tag + "·X1 转储含 ALLOC 行");
+            check(ad.hasAssign, tag + "·X1 转储含 ASSIGN 行");
             check(ad.orderIds.size() == static_cast<std::size_t>(orderCount),
-                  tag + "·G11 ALLOC 覆盖全部订单（" + std::to_string(ad.orderIds.size()) + " / "
+                  tag + "·X1 ALLOC 覆盖全部订单（" + std::to_string(ad.orderIds.size()) + " / "
                       + std::to_string(orderCount) + "）");
             bool sortedIds = true;
             for (std::size_t i = 1; i < ad.orderIds.size(); ++i) {
@@ -859,7 +859,7 @@ int main(int argc, char** argv) {
                     sortedIds = false;
                 }
             }
-            check(sortedIds, tag + "·G11 ALLOC 按订单 ID 升序");
+            check(sortedIds, tag + "·X1 ALLOC 按订单 ID 升序");
 
             // 每张单恰好一次归属，且归属车真的送达了它（ALLOC ↔ STOP 双向对拍）。
             bool allocMatchesStops = true;
@@ -894,7 +894,7 @@ int main(int argc, char** argv) {
                     allocMatchesStops = false;
                 }
             }
-            check(allocMatchesStops, tag + "·G11 每单恰好一台车，且 ALLOC 与逐车 STOP 送达一致");
+            check(allocMatchesStops, tag + "·X1 每单恰好一台车，且 ALLOC 与逐车 STOP 送达一致");
 
             // ASSIGN 的单数 == 该车 STOP 送达数；标签只能是 簇N / 跨簇 / 空车。
             bool assignOk = true;
@@ -927,9 +927,9 @@ int main(int argc, char** argv) {
                     assignOk = false;
                 }
             }
-            check(assignOk, tag + "·G11 ASSIGN 每车单数 == 该车 STOP 送达数，标签为 簇N/跨簇/空车");
+            check(assignOk, tag + "·X1 ASSIGN 每车单数 == 该车 STOP 送达数，标签为 簇N/跨簇/空车");
             check(ad.assignVehicle.size() >= cfg.vehicles.size(),
-                  tag + "·G11 每台车至少一条 ASSIGN（空车也打「空车 0」）");
+                  tag + "·X1 每台车至少一条 ASSIGN（空车也打「空车 0」）");
             allocByStrategy[name] = ad.vehicleIds;
             parsedByStrategy[name] = p;
         }
@@ -940,34 +940,34 @@ int main(int argc, char** argv) {
                     p.avgLoad, p.peak, vehicleCount);
     }
 
-    // ---- G12（#40 验收）：三策略两两分化 + 各自在**自身目标**上不劣于另两条 ----
+    // ---- X2（#40 验收）：三策略两两分化 + 各自在**自身目标**上不劣于另两条 ----
     //
     // 口径与用户看到的一致：距离 / 成本是 Σ（--plan-summary 第 1 行），
     // 耗时是**完工耗时**（#19 Q5 主口径，same 第 1 行的「总耗时」）。
     if (strategies.size() == 3) {
         check(allocByStrategy["distance"] != allocByStrategy["cost"],
-              "G12 距离与成本的 ALLOC 分配映射不同（三策略分化）");
+              "X2 距离与成本的 ALLOC 分配映射不同（三策略分化）");
         check(allocByStrategy["distance"] != allocByStrategy["time"],
-              "G12 距离与时间的 ALLOC 分配映射不同");
+              "X2 距离与时间的 ALLOC 分配映射不同");
         check(allocByStrategy["cost"] != allocByStrategy["time"],
-              "G12 成本与时间的 ALLOC 分配映射不同");
+              "X2 成本与时间的 ALLOC 分配映射不同");
         const double tol = 1e-6;
         check(parsedByStrategy["distance"].distance
                   <= parsedByStrategy["cost"].distance + tol
                   && parsedByStrategy["distance"].distance
                          <= parsedByStrategy["time"].distance + tol,
-              "G12 距离策略的总距离不劣于成本/时间策略");
+              "X2 距离策略的总距离不劣于成本/时间策略");
         check(parsedByStrategy["cost"].cost <= parsedByStrategy["distance"].cost + tol
                   && parsedByStrategy["cost"].cost <= parsedByStrategy["time"].cost + tol,
-              "G12 成本策略的总成本不劣于距离/时间策略");
+              "X2 成本策略的总成本不劣于距离/时间策略");
         check(parsedByStrategy["time"].time <= parsedByStrategy["distance"].time + tol
                   && parsedByStrategy["time"].time <= parsedByStrategy["cost"].time + tol,
-              "G12 时间策略的完工耗时不劣于距离/成本策略");
-        std::printf("    G12 三策略分配映射两两不同；自身目标各自最优（车端口径）\n");
+              "X2 时间策略的完工耗时不劣于距离/成本策略");
+        std::printf("    X2 三策略分配映射两两不同；自身目标各自最优（车端口径）\n");
     }
 
 
-    // ---- G19（#42）：界面初始规划与 CLI 三阶段 ALLOC **逐单一致** ----
+    // ---- X3（#42）：界面初始规划与 CLI 三阶段 ALLOC **逐单一致** ----
     //
     // 两条用户可见路径：
     //   · 界面：`--ui-probe` 打印的「[ui-probe] 分配 O01=V01,…」（MainWindow 的初始规划）；
@@ -1003,12 +1003,12 @@ int main(int argc, char** argv) {
                 guiAlloc = line.substr(prefix.size());
             }
         }
-        check(!guiAlloc.empty(), "G19 --ui-probe 打印界面侧的分配快照（用户可见）");
+        check(!guiAlloc.empty(), "X3 --ui-probe 打印界面侧的分配快照（用户可见）");
 
         const std::string dumpDistance =
             runCapture("'" + appPath + "' --dump-plan distance 2>/dev/null");
         const AllocDump ad = parseAllocDump(dumpDistance);
-        check(ad.hasAlloc, "G19 --dump-plan distance 含 ALLOC 行");
+        check(ad.hasAlloc, "X3 --dump-plan distance 含 ALLOC 行");
 
         // ALLOC 行 -> "O01=V01,…" 的同一形状（订单 ID 升序），逐单比对
         std::string cliAlloc;
@@ -1037,7 +1037,7 @@ int main(int argc, char** argv) {
             firstDiff = "单数 " + std::to_string(guiPairs.size()) + " vs "
                         + std::to_string(cliPairs.size());
         }
-        check(same, "G19 界面分配与 CLI 三阶段 ALLOC 逐单一致（" + std::to_string(guiPairs.size())
+        check(same, "X3 界面分配与 CLI 三阶段 ALLOC 逐单一致（" + std::to_string(guiPairs.size())
                         + " 单" + (firstDiff.empty() ? std::string() : "，差异 " + firstDiff) + "）");
 
         // 判别力：顺序轮转基线与三阶段分配**不同** —— 界面若退回轮转基线，这条必红。
@@ -1056,9 +1056,9 @@ int main(int argc, char** argv) {
             }
         }
         check(seqDiff > 0,
-              "G19（判别力）顺序轮转基线与三阶段分配在 " + std::to_string(seqDiff)
+              "X3（判别力）顺序轮转基线与三阶段分配在 " + std::to_string(seqDiff)
                   + " 单上不同 —— 界面若退回轮转基线，上面的逐单比对必红");
-        std::printf("    G19 界面分配 == CLI ALLOC（%d 单）；轮转基线与之相差 %d 单\n",
+        std::printf("    X3 界面分配 == CLI ALLOC（%d 单）；轮转基线与之相差 %d 单\n",
                     static_cast<int>(guiPairs.size()), static_cast<int>(seqDiff));
     }
 

@@ -769,7 +769,8 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                 }
-                // 逐车「车上载重 ≤ 该车容量」（**该车**的 capacity，不用 front()）
+                // G12（规格二 §7.9 权威编号）：逐车「车上载重 ≤ 该车容量」
+                //（**该车**的 capacity，不用 vehicles.front() 一笔带过）。
                 const QRegularExpression totalRe(
                     QStringLiteral("车上载重：([0-9.]+) kg"));
                 const QRegularExpressionMatch total = totalRe.match(seg);
@@ -781,12 +782,12 @@ int main(int argc, char** argv) {
                 const double shownTotal = total.captured(1).toDouble();
                 if (shownTotal > v.capacityKg + 1e-6) {
                     std::fprintf(stderr,
-                                 "[ui-probe] 车辆 %s 面板显示的载重超过该车上限："
+                                 "[ui-probe] G12 车辆 %s 面板显示的载重超过该车上限："
                                  "车上载重 %.1f > %.1f\n",
                                  v.id.c_str(), shownTotal, v.capacityKg);
                     return 1;
                 }
-                std::printf("[ui-probe] 车辆 %s 车上载重 %.1fkg <= 该车容量 %.1fkg\n",
+                std::printf("[ui-probe] G12 车辆 %s 车上载重 %.1fkg <= 该车容量 %.1fkg\n",
                             v.id.c_str(), shownTotal, v.capacityKg);
             }
             // 把逐车面板文本打出来（报告/人工核对用；也是"用户看得到什么"的证据）。
