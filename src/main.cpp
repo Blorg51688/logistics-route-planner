@@ -500,50 +500,92 @@ int main(int argc, char** argv) {
         std::printf("[ui-probe] 中转站面板（%s）:\n%s",
                     transitHeaders.join(QStringLiteral("|")).toUtf8().constData(),
                     transit.constData());
-        // 车辆面板：断言**界面上显示的载重**不超过载重上限。
+        // 车辆面板（G11）：页签数 == vehicles.size()，每页含「固定信息 / 运行状态」
+        // 两块标题；**逐车**核对 ID / 容量 / 两因子与配置一致，且逐车
+        // 「车上载重 ≤ 该车容量」（不得再用 vehicles.front() 一笔带过）。
         //
         // 历史：用户手工测试发现面板把"剩余待送总量 740kg"当成"当前载重"显示，
         // 而载重上限只有 200kg —— 数据层没错，是显示口径错了，所以必须查显示值本身
         //（读用户看得到的文本，不重算公式）。
-        const QString vehiclePanel = window.vehiclePanelSummary();
         {
-            const double cap = config.vehicles.empty() ? 0.0 : config.vehicles.front().capacityKg;
-            // 车辆信息必须分「固定信息」「运行状态」两页（否则变化的数字会把不变的参数淹没）
             const int vehicleTabs = window.vehicleTabCount();
-            if (vehicleTabs != 2) {
-                std::fprintf(stderr, "[ui-probe] 车辆信息应有 2 个标签页，实际 %d\n", vehicleTabs);
+            if (config.vehicles.empty() || vehicleTabs != static_cast<int>(config.vehicles.size())) {
+                std::fprintf(stderr, "[ui-probe] 车辆信息页签数 %d != 车辆数 %zu\n",
+                             vehicleTabs, config.vehicles.size());
                 return 1;
             }
             std::printf("[ui-probe] 车辆信息 %d 个标签页：%s\n", vehicleTabs,
                         window.vehicleTabTitles().toUtf8().constData());
-            // 「车上载重」是物理事实，必须 <= 载重上限
-            const QRegularExpression totalRe(
-                QStringLiteral("车上载重：([0-9.]+) kg"));
-            const QRegularExpression tripRe(
-                QStringLiteral("本趟出发装载：([0-9.]+) kg"));
-
-            const QRegularExpressionMatch total = totalRe.match(vehiclePanel);
-            const QRegularExpressionMatch trip = tripRe.match(vehiclePanel);
-            if (!total.hasMatch() || !trip.hasMatch()) {
-                std::fprintf(stderr,
-                             "[ui-probe] 车辆面板缺少「车上载重 / 本趟出发装载」"
-                             "两处口径之一：\n%s\n",
-                             vehiclePanel.toUtf8().constData());
+            const QStringList tabTitles =
+                window.vehicleTabTitles().split(QStringLiteral(" | "));
+            for (std::size_t vi = 0; vi < config.vehicles.size(); ++vi) {
+                const logistics::Vehicle& v = config.vehicles[vi];
+                // 页签标题 = `<车辆 ID> · <容量>kg`
+                const QString title = QStringLiteral("%1 · %2kg")
+                                          .arg(QString::fromStdString(v.id))
+                                          .arg(v.capacityKg, 0, 'f', 0);
+                if (vi < static_cast<std::size_t>(tabTitles.size())
+                    && tabTitles[static_cast<int>(vi)] != title) {
+                    std::fprintf(stderr,
+                                 "[ui-probe] 车辆页签标题不符：预期「%s」，实际「%s」\n",
+                                 title.toUtf8().constData(),
+                                 tabTitles[static_cast<int>(vi)].toUtf8().constData());
+                    return 1;
+                }
+                const QString seg = window.vehiclePanelSection(static_cast<int>(vi));
+                // 每页两块标题：固定信息 / 运行状态
+                if (!seg.contains(QStringLiteral("固定信息"))
+                    || !seg.contains(QStringLiteral("运行状态"))) {
+                    std::fprintf(stderr,
+                                 "[ui-probe] 车辆 %s 的页签缺少「固定信息 / 运行状态」两块标题：\n%s\n",
+                                 v.id.c_str(), seg.toUtf8().constData());
+                    return 1;
+                }
+                // 固定信息逐项与配置一致：ID / 容量 / 两因子
+                const auto fieldOk = [&](const char* label, double want) -> bool {
+                    const QRegularExpression re(QString::fromUtf8(label)
+                                                + QStringLiteral("：([0-9.]+)"));
+                    const QRegularExpressionMatch m = re.match(seg);
+                    return m.hasMatch() && std::fabs(m.captured(1).toDouble() - want) <= 1e-6;
+                };
+                const QRegularExpression idRe(QStringLiteral("ID：([^\n：]+)"));
+                const QRegularExpressionMatch idm = idRe.match(seg);
+                if (!idm.hasMatch() || idm.captured(1).trimmed() != QString::fromStdString(v.id)
+                    || !fieldOk("载重上限", v.capacityKg) || !fieldOk("耗时倍率", v.timeFactor)
+                    || !fieldOk("成本倍率", v.costFactor)) {
+                    std::fprintf(stderr,
+                                 "[ui-probe] 车辆 %s 页签固定信息与配置不符"
+                                 "（ID/载重上限/耗时倍率/成本倍率）：\n%s\n",
+                                 v.id.c_str(), seg.toUtf8().constData());
+                    return 1;
+                }
+                // 逐车「车上载重 ≤ 该车容量」（**该车**的 capacity，不用 front()）
+                const QRegularExpression totalRe(
+                    QStringLiteral("车上载重：([0-9.]+) kg"));
+                const QRegularExpressionMatch total = totalRe.match(seg);
+                if (!total.hasMatch()) {
+                    std::fprintf(stderr, "[ui-probe] 车辆 %s 页签缺少「车上载重」：\n%s\n",
+                                 v.id.c_str(), seg.toUtf8().constData());
+                    return 1;
+                }
+                const double shownTotal = total.captured(1).toDouble();
+                if (shownTotal > v.capacityKg + 1e-6) {
+                    std::fprintf(stderr,
+                                 "[ui-probe] 车辆 %s 面板显示的载重超过该车上限："
+                                 "车上载重 %.1f > %.1f\n",
+                                 v.id.c_str(), shownTotal, v.capacityKg);
+                    return 1;
+                }
+                std::printf("[ui-probe] 车辆 %s 车上载重 %.1fkg <= 该车容量 %.1fkg\n",
+                            v.id.c_str(), shownTotal, v.capacityKg);
+            }
+            // 把逐车面板文本打出来（报告/人工核对用；也是"用户看得到什么"的证据）。
+            std::printf("[ui-probe] 车辆面板（%d 页）：\n%s\n", vehicleTabs,
+                        window.vehiclePanelSummary().toUtf8().constData());
+            if (window.vehiclePanelSummary().contains(QStringLiteral("本趟出发装载"))) {
+                std::fprintf(stderr, "[ui-probe] 车辆面板仍含已退役的「本趟出发装载」\n");
                 return 1;
             }
-            const double shownTotal = total.captured(1).toDouble();
-            const double shownTrip = trip.captured(1).toDouble();
-
-            if (shownTotal > cap + 1e-6 || shownTrip > cap + 1e-6) {
-                std::fprintf(stderr,
-                             "[ui-probe] 面板显示的载重超过上限 %.1fkg：车上载重 %.1f、"
-                             "本趟出发装载 %.1f\n",
-                             cap, shownTotal, shownTrip);
-                return 1;
-            }
-            std::printf("[ui-probe] 车辆面板 车上载重 %.1fkg <= 载重上限 %.1fkg；"
-                        "本趟出发装载 %.1fkg\n",
-                        shownTotal, cap, shownTrip);
 
             // 时间必须常驻可见：软件内时间是事件刻/窗口/penalty 的共同基准，
             // 只在日志里出现等于"一滚就没了"。这里查状态栏确实带着它。
@@ -558,7 +600,7 @@ int main(int argc, char** argv) {
             std::printf("[ui-probe] 状态栏时间：%s\n", clockText.toUtf8().constData());
         }
 
-        // 停靠明细必须每个停靠点一行（这些字段此前只有测试在读，界面上看不到）
+        // ---- G8：停靠明细 **9 列**、无「趟」、含 序号/阶段/动作/余货(kg)（MC-E01）----
         const QString stopPanel = window.stopPanelSummary();
         const std::size_t stopRows =
             static_cast<std::size_t>(stopPanel.count(QLatin1Char('\n')));
@@ -566,97 +608,220 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "[ui-probe] 停靠明细面板为空\n");
             return 1;
         }
-        std::printf("[ui-probe] 停靠明细 %zu 行"
-                    "（趟|配送点|原始到达|等待(分)|送达|送后余货(kg)）\n", stopRows);
-        // 打前几行实际数值：这是"数值对不对"的核对依据，光有行数不够
+        std::printf("[ui-probe] 停靠明细 %zu 行（车辆|序号|阶段|配送点|动作|原始到达|等待(分)|送达|余货(kg)）\n",
+                    stopRows);
         {
             const QStringList lines = stopPanel.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
             for (int i = 0; i < lines.size() && i < 3; ++i) {
                 std::printf("[ui-probe]   %s\n", lines[i].toUtf8().constData());
             }
-            // 表头守卫：停靠明细必须恰好 6 列、列名与数据字段一一对应。
-            // 此前服务时间移除时只改了数据填充、漏改表头，于是表头 7 列而数据
-            // 只填 6 列——"离开"下挂着剩余载重、"送后余货(kg)"整列空白。
-            // 这类错位只有读**真实表头**才看得见：旧 printf 只是硬编码描述，不校验。
-            {
-                const QStringList headers = window.stopPanelHeaders();
-                const QStringList expect{
-                    QStringLiteral("趟"),   QStringLiteral("配送点"),
-                    QStringLiteral("原始到达"), QStringLiteral("等待(分)"),
-                    QStringLiteral("送达"), QStringLiteral("送后余货(kg)")};
-                if (headers != expect) {
-                    std::fprintf(stderr,
-                                 "[ui-probe] 停靠明细表头不符：实际 [%s]，预期 [%s]\n",
-                                 headers.join(QStringLiteral(" | ")).toUtf8().constData(),
-                                 expect.join(QStringLiteral(" | ")).toUtf8().constData());
+            // 表头守卫（G8）：停靠明细必须**恰好 9 列**、列名与数据字段一一对应，
+            // 且**无「趟」列**（趟结构退役，列改为 车辆/序号）。
+            // 历史：服务时间移除时只改数据填充、漏改表头 → 表头 7 列而数据只填 6 列；
+            // 这类错位只有读**真实表头**才看得见。
+            const QStringList headers = window.stopPanelHeaders();
+            const QStringList expect{
+                QStringLiteral("车辆"),     QStringLiteral("序号"),   QStringLiteral("阶段"),
+                QStringLiteral("配送点"),   QStringLiteral("动作"),   QStringLiteral("原始到达"),
+                QStringLiteral("等待(分)"), QStringLiteral("送达"),   QStringLiteral("余货(kg)")};
+            if (headers != expect) {
+                std::fprintf(stderr,
+                             "[ui-probe] 停靠明细表头不符（应 9 列）：实际 [%s]，预期 [%s]\n",
+                             headers.join(QStringLiteral(" | ")).toUtf8().constData(),
+                             expect.join(QStringLiteral(" | ")).toUtf8().constData());
+                return 1;
+            }
+            for (const QString& h : headers) {
+                if (h.contains(QStringLiteral("趟"))) {
+                    std::fprintf(stderr, "[ui-probe] 停靠明细不应再有「趟」列：%s\n",
+                                 h.toUtf8().constData());
                     return 1;
                 }
-                // 每一行的单元格数必须等于表头列数，且不得有空白单元格：
-                // "用户看得到的表"里不该出现空列或列名与内容对不上的格子。
-                for (const QString& line : lines) {
-                    const QStringList cells = line.split(QStringLiteral(" | "));
-                    if (cells.size() != headers.size()) {
-                        std::fprintf(stderr,
-                                     "[ui-probe] 停靠明细行列数 %d != 表头列数 %d：%s\n",
-                                     int(cells.size()), int(headers.size()),
-                                     line.toUtf8().constData());
-                        return 1;
-                    }
-                    for (const QString& c : cells) {
-                        if (c.isEmpty()) {
-                            std::fprintf(stderr,
-                                         "[ui-probe] 停靠明细出现空白单元格：%s\n",
-                                         line.toUtf8().constData());
-                            return 1;
-                        }
-                    }
-                }
-                std::printf("[ui-probe] 停靠明细表头 6 列且每行 %d 格非空\n",
-                            int(headers.size()));
             }
-            // 每一行的第一列都必须是「第 N」：趟号映射一旦坏掉，
-            // 停靠明细里"余载从 0 跳回几十"就会重新变成看不懂的数字。
-            const QRegularExpression tripCell(QStringLiteral("^第 ([0-9]+) \\|"));
-            QSet<int> tripNumbers;
+            // 每行 9 格非空；车辆列 ∈ 配置车辆；序号纯整数且逐车 +1 单调；
+            // 阶段 ∈ {紧急, 普通}；动作 = 取<a>·送<b>（计数，不显示订单 ID）；
+            // Σ取 == Σ送 == 取送对数（结构关系，见 MC-E01）。
+            const QRegularExpression actionRe(QStringLiteral("^取([0-9]+)·送([0-9]+)$"));
+            long long sumPick = 0;
+            long long sumDeliver = 0;
+            int prevSeq = 0;
+            QString prevVehicle;
             for (const QString& line : lines) {
-                const QRegularExpressionMatch tm = tripCell.match(line);
-                if (!tm.hasMatch()) {
-                    std::fprintf(stderr,
-                                 "[ui-probe] 停靠明细行缺少趟号: %s\n",
+                const QStringList cells = line.split(QStringLiteral(" | "));
+                if (cells.size() != headers.size()) {
+                    std::fprintf(stderr, "[ui-probe] 停靠明细行列数 %d != 表头列数 %d：%s\n",
+                                 int(cells.size()), int(headers.size()),
                                  line.toUtf8().constData());
                     return 1;
                 }
-                tripNumbers.insert(tm.captured(1).toInt());
-            }
-            // 多趟方案下，趟号列必须真的出现多个不同的趟号。
-            // 用户实测过：切分剩余路线时把整条压成一趟，会让这里全部塌成「第 1」。
-            if (window.tripCount() > 1 && tripNumbers.size() < 2) {
-                std::fprintf(stderr,
-                             "[ui-probe] 共 %d 趟，但停靠明细的趟号只有 %d 种（全塌成同一趟？）\n",
-                             window.tripCount(), int(tripNumbers.size()));
-                return 1;
-            }
-            // 趟号必须沿行**单调不减**且都 >= 1：重规划后趟号接着往下编，
-            // 不允许出现"已完成的趟又冒出来"或"编号倒退"。
-            {
-                int prev = 0;
-                bool monotone = true;
-                for (const QString& line : lines) {
-                    const int n = tripCell.match(line).captured(1).toInt();
-                    if (n < prev || n < 1) {
-                        monotone = false;
+                for (const QString& c : cells) {
+                    if (c.isEmpty()) {
+                        std::fprintf(stderr, "[ui-probe] 停靠明细出现空白单元格：%s\n",
+                                     line.toUtf8().constData());
+                        return 1;
+                    }
+                }
+                const QString& vehicle = cells[0];
+                bool isConfigVehicle = false;
+                for (const logistics::Vehicle& v : config.vehicles) {
+                    if (QString::fromStdString(v.id) == vehicle) {
+                        isConfigVehicle = true;
                         break;
                     }
-                    prev = n;
                 }
-                if (!monotone) {
-                    std::fprintf(stderr, "[ui-probe] 停靠明细的趟号不是单调不减（起点 %d）\n",
-                                 window.completedTripOffset() + 1);
+                if (!isConfigVehicle) {
+                    std::fprintf(stderr, "[ui-probe] 停靠明细「车辆」列不是配置里的车辆：%s\n",
+                                 vehicle.toUtf8().constData());
+                    return 1;
+                }
+                bool seqOk = false;
+                const int seq = cells[1].toInt(&seqOk);
+                if (!seqOk || seq < 1) {
+                    std::fprintf(stderr, "[ui-probe] 停靠明细「序号」不是正整数：%s\n",
+                                 cells[1].toUtf8().constData());
+                    return 1;
+                }
+                const int wantSeq = (vehicle == prevVehicle) ? prevSeq + 1 : 1;
+                if (seq != wantSeq) {
+                    std::fprintf(stderr, "[ui-probe] 停靠明细「序号」不单调（车辆 %s 期望 %d，实际 %d）\n",
+                                 vehicle.toUtf8().constData(), wantSeq, seq);
+                    return 1;
+                }
+                prevVehicle = vehicle;
+                prevSeq = seq;
+                if (cells[2] != QStringLiteral("紧急") && cells[2] != QStringLiteral("普通")) {
+                    std::fprintf(stderr, "[ui-probe] 停靠明细「阶段」列不是 紧急/普通：%s\n",
+                                 cells[2].toUtf8().constData());
+                    return 1;
+                }
+                const QRegularExpressionMatch am = actionRe.match(cells[4]);
+                if (!am.hasMatch()) {
+                    std::fprintf(stderr, "[ui-probe] 停靠明细「动作」列不是 取<a>·送<b>：%s\n",
+                                 cells[4].toUtf8().constData());
+                    return 1;
+                }
+                sumPick += am.captured(1).toLongLong();
+                sumDeliver += am.captured(2).toLongLong();
+                bool loadNumeric = false;
+                cells[8].toDouble(&loadNumeric);
+                if (!loadNumeric) {
+                    std::fprintf(stderr, "[ui-probe] 停靠明细「余货(kg)」不是数字：%s\n",
+                                 cells[8].toUtf8().constData());
                     return 1;
                 }
             }
-            std::printf("[ui-probe] 停靠明细趟号种类 %d 种（共 %d 趟）\n",
-                        int(tripNumbers.size()), window.tripCount());
+            const long long pairs = static_cast<long long>(config.orders.size());
+            if (sumPick != sumDeliver || sumPick != pairs) {
+                std::fprintf(stderr,
+                             "[ui-probe] 停靠明细动作计数 Σ取 %lld / Σ送 %lld != 取送对数 %lld\n",
+                             sumPick, sumDeliver, pairs);
+                return 1;
+            }
+            std::printf("[ui-probe] 停靠明细表头 9 列、无「趟」；每行 9 格非空；"
+                        "Σ取 = Σ送 = %lld（取送对数）\n",
+                        pairs);
+        }
+
+        // ---- G9：路线信息面板含四片段（MC-E03）----
+        {
+            const QString routePanel = window.routePanelSummary();
+            const QRegularExpression stopsActions(
+                QStringLiteral("停靠 ([0-9]+) 站 · 动作 ([0-9]+) 次"));
+            const QRegularExpressionMatch sam = stopsActions.match(routePanel);
+            if (!sam.hasMatch() || !routePanel.contains(QStringLiteral("取货准时率"))
+                || !routePanel.contains(QStringLiteral("送达准时率"))
+                || !routePanel.contains(QStringLiteral("平均在车"))) {
+                std::fprintf(stderr,
+                             "[ui-probe] 路线信息面板缺少四项新指标片段"
+                             "（停靠·动作 / 取货准时率 / 送达准时率 / 平均在车）：\n%s\n",
+                             routePanel.toUtf8().constData());
+                return 1;
+            }
+            // 趟次三段与「各趟」列表已退役（MC-E03），面板里不得再出现。
+            if (routePanel.contains(QStringLiteral("趟次"))
+                || routePanel.contains(QStringLiteral("各趟"))) {
+                std::fprintf(stderr, "[ui-probe] 路线信息面板仍含已退役的「趟次 / 各趟」：\n%s\n",
+                             routePanel.toUtf8().constData());
+                return 1;
+            }
+            std::printf("[ui-probe] 路线信息面板：停靠 %s 站 · 动作 %s 次（四片段齐备）\n",
+                        sam.captured(1).toUtf8().constData(),
+                        sam.captured(2).toUtf8().constData());
+        }
+
+        // ---- G10：超时订单面板 **8 列**、逐单一行（MC-E02）----
+        {
+            const QStringList lateHeaders = window.latePanelHeaders();
+            const QStringList expectLate{
+                QStringLiteral("车辆"),        QStringLiteral("订单"),   QStringLiteral("配送点"),
+                QStringLiteral("档位"),        QStringLiteral("状态"),   QStringLiteral("到达"),
+                QStringLiteral("窗口"),        QStringLiteral("penalty(min)")};
+            if (lateHeaders != expectLate) {
+                std::fprintf(stderr,
+                             "[ui-probe] 超时订单表头不符（应 8 列）：实际 [%s]，预期 [%s]\n",
+                             lateHeaders.join(QStringLiteral(" | ")).toUtf8().constData(),
+                             expectLate.join(QStringLiteral(" | ")).toUtf8().constData());
+                return 1;
+            }
+            const QStringList lateLines =
+                window.latePanelSummary().split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+            // 行数 == 迟到订单数（G10）：逐单一行，不得把同停靠多单压成一行。
+            const int expectLateRows = window.lateOrderCount();
+            if (int(lateLines.size()) != expectLateRows) {
+                std::fprintf(stderr, "[ui-probe] 超时面板行数 %d != 迟到订单数 %d\n",
+                             int(lateLines.size()), expectLateRows);
+                return 1;
+            }
+            const QRegularExpression windowRe(
+                QStringLiteral("^[0-9]{2}:[0-9]{2}-[0-9]{2}:[0-9]{2}$"));
+            for (const QString& line : lateLines) {
+                const QStringList cells = line.split(QStringLiteral(" | "));
+                if (cells.size() != lateHeaders.size()) {
+                    std::fprintf(stderr, "[ui-probe] 超时订单行列数 %d != 表头列数 %d：%s\n",
+                                 int(cells.size()), int(lateHeaders.size()),
+                                 line.toUtf8().constData());
+                    return 1;
+                }
+                for (const QString& c : cells) {
+                    if (c.isEmpty()) {
+                        std::fprintf(stderr, "[ui-probe] 超时订单出现空白单元格：%s\n",
+                                     line.toUtf8().constData());
+                        return 1;
+                    }
+                }
+                // 逐单一行：订单列是**单张**订单 ID（旧实现用 '/' 把同停靠多单拼成一格）。
+                if (cells[1].contains(QLatin1Char('/'))) {
+                    std::fprintf(stderr, "[ui-probe] 超时订单未逐单一行（订单列含 '/' 合并）：%s\n",
+                                 line.toUtf8().constData());
+                    return 1;
+                }
+                if (cells[3] != QStringLiteral("紧急") && cells[3] != QStringLiteral("普通")) {
+                    std::fprintf(stderr, "[ui-probe] 超时订单「档位」列不是 紧急/普通：%s\n",
+                                 line.toUtf8().constData());
+                    return 1;
+                }
+                // 窗口 = 该单自己的 [ws, we]（逐单窗口，不是同停靠多单的并集）。
+                if (!windowRe.match(cells[6]).hasMatch()) {
+                    std::fprintf(stderr, "[ui-probe] 超时订单「窗口」列不是 起-止 时刻：%s\n",
+                                 line.toUtf8().constData());
+                    return 1;
+                }
+                bool penOk = false;
+                const int pen = cells[7].toInt(&penOk);
+                if (!penOk || pen <= 0) {
+                    std::fprintf(stderr, "[ui-probe] 超时订单「penalty(min)」不是正整数：%s\n",
+                                 line.toUtf8().constData());
+                    return 1;
+                }
+            }
+            if (!lateLines.isEmpty()) {
+                std::printf("[ui-probe] 超时订单摘录（逐单一行，窗口 = 该单自己的）：\n");
+                for (const QString& line : lateLines) {
+                    std::printf("[ui-probe]   %s\n", line.toUtf8().constData());
+                }
+            }
+            std::printf("[ui-probe] 超时订单面板表头 8 列（含车辆/档位），%d 行 == 迟到订单数\n",
+                        expectLateRows);
         }
 
         std::printf("[ui-probe] 通过\n");

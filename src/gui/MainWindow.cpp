@@ -107,7 +107,6 @@ MainWindow::MainWindow(Config config, const std::string& configPath, QWidget* pa
         state_.atNodeId = config_.vehicles.front().startNodeId;
         state_.atTimeMin = config_.vehicles.front().departTimeMin;
         state_.loadKg = 0.0;
-        state_.tripNumber = 1;
     }
 
     // 事件刻：绝对时刻对齐（08:00 = 480 是 15 的整数倍，故首个事件落在 08:15）。
@@ -228,23 +227,14 @@ void MainWindow::buildDocks() {
 
     auto* vehicleDock = new QDockWidget(QStringLiteral("车辆信息"), this);
     vehicleDock->setMinimumWidth(360);
-    // 像「订单列表」那样分标签，把两类信息分开：
-    //   · 固定信息 —— 车辆的**固有参数**（ID / 起始仓库 / 载重上限 / 发车时刻），
-    //     整场模拟都不会变，任何时候看都一样；
-    //   · 运行状态 —— **随模拟推进而变**的量（软件内时间 / 车上载重及构成 / 本趟装载 /
-    //     剩余待送）。它们每推进一步都会变，混在一起会让"固定参数"被噪声淹没。
-    // 分成两个只读页签后，用户不必在变化的数字里找不变的参数。
+    // 车辆信息（MC-E04）：**每车一个页签**，标题 = `<车辆 ID> · <容量>kg`；
+    // 页内再分「固定信息 / 运行状态」两块标题：
+    //   · 固定信息 —— 车辆的**固有参数**（ID / 起始仓库 / 载重上限 / 发车时刻 /
+    //     耗时倍率 / 成本倍率），整场模拟都不会变，任何时候看都一样；
+    //   · 运行状态 —— **随模拟推进而变**的量（车上载重及构成 / 剩余待送 / 已送达 /
+    //     已发生 penalty）。软件内时间不在这里重复打印（状态栏常驻显示）。
+    // 页签数由 updatePanels 首刷时按 config_.vehicles 重建。
     vehicleTabs_ = new QTabWidget(vehicleDock);
-    vehicleFixedInfo_ = new QLabel(vehicleTabs_);
-    vehicleFixedInfo_->setTextFormat(Qt::PlainText);
-    vehicleFixedInfo_->setMargin(6);
-    vehicleFixedInfo_->setAlignment(Qt::AlignTop | Qt::AlignLeft);
-    vehicleStateInfo_ = new QLabel(vehicleTabs_);
-    vehicleStateInfo_->setTextFormat(Qt::PlainText);
-    vehicleStateInfo_->setMargin(6);
-    vehicleStateInfo_->setAlignment(Qt::AlignTop | Qt::AlignLeft);
-    vehicleTabs_->addTab(vehicleFixedInfo_, QStringLiteral("固定信息"));
-    vehicleTabs_->addTab(vehicleStateInfo_, QStringLiteral("运行状态"));
     vehicleDock->setWidget(vehicleTabs_);
     addDockWidget(Qt::RightDockWidgetArea, vehicleDock);
 
@@ -277,21 +267,19 @@ void MainWindow::buildDocks() {
     transitDock->setWidget(transitTable_);
     addDockWidget(Qt::RightDockWidgetArea, transitDock);
 
-    // 停靠明细：把每个停靠点的原始到达/等待/送达/送后余载摊开。
-    // （"离开"列已随服务时间一并删除：服务时间移除后「离开 == 送达」是恒等式，
-    //   再单列一列只会与"送达"重复，见 docs/设计.md §16 P-history 与 §4.6。）
-    // 这些字段是设计 §4.6 明确要求记录的，此前只有测试在读、界面上看不到；
-    // 报告要求【需求分析】⑵ 也要求呈现"到达时间"，而"等待"能解释早到的影响。
+    // 停靠明细（MC-E01）：**9 列**、按每车铺行（规格一阶段只有 1 台车，但车辆列
+    // 不写死单值）：车辆 | 序号 | 阶段 | 配送点 | 动作（取<a>·送<b>）| 原始到达 |
+    // 等待(分) | 送达 | 余货(kg)。趟结构已退役，**无「趟」列**；「动作」列显示**计数**
+    // （取<a>·送<b>，380px 面板放不下订单 ID 列表，见 #29 §4.2）；
+    // 「余货(kg)」= `Stop::remainingLoadKg`（离开该站时的**在车货量**）。
     auto* stopDock = new QDockWidget(QStringLiteral("停靠明细"), this);
     stopDock->setMinimumWidth(360);
-    // 列里必须有「趟」：停靠明细是**跨趟拉平**的，不加这一列的话
-    // "送后余货"会从 0 跳回几十公斤，看起来像数据错了，其实是新的一趟开始装货。
-    // 列名用"**余货**"而不是"余载"：该值只统计**订单货**（`Stop::remainingLoadKg`）。
-    stopTable_ = new QTableWidget(0, 6, stopDock);
+    stopTable_ = new QTableWidget(0, 9, stopDock);
     stopTable_->setHorizontalHeaderLabels(
-        {QStringLiteral("趟"), QStringLiteral("配送点"), QStringLiteral("原始到达"),
+        {QStringLiteral("车辆"), QStringLiteral("序号"), QStringLiteral("阶段"),
+         QStringLiteral("配送点"), QStringLiteral("动作"), QStringLiteral("原始到达"),
          QStringLiteral("等待(分)"), QStringLiteral("送达"),
-         QStringLiteral("送后余货(kg)")});
+         QStringLiteral("余货(kg)")});
     stopTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     stopTable_->horizontalHeader()->setStretchLastSection(true);
     stopTable_->verticalHeader()->setVisible(false);
@@ -301,10 +289,14 @@ void MainWindow::buildDocks() {
 
     auto* lateDock = new QDockWidget(QStringLiteral("超时订单"), this);
     lateDock->setMinimumWidth(360);
-    lateTable_ = new QTableWidget(0, 6, lateDock);
+    // 超时订单（MC-E02）：**逐单一行**、8 列：车辆 | 订单 | 配送点 | 档位 | 状态 |
+    // 到达 | 窗口 | penalty(min)。窗口用**该单自己的** [ws, we]（不再取同停靠
+    // 多单的并集——那正是合并窗口口径的残留）。
+    lateTable_ = new QTableWidget(0, 8, lateDock);
     lateTable_->setHorizontalHeaderLabels(
-        {QStringLiteral("订单"), QStringLiteral("配送点"), QStringLiteral("状态"),
-         QStringLiteral("到达"), QStringLiteral("窗口"), QStringLiteral("penalty(min)")});;
+        {QStringLiteral("车辆"), QStringLiteral("订单"), QStringLiteral("配送点"),
+         QStringLiteral("档位"), QStringLiteral("状态"), QStringLiteral("到达"),
+         QStringLiteral("窗口"), QStringLiteral("penalty(min)")});
     lateTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     lateTable_->horizontalHeader()->setStretchLastSection(true);
     lateTable_->verticalHeader()->setVisible(false);
@@ -350,6 +342,21 @@ double MainWindow::currentLoadKg() const {
 }
 
 
+QString MainWindow::onboardGoodsText() const {
+    const std::vector<logistics::OnboardItem> items = onboardGoods();
+    if (items.empty()) {
+        return QStringLiteral("（空）");
+    }
+    QStringList parts;
+    for (const logistics::OnboardItem& it : items) {
+        parts << QStringLiteral("%1:%2kg@%3")
+                     .arg(QString::fromStdString(it.orderId))
+                     .arg(it.kg, 0, 'f', 0)
+                     .arg(QString::fromStdString(it.nodeId));
+    }
+    return parts.join(QStringLiteral("、"));
+}
+
 std::vector<logistics::OnboardItem> MainWindow::onboardGoods() const {
     // 车上有哪些货是**显式状态**，不再从计划反推。
     // 反推的版本会在重规划后把已经送掉/已经寄存的货又当成在途货，造成重复寄存与
@@ -391,21 +398,16 @@ void MainWindow::deliverAt(const logistics::Stop& stop) {
     }
 }
 
-QString MainWindow::orderIdsAt(const std::string& nodeId) const {
-    QString ids;
-    for (const Order& order : config_.orders) {
-        if (order.nodeId != nodeId) {
-            continue;
+// 某张订单的货量（供降载/取回日志显示；按订单查，不按节点查）。
+const logistics::Order* MainWindow::findOrderById(const std::string& orderId) const {
+    for (const Order& o : config_.orders) {
+        if (o.id == orderId) {
+            return &o;
         }
-        if (!ids.isEmpty()) {
-            ids += QLatin1Char('/');
-        }
-        ids += QString::fromStdString(order.id);
     }
-    return ids;
+    return nullptr;
 }
 
-// 某张订单的货量（供降载/取回日志显示；按订单查，不按节点查）。
 double MainWindow::orderKg(const std::string& orderId) const {
     for (const Order& o : config_.orders) {
         if (o.id == orderId) {
@@ -413,27 +415,6 @@ double MainWindow::orderKg(const std::string& orderId) const {
         }
     }
     return 0.0;
-}
-
-// 某配送点的合并窗口 [min 起, max 止]，与规划器使用的口径一致
-QString MainWindow::windowTextAt(const std::string& nodeId) const {
-    int lo = -1;
-    int hi = -1;
-    for (const Order& order : config_.orders) {
-        if (order.nodeId != nodeId) {
-            continue;
-        }
-        if (lo < 0 || order.windowStartMin < lo) {
-            lo = order.windowStartMin;
-        }
-        if (hi < 0 || order.windowEndMin > hi) {
-            hi = order.windowEndMin;
-        }
-    }
-    if (lo < 0) {
-        return QStringLiteral("-");
-    }
-    return minutesToClock(lo) + QStringLiteral("-") + minutesToClock(hi);
 }
 
 std::vector<Order> MainWindow::remainingOrders() const {
@@ -474,7 +455,6 @@ void MainWindow::afterPlanReplaced() {
         routeFinishedReported_ = false;
     }
     // 单条连续路线下车辆空载出发、货在取货点 A 装车，重规划后**不需要**装车。
-    // 出发时装载量按车辆状态（在车货）冻结，供界面「本趟出发装载」显示。
 }
 
 void MainWindow::replan() {
@@ -1673,20 +1653,26 @@ void MainWindow::updatePanels() {
         // 三者全部来自车辆状态：已送达是累计事实；"停靠 N 站"= 已送达 + 尚未走完的；
         const std::size_t remainingStops =
             plan_.stops.size() > stopCursor_ ? plan_.stops.size() - stopCursor_ : 0;
-        // 停靠点数 · 动作数（规格一 §6.1 / §6.3 的同一口径）。
-        // 面板列数与文本改造归 #37；本票只把数据换成新模型的真源。
+        // 停靠 S 站 · 动作 A 次 · 已送达 M 站（MC-E03：动作数 = Σ取+Σ送，
+        // 与 --plan-summary 同口径；趟次三段与「各趟」列表已随 #37 退役）。
         int actionCount = 0;
         for (const Stop& st : plan_.stops) {
             actionCount += static_cast<int>(st.pickups.size() + st.deliveries.size());
         }
-        route += QStringLiteral("停靠 %1 站 · 动作 %2 次（已送达 %3 站）\n")
+        route += QStringLiteral("停靠 %1 站 · 动作 %2 次 · 已送达 %3 站\n")
                      .arg(state_.servedStops + static_cast<int>(remainingStops))
                      .arg(actionCount)
                      .arg(state_.servedStops);
+        // 三项新指标（MC-E03）：分母 0 记「—」；送达准时率按紧急/普通分列。
         route += QStringLiteral("取货准时率：%1\n").arg(rateText(plan_.metrics.pickupOnTimeCount,
                                                                 plan_.metrics.pickupTotal));
-        route += QStringLiteral("送达准时率：%1\n").arg(rateText(plan_.metrics.deliveryOnTimeCount,
-                                                                plan_.metrics.deliveryTotal));
+        route += QStringLiteral("送达准时率：%1（紧急 %2 · 普通 %3）\n")
+                     .arg(rateText(plan_.metrics.deliveryOnTimeCount,
+                                   plan_.metrics.deliveryTotal))
+                     .arg(rateText(plan_.metrics.urgentOnTimeCount,
+                                   plan_.metrics.urgentTotal))
+                     .arg(rateText(plan_.metrics.normalOnTimeCount,
+                                   plan_.metrics.normalTotal));
         route += QStringLiteral("平均在车：%1 kg（利用率 %2% · 峰值 %3 kg）\n")
                      .arg(plan_.metrics.avgLoadKg, 0, 'f', 1)
                      .arg(plan_.metrics.loadUtilization * 100.0, 0, 'f', 1)
@@ -1701,47 +1687,99 @@ void MainWindow::updatePanels() {
     }
     routeInfo_->setPlainText(route);
 
-    // 车辆信息
+    // 车辆信息（MC-E04）：每车一个页签，标题 `<车辆 ID> · <容量>kg`；
+    // 页内「固定信息 / 运行状态」两块。软件内时间不重复打印（状态栏常驻）。
     //
     // 这里必须区分两个量（此前混为一谈，导致"载重上限 200kg / 当前载重 740kg"）：
-    //   · 本趟装载：当前这趟车上实际装的货量，不变量是 **不得超过载重上限**
-    //   · 剩余待送：全部未送达订单的货量之和，可以远超载重上限
-    //     —— 多趟模式下车辆正是一趟趟把这些货送完的
-    if (!config_.vehicles.empty()) {
-        const logistics::Vehicle& v = config_.vehicles.front();
-
-        // 本趟尚未驶离出发点时，装载量以计划为准（还没装）；一经出发即冻结，
-        // 之后的重规划不得改动它——那已经是被执行了的事实。
-        // 本趟装载与趟号都来自车辆状态，重规划不改写
-        const double tripLoad = state_.tripLoadKg;
-        const std::size_t tripNo = static_cast<std::size_t>(state_.tripNumber);
-
-        double remainingDemand = 0.0;
-        for (const Order& o : remainingOrders()) {
-            remainingDemand += o.demandKg;
+    //   · 车上载重：车上此刻实际载的订单货量，不变量是 **不得超过该车载重上限**
+    //   · 剩余待送：全部未送达订单的货量之和，可以远超单车载重上限
+    if (vehicleTabs_ != nullptr) {
+        // 页签按车辆重建：标题、固定信息、运行状态全部逐车来自 config_。
+        // 重建以 vehicles.size() 为准（首刷一次；之后只在页签数不符时重建，
+        // 保持页签当前选择不被无谓重置）。
+        while (vehicleTabs_->count() > static_cast<int>(config_.vehicles.size())) {
+            QWidget* w = vehicleTabs_->widget(vehicleTabs_->count() - 1);
+            vehicleTabs_->removeTab(vehicleTabs_->count() - 1);
+            delete w;
+        }
+        for (std::size_t vi = 0; vi < config_.vehicles.size(); ++vi) {
+            const logistics::Vehicle& v = config_.vehicles[vi];
+            const QString tabTitle = QStringLiteral("%1 · %2kg")
+                                         .arg(QString::fromStdString(v.id))
+                                         .arg(v.capacityKg, 0, 'f', 0);
+            if (vi >= static_cast<std::size_t>(vehicleTabs_->count())) {
+                // 首次出现这辆车：两块 QLabel（固定信息 + 运行状态）叠成一个容器页。
+                QWidget* page = new QWidget(vehicleTabs_);
+                QVBoxLayout* lay = new QVBoxLayout(page);
+                lay->setContentsMargins(0, 0, 0, 0);
+                lay->setSpacing(0);
+                QLabel* fixed = new QLabel(page);
+                QLabel* run = new QLabel(page);
+                for (QLabel* l : {fixed, run}) {
+                    l->setTextFormat(Qt::PlainText);
+                    l->setMargin(6);
+                    l->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+                }
+                lay->addWidget(fixed);
+                lay->addWidget(run);
+                page->setProperty("vehicleFixedLabel",
+                                  QVariant::fromValue<QLabel*>(fixed));
+                page->setProperty("vehicleRunLabel", QVariant::fromValue<QLabel*>(run));
+                vehicleTabs_->addTab(page, tabTitle);
+            } else {
+                vehicleTabs_->setTabText(static_cast<int>(vi), tabTitle);
+            }
         }
 
-        // ---- 固定信息：整场模拟都不变的车辆固有参数 ----
-        vehicleFixedInfo_->setText(
-            QStringLiteral("ID：%1\n起始仓库：%2\n载重上限：%3 kg\n发车时刻：%4\n"
-                           "（以上为配置给定的固有参数，模拟过程中不会变化）")
-                .arg(QString::fromStdString(v.id))
-                .arg(QString::fromStdString(v.startNodeId))
-                .arg(v.capacityKg, 0, 'f', 0)
-                .arg(minutesToClock(v.departTimeMin)));
+        // 状态由**当前页签**对应的车辆驱动（规格一阶段只有 V01；多车时页签即切换视角）。
+        const int cur = vehicleTabs_->currentIndex() >= 0 ? vehicleTabs_->currentIndex() : 0;
+        const std::size_t vi = static_cast<std::size_t>(cur);
+        if (vi < config_.vehicles.size()) {
+            const logistics::Vehicle& v = config_.vehicles[vi];
+            QWidget* page = vehicleTabs_->widget(cur);
+            QLabel* fixed = page->property("vehicleFixedLabel").value<QLabel*>();
+            QLabel* run = page->property("vehicleRunLabel").value<QLabel*>();
+            if (fixed != nullptr && run != nullptr) {
+                double remainingDemand = 0.0;
+                for (const Order& o : remainingOrders()) {
+                    remainingDemand += o.demandKg;
+                }
 
-        // ---- 运行状态：随模拟推进而变的量 ----
-        vehicleStateInfo_->setText(
-            QStringLiteral("软件内时间：%1\n"
-                           "车上载重：%2 kg\n"
-                           "本趟出发装载：%3 kg（第 %4 趟）\n"
-                           "剩余待送：%5 kg")
-                .arg(minutesToClock(currentTimeMin()))
-                // 「车上载重」是**物理事实**：车上此刻实际载着的订单货量。
-                .arg(currentLoadKg(), 0, 'f', 0)
-                .arg(tripLoad, 0, 'f', 0)
-                .arg(tripNo)
-                .arg(remainingDemand, 0, 'f', 0));
+                // ---- 固定信息：整场模拟都不变的车辆固有参数（6 行）----
+                fixed->setText(
+                    QStringLiteral("固定信息\n"
+                                   "ID：%1\n起始仓库：%2\n载重上限：%3 kg\n发车时刻：%4\n"
+                                   "耗时倍率：%5\n成本倍率：%6\n"
+                                   "（以上为配置给定的固有参数，模拟过程中不会变化）")
+                        .arg(QString::fromStdString(v.id))
+                        .arg(QString::fromStdString(v.startNodeId))
+                        .arg(v.capacityKg, 0, 'f', 0)
+                        .arg(minutesToClock(v.departTimeMin))
+                        .arg(v.timeFactor, 0, 'f', 2)
+                        .arg(v.costFactor, 0, 'f', 2));
+
+                // ---- 运行状态：随模拟推进而变的量（规格一口径）----
+                run->setText(
+                    QStringLiteral("运行状态\n"
+                                   "位置：%1\n"
+                                   "时刻：%2\n"
+                                   "车上载重：%3 kg\n"
+                                   "在车明细：%4\n"
+                                   "剩余待送：%5 kg\n"
+                                   "已送达：%6 站\n"
+                                   "已发生 penalty：%7 min")
+                        .arg(QString::fromStdString(currentPositionId()))
+                        // 车辆自己的时刻（= 软件内时间）。状态栏常驻显示时钟，
+                        // 这里不重复「软件内时间」那一行，只作为运行状态字段。
+                        .arg(minutesToClock(state_.atTimeMin))
+                        // 「车上载重」是**物理事实**：车上此刻实际载着的订单货量。
+                        .arg(currentLoadKg(), 0, 'f', 0)
+                        .arg(onboardGoodsText())
+                        .arg(remainingDemand, 0, 'f', 0)
+                        .arg(state_.servedStops)
+                        .arg(state_.incurredPenaltyMin));
+            }
+        }
     }
 
     // 订单列表：按"未送达的紧急 → 未送达普通 → 已送达"排序。
@@ -1780,29 +1818,54 @@ void MainWindow::updatePanels() {
                                                       : QStringLiteral("待配送"))));
     }
 
-    // 停靠明细（顺序与 plan_.stops 一致，即服务顺序）。
-    // 趟结构已退役（规格一 MC-A01）：第一列保留「第 N」的**格式**（列数与文本改造归 #37），
-    // 单条连续路线下恒为「第 1」。
+    // 停靠明细（MC-E01）：9 列、按**每车**铺行。规格一阶段只有一台车，但列按
+    // 每车铺（车辆列填该车 ID），不把「车辆」写死成单值。动作列显示**计数**
+    // （取<a>·送<b>），Σ取 == Σ送 == 取送对数 是可断言的结构关系；
+    // 余货(kg) = `Stop::remainingLoadKg`（离开该站时的在车量）。
     // 只列**尚未走过**的停靠点：推进一站与重规划应当有一致的效果，
-    // 都表现为"已送达的那一行从表里消失"。此前推进不改计划、表也就不动，
-    // 与重规划后表被重建的行为不一致，容易被误判为卡住。
-    const std::size_t fromStop =
-        (stopCursor_ < plan_.stops.size()) ? stopCursor_ : plan_.stops.size();
-    const int shown = static_cast<int>(plan_.stops.size() - fromStop);
-    stopTable_->setRowCount(shown);
-    for (int i = 0; i < shown; ++i) {
-        const std::size_t idx = fromStop + static_cast<std::size_t>(i);
-        const Stop& s = plan_.stops[idx];
-        // 趟号 = 已完成趟数 + 当前计划里的趟号。
-        // 这样重规划后趟号接着往下编，而不是又变回「第 1 趟」。
-        // 绝对趟号 = 车辆当前趟号 + 计划内相对趟号 - 1。
-        // tripNumber 是车辆状态，重规划不改；相对趟号由计划给出。二者配合即得绝对编号。
-        stopTable_->setItem(i, 0, new QTableWidgetItem(QStringLiteral("第 1")));
-        stopTable_->setItem(i, 1, new QTableWidgetItem(QString::fromStdString(s.nodeId)));
-        stopTable_->setItem(i, 2, new QTableWidgetItem(minutesToClock(s.rawArrivalMin)));
-        stopTable_->setItem(i, 3, new QTableWidgetItem(QString::number(s.waitMin)));
-        stopTable_->setItem(i, 4, new QTableWidgetItem(minutesToClock(s.arrivalMin)));
-        stopTable_->setItem(i, 5, new QTableWidgetItem(QString::number(s.remainingLoadKg, 'f', 0)));
+    // 都表现为"已送达的那一行从表里消失"。
+    {
+        const std::size_t fromStop =
+            (stopCursor_ < plan_.stops.size()) ? stopCursor_ : plan_.stops.size();
+        const int shown = static_cast<int>(plan_.stops.size() - fromStop);
+        int row = 0;
+        // 规格一：单台车（vehicles 非空才有计划）。多车时逐车各铺一段行。
+        for (std::size_t vi = 0; vi < config_.vehicles.size(); ++vi) {
+            const logistics::Vehicle& v = config_.vehicles[vi];
+            const bool myPlan = (vi == 0);   // 规格一只有第 0 台车有计划；后续票按车拆计划
+            const int rowsForVehicle = myPlan ? shown : 0;
+            stopTable_->setRowCount(row + rowsForVehicle);
+            for (int i = 0; i < rowsForVehicle; ++i) {
+                const std::size_t idx = fromStop + static_cast<std::size_t>(i);
+                const Stop& s = plan_.stops[idx];
+                const QString actionText = QStringLiteral("取%1·送%2")
+                                               .arg(s.pickups.size())
+                                               .arg(s.deliveries.size());
+                stopTable_->setItem(row, 0,
+                                    new QTableWidgetItem(QString::fromStdString(v.id)));
+                stopTable_->setItem(row, 1,
+                                    new QTableWidgetItem(QString::number(i + 1)));
+                stopTable_->setItem(
+                    row, 2,
+                    new QTableWidgetItem(s.phase == logistics::StopPhase::Urgent
+                                             ? QStringLiteral("紧急")
+                                             : QStringLiteral("普通")));
+                stopTable_->setItem(row, 3,
+                                    new QTableWidgetItem(QString::fromStdString(s.nodeId)));
+                stopTable_->setItem(row, 4, new QTableWidgetItem(actionText));
+                stopTable_->setItem(row, 5,
+                                    new QTableWidgetItem(minutesToClock(s.rawArrivalMin)));
+                stopTable_->setItem(row, 6,
+                                    new QTableWidgetItem(QString::number(s.waitMin)));
+                stopTable_->setItem(row, 7,
+                                    new QTableWidgetItem(minutesToClock(s.arrivalMin)));
+                stopTable_->setItem(row, 8,
+                                    new QTableWidgetItem(
+                                        QString::number(s.remainingLoadKg, 'f', 0)));
+                ++row;
+            }
+        }
+        stopTable_->setRowCount(row);
     }
 
     // 中转站 / 集散：子网络标识 + 下属配送点数 + 当前暂存货（kg）
@@ -1851,40 +1914,65 @@ void MainWindow::updatePanels() {
         }
     }
 
-    // 超时订单：区分**已经发生**的超时（事实，跨重规划保留）与**剩余计划预计**的超时。
-    //
+    // 超时订单（MC-E02）：**按订单一行**，窗口用**该单自己的** [ws, we]。
+    // 区分**已经发生**的超时（事实，跨重规划保留）与**剩余计划预计**的超时。
     // 只列 plan_.stops 里 late 的那些是不够的：重规划后剩余计划里可能一个都不 late，
     // 于是"已经超时过"的订单会从表里凭空消失，看起来像超时被抹掉了。
-    int lateRows = 0;
-    const auto putLate = [&](const QString& orderText, const std::string& nodeId,
-                             const QString& status, int arrivalMin, int penaltyMin) {
-        lateTable_->setRowCount(lateRows + 1);
-        lateTable_->setItem(lateRows, 0, new QTableWidgetItem(orderText));
-        lateTable_->setItem(lateRows, 1, new QTableWidgetItem(QString::fromStdString(nodeId)));
-        lateTable_->setItem(lateRows, 2, new QTableWidgetItem(status));
-        lateTable_->setItem(lateRows, 3, new QTableWidgetItem(minutesToClock(arrivalMin)));
-        lateTable_->setItem(lateRows, 4, new QTableWidgetItem(windowTextAt(nodeId)));
-        lateTable_->setItem(lateRows, 5, new QTableWidgetItem(QString::number(penaltyMin)));
-        ++lateRows;
-    };
-    for (const VehicleState::LateStop& ls : state_.deliveredLate) {
-        putLate(QString::fromStdString(ls.orderId), ls.nodeId,
-                QStringLiteral("已超时"), ls.arrivalMin, ls.penaltyMin);
-    }
-    if (plan_.status == logistics::PlanStatus::Ok) {
-        // 逐单列（规格一 §6.3：penalty 逐单，一个停靠上可能一单一迟一早）。
-        for (std::size_t k = stopCursor_; k < plan_.stops.size(); ++k) {
-            const Stop& s = plan_.stops[k];
-            for (const logistics::StopDelivery& d : s.deliveries) {
-                if (!d.late) {
-                    continue;
+    {
+        // 订单 ID -> 订单（窗口 / 档位按单查，不再合并）。
+        std::map<std::string, const Order*> orderById;
+        for (const Order& o : config_.orders) {
+            orderById[o.id] = &o;
+        }
+        const QString vehicleId =
+            config_.vehicles.empty()
+                ? QStringLiteral("-")
+                : QString::fromStdString(config_.vehicles.front().id);
+        int lateRows = 0;
+        const auto putLate = [&](const std::string& orderId, const std::string& nodeId,
+                                 const QString& status, int arrivalMin, int penaltyMin) {
+            QString windowText = QStringLiteral("-");
+            QString tier = QStringLiteral("普通");
+            const std::map<std::string, const Order*>::const_iterator it =
+                orderById.find(orderId);
+            if (it != orderById.end()) {
+                windowText = minutesToClock(it->second->windowStartMin)
+                             + QStringLiteral("-")
+                             + minutesToClock(it->second->windowEndMin);
+                tier = it->second->urgent ? QStringLiteral("紧急") : QStringLiteral("普通");
+            }
+            lateTable_->setRowCount(lateRows + 1);
+            lateTable_->setItem(lateRows, 0, new QTableWidgetItem(vehicleId));
+            lateTable_->setItem(lateRows, 1,
+                                new QTableWidgetItem(QString::fromStdString(orderId)));
+            lateTable_->setItem(lateRows, 2,
+                                new QTableWidgetItem(QString::fromStdString(nodeId)));
+            lateTable_->setItem(lateRows, 3, new QTableWidgetItem(tier));
+            lateTable_->setItem(lateRows, 4, new QTableWidgetItem(status));
+            lateTable_->setItem(lateRows, 5, new QTableWidgetItem(minutesToClock(arrivalMin)));
+            lateTable_->setItem(lateRows, 6, new QTableWidgetItem(windowText));
+            lateTable_->setItem(lateRows, 7, new QTableWidgetItem(QString::number(penaltyMin)));
+            ++lateRows;
+        };
+        for (const VehicleState::LateStop& ls : state_.deliveredLate) {
+            putLate(ls.orderId, ls.nodeId,
+                    QStringLiteral("已超时"), ls.arrivalMin, ls.penaltyMin);
+        }
+        if (plan_.status == logistics::PlanStatus::Ok) {
+            // 逐单列（规格一 §6.3：penalty 逐单，一个停靠上可能一单一迟一早）。
+            for (std::size_t k = stopCursor_; k < plan_.stops.size(); ++k) {
+                const Stop& s = plan_.stops[k];
+                for (const logistics::StopDelivery& d : s.deliveries) {
+                    if (!d.late) {
+                        continue;
+                    }
+                    putLate(d.orderId, s.nodeId,
+                            QStringLiteral("预计超时"), s.arrivalMin, d.penaltyMin);
                 }
-                putLate(QString::fromStdString(d.orderId), s.nodeId,
-                        QStringLiteral("预计超时"), s.arrivalMin, d.penaltyMin);
             }
         }
+        lateTable_->setRowCount(lateRows);
     }
-    lateTable_->setRowCount(lateRows);
 }
 
 void MainWindow::appendLog(const QString& text, int atMin) {
@@ -2062,6 +2150,17 @@ QString MainWindow::transitPanelSummary() const {
     return out;
 }
 
+int MainWindow::lateOrderCount() const {
+    int late = 0;
+    for (const logistics::OrderMetric& om : plan_.metrics.orders) {
+        if (om.late) {
+            ++late;
+        }
+    }
+    late += static_cast<int>(state_.deliveredLate.size());
+    return late;
+}
+
 QStringList MainWindow::transitPanelHeaders() const {
     QStringList names;
     if (transitTable_ != nullptr) {
@@ -2087,18 +2186,52 @@ QString MainWindow::vehicleTabTitles() const {
     return names.join(QStringLiteral(" | "));
 }
 
-QString MainWindow::vehiclePanelSummary() const {
-    // 两个页签都给出去：--ui-probe 要能同时核对固定信息与运行状态
-    // （只给当前页签的话，切页状态会影响断言结果）。
-    QString out;
-    if (vehicleFixedInfo_ != nullptr) {
-        out += vehicleFixedInfo_->text();
+QString MainWindow::vehiclePanelSection(int index) const {
+    if (vehicleTabs_ == nullptr || index < 0 || index >= vehicleTabs_->count()) {
+        return QString();
     }
-    if (vehicleStateInfo_ != nullptr) {
-        if (!out.isEmpty()) {
-            out += QLatin1Char('\n');
+    const QWidget* page = vehicleTabs_->widget(index);
+    if (page == nullptr) {
+        return QString();
+    }
+    const QLabel* fixed = page->property("vehicleFixedLabel").value<QLabel*>();
+    const QLabel* run = page->property("vehicleRunLabel").value<QLabel*>();
+    QString out = QStringLiteral("[") + vehicleTabs_->tabText(index) + QStringLiteral("]\n");
+    if (fixed != nullptr) {
+        out += fixed->text();
+        out += QLatin1Char('\n');
+    }
+    if (run != nullptr) {
+        out += run->text();
+    }
+    return out;
+}
+
+QString MainWindow::vehiclePanelSummary() const {
+    // **每车**页签都给出去：--ui-probe 要能逐车核对页签标题、固定信息与运行状态
+    //（只给当前页签的话，切页状态会影响断言结果）。
+    QString out;
+    if (vehicleTabs_ != nullptr) {
+        for (int i = 0; i < vehicleTabs_->count(); ++i) {
+            const QWidget* page = vehicleTabs_->widget(i);
+            if (page == nullptr) {
+                continue;
+            }
+            const QLabel* fixed = page->property("vehicleFixedLabel").value<QLabel*>();
+            const QLabel* run = page->property("vehicleRunLabel").value<QLabel*>();
+            if (!out.isEmpty()) {
+                out += QLatin1Char('\n');
+            }
+            out += QStringLiteral("[") + vehicleTabs_->tabText(i)
+                    + QStringLiteral("]\n");
+            if (fixed != nullptr) {
+                out += fixed->text();
+                out += QLatin1Char('\n');
+            }
+            if (run != nullptr) {
+                out += run->text();
+            }
         }
-        out += vehicleStateInfo_->text();
     }
     return out;
 }
@@ -2124,17 +2257,6 @@ QString MainWindow::toolbarActionTexts() const {
     return names.join(QStringLiteral(" | "));
 }
 
-int MainWindow::completedTripOffset() const {
-    // 趟结构已退役（规格一 MC-A01）：单条连续路线恒为第 1 趟。
-    return 0;
-}
-
-int MainWindow::tripCount() const {
-    // 趟结构已退役：恒为 1 条连续路线。保留此接口只为 --ui-probe 的
-    // 「共 N 趟 ⇒ 趟号必须多种」这类断言不因空指针崩溃（该断言在 N == 1 时本就不触发）。
-    return 1;
-}
-
 QString MainWindow::dockTitles() const {
     QStringList names;
     for (QDockWidget* d : findChildren<QDockWidget*>()) {
@@ -2145,6 +2267,32 @@ QString MainWindow::dockTitles() const {
     names.removeDuplicates();
     names.sort();
     return names.join(QStringLiteral(" | "));
+}
+
+QString MainWindow::routePanelSummary() const {
+    return routeInfo_ != nullptr ? routeInfo_->toPlainText() : QString();
+}
+
+QString MainWindow::latePanelSummary() const {
+    QString out;
+    for (int row = 0; row < lateTable_->rowCount(); ++row) {
+        QStringList cells;
+        for (int col = 0; col < lateTable_->columnCount(); ++col) {
+            const QTableWidgetItem* item = lateTable_->item(row, col);
+            cells << (item != nullptr ? item->text() : QString());
+        }
+        out += cells.join(QStringLiteral(" | ")) + QLatin1Char('\n');
+    }
+    return out;
+}
+
+QStringList MainWindow::latePanelHeaders() const {
+    QStringList out;
+    for (int col = 0; col < lateTable_->columnCount(); ++col) {
+        const QTableWidgetItem* item = lateTable_->horizontalHeaderItem(col);
+        out << (item != nullptr ? item->text() : QString());
+    }
+    return out;
 }
 
 QString MainWindow::stopPanelSummary() const {
@@ -2397,6 +2545,8 @@ int MainWindow::runActionSelfCheck() {
     }
 
     // ---- 5. 重规划绝不改写车辆物理状态 ----
+    // 规格一 MC-A01：趟字段已退役（#37 删除），这里改断**仍在的**物理事实：
+    // 位置 / 时刻 / 在车货 / 已送达 / 已发生 penalty / 逐单超时账本。
     {
         for (int i = 0; i < 4; ++i) {
             onAdvanceStop();
@@ -2404,52 +2554,94 @@ int MainWindow::runActionSelfCheck() {
         const VehicleState snapshot = state_;
         onSimulateTraffic();
         onReplan();
-        expect(state_.tripNumber == snapshot.tripNumber,
-               QStringLiteral("重规划不得改变车辆所在趟次"));
-        expect(state_.completedTrips == snapshot.completedTrips,
-               QStringLiteral("重规划不得改变已完成趟数"));
+        expect(state_.atNodeId == snapshot.atNodeId,
+               QStringLiteral("重规划不得改变车辆位置"));
+        expect(state_.atTimeMin == snapshot.atTimeMin,
+               QStringLiteral("重规划不得改变车辆时刻"));
+        expect(state_.loadKg == snapshot.loadKg,
+               QStringLiteral("重规划不得改变车上载重"));
+        expect(state_.onboard.size() == snapshot.onboard.size()
+                   && state_.sumOnboard() == snapshot.sumOnboard(),
+               QStringLiteral("重规划不得改变在车货构成（数量 / 合计）"));
         expect(state_.servedStops == snapshot.servedStops,
                QStringLiteral("重规划不得改变已送达计数"));
         expect(state_.incurredPenaltyMin == snapshot.incurredPenaltyMin,
                QStringLiteral("重规划不得改变已发生的 penalty"));
+        expect(state_.deliveredLate.size() == snapshot.deliveredLate.size(),
+               QStringLiteral("重规划不得改变已发生的超时账本"));
     }
 
-    // ---- 6. 装不下 → 整单降载 + 完成后取回（issue #4，轻量可见检查）----
+    // ---- 6. 「在 A 装满后」触发降载 + 同车取回（MC-E08 / MC-A09）----
     // 放在最后：前五段的断言依赖"全新状态 + 恰有一张紧急单"的前提，而本段要
     // 长距离推进（会跨事件刻、抽到插单/路况事件），放在前面会打乱它们的前提。
-    // 插入一张顶到载重上限的紧急单，强制走"降载 → A 取 → B 送 → 取回"分支。
+    //
+    // 构造（MC-E08「在 A 装满后触发」，确定性）：
+    //
+    // 规划器里"在 A 装不下"的判定：新紧急单的取货停靠排在**全部普通停靠之前**
+    //（硬优先），而车上的货属于普通单 ⇒ 其送达都在普通段 ⇒ 在新紧急取货点 A 处
+    // **全部仍在车上**。于是只要：
+    //   ① 车上已有货（在车 = X kg，来自已取未送的普通单）；
+    //   ② 再插一张需求 = 上限 − X + 1 的紧急单（单笔 ≤ 上限，合法）；
+    // A 处装载 = X + (上限 − X + 1) = 上限 + 1，**必然**溢出 1kg ⇒ 降载。
+    // 前提①②都由构造保证，不再是"恰好装不下"的概率条件。
+    // 事件刷出的未完成紧急单会插进紧急段 FIFO、在 A 之前先卸货（把溢出吃掉）
+    // ⇒ 开跑前先把未完成紧急单逐站送完（排空）。
     if (cust.size() >= 2 && !config_.vehicles.empty()) {
         const double cap = config_.vehicles.front().capacityKg;
-        const double freeKg = cap - state_.loadKg;
-        const double offloadDemand = std::floor(cap * 0.6);
-        const bool shouldOffload = !state_.onboard.empty() && offloadDemand > freeKg + 1e-9;
-        // 选 A/B：避开车上已有货的节点——在途货是"整条普通货"的释放候选，
-        // 规划器不会卸掉 A/B 本身的货，撞上它们会让降载凑不齐而判不可行。
-        std::string A;
-        std::string B;
-        for (std::size_t i = 0; i < cust.size() && A.empty(); ++i) {
-            bool iTaken = false;
-            for (const logistics::OnboardItem& it : state_.onboard) {
-                if (it.nodeId == cust[i]) {
-                    iTaken = true;
-                    break;
-                }
-            }
-            if (iTaken) {
-                continue;
-            }
-            for (std::size_t j = 0; j < cust.size(); ++j) {
-                if (j == i) {
-                    continue;
-                }
-                bool jTaken = false;
-                for (const logistics::OnboardItem& it : state_.onboard) {
-                    if (it.nodeId == cust[j]) {
-                        jTaken = true;
+        // 排空 + 等车上有货：事件刷出的紧急单逐站送完；普通货随车推进自然装上。
+        {
+            bool ready = false;
+            for (int i = 0; i < 1200 && !ready && !atRouteEnd(); ++i) {
+                bool pendingUrgent = false;
+                for (const Order& o : config_.orders) {
+                    if (o.urgent && !o.served) {
+                        pendingUrgent = true;
                         break;
                     }
                 }
-                if (jTaken) {
+                if (pendingUrgent) {
+                    onAdvanceStop();   // 紧急单 FIFO 最先，送完即清
+                    continue;
+                }
+                if (state_.loadKg > 0.0) {
+                    ready = true;
+                    break;
+                }
+                onAdvanceStop();       // 车还空着：推进到下一个取货停靠
+            }
+            bool nonePending = true;
+            for (const Order& o : config_.orders) {
+                if (o.urgent && !o.served) {
+                    nonePending = false;
+                    break;
+                }
+            }
+            expect(ready && nonePending && state_.loadKg > 0.0,
+                   QStringLiteral("（前提）未完成紧急单清零且车上有货（在车 %1kg）")
+                       .arg(state_.loadKg, 0, 'f', 0));
+        }
+        // 在车货必须是**普通单**的货（其送达在普通段 ⇒ 在新紧急 A 处仍在车上）。
+        // 紧急段已排空 ⇒ 车上的货必然全部来自普通单，此断言只是把前提显式化。
+        bool onboardAllNormal = true;
+        for (const logistics::OnboardItem& it : state_.onboard) {
+            const Order* o = findOrderById(it.orderId);
+            if (o == nullptr || o->urgent) {
+                onboardAllNormal = false;
+            }
+        }
+        expect(onboardAllNormal,
+               QStringLiteral("（前提）在车货全部属于普通单（送达在普通段，A 处仍在车上）"));
+        const double overflowDemand = cap - state_.loadKg + 1.0;
+        expect(overflowDemand <= cap + 1e-9,
+               QStringLiteral("（前提）溢出单需求 %1kg ≤ 上限 %2kg（单笔合法）")
+                   .arg(overflowDemand, 0, 'f', 0)
+                   .arg(cap, 0, 'f', 0));
+        // 选 A/B：任意两个不同客户点（紧急段已排空 ⇒ 不存在可并入的既有紧急停靠）。
+        std::string A;
+        std::string B;
+        for (std::size_t i = 0; i < cust.size() && A.empty(); ++i) {
+            for (std::size_t j = 0; j < cust.size(); ++j) {
+                if (j == i) {
                     continue;
                 }
                 A = cust[i];
@@ -2457,22 +2649,45 @@ int MainWindow::runActionSelfCheck() {
                 break;
             }
         }
-        if (A.empty()) {
-            A = cust.front();
-            B = cust[cust.size() > 1 ? 1 : 0];
-        }
-        const std::string id = insertOrderAt(A, B, offloadDemand, true,
+        const std::string id = insertOrderAt(A, B, overflowDemand, true,
                                             logistics::OrderSource::ManualUrgent, currentTimeMin());
-        expect(!id.empty(), QStringLiteral("接近满载的紧急取送单应插入成功"));
+        expect(!id.empty(), QStringLiteral("A 装满后溢出的紧急取送单应插入成功"));
         if (!id.empty()) {
-            // 计划层（确定性）：降载账本的暂存守恒与载重不变量。
-            // 规格一 MC-A09：降载记在 RoutePlan::offloads（OffloadLeg 账本），不再挂在"趟"上。
-            bool hasOffload = !plan_.offloads.empty();
+            // 计划层（确定性）：A 装满后溢出 ⇒ **必然**出现降载记录。
+            expect(!plan_.offloads.empty(),
+                   QStringLiteral("A 装满后溢出 1kg ⇒ 应出现降载记录"
+                                  "（在车 %1kg + 需求 %2kg > 上限 %3kg）")
+                       .arg(state_.loadKg, 0, 'f', 0)
+                       .arg(overflowDemand, 0, 'f', 0)
+                       .arg(cap, 0, 'f', 0));
             bool conserve = true;
             bool loadOk = true;
+            bool sameVehicleCustody = true;
             for (const logistics::OffloadLeg& leg : plan_.offloads) {
                 if (leg.reclaimTimeMin < 0) {
                     conserve = false;   // 期末必须已取回（暂存守恒）
+                }
+                if (leg.reclaimTimeMin >= 0 && leg.reclaimTimeMin < leg.offloadTimeMin) {
+                    sameVehicleCustody = false;   // 取回必须晚于卸下
+                }
+                // MC-A09 同车卸同车取：取回动作必须出现在**同一条路线**的某停靠里。
+                bool reclaimSeen = false;
+                for (const logistics::Stop& st : plan_.stops) {
+                    if (st.nodeId != leg.station) {
+                        continue;
+                    }
+                    for (const std::string& rid : st.reclaims) {
+                        if (rid == leg.orderId) {
+                            reclaimSeen = true;
+                            break;
+                        }
+                    }
+                    if (reclaimSeen) {
+                        break;
+                    }
+                }
+                if (!reclaimSeen) {
+                    sameVehicleCustody = false;
                 }
             }
             for (const logistics::Stop& st : plan_.stops) {
@@ -2480,14 +2695,11 @@ int MainWindow::runActionSelfCheck() {
                     loadOk = false;
                 }
             }
-            if (shouldOffload) {
-                expect(hasOffload, QStringLiteral("装不下时应出现降载记录"));
-            }
-            if (hasOffload) {
-                expect(conserve, QStringLiteral("暂存守恒：每条降载记录期末都已取回"));
-                expect(loadOk, QStringLiteral("停靠离站在车量不超过上限"));
-            }
-            // 推进到结束：全程载重不超限
+            expect(conserve, QStringLiteral("暂存守恒：每条降载记录期末都已取回"));
+            expect(sameVehicleCustody,
+                   QStringLiteral("MC-A09：降载与取回在同一条路线（同车卸、同车取），不是转运"));
+            expect(loadOk, QStringLiteral("停靠离站在车量不超过上限"));
+            // 推进到结束：全程载重不超限 + 中转站面板逐帧反映物理状态
             bool traceOk = true;
             double maxLoad = 0.0;
             std::string maxNode;
@@ -2550,6 +2762,24 @@ int MainWindow::runActionSelfCheck() {
             if (!state_.appliedOffloads.empty()) {
                 expect(runLogText().contains(QStringLiteral("降载")),
                        QStringLiteral("执行降载后日志应出现「降载」"));
+                // MC-A09 用户可见证据：同一张降载单的「卸下」与「取回」都出现在
+                // 这台车的运行日志里（规格一只有一台车；转运的「卸入车 ≠ 取走车」
+                // 归规格二 #41，本票不建转运面板）。
+                bool custodyOk = true;
+                for (const VehicleState::OffloadKey& key : state_.appliedOffloads) {
+                    const QString unloadMark =
+                        QStringLiteral("卸下订单 %1 ").arg(QString::fromStdString(key.orderId));
+                    const QString reclaimMark =
+                        QStringLiteral("取回订单 %1 ").arg(QString::fromStdString(key.orderId));
+                    if (!runLogText().contains(unloadMark)
+                        || !runLogText().contains(reclaimMark)) {
+                        custodyOk = false;
+                    }
+                }
+                expect(custodyOk,
+                       QStringLiteral("MC-A09 卸货车 == 取回车：同一张单同车卸下、同车取回"));
+                expect(state_.stashItems.empty(),
+                       QStringLiteral("期末暂存堆清空：暂存货已由同一台车全部取回"));
             }
         }
     }

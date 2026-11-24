@@ -248,15 +248,44 @@ int main(int argc, char** argv) {
         check(parseSummary(out, p, lines), tag + "：--plan-summary 输出四行且可解析");
 
         // ---- G1：标签 / 单位 / 顺序与 §6.3 逐字一致 ----
+        // #37 扩展：把 §6.3 的**分隔符**也纳入有序 token（「站 · 动作」「（」「；」），
+        // 标签被静默改名/改分隔符（不只是被删）同样会红。
         const std::vector<std::string> tokens1 = {"总距离", "km", "总耗时", "min", "总成本", "元",
-                                                  "总 penalty", "min", "停靠", "站", "动作", "次"};
+                                                  "总 penalty", "min", "停靠", "站 · 动作", "次"};
         const std::vector<std::string> tokens2 = {
-            "取货准时率", "%", "送达准时率", "%", "紧急", "普通", "平均在车", "kg",
-            "利用率", "%", "峰值", "kg"};
+            "取货准时率", "%", "） | 送达准时率", "；紧急 ", "普通 ", "平均在车", "kg",
+            "利用率 ", "% · 峰值 ", "kg"};
         if (lines.size() >= 4) {
             checkOrdered(lines[0], tokens1, tag + "·G1 第1行");
             checkOrdered(lines[1], tokens2, tag + "·G1 第2行");
             check(lines[2].rfind("超时订单：", 0) == 0, tag + "·G1 第3行以「超时订单：」开头");
+            // §6.3 第 3 行逐字：无迟到单时整行为「超时订单：（无）」；
+            // 有迟到单时为 `<订单ID>@<节点ID>(+<n>min)、…`（逐单）。
+            if (g->penaltyMin == 0) {
+                check(lines[2] == "超时订单：（无）",
+                      tag + "·G1 无迟到单时第3行逐字为「超时订单：（无）」");
+            } else {
+                const std::string body = lines[2].substr(std::strlen("超时订单："));
+                bool shapeOk = !body.empty();
+                std::size_t pos = 0;
+                while (pos < body.size()) {
+                    const std::size_t sep = body.find("、", pos);
+                    const std::string one = body.substr(pos, sep == std::string::npos
+                                                                ? std::string::npos
+                                                                : sep - pos);
+                    if (one.find('@') == std::string::npos
+                        || one.find("(+") == std::string::npos
+                        || one.size() < 5
+                        || one.compare(one.size() - 4, 4, "min)") != 0) {
+                        shapeOk = false;
+                    }
+                    if (sep == std::string::npos) {
+                        break;
+                    }
+                    pos = sep + std::strlen("、");
+                }
+                check(shapeOk, tag + "·G1 第3行逐单格式 `ID@节点(+nmin)、…`");
+            }
             check(lines[3].rfind("路线", 0) == 0, tag + "·G1 第4行以「路线」开头");
         }
 

@@ -38,8 +38,8 @@ public:
     // 这一组数据是**唯一权威**。重规划会整个重建 plan_，但**绝不允许**改写这里任何一项。
     //
     // 本项目反复栽在同一件事上：某个物理事实被"从当前计划反推"，于是重规划一发生，
-    // 它就变错 —— 趟号塌成「第 1 趟」、「已送达」归零、「停靠 N 站」缩水、
-    // 已发生的 penalty 消失、「本趟装载」被重算、在途货被反复寄存。
+    // 它就变错 —— 「已送达」归零、「停靠 N 站」缩水、
+    // 已发生的 penalty 消失、在途货被反复寄存。
     //
     // 规则（新增功能时请遵守）：
     //   · 只有车辆**真的做了什么**才能改它 —— 装载 / 到达 / 送达，全部发生在
@@ -59,13 +59,9 @@ public:
         double                              loadKg = 0.0;
         std::vector<logistics::OnboardItem> onboard;
 
-        // 趟次（规格一 MC-A01：趟结构已退役，单条连续路线 ⇒ 恒为第 1 趟）
-        // 三个字段保留**只为界面文案与探针不改造**（列数与文本归 #37）；
-        // 语义固定为「1 / 出发时装载 / 是否已驶离」。
-        int    tripNumber = 1;            // 恒为 1
-        double tripLoadKg = 0.0;          // 出发时装载（驶离后冻结）
-        bool   departed = false;          // 是否已驶离
-        int    completedTrips = 0;        // 恒为 0（单条路线不"跑完几趟"）
+        // 趟次结构已退役（规格一 MC-A01，界面与探针已由 #37 改造）。
+        // 「是否已驶离」保留：回仓库后置 false，是**物理事实**（重规划不得改写）。
+        bool   departed = false;          // 是否已驶离出发点
 
         // 累计量
         int    servedStops = 0;           // 已送达停靠点总数
@@ -88,7 +84,7 @@ public:
         // 已执行过的降载键（issue #4），防止 S 一趟出现两次时重复执行。
         // 结构化键取代旧的「站@点@kg」分隔符字符串：kg 存 lround 后的整数值，
         // 比较口径与旧字符串键一致（同站同点同整数 kg 视为同一件事）。
-        // 取回不再进这个键（由本趟 pickups/reclaim 状态单独判定，reclaim 字段已退役）。
+        // 取回不再进这个键（由本停靠动作集 pickups/reclaims 单独判定）。
         // 同样是**物理事实**，跨重规划保留。
         // 降载去重键（规格一 MC-A05：按**订单**记账）。同一张单的降载只发生一次。
         struct OffloadKey {
@@ -163,8 +159,17 @@ public:
     // 中转站面板**真实表头**（供 --ui-probe 校验「当前暂存货」列确实在界面上）。
     // 与 stopPanelHeaders() 同理：守卫读界面上真正的列名，不背预期清单。
     QStringList transitPanelHeaders() const;
+    // 超时订单面板**应有**的行数 = 已经发生的迟到单 + 剩余计划预计迟到单。
+    // 读的是 `RoutePlan::metrics.orders`（规划器逐单真源）+ `deliveredLate`，
+    // 供 --ui-probe 校验「行数 == 迟到订单数」（G10）——不是把面板公式重算一遍。
+    int lateOrderCount() const;
     // 停靠明细面板的文本快照（供 --ui-probe）
     QString stopPanelSummary() const;
+    // 路线信息面板的文本快照（供 --ui-probe 校验三项新指标与「停靠·动作」片段）
+    QString routePanelSummary() const;
+    // 超时订单面板的文本快照与**真实表头**（供 --ui-probe 校验 8 列 / 逐单一行）
+    QString     latePanelSummary() const;
+    QStringList latePanelHeaders() const;
     // 停靠明细面板**真实表头**（供 --ui-probe 校验表头与数据不错位）。
     // 守卫必须读界面上真正的列名，而不是把预期列表再背一遍——本项目
     // 正是因此漏过"表头 7 列、数据只填 6 列"的错位。
@@ -172,15 +177,13 @@ public:
     // 工具栏动作名与面板标题（供 --ui-probe，供向导检查器比对）
     QString toolbarActionTexts() const;
     QString dockTitles() const;
-    // 当前规划的趟数（供 --ui-probe 核对停靠明细的趟号）
-    int     tripCount() const;
-    // 已经跑完的趟数（趟号的偏移量）
-    int     completedTripOffset() const;
-    // 本趟装载量（供 --self-check-actions 核对）
-    double  currentTripLoadKg() const { return state_.tripLoadKg; }
-    // 车辆信息面板的文本快照（供 --ui-probe）
+    // 车辆信息面板的文本快照（供 --ui-probe；**每车**页签都收进来）
     QString vehiclePanelSummary() const;
-    // 车辆信息的页签数与标题（供 --ui-probe 核对"固定信息 / 运行状态"确实分开了）
+    // 第 index 个车辆页签的完整文本（页签标题 + 固定信息块 + 运行状态块）；
+    // --ui-probe 逐车核对 ID/容量/两因子/载重上限时按此读，免去切页状态影响。
+    QString vehiclePanelSection(int index) const;
+    // 车辆信息的页签数与标题（供 --ui-probe 核对页签数 == vehicles.size()，
+    // 每页标题 = `<车辆 ID> · <容量>kg`）
     int     vehicleTabCount() const;
     QString vehicleTabTitles() const;
     // 状态栏"软件内时间"的文本快照（供 --ui-probe 断言它确实常驻可见）
@@ -272,16 +275,19 @@ private:
     void reportRouteFinishedOnce();       // 终点只播报一次（消除原来每 tick 重复刷的噪音）
 
     std::string        currentPositionId() const;
-    QString            orderIdsAt(const std::string& nodeId) const;
     // 某张订单的货量（降载/取回日志用；按订单查，不按节点查）。
     double             orderKg(const std::string& orderId) const;
-    // 车辆**当前**载着的货量（随送达递减），不是本趟出发时的装载量
+    // 按 ID 查订单（只读；找不到返回 nullptr）。
+    const logistics::Order* findOrderById(const std::string& orderId) const;
+    // 车辆**当前**载着的货量（随送达递减），不是出发时装载量
     double             currentLoadKg() const;
+    // 在车明细的**一行文本**（`O01:20kg@D01` 顿号相连；空车记「（空）」）。
+    // 「运行状态」块显示构成，不只是总量。
+    QString            onboardGoodsText() const;
     // 车辆此刻**已经载在车上**的货（显式状态，不从计划反推）。
     // 重规划时交给规划器，才能让它知道"车不是空的"。
     std::vector<logistics::OnboardItem> onboardGoods() const;
     void               onShowGraphTables();
-    QString            windowTextAt(const std::string& nodeId) const;
     int                currentTimeMin() const;
     std::vector<logistics::Order> remainingOrders() const;
 
@@ -314,25 +320,13 @@ private:
 
     // ---- 重规划必须继承的"既定事实" ----
     //
-    // 重规划会重建整个计划，但有两件事在物理上早已确定，不该被抹掉：
-    //   · completedTrips_：已经跑完了几趟（即回过几次仓库）。趟号要接着往下编，
-    //     否则跑一段时间后最上面一行又变回「第 1 趟」，与"已经完成 2 趟"的事实矛盾。
-    //   · currentTripLoadKg_：本趟**出发时**装了多少。一旦驶离仓库，这一趟的装载量
-    //     就不会再变了；重规划把它重算，会得到与事实不符的值。
-    // 物理事实：车回过几次仓库（= 跑完了几趟）。
-    // **不能**用"计划内游标 curTrip"来推：Debug 每 tick 都重规划，
-    // nodeIndex_ 随之归零，curTrip 永远是 0，偏移量就永远加 0。
-    // 本趟是否已经驶离出发点。不能用"车辆是否停在该趟起点"来判断：
-    // 重规划后车辆恰好位于新计划的起点，会被误判成"还没出发"，
-    // 于是本趟装载被重算成与事实不符的值。
-
-    // 同样是"既定事实"，不能从 plan_ 反推：
-    //   · servedStopsBase_：本次计划之前**已经送达**的停靠点数。
+    // 重规划会重建整个计划，但以下各项在物理上早已确定，不能从 plan_ 反推：
+    //   · servedStops_：本次计划之前**已经送达**的停靠点数。
     //     重规划后 plan_.stops 只剩"剩余要送的"，若不记账，
     //     界面上的「已送达」会归 0、「停靠 N 站」会缩水成剩余数。
     //   · incurredPenaltyMin_：**已经发生**的超时惩罚合计。
     //     重规划只算剩余计划的 penalty，不记账的话总数会往回跳。
-    //   · deliveredLate_：已送达且超时的停靠点（订单/配送点/到达/窗口/penalty），
+    //   · deliveredLate_：已送达且超时的订单（逐单：订单/配送点/到达/penalty），
     //     供"超时订单"表区分「已经超时」与「预计会超时」。
     struct LateStop {
         std::string orderId;
@@ -349,21 +343,16 @@ private:
     // 因此**没有** loadForTrip / loadForCurrentTrip（规格一 MC-A01/MC-A02 退役）。
     // 换计划后的统一收尾（三处重规划路径共用）
     void afterPlanReplaced();
-    // 到达：更新位置与时刻；车回到仓库 = 一趟跑完，推进趟次并装载下一趟
+    // 到达：更新位置与时刻（回到仓库只是"已驶离"复位，趟结构已退役）
     void arriveAt(const std::string& nodeId, int timeMin);
     // 送达：把该点的货从车上卸下、记账（含超时惩罚与已送达计数）
     void deliverAt(const logistics::Stop& stop);
-    // 换计划时应把多少"已完成趟"并进 completedTrips_：
-    //   · 车在仓库且不是初始位置 -> 刚跑完的那一趟已经结束，记 curTrip + 1
-    //   · 否则（途中）-> 当前这一趟还没跑完，只记 curTrip
-    // 不能一律用 curTrip：车停在仓库时，它的 nodeTripIndex 指向的正是
-    // "它刚跑完的那一趟"（该趟终点就是仓库），用 curTrip 会少记一趟，
-    // 于是趟号永远停在「第 1 趟」——这正是人工测试反馈的现象。
+
     QTextBrowser*  routeInfo_ = nullptr;
-    // 车辆信息分两页签：固定信息（固有参数）/ 运行状态（随模拟变化）
+    // 车辆信息（MC-E04）：**每车一个页签**，页签数 == config_.vehicles.size()，
+    // 标题 = `<车辆 ID> · <容量>kg`；每页内再分「固定信息 / 运行状态」两块标题。
+    // 两块都是 QLabel（PlainText），文本由 updatePanels 按车重建。
     QTabWidget*    vehicleTabs_ = nullptr;
-    QLabel*        vehicleFixedInfo_ = nullptr;
-    QLabel*        vehicleStateInfo_ = nullptr;
     // 状态栏上的**软件内时间**：它是这套模拟的核心驱动量（事件刻、订单窗口、
     // penalty 全按它算），但此前只出现在日志里，一滚就看不见了。
     QLabel*        clockLabel_ = nullptr;
