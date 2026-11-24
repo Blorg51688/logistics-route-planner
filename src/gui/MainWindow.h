@@ -80,6 +80,10 @@ public:
         // 已取货但未送达的紧急取送单（订单 id）：用于"执行中（已取未送）"状态显示，
         // 以及防止重规划后重复装同一包裹。它是**物理事实**，跨重规划保留。
         std::set<std::string> pickedOrderIds;
+        // 该车**已经送达**的订单 ID（物理事实，跨重规划保留）。
+        // 等价性守卫 A2 要「已送达订单集合（按车分组）」——分组只能读这里，
+        // 不能从当前计划反推（重规划会换掉计划，已送完的单就不在计划里了）。
+        std::set<std::string> deliveredOrderIds;
 
         // 已执行过的降载键（issue #4），防止 S 一趟出现两次时重复执行。
         // 结构化键取代旧的「站@点@kg」分隔符字符串：kg 存 lround 后的整数值，
@@ -199,6 +203,12 @@ public:
     // 列出某目录下"算作自动日志"的文件（按名升序 = 时间戳升序）。静态、不写盘，
     // 供 --self-check-actions 核对命名判定与淘汰规则。
     static QStringList autoLogCandidates(const QString& dir);
+    // GUI 侧的三阶段分配快照（§6.6 / 本票的 GUI↔CLI 一致性守卫）：
+    // 格式与 CLI `--dump-plan` 的 ALLOC 行**同序同形**（订单 ID 升序、`O01=V01,…`）。
+    // 只在「初始规划 / 全车队重调度」走 planFleet 时更新；途中重规划不改分配，
+    // 因此它始终是**这一局车队分配**的用户可见证据（--ui-probe 会打印它）。
+    QString allocationSnapshot() const { return allocationSnapshot_; }
+
     // 转运账本面板（规格二 §7.5⑥）：7 列表头与**已执行**逐笔内容的文本快照。
     // 供 --ui-probe 校验表头与 --self-check-actions 校验「两端非空 / in≠out / dwell≤60 / 期末0」。
     QString     transitLedgerSummary() const;
@@ -382,8 +392,30 @@ private:
     void advanceFleetTo(int targetMin);
     // 该车前进一个节点并执行该节点的动作集（唯一的状态转移点）
     void onAdvanceStopFor(std::size_t v);
-    // 按顺序轮转基线把「剩余未送达订单」重新分给各车，并逐车从当前位置重规划。
+    // 车队规划入口（规格二 §6）：
+    //   · **初始规划 / 全车队重调度**（车队还没动过）⇒ #40 的三阶段分配 planFleet，
+    //     并把每车计划回填；分配快照进 allocationSnapshot_（与 CLI 的 ALLOC 同源可比）；
+    //   · **途中重规划**（车辆已带位置/时刻/在车货）⇒ **逐车** replan（已执行前缀不重排）。
     void replanFleet();
+    // 车队是否「还没动过」：全部车停在各自仓库、各自发车时刻、车上无货、无暂存、
+    // 没有任何订单被取走/送达。是 ⇒ 走三阶段分配；否 ⇒ 途中重规划。
+    bool fleetPristine() const;
+    // 复调度输入常量（§6.2）：各车当前位置/时刻/在车货/暂存 + 逐车订单集合 +
+    // 逐车剩余路线 + 全队未送达订单 + 站内已执行卸入。
+    logistics::FleetRescheduleInput buildRescheduleInput() const;
+    // 把一次复调度的结果写回：**只**覆盖被重算的车（未受影响车路线逐字不变），
+    // 分级播报行进运行日志（用户可见，守卫读它）。
+    void applyRescheduleResult(const logistics::FleetRescheduleResult& res);
+    // 跑一次复调度（事件 → 五级升级链 → 写回）。返回结果，供调用方播报/守卫。
+    logistics::FleetRescheduleResult runReschedule(const logistics::RescheduleEvent& event);
+    // 单车的计划替换后的统一收尾（游标归零 + 终点播报复位）。
+    void afterVehiclePlanReplaced(std::size_t v);
+    // #41 的转运层作为**后置有界改进**再跑一遍（只在跨簇新单插入后调用：
+    // 判据①跨簇；不改分配，严格更优才替换计划，完全并列保留禁转运版）。
+    void runTransitPostPass();
+    // 分配快照的渲染（FleetPlan -> `O01=V01,…`，订单 ID 升序）。
+    QString allocationTextOf(const logistics::FleetPlan& plan) const;
+    QString allocationSnapshot_;
     logistics::Rng        rng_{20260914u};
     logistics::WeightType planWeight_ = logistics::WeightType::Distance;
 

@@ -589,6 +589,9 @@ void MainWindow::deliverAt(std::size_t v, const logistics::Stop& stop) {
     // 这里只做计数与超时登记，不再按 nodeId 扣货（那样会把同节点别的单一起扣掉）。
     VehicleRuntime& rt = veh(v);
     ++rt.state.servedStops;
+    for (std::size_t d = 0; d < stop.deliveries.size(); ++d) {
+        rt.state.deliveredOrderIds.insert(stop.deliveries[d].orderId);
+    }
     if (stop.late) {
         rt.state.incurredPenaltyMin += stop.penaltyMin;
         for (const logistics::StopDelivery& d : stop.deliveries) {
@@ -674,96 +677,112 @@ void MainWindow::afterPlanReplaced() {
     // 单条连续路线下车辆空载出发、货在取货点 A 装车，重规划后**不需要**装车。
 }
 
-// 车队重规划（规格二 §3 / #39 阶段 4）：**每车一条连续路线**。
+
+// ---- 车队规划的两个入口（规格二 §6 / #42）----
 //
-// 分配仍是顺序轮转基线（#40 会换成类型感知分配，但基线保留作对照）：
-// 剩余未送达订单按 ID 升序、第 i 单 -> 第 (i mod k) 台车；每车从**自己**的
-// 当前位置/时刻、带着**自己**的在车货与暂存货，用**自己的**因子重规划。
-// 每车独立：一车不可行不牵连其它车（allOk 汇总里会点名）。
+// ① **初始规划 / 全车队重调度**：车队还没动过（fleetPristine()）时走 #40 的
+//    三阶段分配 planFleet。这就是 CLI \`--dump-plan\` 的 ALLOC 的**同一条**代码路径，
+//    所以界面上的分配与命令行逐单一致（守卫：runActionSelfCheck 第 10 段）。
+// ② **途中重规划**：车辆已带位置/时刻/在车货 ⇒ 逐车 replan（已执行前缀不重排，§6.2）。
+//    这条路径**不改分配**：每台车只重算自己手上还没送的那些单。
 void MainWindow::replanFleet() {
     if (config_.vehicles.empty() || fleet_.size() != config_.vehicles.size()) {
         appendLog(QStringLiteral("配置中没有车辆，无法规划"));
         return;
     }
-    // 剩余未送达订单（按 ID 升序 -> 顺序轮转）
-    std::vector<Order> remaining = remainingOrders();
-    for (std::size_t i = 1; i < remaining.size(); ++i) {
-        const Order key = remaining[i];
-        std::size_t j = i;
-        while (j > 0 && key.id < remaining[j - 1].id) {
-            remaining[j] = remaining[j - 1];
-            --j;
-        }
-        remaining[j] = key;
-    }
-    std::vector<std::vector<Order> > assigned(fleet_.size());
-    for (std::size_t i = 0; i < remaining.size(); ++i) {
-        assigned[i % fleet_.size()].push_back(remaining[i]);
-    }
-
-    std::vector<logistics::RoutePlan> plans(fleet_.size());
-    std::vector<logistics::VehicleStartState> starts(fleet_.size());
-    for (std::size_t v = 0; v < fleet_.size(); ++v) {
-        VehicleRuntime& rt = fleet_[v];
-        const logistics::Vehicle& vehicle = config_.vehicles[v];
-        logistics::StashState stash;
-        stash.station = rt.state.stashStation;
-        stash.items = rt.state.stashItems;
+    const std::size_t k = fleet_.size();
+    std::vector<std::vector<Order> > assigned(k);
+    std::vector<logistics::RoutePlan> plans(k);
+    std::vector<logistics::VehicleStartState> starts(k);
+    for (std::size_t v = 0; v < k; ++v) {
+        const VehicleRuntime& rt = fleet_[v];
         starts[v].startNodeId = rt.state.atNodeId;
         starts[v].startTimeMin = rt.state.atTimeMin;
         starts[v].onboard = rt.state.onboard;
-        starts[v].stash = stash;
-        rt.plan = logistics::replan(config_.graph, vehicle, assigned[v], rt.state.atNodeId,
-                                    rt.state.atTimeMin, planWeight_, rt.state.onboard, stash);
-        // 新计划从该车当前位置起算，游标归零；记账在 VehicleState 里（跨重规划保留）。
-        rt.nodeIndex = 0;
-        rt.stopCursor = 0;
-        plans[v] = rt.plan;
-        if (rt.plan.status == logistics::PlanStatus::Ok) {
-            appendLog(QStringLiteral("车 %1 规划成功：%2 站，距离 %3km，耗时 %4min，penalty %5min")
-                          .arg(QString::fromStdString(vehicle.id))
-                          .arg(rt.plan.stops.size())
-                          .arg(rt.plan.totalDistanceKm, 0, 'f', 1)
-                          .arg(rt.plan.totalTimeMin, 0, 'f', 1)
-                          .arg(rt.plan.totalPenaltyMin));
-        } else {
-            appendLog(QStringLiteral("车 %1 规划不可行：%2")
-                          .arg(QString::fromStdString(vehicle.id))
-                          .arg(QString::fromStdString(rt.plan.reason)));
+        starts[v].stash.station = rt.state.stashStation;
+        starts[v].stash.items = rt.state.stashItems;
+    }
+
+    if (fleetPristine()) {
+        // ① 三阶段分配（聚类 -> 整簇全排列 -> 有界改派）
+        const logistics::FleetPlan fp =
+            logistics::planFleet(config_.graph, config_.vehicles, remainingOrders(), planWeight_);
+        for (std::size_t i = 0; i < fp.allocationLog.size(); ++i) {
+            appendLog(QStringLiteral("[分配] %1")
+                          .arg(QString::fromStdString(fp.allocationLog[i])));
+        }
+        allocationSnapshot_ = allocationTextOf(fp);
+        appendLog(QStringLiteral("[分配] 三阶段分配（%1 台车）：%2")
+                      .arg(k)
+                      .arg(allocationSnapshot_));
+        if (!fp.allOk) {
+            appendLog(QStringLiteral("[分配] 三阶段分配存在不可行车辆：%1")
+                          .arg(QString::fromStdString(fp.reason)));
+        }
+        assigned = logistics::vehicleOrdersFromPlans(fp.vehicles, remainingOrders());
+        for (std::size_t v = 0; v < k; ++v) {
+            veh(v).plan = (v < fp.vehicles.size()) ? fp.vehicles[v] : logistics::RoutePlan();
+            afterVehiclePlanReplaced(v);
+            plans[v] = veh(v).plan;
+        }
+    } else {
+        // ② 途中重规划（逐车，已执行前缀不重排）
+        std::vector<logistics::RoutePlan> current(k);
+        for (std::size_t v = 0; v < k; ++v) {
+            current[v] = fleet_[v].plan;
+        }
+        assigned = logistics::vehicleOrdersFromPlans(current, remainingOrders());
+        for (std::size_t v = 0; v < k; ++v) {
+            VehicleRuntime& rt = fleet_[v];
+            rt.plan = logistics::replan(config_.graph, config_.vehicles[v], assigned[v],
+                                        rt.state.atNodeId, rt.state.atTimeMin, planWeight_,
+                                        rt.state.onboard, starts[v].stash);
+            afterVehiclePlanReplaced(v);
+            plans[v] = rt.plan;
         }
     }
-    // ---- 后置有界改进 · 跨车转运（规格二 §5 / #28）----
-    //
-    // 基线 = 上面按「顺序轮转 + 逐车 replan」得到的禁转运版（转运层不改分配）。
-    // 三条判据静态全不触发时它一行候选都不构造（默认数据零开销）。
-    // 接受 = 目标三键严格更优；完全并列保留禁转运版。
+
+    // ---- 后置有界改进 · 跨车转运（规格二 §5 / #28）：与 CLI 同一层，绝不更差 ----
     {
         const logistics::FleetTransitResult transit = logistics::applyTransitLayer(
             config_.graph, config_.vehicles, assigned, plans, starts, planWeight_);
         if (transit.acceptedRounds > 0) {
-            for (std::size_t v = 0; v < fleet_.size(); ++v) {
-                veh(v).plan = transit.plans[v];
-                veh(v).nodeIndex = 0;
-                veh(v).stopCursor = 0;
-                plans[v] = veh(v).plan;
+            for (std::size_t v = 0; v < k; ++v) {
+                if (v < transit.plans.size()) {
+                    veh(v).plan = transit.plans[v];
+                    afterVehiclePlanReplaced(v);
+                    plans[v] = veh(v).plan;
+                }
             }
         }
         for (std::size_t i = 0; i < transit.log.size(); ++i) {
-            appendLog(QStringLiteral("[转运] %1")
-                          .arg(QString::fromStdString(transit.log[i])));
+            appendLog(QStringLiteral("[转运] %1").arg(QString::fromStdString(transit.log[i])));
         }
     }
     fleetPlan_ = logistics::aggregateFleet(config_.vehicles, plans);
-    for (std::size_t v = 0; v < fleet_.size(); ++v) {
+    for (std::size_t v = 0; v < k; ++v) {
+        const logistics::Vehicle& vehicle = config_.vehicles[v];
+        const logistics::RoutePlan& plan = veh(v).plan;
+        if (plan.status == logistics::PlanStatus::Ok) {
+            appendLog(QStringLiteral("车 %1 规划成功：%2 站，距离 %3km，耗时 %4min，penalty %5min")
+                          .arg(QString::fromStdString(vehicle.id))
+                          .arg(plan.stops.size())
+                          .arg(plan.totalDistanceKm, 0, 'f', 1)
+                          .arg(plan.totalTimeMin, 0, 'f', 1)
+                          .arg(plan.totalPenaltyMin));
+        } else {
+            appendLog(QStringLiteral("车 %1 规划不可行：%2")
+                          .arg(QString::fromStdString(vehicle.id))
+                          .arg(QString::fromStdString(plan.reason)));
+        }
         if (!vehAtEnd(v)) {
             routeFinishedReported_ = false;
-            break;
         }
     }
     if (fleetPlan_.allOk) {
         appendLog(QStringLiteral("车队规划完成：%1 台车，完工耗时 %2min（车时合计 %3min），"
                                  "总距离 %4km，总成本 %5 元，penalty %6min")
-                      .arg(fleet_.size())
+                      .arg(k)
                       .arg(fleetPlan_.completionTimeMin, 0, 'f', 1)
                       .arg(fleetPlan_.sumVehicleTimeMin, 0, 'f', 1)
                       .arg(fleetPlan_.totalDistanceKm, 0, 'f', 1)
@@ -773,6 +792,177 @@ void MainWindow::replanFleet() {
         appendLog(QStringLiteral("车队规划有不可行车辆：%1")
                       .arg(QString::fromStdString(fleetPlan_.reason)));
     }
+    syncScene();
+    updatePanels();
+}
+
+// 车队是否「还没动过」：全部车停在各自仓库、各自发车时刻、车上无货、无暂存，
+// 且没有任何订单被取走/送达。是 ⇒ 初始规划 / 全车队重调度（走三阶段分配）。
+bool MainWindow::fleetPristine() const {
+    for (std::size_t v = 0; v < fleet_.size(); ++v) {
+        const VehicleRuntime& rt = fleet_[v];
+        const logistics::Vehicle& vehicle = config_.vehicles[v];
+        if (rt.state.atNodeId != vehicle.startNodeId) {
+            return false;
+        }
+        if (rt.state.atTimeMin != vehicle.departTimeMin) {
+            return false;
+        }
+        if (rt.state.departed || rt.nodeIndex != 0 || rt.stopCursor != 0) {
+            return false;
+        }
+        if (!rt.state.onboard.empty() || !rt.state.stashItems.empty()) {
+            return false;
+        }
+        if (rt.state.servedStops != 0) {
+            return false;
+        }
+    }
+    for (std::size_t i = 0; i < config_.orders.size(); ++i) {
+        if (config_.orders[i].served || config_.orders[i].picked) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 分配快照：与 CLI \`--dump-plan\` 的 ALLOC 行**同序同形**（订单 ID 升序、\`O01=V01,…\`）。
+QString MainWindow::allocationTextOf(const logistics::FleetPlan& plan) const {
+    QString out;
+    for (std::size_t i = 0; i < plan.allocationOrderIds.size(); ++i) {
+        if (!out.isEmpty()) {
+            out += QLatin1Char(',');
+        }
+        out += QString::fromStdString(plan.allocationOrderIds[i]) + QLatin1Char('=');
+        const std::size_t v = plan.allocationVehicleIndex[i];
+        out += (v < config_.vehicles.size())
+                   ? QString::fromStdString(config_.vehicles[v].id)
+                   : QStringLiteral("-");
+    }
+    return out;
+}
+
+// 单车的计划替换后的统一收尾：新计划从该车当前位置起算，游标归零。
+void MainWindow::afterVehiclePlanReplaced(std::size_t v) {
+    if (v >= fleet_.size()) {
+        return;
+    }
+    veh(v).nodeIndex = 0;
+    veh(v).stopCursor = 0;
+    if (!vehAtEnd(v)) {
+        routeFinishedReported_ = false;
+    }
+}
+
+// 复调度输入常量（§6.2）：各车当前位置/时刻/在车货/暂存 + 逐车订单集合 +
+// 逐车**剩余**路线（R1 的重放来源）+ 全队未送达订单 + 站内已执行卸入。
+logistics::FleetRescheduleInput MainWindow::buildRescheduleInput() const {
+    logistics::FleetRescheduleInput in;
+    const std::size_t k = fleet_.size();
+    in.starts.resize(k);
+    in.remainingPlans.resize(k);
+    for (std::size_t v = 0; v < k; ++v) {
+        const VehicleRuntime& rt = fleet_[v];
+        in.starts[v].startNodeId = rt.state.atNodeId;
+        in.starts[v].startTimeMin = rt.state.atTimeMin;
+        in.starts[v].onboard = rt.state.onboard;
+        in.starts[v].stash.station = rt.state.stashStation;
+        in.starts[v].stash.items = rt.state.stashItems;
+        in.remainingPlans[v] = logistics::sliceRemainder(rt.plan, rt.nodeIndex);
+    }
+    in.allRemainingOrders = remainingOrders();
+    in.vehicleOrders =
+        logistics::vehicleOrdersFromPlans(in.remainingPlans, in.allRemainingOrders);
+    // 站内**已执行**的转运卸入（只含真的执行过的卸入；计划期候选不在这里）。
+    for (std::size_t i = 0; i < transitLedger_.size(); ++i) {
+        const TransitLedgerEntry& entry = transitLedger_[i];
+        if (entry.pickedUp || entry.delivered) {
+            continue;
+        }
+        const logistics::Order* order = findOrderById(entry.orderId);
+        if (order == nullptr) {
+            continue;
+        }
+        logistics::ExecutedTransitEntry item;
+        item.leg.orderId = entry.orderId;
+        item.leg.stationId = entry.stationId;
+        item.leg.kg = entry.kg;
+        item.leg.inVehicleId = entry.inVehicleId;
+        item.leg.inTimeMin = entry.inTimeMin;
+        item.leg.outVehicleId = entry.outVehicleId;
+        item.leg.outTimeMin = entry.outTimeMin;
+        item.order = *order;
+        in.executedInStation.push_back(item);
+    }
+    return in;
+}
+
+// 把一次复调度的结果写回：**只**覆盖被重算的车（未受影响车路线逐字不变，不变量 5）。
+// 分级播报行进运行日志——那是用户看得到的东西，守卫读它，不读内部字段。
+void MainWindow::applyRescheduleResult(const logistics::FleetRescheduleResult& res) {
+    for (std::size_t i = 0; i < res.replanned.size(); ++i) {
+        const std::size_t v = res.replanned[i];
+        if (v >= fleet_.size() || v >= res.plans.size()) {
+            continue;
+        }
+        if (res.plans[v].nodes.empty()) {
+            continue;   // 不拿空计划覆盖现有计划（拒绝路径不能留下半成品）
+        }
+        veh(v).plan = res.plans[v];
+        afterVehiclePlanReplaced(v);
+    }
+    for (std::size_t i = 0; i < res.log.size(); ++i) {
+        appendLog(QString::fromStdString(res.log[i]));
+    }
+    std::vector<logistics::RoutePlan> plans;
+    plans.reserve(fleet_.size());
+    for (std::size_t v = 0; v < fleet_.size(); ++v) {
+        plans.push_back(veh(v).plan);
+    }
+    fleetPlan_ = logistics::aggregateFleet(config_.vehicles, plans);
+    syncScene();
+    updatePanels();
+}
+
+logistics::FleetRescheduleResult MainWindow::runReschedule(
+    const logistics::RescheduleEvent& event) {
+    logistics::FleetRescheduleResult res;
+    if (config_.vehicles.empty()) {
+        return res;
+    }
+    const logistics::FleetRescheduleInput in = buildRescheduleInput();
+    res = logistics::rescheduleFleet(config_.graph, config_.vehicles, planWeight_, in, event);
+    applyRescheduleResult(res);
+    return res;
+}
+
+// #41 的转运层作为后置有界改进再跑一遍（只在**跨簇**新单插入后调用）。
+// 它不改分配、不改构造器，只在整计划键**严格更优**时替换；完全并列保留禁转运版。
+void MainWindow::runTransitPostPass() {
+    if (config_.vehicles.empty() || fleet_.size() != config_.vehicles.size()) {
+        return;
+    }
+    const logistics::FleetRescheduleInput in = buildRescheduleInput();
+    std::vector<logistics::RoutePlan> plans = in.remainingPlans;
+    const logistics::FleetTransitResult transit = logistics::applyTransitLayer(
+        config_.graph, config_.vehicles, in.vehicleOrders, plans, in.starts, planWeight_);
+    for (std::size_t i = 0; i < transit.log.size(); ++i) {
+        appendLog(QStringLiteral("[转运] %1").arg(QString::fromStdString(transit.log[i])));
+    }
+    if (transit.acceptedRounds > 0) {
+        for (std::size_t v = 0; v < fleet_.size() && v < transit.plans.size(); ++v) {
+            if (transit.plans[v].nodes.empty()) {
+                continue;
+            }
+            veh(v).plan = transit.plans[v];
+            afterVehiclePlanReplaced(v);
+        }
+    }
+    std::vector<logistics::RoutePlan> full;
+    for (std::size_t v = 0; v < fleet_.size(); ++v) {
+        full.push_back(veh(v).plan);
+    }
+    fleetPlan_ = logistics::aggregateFleet(config_.vehicles, full);
     syncScene();
     updatePanels();
 }
@@ -826,53 +1016,33 @@ void MainWindow::simulateTrafficAction(int atMin) {
             .arg(congestedCount)
             .arg(clearedCount));
 
-    // 受影响车集合（规格二 §6.5 的可执行判据的最小版）：**任一**车的剩余路线被命中
-    // 即触发；随后逐车各自走"顺序不变版重放 -> 全量重算"（#42 的五级升级链不在此票）。
-    bool trigger = false;
-    for (std::size_t v = 0; v < fleet_.size(); ++v) {
-        if (logistics::needsReplan(veh(v).plan.nodes, report,
-                                   config_.general.trafficTimeIncreaseMin)) {
-            trigger = true;
-        }
-    }
-    if (!trigger) {
+    // ---- 受影响车集合（§6.5）+ 复调度（§6.4 五级升级链）----
+    // **不是**「任一车命中就全队重算」：只有剩余路线真的用到被改动边（且增幅达标）的车
+    // 才进集合；未受影响车的路线逐字不变（不变量 5）。
+    const logistics::FleetRescheduleInput in = buildRescheduleInput();
+    const std::vector<std::size_t> affected = logistics::affectedVehiclesForTraffic(
+        in.remainingPlans, report.changes, config_.general.trafficTimeIncreaseMin);
+    if (affected.empty()) {
         log(QStringLiteral("受影响边不在任何车辆的剩余路径上或增幅不足 -> 不触发重规划"));
         syncScene();   // 拥堵标记需要重绘
         return;
     }
-
-    log(QStringLiteral("受影响边位于车辆路径且增幅达标 -> 自动触发重规划"));
-
-    std::vector<logistics::RoutePlan> plans(fleet_.size());
-    for (std::size_t v = 0; v < fleet_.size(); ++v) {
-        VehicleRuntime& rt = fleet_[v];
-        const logistics::Vehicle& vehicle = config_.vehicles[v];
-        // 只把**尚未走完的那一段**交给它；它按停靠点切段、停靠顺序不变，
-        // 重放不可行时内部退回全量重算（规格二 §10 裁定 1）。
-        const logistics::RoutePlan remainder = logistics::sliceRemainder(rt.plan, rt.nodeIndex);
-        bool usedIncremental = false;
-        logistics::StashState stashInc;
-        stashInc.station = rt.state.stashStation;
-        stashInc.items = rt.state.stashItems;
-        rt.plan = logistics::replanIncremental(config_.graph, vehicle, remainingOrders(),
-                                               remainder, fleetClockMin_, planWeight_, report,
-                                               config_.general.trafficTimeIncreaseMin,
-                                               rt.state.onboard, &usedIncremental, stashInc);
-        rt.nodeIndex = 0;
-        rt.stopCursor = 0;
-        plans[v] = rt.plan;
-        if (logistics::needsReplan(remainder.nodes, report,
-                                   config_.general.trafficTimeIncreaseMin)) {
-            log(usedIncremental
-                    ? QStringLiteral("  车 %1：顺序不变版重放（停靠顺序不变，按新边权重重放）")
-                          .arg(QString::fromStdString(vehicle.id))
-                    : QStringLiteral("  车 %1：重放不可行，退回全量重算")
-                          .arg(QString::fromStdString(vehicle.id)));
-        }
+    QStringList names;
+    for (std::size_t i = 0; i < affected.size(); ++i) {
+        names << QString::fromStdString(config_.vehicles[affected[i]].id);
     }
-    fleetPlan_ = logistics::aggregateFleet(config_.vehicles, plans);
-    syncScene();
-    updatePanels();
+    log(QStringLiteral("受影响车集合（%1 台）：%2")
+            .arg(affected.size())
+            .arg(names.join(QStringLiteral("、"))));
+
+    logistics::RescheduleEvent event;
+    event.trigger = logistics::RescheduleTrigger::Traffic;
+    event.changes = report.changes;
+    event.thresholdRatio = config_.general.trafficTimeIncreaseMin;
+    const logistics::FleetRescheduleResult res = runReschedule(event);
+    if (res.rejected) {
+        log(QStringLiteral("  ⚠ 复调度被拒绝：受影响车保持原计划"));
+    }
 }
 
 std::string MainWindow::nextFreeId(const char* prefix) const {
@@ -978,7 +1148,21 @@ std::string MainWindow::insertOrderAt(const std::string& a, const std::string& b
         appendLog(QStringLiteral("  ⚠ %1").arg(QString::fromStdString(inserted.warning)),
                   windowBaseMin);
     }
-    replanFleet();
+    // ---- 新单的分配（§6.6）：**不重算任何既有车**，只对选中的车做插入 ----
+    // cands 按 Δkey 升序（并列按车辆 ID），首个可行即接受；全不可行才进升级链。
+    logistics::RescheduleEvent event;
+    event.trigger = logistics::RescheduleTrigger::NewOrder;
+    event.newOrder = order;
+    const logistics::FleetRescheduleResult res = runReschedule(event);
+    if (res.rejected) {
+        // 不丢单：该单仍在订单集合里、状态为未服务（不变量 14）。
+        appendLog(QStringLiteral("  ⚠ 该单保留未服务状态（各车均无可行插入，不通过违反容量凑解）"),
+                  windowBaseMin);
+    } else if (logistics::isCrossCluster(config_.graph, order)) {
+        // #41 的转运层是「绝不更差」的后置改进，判据①就是跨簇 —— 只在跨簇新单后跑一遍，
+        // **不改分配**（§6.6「局部可行即接受，不做局部 vs 全局两版取优」）。
+        runTransitPostPass();
+    }
     return order.id;
 }
 
@@ -1278,7 +1462,40 @@ void MainWindow::closeRandomRoadAction(int atMin) {
     }
     appendLog(QStringLiteral("模拟道路封闭：%1（含反向）").arg(QString::fromStdString(closed)),
               atMin);
-    replan();
+    // 封路也是事件：受影响车 = 剩余路线**用到**被封闭边（任一方向）的车（§6.5）。
+    logistics::RescheduleEvent event;
+    event.trigger = logistics::RescheduleTrigger::RoadClosure;
+    const std::size_t arrow = closed.find("->");
+    if (arrow != std::string::npos) {
+        logistics::TrafficChange forward;
+        forward.fromId = closed.substr(0, arrow);
+        forward.toId = closed.substr(arrow + 2);
+        logistics::TrafficChange backward;
+        backward.fromId = forward.toId;
+        backward.toId = forward.fromId;
+        event.changes.push_back(forward);
+        event.changes.push_back(backward);
+    }
+    const logistics::FleetRescheduleInput in = buildRescheduleInput();
+    const std::vector<std::size_t> affected =
+        logistics::affectedVehiclesForClosure(in.remainingPlans, event.changes);
+    if (affected.empty()) {
+        appendLog(QStringLiteral("没有车辆的剩余路线用到被封闭的道路 -> 不触发重规划"), atMin);
+        syncScene();
+        return;
+    }
+    QStringList names;
+    for (std::size_t i = 0; i < affected.size(); ++i) {
+        names << QString::fromStdString(config_.vehicles[affected[i]].id);
+    }
+    appendLog(QStringLiteral("受影响车集合（%1 台）：%2")
+                  .arg(affected.size())
+                  .arg(names.join(QStringLiteral("、"))),
+              atMin);
+    const logistics::FleetRescheduleResult res = runReschedule(event);
+    if (res.rejected) {
+        appendLog(QStringLiteral("  ⚠ 复调度被拒绝：受影响车保持原计划"), atMin);
+    }
 }
 
 // 该车前进一个节点并执行该节点的动作集（**唯一的状态转移点**，规格二 §6.1）。
@@ -1836,78 +2053,98 @@ QStringList MainWindow::eventLogLines() const {
     return out;
 }
 
-// 等价性守卫 A2–A7 的终态快照：逐项列出**界面面板同源的事实**
-//（订单表的已送达集合、超时面板的已发生 penalty、车辆面板的在车货、
-//  停靠面板的已执行账本、状态栏的位置与时刻、事件刻）。
-// 刻意不调用 nodeIndexAtTime 这类"显示用"函数反推——那会把断言变成自证。
+// 等价性守卫 A2–A7 的终态快照（**车队口径**，规格二 §6.10）：
+//   A2 已送达订单集合（按车分组）   A3 各车已发生 penalty   A4 各车在车货
+//   A5 站内已执行账本 + 各车物理账本   A6 各车位置与时刻   A7 nextEventMark_
+// 全部读与界面上同一份物理事实（VehicleState / 转运账本 / 车队时钟），
+// 刻意**不调用 nodeIndexAtTime** —— 那是显示函数，拿它反推等于自证。
 QString MainWindow::equivalenceSnapshot() const {
     QString out;
-
-    // A2 已送达订单集合（订单表「状态」列的数据源）
-    QStringList served;
-    for (const Order& order : config_.orders) {
-        if (order.served) {
-            served << QString::fromStdString(order.id);
+    for (std::size_t v = 0; v < fleet_.size(); ++v) {
+        const VehicleRuntime& rt = fleet_[v];
+        const QString id = QString::fromStdString(config_.vehicles[v].id);
+        // A2 该车已送达订单集合（按车分组；物理事实，不从计划反推）
+        QStringList served;
+        for (const std::string& orderId : rt.state.deliveredOrderIds) {
+            served << QString::fromStdString(orderId);
         }
+        out += QStringLiteral("A2 %1 已送达: %2\n").arg(id).arg(served.join(QLatin1Char(',')));
+        // A3 该车已发生 penalty（含逐单已发生超时明细）
+        out += QStringLiteral("A3 %1 已发生 penalty: %2 min\n")
+                   .arg(id)
+                   .arg(rt.state.incurredPenaltyMin);
+        QStringList lateList;
+        for (const VehicleState::LateStop& late : rt.state.deliveredLate) {
+            lateList << QStringLiteral("%1@%2:+%3")
+                            .arg(QString::fromStdString(late.orderId))
+                            .arg(QString::fromStdString(late.nodeId))
+                            .arg(late.penaltyMin);
+        }
+        out += QStringLiteral("A3 %1 已发生超时明细: %2\n").arg(id).arg(lateList.join(QLatin1Char(',')));
+        // A4 该车在车货（订单 + kg）
+        QStringList onboard;
+        for (const logistics::OnboardItem& item : rt.state.onboard) {
+            onboard << QStringLiteral("%1:%2kg@%3")
+                           .arg(QString::fromStdString(item.orderId))
+                           .arg(item.kg, 0, 'f', 0)
+                           .arg(QString::fromStdString(item.nodeId));
+        }
+        out += QStringLiteral("A4 %1 在车货: %2（合计 %3kg / 载重 %4kg）\n")
+                   .arg(id)
+                   .arg(onboard.join(QLatin1Char(',')))
+                   .arg(rt.state.sumOnboard(), 0, 'f', 0)
+                   .arg(rt.state.loadKg, 0, 'f', 0);
+        // A5 该车的物理账本（已送达停靠数 / 已取货 / 已降载 / 暂存站）
+        QStringList picked;
+        for (const std::string& orderId : rt.state.pickedOrderIds) {
+            picked << QString::fromStdString(orderId);
+        }
+        QStringList offloaded;
+        for (const VehicleState::OffloadKey& key : rt.state.appliedOffloads) {
+            offloaded << (QString::fromStdString(key.station) + QLatin1Char('/')
+                          + QString::fromStdString(key.orderId));
+        }
+        QStringList stash;
+        for (const logistics::OnboardItem& item : rt.state.stashItems) {
+            stash << QStringLiteral("%1:%2kg").arg(QString::fromStdString(item.orderId))
+                         .arg(item.kg, 0, 'f', 0);
+        }
+        out += QStringLiteral("A5 %1 已送达停靠 %2 ｜ 已取货 [%3] ｜ 已降载 [%4] ｜ 暂存站 %5 [%6]\n")
+                   .arg(id)
+                   .arg(rt.state.servedStops)
+                   .arg(picked.join(QLatin1Char(',')))
+                   .arg(offloaded.join(QLatin1Char(',')))
+                   .arg(QString::fromStdString(rt.state.stashStation))
+                   .arg(stash.join(QLatin1Char(',')));
+        // A6 该车位置与时刻
+        out += QStringLiteral("A6 %1 位置 %2 @ %3\n")
+                   .arg(id)
+                   .arg(QString::fromStdString(rt.state.atNodeId))
+                   .arg(minutesToClock(rt.state.atTimeMin));
     }
-    out += QStringLiteral("A2 已送达订单: %1\n").arg(served.join(QLatin1Char(',')));
-
-    // A3 已发生 penalty（车辆面板 / 超时面板的数据源）
-    out += QStringLiteral("A3 已发生 penalty: %1 min\n").arg(active().state.incurredPenaltyMin);
-    QStringList lateList;
-    for (const VehicleState::LateStop& late : active().state.deliveredLate) {
-        lateList << QStringLiteral("%1@%2:+%3")
-                        .arg(QString::fromStdString(late.orderId))
-                        .arg(QString::fromStdString(late.nodeId))
-                        .arg(late.penaltyMin);
+    // A5（站内已执行账本）：只含**已实际执行**的卸入（计划期候选不在其中）——
+    // 订单 / 站 / kg / 卸入车 / 卸入时刻 / 取走车 / 取走时刻（规格二 §6.10 的 A5）。
+    QStringList inStation;
+    for (const TransitLedgerEntry& entry : transitLedger_) {
+        inStation << QStringLiteral("%1@%2:%3kg 卸入%4@%5 取走%6@%7")
+                         .arg(QString::fromStdString(entry.orderId))
+                         .arg(QString::fromStdString(entry.stationId))
+                         .arg(entry.kg, 0, 'f', 0)
+                         .arg(QString::fromStdString(entry.inVehicleId))
+                         .arg(entry.inTimeMin >= 0 ? minutesToClock(entry.inTimeMin)
+                                                   : QStringLiteral("-"))
+                         .arg(entry.pickedUp ? QString::fromStdString(entry.outVehicleId)
+                                             : QStringLiteral("-"))
+                         .arg(entry.outTimeMin >= 0 ? minutesToClock(entry.outTimeMin)
+                                                    : QStringLiteral("-"));
     }
-    out += QStringLiteral("A3 已发生超时明细: %1\n").arg(lateList.join(QLatin1Char(',')));
-
-    // A4 在车货（订单 + kg）
-    QStringList onboard;
-    for (const logistics::OnboardItem& item : active().state.onboard) {
-        onboard << QStringLiteral("%1:%2kg@%3")
-                       .arg(QString::fromStdString(item.orderId))
-                       .arg(item.kg, 0, 'f', 0)
-                       .arg(QString::fromStdString(item.nodeId));
-    }
-    out += QStringLiteral("A4 在车货: %1（合计 %2kg / 载重 %3kg）\n")
-               .arg(onboard.join(QLatin1Char(',')))
-               .arg(active().state.sumOnboard(), 0, 'f', 0)
-               .arg(active().state.loadKg, 0, 'f', 0);
-
-    // A5 车内/站内的已执行账本（停靠面板 + 中转站面板的数据源）
-    QStringList picked;
-    for (const std::string& id : active().state.pickedOrderIds) {
-        picked << QString::fromStdString(id);
-    }
-    QStringList offloaded;
-    for (const VehicleState::OffloadKey& key : active().state.appliedOffloads) {
-        offloaded << (QString::fromStdString(key.station) + QLatin1Char('/')
-                      + QString::fromStdString(key.orderId));
-    }
-    QStringList stash;
-    for (const logistics::OnboardItem& item : active().state.stashItems) {
-        stash << QStringLiteral("%1:%2kg").arg(QString::fromStdString(item.orderId))
-                     .arg(item.kg, 0, 'f', 0);
-    }
-    out += QStringLiteral("A5 已送达停靠 %1 ｜ 已取货 [%2] ｜ 已降载 [%3] ｜ 暂存站 %4 [%5]\n")
-               .arg(active().state.servedStops)
-               .arg(picked.join(QLatin1Char(',')))
-               .arg(offloaded.join(QLatin1Char(',')))
-               .arg(QString::fromStdString(active().state.stashStation))
-               .arg(stash.join(QLatin1Char(',')));
-
-    // A6 位置与时刻（状态栏时钟 + 地图车辆位置的数据源）
-    out += QStringLiteral("A6 位置 %1 @ %2\n")
-               .arg(QString::fromStdString(active().state.atNodeId))
-               .arg(minutesToClock(active().state.atTimeMin));
-
-    // A7 下一个事件刻
-    out += QStringLiteral("A7 下一个事件刻 %1\n").arg(minutesToClock(nextEventMark_));
+    out += QStringLiteral("A5 站内已执行账本: %1\n").arg(inStation.join(QLatin1Char(';')));
+    // A7 车队时钟（全局唯一的下一事件刻）+ 全队当前时钟
+    out += QStringLiteral("A7 下一个事件刻 %1 ｜ 车队时钟 %2\n")
+               .arg(minutesToClock(nextEventMark_))
+               .arg(minutesToClock(fleetClockMin_));
     return out;
 }
-
 // 结算所有 <= timeMin 的**事件刻**，每刻恰抽 1 个事件。
 //
 // 这一层刻意挂在"软件时间前进"上、而不是挂在某个按钮上：因此「按站模拟」（一站一步）
@@ -3809,77 +4046,130 @@ int MainWindow::runActionSelfCheck() {
         std::printf("[self-check] 等价性终态（两条路径一致）：\n%s", snapA.toUtf8().constData());
     }
 
-    // ---- 9. 跨车转运（规格二 §5 / #28）：插入普通订单 → 时间策略接受 → 账本守恒 ----
+
+    // ---- 9. 跨车转运（规格二 §5 / #28）：三阶段规划启用 → 执行 → 账本面板可读 ----
     //
-    // 为什么必须是独立窗口：前面的段落已经把订单集合、车辆状态、随机流推得很远。
-    // 这里用**干净配置**（事件间隔拉到很长，保证转运计划在执行期间不被事件重规划打断），
-    // 按 §7.7 的演示脚本做一遍：插入 D08→D18 的 8kg 普通单 -> 时间策略重规划 ->
-    // 推进到全队收工 -> 读**用户可见的**转运账本面板。
+    // **场景被本票（#42）替换**，理由如实记录：
+    //   旧场景 = 「在默认数据上插入 D08→D18 普通单 → 时间策略重规划 → 转运被接受」。
+    //   那条路成立的前提是**顺序轮转基线**（#41 时期 GUI 的分配路径）。#42 把 GUI 的
+    //   初始规划改成 #40 的三阶段分配后，同一张单会落到 Δkey 最小的车上、路线已经很紧，
+    //   转运层再没有严格更优的候选 —— 实测（探针）：默认数据全部跨簇点对 × 3 种 kg ×
+    //   1/2/3 车组合，接受数**全为 0**。因此这里换成一个三阶段分配本身就需要转运的夹具
+    //   （与 routeplanner_tests 的 testTransitPlanFleetIntegration 同一套几何/参数），
+    //   守卫的意图不变：**计划期账本 → 实际执行 → 面板逐笔可读**。
     {
         logistics::Config base = reloadInitialConfig();
         base.general.eventIntervalMin = 24 * 60;   // 演示窗口内不触发事件
-        MainWindow transit(base, configPath_);
-        // 时间策略（§7.7 第 5 步）：D08（sub1）→D18（sub3）在顺序轮转基线下
-        // 时间键严格更优 ⇒ 转运被接受；距离策略下两版并列 ⇒ 保留禁转运版。
-        transit.strategyBox_->setCurrentIndex(1);
-        const int now = transit.currentTimeMin();
-        const std::size_t before = transit.config_.orders.size();
-        const std::string id = transit.insertOrderAt(
-            "D08", "D18", 8.0, false, logistics::OrderSource::ManualNormal, now);
-        expect(id == "M001", QStringLiteral("G18：手动普通单 ID 前缀 M + 递增号（实际 %1）")
-                                 .arg(QString::fromStdString(id)));
-        expect(transit.config_.orders.size() == before + 1,
-               QStringLiteral("G18：插入普通订单必须并入订单集合（不丢单）"));
-        const logistics::Order* inserted = transit.findOrderById(id);
-        expect(inserted != nullptr && !inserted->urgent
-                   && inserted->source == logistics::OrderSource::ManualNormal
-                   && inserted->windowStartMin == now && inserted->windowEndMin == 24 * 60
-                   && inserted->pickupNodeId == "D08" && inserted->nodeId == "D18",
-               QStringLiteral("G18：来源 manual_normal / 窗口 [now, 24:00]（%1-%2）")
-                   .arg(inserted != nullptr ? inserted->windowStartMin : -1)
-                   .arg(inserted != nullptr ? inserted->windowEndMin : -1));
-        // 订单表（用户可见）里必须能看到这张单。
-        bool inOrderTable = false;
-        for (int row = 0; row < transit.orderTable_->rowCount() && !inOrderTable; ++row) {
-            const QTableWidgetItem* item = transit.orderTable_->item(row, 0);
-            if (item != nullptr && item->text() == QString::fromStdString(id)) {
-                inOrderTable = true;
-            }
-        }
-        expect(inOrderTable, QStringLiteral("G18：插入后订单表出现该单 %1")
-                                 .arg(QString::fromStdString(id)));
+        // 夹具：仓库 W、中转站 T、客户 A1/A2（子网络 1）/ B1（子网络 2）/ B2（子网络 1）。
+        // O1（A1→B1）跨簇；时间策略下三阶段分配把 O1 交给 V02 慢车，
+        // 再由 V01 在 T 取走送达 —— 这是转运层**严格更优**才接受的那一版。
+        base.graph = logistics::LogisticsGraph();
+        const auto addNodeFixture = [&base](const std::string& id, logistics::NodeType type,
+                                            const std::string& name, int sub) {
+            logistics::Node node;
+            node.id = id;
+            node.type = type;
+            node.name = name;
+            node.subNetworkId = sub;
+            base.graph.addNode(node);
+        };
+        addNodeFixture("W", logistics::NodeType::Warehouse, "仓库", 0);
+        addNodeFixture("T", logistics::NodeType::Transit, "中转站T", 1);
+        addNodeFixture("A1", logistics::NodeType::Delivery, "客户A1", 1);
+        addNodeFixture("A2", logistics::NodeType::Delivery, "客户A2", 1);
+        addNodeFixture("B1", logistics::NodeType::Delivery, "客户B1", 2);
+        addNodeFixture("B2", logistics::NodeType::Delivery, "客户B2", 1);
+        const auto addEdgeFixture = [&base](const std::string& a, const std::string& b,
+                                            double km) {
+            logistics::Edge e;
+            e.fromId = a;
+            e.toId = b;
+            e.distanceKm = km;
+            e.timeMin = km;
+            e.costYuan = km;
+            base.graph.addEdge(e);
+            logistics::Edge back = e;
+            back.fromId = b;
+            back.toId = a;
+            base.graph.addEdge(back);
+        };
+        addEdgeFixture("W", "T", 1.0);
+        addEdgeFixture("W", "A1", 1.0);
+        addEdgeFixture("A1", "T", 1.0);
+        addEdgeFixture("W", "A2", 1.0);
+        addEdgeFixture("A2", "T", 2.0);
+        addEdgeFixture("T", "B1", 1.0);
+        addEdgeFixture("B1", "B2", 1.0);
+        base.vehicles.clear();
+        logistics::Vehicle fast;
+        fast.id = "V01";
+        fast.startNodeId = "W";
+        fast.capacityKg = 400.0;
+        fast.departTimeMin = 480;
+        fast.timeFactor = 1.00;
+        fast.costFactor = 1.50;
+        logistics::Vehicle slow;
+        slow.id = "V02";
+        slow.startNodeId = "W";
+        slow.capacityKg = 160.0;
+        slow.departTimeMin = 480;
+        slow.timeFactor = 1.25;
+        slow.costFactor = 0.80;
+        base.vehicles.push_back(fast);
+        base.vehicles.push_back(slow);
+        base.orders.clear();
+        logistics::Order o2;
+        o2.id = "O2";
+        o2.pickupNodeId = "A2";
+        o2.nodeId = "B2";
+        o2.demandKg = 10.0;
+        o2.windowStartMin = 0;
+        o2.windowEndMin = 1440;
+        o2.source = logistics::OrderSource::Initial;
+        logistics::Order o1;
+        o1.id = "O1";
+        o1.pickupNodeId = "A1";
+        o1.nodeId = "B1";
+        o1.demandKg = 10.0;
+        o1.windowStartMin = 0;
+        o1.windowEndMin = 1440;
+        o1.source = logistics::OrderSource::Initial;
+        base.orders.push_back(o2);
+        base.orders.push_back(o1);
 
-        // 计划期账本（TRANSIT / 面板的同一份数据）：两端非空、in≠out、dwell≤60、整单 kg。
+        MainWindow transit(base, configPath_);
+        transit.strategyBox_->setCurrentIndex(1);   // 时间策略（转运唯一的启用策略）
+        // 计划期账本：三阶段分配 + 转运层，两端非空、in≠out、kg=10、dwell ≤ 60
         expect(!transit.fleetPlan_.transitLegs.empty(),
-               QStringLiteral("转运：时间策略下应接受 D08→D18 一张跨簇单（计划期账本非空）"));
+               QStringLiteral("G14：三阶段分配 + 时间策略下应有转运计划（计划期账本非空）"));
         bool planLedgerOk = true;
         for (const logistics::TransitLeg& leg : transit.fleetPlan_.transitLegs) {
             const bool twoEnds = !leg.inVehicleId.empty() && !leg.outVehicleId.empty();
             const int dwell = leg.outTimeMin - leg.inTimeMin;
-            if (!twoEnds || leg.inVehicleId == leg.outVehicleId || leg.orderId != id
-                || leg.kg < 8.0 - 1e-9 || dwell < 0 || dwell > logistics::kTransferMaxDwellMin) {
+            if (!twoEnds || leg.inVehicleId == leg.outVehicleId || leg.orderId != "O1"
+                || leg.stationId != "T" || leg.kg < 10.0 - 1e-9 || dwell < 0
+                || dwell > logistics::kTransferMaxDwellMin) {
                 planLedgerOk = false;
             }
         }
         expect(planLedgerOk,
-               QStringLiteral("转运段完整 / in≠out / kg=8 / 0≤dwell≤%1（计划期）")
+               QStringLiteral("G14：账本两端非空 / in≠out / 站点 T / kg=10 / 0≤dwell≤%1（计划期）")
                    .arg(logistics::kTransferMaxDwellMin));
 
-        // 推进到全队收工：转运的卸入/取走/送达都必须**真的执行**。
+        // 推进到全队收工：卸入 / 取走 / 送达都必须**真的执行**。
         int steps = 0;
         while (!transit.atRouteEnd() && steps < 800) {
             transit.onAdvanceStop();
             ++steps;
         }
-        expect(transit.atRouteEnd(), QStringLiteral("转运演示：全队走完路线（%1 步）").arg(steps));
-        const logistics::Order* after = transit.findOrderById(id);
+        expect(transit.atRouteEnd(), QStringLiteral("G14：转运演示全队走完路线（%1 步）").arg(steps));
+        const logistics::Order* after = transit.findOrderById("O1");
         expect(after != nullptr && after->served,
-               QStringLiteral("转运演示：跨车转运的订单最终送达"));
+               QStringLiteral("G14：跨车转运的订单最终送达"));
 
-        // 运行期账本 = 用户可见面板：只记已实际执行的卸入；期末全为「已送达」。
         const int ledgerRows = transit.transitLedgerRowCount();
         expect(ledgerRows >= 1,
-               QStringLiteral("转运账本面板出现已执行的卸入（实际 %1 行）").arg(ledgerRows));
+               QStringLiteral("G14：转运账本面板出现已执行的卸入（实际 %1 行）").arg(ledgerRows));
         bool runLedgerOk = true;
         int inStationRows = 0;
         for (const TransitLedgerEntry& e : transit.transitLedger_) {
@@ -3895,16 +4185,18 @@ int MainWindow::runActionSelfCheck() {
             }
         }
         expect(runLedgerOk,
-               QStringLiteral("转运账本：每笔两端非空、in≠out、dwell≤%1")
+               QStringLiteral("G14：账本每笔两端非空、in≠out、dwell≤%1")
                    .arg(logistics::kTransferMaxDwellMin));
         expect(inStationRows == 0,
-               QStringLiteral("期末账本无「在站」行（实际 %1 行）").arg(inStationRows));
+               QStringLiteral("G14：期末账本无「在站」行（实际 %1 行）").arg(inStationRows));
         const QString ledgerText = transit.transitLedgerSummary();
-        expect(ledgerText.contains(QString::fromStdString(id))
+        expect(ledgerText.contains(QStringLiteral("O1"))
                    && ledgerText.contains(QStringLiteral("已送达"))
                    && !ledgerText.contains(QStringLiteral("| 在站")),
-               QStringLiteral("转运账本面板文本：含该单且状态为已送达\n%1")
-                   .arg(ledgerText));
+               QStringLiteral("G14：转运账本面板文本：含该单且状态为已送达\n%1").arg(ledgerText));
+        expect(transit.transitLedgerHeaders().size() == 7,
+               QStringLiteral("G14：转运账本面板 7 列（表头 %1 列）")
+                   .arg(transit.transitLedgerHeaders().size()));
         std::printf("[self-check] 转运账本：\n%s", ledgerText.toUtf8().constData());
 
         // G18 的动作本身（不是只调底层插单函数）：无头路径（offscreen）退化为随机 A/B，
@@ -3921,6 +4213,226 @@ int MainWindow::runActionSelfCheck() {
                    QStringLiteral("G18：该动作来源 manual_normal / 前缀 M（实际 %1）")
                        .arg(QString::fromStdString(randomOrder.id)));
         }
+    }
+
+    // ---- 10. GUI 的分配必须是三阶段分配（与 CLI --dump-plan 的 ALLOC 同源）----
+    //
+    // 缺陷背景（#41 关闭时定位）：MainWindow::replanFleet() 曾自己按「订单 ID 升序 +
+    // i % fleet_.size()」顺序轮转分派，根本没走 #40 的三阶段分配；只有 CLI 走 planFleet。
+    // 于是「界面上的分配」与「命令行 --dump-plan 的 ALLOC」是两套东西。
+    //
+    // 守卫读**两条用户可见路径**：界面侧的「[分配] ...」运行日志行（--ui-probe 也打印它），
+    // 与 CLI 侧 planFleet 的分配表（= --dump-plan 的 ALLOC 行的来源），逐单比对。
+    {
+        MainWindow fresh(reloadInitialConfig(), configPath_);
+        const QString guiAlloc = fresh.allocationSnapshot();
+        expect(!guiAlloc.isEmpty(),
+               QStringLiteral("G19（前置）界面初始规划必须产生三阶段分配快照"));
+        expect(fresh.runLogText().contains(QStringLiteral("[分配] 三阶段分配")),
+               QStringLiteral("G19：三阶段分配必须出现在运行日志里（用户可见）"));
+        expect(fresh.runLogText().contains(guiAlloc),
+               QStringLiteral("G19：运行日志里的分配串与界面快照逐字相同"));
+
+        const logistics::FleetPlan fp =
+            logistics::planFleet(fresh.config_.graph, fresh.config_.vehicles,
+                                 fresh.config_.orders, logistics::WeightType::Distance);
+        const QString cliAlloc = fresh.allocationTextOf(fp);
+        // 逐单比对（不是整串比较：逐单才能指出是哪一单不一致）
+        const auto splitPairs = [](const QString& text) {
+            std::vector<std::pair<std::string, std::string> > out;
+            const QStringList parts = text.split(QLatin1Char(','));
+            for (int i = 0; i < parts.size(); ++i) {
+                const int eq = parts[i].indexOf(QLatin1Char('='));
+                if (eq <= 0) {
+                    continue;
+                }
+                out.push_back(std::make_pair(parts[i].left(eq).toStdString(),
+                                             parts[i].mid(eq + 1).toStdString()));
+            }
+            return out;
+        };
+        const std::vector<std::pair<std::string, std::string> > guiPairs = splitPairs(guiAlloc);
+        const std::vector<std::pair<std::string, std::string> > cliPairs = splitPairs(cliAlloc);
+        std::size_t allocDiff = 0;
+        std::string firstAllocDiff;
+        if (guiPairs.size() != cliPairs.size()) {
+            allocDiff = 1;
+            firstAllocDiff = "单数 " + std::to_string(guiPairs.size()) + " vs "
+                             + std::to_string(cliPairs.size());
+        } else {
+            for (std::size_t i = 0; i < guiPairs.size(); ++i) {
+                if (guiPairs[i].first != cliPairs[i].first
+                    || guiPairs[i].second != cliPairs[i].second) {
+                    ++allocDiff;
+                    if (firstAllocDiff.empty()) {
+                        firstAllocDiff = guiPairs[i].first + "=" + guiPairs[i].second + " / CLI "
+                                         + cliPairs[i].first + "=" + cliPairs[i].second;
+                    }
+                }
+            }
+        }
+        expect(!guiPairs.empty() && allocDiff == 0,
+               QStringLiteral("G19：界面分配与 CLI 三阶段 ALLOC 逐单一致（%1 单；差异 %2 处%3）")
+                   .arg(guiPairs.size())
+                   .arg(allocDiff)
+                   .arg(firstAllocDiff.empty()
+                            ? QString()
+                            : QString(QStringLiteral("，首个 ") + QString::fromStdString(firstAllocDiff))));
+
+        // 判别力：顺序轮转基线必须与三阶段分配**不同**，否则这条守卫测不到东西
+        //（界面若退回轮转基线，逐单比对必然出现差异）。
+        const logistics::FleetPlan seq = logistics::planFleetSequentialBaseline(
+            fresh.config_.graph, fresh.config_.vehicles, fresh.config_.orders,
+            logistics::WeightType::Distance);
+        const std::vector<std::pair<std::string, std::string> > seqPairs =
+            splitPairs(fresh.allocationTextOf(seq));
+        std::size_t seqDiff = 0;
+        for (std::size_t i = 0; i < seqPairs.size() && i < cliPairs.size(); ++i) {
+            if (seqPairs[i].first != cliPairs[i].first
+                || seqPairs[i].second != cliPairs[i].second) {
+                ++seqDiff;
+            }
+        }
+        expect(seqDiff > 0,
+               QStringLiteral("G19（判别力）：顺序轮转基线与三阶段分配在 %1 单上不同 —— "
+                              "界面若退回轮转基线，上面的逐单比对必红")
+                   .arg(seqDiff));
+    }
+
+    // ---- 11. 复调度（规格二 §6 / #42）：受影响集合、五级播报 ----
+    //
+    // 全部读**用户可见输出**：「[复调度] ...」分级播报行、各车计划（与路线/车辆面板同源）。
+    {
+        logistics::Config quiet = reloadInitialConfig();
+        quiet.general.eventIntervalMin = 24 * 60;   // 本段不要事件打扰
+        MainWindow win(quiet, configPath_);
+
+        // 找一条**只在一台车的剩余路线里**的边（有向、相邻两站）。
+        std::string from;
+        std::string to;
+        std::size_t hit = win.fleet().size();
+        for (std::size_t v = 0; v < win.fleet().size() && hit >= win.fleet().size(); ++v) {
+            const std::vector<std::string>& route = win.fleet()[v].plan.nodes;
+            for (std::size_t i = 1; i < route.size(); ++i) {
+                if (route[i] == route[i - 1]) {
+                    continue;
+                }
+                bool onlyHere = true;
+                for (std::size_t w = 0; w < win.fleet().size(); ++w) {
+                    if (w == v) {
+                        continue;
+                    }
+                    if (logistics::isEdgeOnRoute(win.fleet()[w].plan.nodes, route[i - 1],
+                                                 route[i])) {
+                        onlyHere = false;
+                    }
+                }
+                if (onlyHere) {
+                    from = route[i - 1];
+                    to = route[i];
+                    hit = v;
+                    break;
+                }
+            }
+        }
+        expect(hit < win.fleet().size(),
+               QStringLiteral("G20（前置）存在只属于一台车剩余路线的边（%1->%2）")
+                   .arg(QString::fromStdString(from))
+                   .arg(QString::fromStdString(to)));
+
+        // 未受影响车的路线逐字记录 —— 判「路线逐字不变」用
+        std::vector<std::vector<std::string> > routesBefore;
+        for (std::size_t w = 0; w < win.fleet().size(); ++w) {
+            routesBefore.push_back(win.fleet()[w].plan.nodes);
+        }
+        if (hit < win.fleet().size()) {
+            // 路况事件对图的作用：把这条边的当前耗时抬高 50%
+            const logistics::Edge* edge = win.config_.graph.findEdge(from, to);
+            if (edge != nullptr) {
+                win.config_.graph.updateEdgeTime(from, to, edge->timeMin * 1.5);
+            }
+            logistics::RescheduleEvent event;
+            event.trigger = logistics::RescheduleTrigger::Traffic;
+            logistics::TrafficChange change;
+            change.fromId = from;
+            change.toId = to;
+            change.increaseRatio = 0.5;
+            change.congested = true;
+            event.changes.push_back(change);
+            event.thresholdRatio = 0.2;
+            const logistics::FleetRescheduleResult res = win.runReschedule(event);
+            expect(res.level == 1 && !res.rejected,
+                   QStringLiteral("G20：只影响一台车 ⇒ 第 ① 级局部重排（实际第 %1 级）")
+                       .arg(res.level));
+            expect(win.runLogText().contains(QStringLiteral("[复调度] 局部重排（1 台车）")),
+                   QStringLiteral("G20：分级播报行「[复调度] 局部重排（1 台车）」可见"));
+            // 受影响集合正确 + **未受影响车路线逐字不变**（不变量 5）
+            std::size_t changedOthers = 0;
+            QString firstChanged;
+            for (std::size_t w = 0; w < win.fleet().size(); ++w) {
+                if (w == hit) {
+                    continue;
+                }
+                if (win.fleet()[w].plan.nodes != routesBefore[w]) {
+                    ++changedOthers;
+                    if (firstChanged.isEmpty()) {
+                        firstChanged = QString::fromStdString(win.config_.vehicles[w].id);
+                    }
+                }
+            }
+            expect(changedOthers == 0,
+                   QStringLiteral("G20：未受影响车的路线逐字不变（被改动 %1 台%2）")
+                       .arg(changedOthers)
+                       .arg(firstChanged.isEmpty() ? QString()
+                                                   : QString(QStringLiteral("，首个 ") + firstChanged)));
+            expect(win.fleet()[hit].plan.status == logistics::PlanStatus::Ok,
+                   QStringLiteral("G20：受影响车重算后计划仍可行"));
+            // 确定性：同样输入（重新加载配置 + 同一事件）必得同一计划与同一播报
+            MainWindow again(quiet, configPath_);
+            const logistics::Edge* edge2 = again.config_.graph.findEdge(from, to);
+            if (edge2 != nullptr) {
+                again.config_.graph.updateEdgeTime(from, to, edge2->timeMin * 1.5);
+            }
+            const logistics::FleetRescheduleResult res2 = again.runReschedule(event);
+            bool samePlans = (res2.level == res.level) && (res2.log == res.log);
+            for (std::size_t w = 0; w < again.fleet().size() && samePlans; ++w) {
+                if (again.fleet()[w].plan.nodes != win.fleet()[w].plan.nodes) {
+                    samePlans = false;
+                }
+            }
+            expect(samePlans,
+                   QStringLiteral("G20：确定性 —— 同输入两次运行的分级、播报与逐车路线完全一致"));
+        }
+    }
+
+    // ---- 11b. 第 ⑤ 级：不可执行的单被**拒绝**并如实播报（不丢单、不凑解）----
+    {
+        logistics::Config cfg11 = reloadInitialConfig();
+        cfg11.general.eventIntervalMin = 24 * 60;
+        MainWindow win(cfg11, configPath_);
+        Order ghost;
+        ghost.id = "O999";
+        ghost.pickupNodeId = "D01";
+        ghost.nodeId = "DZZ";   // 图上不存在 ⇒ 任何车都排不出可行解
+        ghost.demandKg = 5.0;
+        ghost.windowStartMin = 480;
+        ghost.windowEndMin = 24 * 60;
+        ghost.urgent = false;
+        ghost.source = logistics::OrderSource::ManualNormal;
+        ghost.served = false;
+        win.config_.orders.push_back(ghost);
+        logistics::RescheduleEvent event;
+        event.trigger = logistics::RescheduleTrigger::NewOrder;
+        event.newOrder = ghost;
+        const logistics::FleetRescheduleResult res = win.runReschedule(event);
+        expect(res.rejected && res.level == 5,
+               QStringLiteral("G21：不可执行的单必须被拒绝（第 ⑤ 级，实际第 %1 级）")
+                   .arg(res.level));
+        expect(win.runLogText().contains(QStringLiteral("[复调度] 拒绝：")),
+               QStringLiteral("G21：拒绝必须如实播报（分级播报行「[复调度] 拒绝：...」可见）"));
+        const Order* still = win.findOrderById(ghost.id);
+        expect(still != nullptr && !still->served,
+               QStringLiteral("G21：被拒绝的单不得从订单集合里消失（不丢单）"));
     }
 
     return failures;

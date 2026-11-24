@@ -525,6 +525,11 @@ int main(int argc, char** argv) {
         const int actions = window.toolbarActionCount();
         const int docks = window.dockCount();
         std::printf("[ui-probe] 工具栏动作 %d 个，停靠面板 %d 个\n", actions, docks);
+        // 界面侧的**三阶段分配**快照（格式与 --dump-plan 的 ALLOC 行同序同形）。
+        // 守卫（cli_plan_summary）拿它与 CLI 的 ALLOC 逐单比对：
+        // 界面若退回顺序轮转基线，这一行立刻与 CLI 不一致（反向验证见测试用例表）。
+        std::printf("[ui-probe] 分配 %s\n",
+                    window.allocationSnapshot().toUtf8().constData());
         // 打印实际的动作名与面板名：向导里让用户点的按钮必须真实存在，
         // 由 `--ui-probe` 逐条比对，避免界面名称与实现漂移。
         const QString actionTexts = window.toolbarActionTexts();
