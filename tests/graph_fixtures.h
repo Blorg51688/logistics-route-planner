@@ -81,11 +81,20 @@ inline int nonForcedRevisitStops(const std::vector<logistics::Stop>& stops,
     }
 
     int bad = 0;
-    for (std::size_t i = 0; i < stops.size(); ++i) {
-        for (std::size_t j = i + 1; j < stops.size(); ++j) {
-            if (stops[i].nodeId != stops[j].nodeId || stops[i].phase != stops[j].phase) {
-                continue;
+    // 例外判据（规格原文）：把重访动作并入该节点**首次**停靠。因此每个重访停靠
+    // 只跟同阶段同节点的**第一个**停靠比一次 —— 与实现的 checkOrderingCore 同源
+    // （它按「首次停靠」记 firstAt）。逐个 (i,j) 全比会把"并进第二处可行"也当成
+    // 违规，那是比规格更严的另一条规则，不是这条不变量。
+    for (std::size_t j = 0; j < stops.size(); ++j) {
+        std::size_t i = stops.size();
+        for (std::size_t k = 0; k < j; ++k) {
+            if (stops[k].nodeId == stops[j].nodeId && stops[k].phase == stops[j].phase) {
+                i = k;
+                break;
             }
+        }
+        if (i < j) {
+            {
             if (base[j].size() != 1) {
                 ++bad;   // 重访停靠只允许承载一个动作
                 continue;
@@ -164,6 +173,7 @@ inline int nonForcedRevisitStops(const std::vector<logistics::Stop>& stops,
             }
             if (ok) {
                 ++bad;   // 并进去仍然可行 ⇒ 不是强制重访
+            }
             }
         }
     }
