@@ -4404,6 +4404,7 @@ int MainWindow::runActionSelfCheck() {
         // G18 的动作本身（不是只调底层插单函数）：无头路径（offscreen）退化为随机 A/B，
         // 走的是工具栏「插入普通订单…」同一入口。断读订单集合与来源/前缀。
         const std::size_t beforeSlot = transit.config_.orders.size();
+        const int normalInsertNow = transit.currentTimeMin();
         transit.onInsertNormalOrder();
         expect(transit.config_.orders.size() == beforeSlot + 1,
                QStringLiteral("G18：工具栏「插入普通订单…」无头路径可用（退化为随机 A/B，不丢单）"));
@@ -4414,6 +4415,14 @@ int MainWindow::runActionSelfCheck() {
                        && randomOrder.id[0] == 'M',
                    QStringLiteral("G18：该动作来源 manual_normal / 前缀 M（实际 %1）")
                        .arg(QString::fromStdString(randomOrder.id)));
+            // G18 / §7.9：窗口必须是 [当前时刻, 24:00]（不是 [now, now+60]——
+            // 后者是紧急单窗口，会把普通单误当紧窗单）。这条让「窗口写错」变红。
+            expect(randomOrder.windowStartMin == normalInsertNow
+                       && randomOrder.windowEndMin == 24 * 60,
+                   QStringLiteral("G18：插入普通订单窗口 = [当前时刻 %1, 24:00]（实际 [%2, %3]）")
+                       .arg(normalInsertNow)
+                       .arg(randomOrder.windowStartMin)
+                       .arg(randomOrder.windowEndMin));
         }
     }
 
