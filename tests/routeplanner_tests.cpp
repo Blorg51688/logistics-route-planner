@@ -884,17 +884,9 @@ void testIncrementalReplayKeepsStopOrderAndReplaysWeights() {
         g.updateEdgeTime("D2", "D1", e2->baseTimeMin * 1.5);
     }
 
-    TrafficReport report;
-    TrafficChange c;
-    c.fromId = "D1";
-    c.toId = "D2";
-    c.increaseRatio = 0.5;
-    c.congested = true;
-    report.changes.push_back(c);
-
     bool used = false;
     const RoutePlan after =
-        replanIncremental(g, v, orders, before, 480, WeightType::Time, report, 0.2,
+        replanIncremental(g, v, orders, before, 480, WeightType::Time,
                           std::vector<logistics::OnboardItem>(), &used);
 
     check(after.status == PlanStatus::Ok, "重放可行");
@@ -924,10 +916,9 @@ void testIncrementalReplayIsIdempotentWhenNothingAffected() {
     };
 
     const RoutePlan before = planRoute(g, v, orders, WeightType::Time);
-    TrafficReport report;   // 空报告
     bool used = false;
     const RoutePlan after =
-        replanIncremental(g, v, orders, before, 480, WeightType::Time, report, 0.2,
+        replanIncremental(g, v, orders, before, 480, WeightType::Time,
                           std::vector<logistics::OnboardItem>(), &used);
 
     check(used, "空报告下仍走重放");
@@ -955,7 +946,7 @@ void testIncrementalFallsBackWhenReplayInfeasible() {
 
     bool used = true;
     const RoutePlan after =
-        replanIncremental(g, v, orders, broken, 480, WeightType::Distance, TrafficReport(), 0.2,
+        replanIncremental(g, v, orders, broken, 480, WeightType::Distance,
                           std::vector<logistics::OnboardItem>(), &used);
     check(after.status == PlanStatus::Ok, "回退全量后仍可行");
     check(!used, "序列不全时 usedIncremental == false（退回了全量）");
@@ -1703,10 +1694,9 @@ void testIncrementalFallbackKeepsStash() {
     pending.push_back(makeOrder("O1", "W", "D1", 60.0, 0, 1440));
     pending.push_back(makeOrder("O2", "W", "D2", 30.0, 0, 1440));
 
-    const logistics::TrafficReport report;
     bool used = true;
     const RoutePlan p = replanIncremental(
-        g, v, pending, prev, 480, WeightType::Distance, report, 0.2,
+        g, v, pending, prev, 480, WeightType::Distance,
         std::vector<logistics::OnboardItem>(), &used, stash);
 
     check(p.status == PlanStatus::Ok, "增量失败回退后规划可行");

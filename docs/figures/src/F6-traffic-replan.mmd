@@ -25,7 +25,7 @@ flowchart TD
     J --> K{"受影响边在当前路径的相邻两站之间<br/>（isEdgeOnRoute）且增幅 ≥ 阈值"}
     K -->|否| L["syncScene()（只重绘拥堵标记）"] --> L2(["不触发重规划"])
     K -->|是| M["sliceRemainder(plan_, 当前下标)<br/>切出剩余路线（停靠按 nodeIsStop 对齐保留）"]
-    M --> N["replanIncremental(graph, vehicle, remaining, remainder,<br/>now, weight, report, threshold, onboard, &usedIncremental, stash)"]
+    M --> N["replanIncremental(graph, vehicle, remaining, remainder,<br/>now, weight, onboard, &usedIncremental, stash)"]
     N --> O{"previous 合法？<br/>status=Ok 且 stops 非空 且 nodes ≥ 2"}
     O -->|否| FULL["退回全量：replan(...)<br/>usedIncremental = false"] --> DONE
     O -->|是| P["把上一版剩余停靠的动作集原样搬进一次新 Ctx：<br/>订单表仍是剩余订单，在车货仍是当前 onboard"]

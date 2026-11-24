@@ -31,7 +31,7 @@ sequenceDiagram
         MW->>Core: sliceRemainder(plan_, nodeIndex_)
         Note over Core: 按 nodeIsStop 对齐，只保留尚未走完的停靠<br/>（趟结构已不存在）
         Core-->>MW: remainder（nodes / nodeIsStop / stops / offloads）
-        MW->>Core: replanIncremental(..., now, weight, report, threshold,<br/>onboard, &usedIncremental, stash)
+        MW->>Core: replanIncremental(..., now, weight,<br/>onboard, &usedIncremental, stash)
 
         alt previous 不合法（status≠Ok / stops 空 / nodes < 2）
             Core->>Core: 退回全量 replan()（usedIncremental = false）

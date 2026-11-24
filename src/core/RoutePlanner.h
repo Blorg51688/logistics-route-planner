@@ -566,8 +566,6 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
                             const RoutePlan& previous,
                             int currentTimeMin,
                             WeightType weight,
-                            const TrafficReport& report,
-                            double thresholdRatio,
                             // 与 replan 一致：回退到全量重算时在途货必须一并带上
                             const std::vector<OnboardItem>& onboard
                                 = std::vector<OnboardItem>(),

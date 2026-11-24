@@ -4787,16 +4787,12 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
                             const RoutePlan& previous,
                             int currentTimeMin,
                             WeightType weight,
-                            const TrafficReport& report,
-                            double thresholdRatio,
                             const std::vector<OnboardItem>& onboard,
                             bool* usedIncremental,
                             const StashState& stash) {
     if (usedIncremental != nullptr) {
         *usedIncremental = false;
     }
-    (void)report;
-    (void)thresholdRatio;
     const std::string startPos =
         previous.nodes.empty() ? vehicle.startNodeId : previous.nodes.front();
 
@@ -4902,22 +4898,12 @@ namespace {
 
 // 把停靠序列翻成重放规格（R1「顺序不变版」的唯一来源）。
 std::vector<StopSpec> specsOfStops(const std::vector<Stop>& stops) {
+    // 复用唯一的「Stop -> StopSpec」搬运点 specFromStop（原实现逐字段复刻，
+    // StopSpec 加字段时会漏搬；评审 F1）。
     std::vector<StopSpec> specs;
     specs.reserve(stops.size());
     for (std::size_t i = 0; i < stops.size(); ++i) {
-        const Stop& s = stops[i];
-        StopSpec spec;
-        spec.nodeId = s.nodeId;
-        spec.phase = s.phase;
-        spec.pickups = s.pickups;
-        spec.offloads = s.offloads;
-        spec.reclaims = s.reclaims;
-        spec.transitUnloads = s.transitUnloads;
-        spec.transitPickups = s.transitPickups;
-        for (std::size_t d = 0; d < s.deliveries.size(); ++d) {
-            spec.deliveries.push_back(s.deliveries[d].orderId);
-        }
-        specs.push_back(spec);
+        specs.push_back(specFromStop(stops[i]));
     }
     return specs;
 }
