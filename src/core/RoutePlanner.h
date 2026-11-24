@@ -142,12 +142,44 @@ RoutePlan planRoute(const LogisticsGraph& graph,
                     const std::vector<Order>& orders,
                     WeightType weight);
 
+// ---- 类型感知分配（规格二 §4 / #40）：日志与度量类型 ----
+
+// 一条被接受的跨车改派（阶段三日志）。**不变量 8 直接读它**：
+// completionAfterMin 必须 ≤ completionBeforeMin（完工耗时不变差）。
+struct RelocateRecord {
+    int         round = 0;              // 1..3
+    std::string orderId;
+    std::string fromVehicleId;
+    std::string toVehicleId;
+    int         penaltyBefore = 0;      // 改派前后**车队键**（三层）
+    int         penaltyAfter = 0;
+    double      weightBefore = 0.0;
+    double      weightAfter = 0.0;
+    double      balanceBefore = 0.0;    // 均衡键 = 峰值利用率极差
+    double      balanceAfter = 0.0;
+    double      completionBeforeMin = 0.0;   // 改派前后**完工耗时**
+    double      completionAfterMin = 0.0;
+};
+
+// 边际代价（规格二 §4.7 / #27 的接口）：key(在该车插入后) − key(该车现状)。
+// 三元组按字典序比较；**必须用候选车自己的因子重放**（候选计划由 planRoute 以
+// 该车的 time_factor / cost_factor / capacity 重建）。
+// currentVehicleOrders = 该车当前计划所服务的订单（顺序无关，构造器内部按 EDD 排）；
+// currentPlan = 该车当前计划（提供「现状」侧的三项）。
+// balanceDelta = 该车峰值利用率的变化（本车容量口径）；跨车的极差变化只有拿着
+// 整队计划才算得出，这里如实只给本车分量（#27 用它排序候选车）。
+struct MarginalCost {
+    double penaltyDelta = 0.0;
+    double weightDelta = 0.0;
+    double balanceDelta = 0.0;
+};
+
 // ---- 车队（规格二 §3 / #39）----
 //
-// 每车一条**连续路线**（自己的 start_node / depart_time 空载出发，回同一基地）；
-// 本票的分配是**顺序轮转基线**（规格二 §4.5）：订单 ID 升序、第 i 单 -> 第 (i mod k)
-// 台车、车辆序 = [vehicles] 行序，不跳车、不重分配、不做可行性预判。
-// #40 会保留这条基线作对照，**不要删**。
+// 每车一条**连续路线**（自己的 start_node / depart_time 空载出发，回同一基地）。
+// 分配有**两个入口**（规格二 §4）：
+//   · `planFleet`（默认）= 类型感知三阶段：聚类 -> 整簇指派（全排列枚举）-> 有界改派；
+//   · `planFleetSequentialBaseline` = 顺序轮转基线（§4.5），只作对照与确定性守卫，**不要删**。
 struct FleetPlan {
     // 与传入 vehicles 下标**一一对应**（失败的车上也留一个占位计划，便于定长对齐）。
     std::vector<RoutePlan> vehicles;
@@ -169,12 +201,73 @@ struct FleetPlan {
     //   两率 = Σ命中 / Σ分母；平均在车 / 利用率按**时间加权**跨车积分；
     //   峰值 = max(各车峰值)。
     RouteMetrics metrics;
+
+    // ---- 类型感知分配的产物（规格二 §4 / #40）----
+    //
+    // 均衡度（§4.3 / Q5 定稿）= max_v(峰值在车_v ÷ capacity_v) − min_v(…)。
+    // **分母口径按「全部车」**：空车 utilization 记 0 并参与极差（否则「一台车干活、
+    // 两台空转」会被算成最均衡）。地位 = 决策键第三级 + 报告指标，**不作硬约束**。
+    // 由 aggregateFleet 统一算（车队汇总只有这一处实现），GUI 的均衡度行也读它。
+    double balanceSpread = 0.0;
+
+    // 分配表：订单 ID -> 车辆**行下标**。按订单 ID 升序排列（与 --dump-plan 的
+    // ALLOC 行同序）；allocationClusterId 同下标：>=1 = 该单所属本地簇；-1 = 跨簇单
+    // （跨簇单不属任何簇，见 §4.2）。
+    std::vector<std::string> allocationOrderIds;
+    std::vector<std::size_t> allocationVehicleIndex;
+    std::vector<int>         allocationClusterId;
+
+    // 每车分到的订单数 / 本地簇编号（升序去重）/ 跨簇单数（按车辆行下标）。
+    std::vector<int>               vehicleOrderCount;
+    std::vector<std::vector<int> > vehicleClusters;
+    std::vector<int>               vehicleCrossClusterCount;
+
+    // 阶段三被接受的跨车改派日志（不变量 8：逐条核对「完工耗时不变差」）。
+    std::vector<RelocateRecord> relocations;
+
+    // 分配过程的文字日志（规格二 §4.6：拆簇「仅此级触发并留日志」；子网络 0 的
+    // 异常数据归跨簇队列也记这里；被拒绝的订单点名原因）。
+    std::vector<std::string> allocationLog;
+
+    // 阶段二的枚举留痕：每种「簇 -> 车」排列一行，供人工核对「6 种排列各自怎么取优」。
+    std::vector<std::string> candidateKeyLog;
 };
 
+// 类型感知三阶段分配（规格二 §4，**默认入口**）。
+//   阶段一 聚类：簇 = 取货点 A 的 subNetworkId；A、B 跨网 ⇒ 跨簇单（单独成队列）；
+//                  subNetworkId == 0 的异常数据也并入跨簇队列并记日志（不静默丢单）。
+//   阶段二 整簇指派：枚举全部「簇 -> 车」排列（默认 3 簇 3 车 = 6 种，**手写全排列**），
+//                  每簇的订单交给该车跑**规格一的单车构造器**；候选按车队键
+//                  (Σpenalty, Σ策略权重, 均衡键, tieKey) 取优。簇数 > 车数时按簇货量
+//                  降序取前 k 个各占一车、其余并入「货量最接近且仍可行」的车。
+//   阶段三 有界跨车改派：R ≤ 3 轮、只普通段、EDD 序；两条接受条件**同时**成立才接受
+//                  （① 车队键严格变优；② 完工耗时不得变差）。一轮无改进即停。
+// 失败兜底链（§4.6）：换车（枚举覆盖）-> 拆簇（仅此级触发并记 allocationLog）->
+// 规格一的降载/全量兜底（在 planRoute 内部）-> 拒绝该单并报原因。
 FleetPlan planFleet(const LogisticsGraph& graph,
                     const std::vector<Vehicle>& vehicles,
                     const std::vector<Order>& orders,
                     WeightType weight);
+
+// 顺序轮转基线（规格二 §4.5，**对照组不是候选方案**）：
+// 订单 ID 升序、第 i 单 -> 第 (i mod k) 台车、车辆序 = [vehicles] 行序；
+// 不跳车、不重分配、不做可行性预判；分完后各车独立跑 planRoute。
+// 分配只由「订单 ID 升序 + 车队行序」决定，与策略/容量/窗口**全部无关**（不变量 9）。
+FleetPlan planFleetSequentialBaseline(const LogisticsGraph& graph,
+                                      const std::vector<Vehicle>& vehicles,
+                                      const std::vector<Order>& orders,
+                                      WeightType weight);
+
+// ---- 阶段一的两个判据（规格二 §4.2；#27 也直接用）----
+// 簇(order) = node(order.pickupNodeId).subNetworkId；取货点不在图上返回 -1。
+int clusterOfOrder(const LogisticsGraph& graph, const Order& order);
+// isCrossCluster(order) = 簇(A) ≠ 簇(B)；任一端不在图上返回 false（不可达另由拒绝链报）。
+bool isCrossCluster(const LogisticsGraph& graph, const Order& order);
+
+// 边际代价（规格二 §4.7 / #27 的接口）：key(在该车插入后) − key(该车现状)。
+MarginalCost marginalCost(const LogisticsGraph& graph, const Vehicle& vehicle,
+                          const Order& order, const std::vector<Order>& currentVehicleOrders,
+                          const RoutePlan& currentPlan, WeightType weight);
 
 // 把**已经算好的**逐车计划聚合成车队汇总（规格二 §3.4 的可加口径）。
 // planFleet 用它，GUI 的中途重规划也用它 —— 汇总口径只有这一处实现。

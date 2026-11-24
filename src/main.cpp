@@ -354,6 +354,50 @@ int main(int argc, char** argv) {
             }
             printMetrics("METRICS", vehicle.id, plan, vehicle.capacityKg);
         }
+        // 规格二 §4（#40）分配可核对：**只加行，不改既有行格式**（oracle 会跳过未知行）。
+        //   ALLOC  <orderId>=<vehicleId>,…      按**订单 ID 升序**
+        //   ASSIGN <vehicleId> <簇N | 跨簇 | 空车> <订单数>
+        // 同一台车可能既有簇单又有跨簇单 ⇒ 各一行；空车打「空车 0」。
+        {
+            std::string alloc;
+            for (std::size_t i = 0; i < fleet.allocationOrderIds.size(); ++i) {
+                const std::size_t v = fleet.allocationVehicleIndex[i];
+                if (!alloc.empty()) {
+                    alloc += ",";
+                }
+                alloc += fleet.allocationOrderIds[i] + "=";
+                alloc += (v < config.vehicles.size()) ? config.vehicles[v].id : std::string("-");
+            }
+            std::printf("ALLOC %s\n", alloc.c_str());
+            for (std::size_t vi = 0; vi < config.vehicles.size(); ++vi) {
+                const std::string& vid = config.vehicles[vi].id;
+                const std::vector<int>& clusters =
+                    (vi < fleet.vehicleClusters.size()) ? fleet.vehicleClusters[vi]
+                                                        : std::vector<int>();
+                for (std::size_t c = 0; c < clusters.size(); ++c) {
+                    int n = 0;
+                    for (std::size_t i = 0; i < fleet.allocationOrderIds.size(); ++i) {
+                        if (fleet.allocationVehicleIndex[i] == vi
+                            && fleet.allocationClusterId[i] == clusters[c]) {
+                            ++n;
+                        }
+                    }
+                    std::printf("ASSIGN %s 簇%d %d\n", vid.c_str(), clusters[c], n);
+                }
+                const int cross = (vi < fleet.vehicleCrossClusterCount.size())
+                                      ? fleet.vehicleCrossClusterCount[vi]
+                                      : 0;
+                if (cross > 0) {
+                    std::printf("ASSIGN %s 跨簇 %d\n", vid.c_str(), cross);
+                }
+                const int total = (vi < fleet.vehicleOrderCount.size())
+                                      ? fleet.vehicleOrderCount[vi]
+                                      : 0;
+                if (total == 0) {
+                    std::printf("ASSIGN %s 空车 0\n", vid.c_str());
+                }
+            }
+        }
         // 车队自报值（与 --plan-summary 第 1–2 行同源）：13 字段 + 完工耗时口径。
         {
             const logistics::RouteMetrics& m = fleet.metrics;
@@ -823,6 +867,14 @@ int main(int argc, char** argv) {
             if (routePanel.contains(QStringLiteral("趟次"))
                 || routePanel.contains(QStringLiteral("各趟"))) {
                 std::fprintf(stderr, "[ui-probe] 路线信息面板仍含已退役的「趟次 / 各趟」：\n%s\n",
+                             routePanel.toUtf8().constData());
+                return 1;
+            }
+            // #40（规格二 §4.3）：均衡度（峰值利用率极差）是**纯增量一行**文本，
+            // 必须真的出现在「逐车指标」小节里（不新增控件，也不改既有行）。
+            if (!routePanel.contains(QStringLiteral("均衡度（峰值利用率极差）"))) {
+                std::fprintf(stderr,
+                             "[ui-probe] 路线信息面板缺少均衡度行（#40）：\n%s\n",
                              routePanel.toUtf8().constData());
                 return 1;
             }

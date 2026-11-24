@@ -23,7 +23,11 @@ using logistics::Vehicle;
 using logistics::WeightType;
 using logistics::planRoute;
 using logistics::planFleet;
+using logistics::planFleetSequentialBaseline;
+using logistics::clusterOfOrder;
+using logistics::isCrossCluster;
 using logistics::FleetPlan;
+using logistics::RelocateRecord;
 using logistics::replan;
 using logistics::simulateTrafficChange;
 using logistics::needsReplan;
@@ -374,12 +378,30 @@ void checkFleetInvariants(const Config& cfg, const FleetPlan& fleet, const std::
           tag + "车队平均在车 <= 车队峰值（G5）");
 }
 
+// 分配表 -> 每车订单集合。**只读 FleetPlan 的公开分配产物**（不重算分配），
+// 随后 checkPlanInvariants 用计划自身的 stops 反向核对，所以分配表与路线是双向对拍。
+std::vector<std::vector<logistics::Order> > allocationOrderSets(const Config& cfg,
+                                                                const FleetPlan& fleet) {
+    std::vector<std::vector<logistics::Order> > out(cfg.vehicles.size());
+    for (std::size_t i = 0; i < fleet.allocationOrderIds.size(); ++i) {
+        const std::size_t v = fleet.allocationVehicleIndex[i];
+        const logistics::Order* o = findOrder(cfg, fleet.allocationOrderIds[i]);
+        if (o != nullptr && v < out.size()) {
+            out[v].push_back(*o);
+        }
+    }
+    return out;
+}
+
 FleetPlan planFleetForWeight(const Config& cfg, WeightType weight, const char* label) {
+    // 默认入口 = 类型感知三阶段（规格二 §4 / #40）。
     const FleetPlan fleet = planFleet(cfg.graph, cfg.vehicles, cfg.orders, weight);
     checkFleetInvariants(cfg, fleet, label);
 
     // 逐车不变量（每车自己的起点/容量/订单集合）+ 逐车摘要打印。
-    const std::vector<std::vector<logistics::Order> > assigned = roundRobinAssignment(cfg);
+    // 订单集合取自**分配表**；checkPlanInvariants 再用该车 stops 反向核对
+    // （分配说归它的单必须真在路线上；动作数 = 2 × 该车单数）。
+    const std::vector<std::vector<logistics::Order> > assigned = allocationOrderSets(cfg, fleet);
     int lateTotal = 0;
     for (std::size_t v = 0; v < fleet.vehicles.size() && v < cfg.vehicles.size(); ++v) {
         const RoutePlan& plan = fleet.vehicles[v];
@@ -590,6 +612,287 @@ void checkDataQualityInvariants(const Config& cfg, const FleetPlan& byDistance,
                   && m.pickupTotal == static_cast<int>(cfg.orders.size()),
               tag + "准时率分母 = 已规划订单数");
     }
+}
+
+// 规格二 §4.9 的 9 条分配不变量（默认数据，三策略 + 顺序轮转基线）。
+// 断言读的都是**规划产物**（分配表 / 逐车计划 / 改派日志 / 候选键留痕），
+// 不自己重算分配；基线的独立对照由 roundRobinAssignment（测试自算）给出。
+void checkAllocationInvariants(const Config& cfg, const FleetPlan* fleets[3],
+                               const char* labels[3], const FleetPlan& baseDistance,
+                               const FleetPlan& baseCost, const FleetPlan& baseTime) {
+    // ---- ① 全部订单恰好服务一次、每张只出现在**一台**车的路线上 ----
+    for (int f = 0; f < 3; ++f) {
+        const FleetPlan& fleet = *fleets[f];
+        const std::string tag = std::string(labels[f]) + "·分配①：";
+        check(fleet.allocationOrderIds.size() == cfg.orders.size(),
+              tag + "分配表覆盖全部订单（" + std::to_string(fleet.allocationOrderIds.size())
+                  + " / " + std::to_string(cfg.orders.size()) + "）");
+        for (std::size_t i = 0; i < cfg.orders.size(); ++i) {
+            const logistics::Order& o = cfg.orders[i];
+            int owners = 0;
+            std::size_t ownerVehicle = cfg.vehicles.size();
+            for (std::size_t v = 0; v < fleet.vehicles.size(); ++v) {
+                for (std::size_t s = 0; s < fleet.vehicles[v].stops.size(); ++s) {
+                    const std::vector<logistics::StopDelivery>& ds =
+                        fleet.vehicles[v].stops[s].deliveries;
+                    for (std::size_t d = 0; d < ds.size(); ++d) {
+                        if (ds[d].orderId == o.id) {
+                            ++owners;
+                            ownerVehicle = v;
+                        }
+                    }
+                }
+            }
+            check(owners == 1, tag + "订单 " + o.id + " 恰好由一台车送达（实际 "
+                                   + std::to_string(owners) + " 台）");
+            // 分配表必须与路线一致（分配说归谁，谁的路线上就得真有这单）。
+            bool listed = false;
+            std::size_t listedVehicle = cfg.vehicles.size();
+            for (std::size_t k = 0; k < fleet.allocationOrderIds.size(); ++k) {
+                if (fleet.allocationOrderIds[k] == o.id) {
+                    listed = true;
+                    listedVehicle = fleet.allocationVehicleIndex[k];
+                }
+            }
+            check(listed, tag + "订单 " + o.id + " 出现在分配表里");
+            if (owners == 1 && listed) {
+                check(listedVehicle == ownerVehicle,
+                      tag + "订单 " + o.id + " 的分配与路线一致");
+            }
+        }
+    }
+
+    // ---- ② 簇归属完备且互斥：本地单恰属一个簇、跨簇单不属任何簇、两者并 = 全部订单 ----
+    int localCount = 0;
+    int crossCount = 0;
+    for (std::size_t i = 0; i < cfg.orders.size(); ++i) {
+        const logistics::Order& o = cfg.orders[i];
+        const int cluster = clusterOfOrder(cfg.graph, o);
+        const bool cross = isCrossCluster(cfg.graph, o) || cluster <= 0;
+        int matched = 0;
+        for (int f = 0; f < 3; ++f) {
+            const FleetPlan& fleet = *fleets[f];
+            std::size_t at = fleet.allocationOrderIds.size();
+            for (std::size_t k = 0; k < fleet.allocationOrderIds.size(); ++k) {
+                if (fleet.allocationOrderIds[k] == o.id) {
+                    at = k;
+                }
+            }
+            const bool ok = (at < fleet.allocationOrderIds.size())
+                            && (cross ? fleet.allocationClusterId[at] == -1
+                                      : fleet.allocationClusterId[at] == cluster);
+            check(ok, std::string(labels[f]) + "·分配②：订单 " + o.id
+                          + (cross ? " 是跨簇单 ⇒ 不属任何簇（-1）"
+                                   : " 恰属簇 " + std::to_string(cluster)));
+            if (ok) {
+                ++matched;
+            }
+        }
+        if (matched == 3) {
+            if (cross) {
+                ++crossCount;
+            } else {
+                ++localCount;
+            }
+        }
+    }
+    check(localCount + crossCount == static_cast<int>(cfg.orders.size()),
+          "分配②：本地单 + 跨簇单 = 全部订单（完备且互斥）");
+    std::printf("      分配②：本地单 %d 张、跨簇单 %d 张（默认数据应为 0 跨簇）\n", localCount,
+                crossCount);
+    check(crossCount == 0, "分配②：默认数据 0 条跨簇单（§4.2 数据事实）");
+
+    // ---- ③ 前缀峰值 0 ≤ L ≤ **该车**容量；并实证「总分配 kg ≤ 容量」是**非法**判据 ----
+    for (int f = 0; f < 3; ++f) {
+        const FleetPlan& fleet = *fleets[f];
+        const std::string tag = std::string(labels[f]) + "·分配③：";
+        for (std::size_t v = 0; v < cfg.vehicles.size() && v < fleet.vehicles.size(); ++v) {
+            const double peak = fleet.vehicles[v].metrics.peakLoadKg;
+            check(peak <= cfg.vehicles[v].capacityKg + 1e-6,
+                  tag + cfg.vehicles[v].id + " 前缀峰值 ≤ 该车容量（"
+                      + std::to_string(peak) + " / "
+                      + std::to_string(cfg.vehicles[v].capacityKg) + "）");
+        }
+    }
+    // 反例（§4.3 / Q5 实证）：顺序轮转基线上 V02/V03 各分到 165kg > 160kg 容量，
+    // 但峰值只有 64 / 57kg，**完全可行**。任何「总 kg ≤ 容量」的判定都会误报违规。
+    {
+        const std::vector<std::vector<logistics::Order> > assigned =
+            allocationOrderSets(cfg, baseDistance);
+        int overTotal = 0;
+        for (std::size_t v = 0; v < cfg.vehicles.size() && v < assigned.size(); ++v) {
+            double totalKg = 0.0;
+            for (std::size_t i = 0; i < assigned[v].size(); ++i) {
+                totalKg += assigned[v][i].demandKg;
+            }
+            const double peak = baseDistance.vehicles[v].metrics.peakLoadKg;
+            const double cap = cfg.vehicles[v].capacityKg;
+            std::printf("      分配③（基线）%s：总分配 %.0fkg / 容量 %.0fkg，峰值 %.0fkg\n",
+                        cfg.vehicles[v].id.c_str(), totalKg, cap, peak);
+            if (totalKg > cap + 1e-6) {
+                ++overTotal;
+                check(peak <= cap + 1e-6,
+                      std::string("分配③：") + cfg.vehicles[v].id
+                          + " 总分配 kg > 容量（" + std::to_string(totalKg) + " > "
+                          + std::to_string(cap) + "）但前缀峰值合规（"
+                          + std::to_string(peak) + "）⇒ 总 kg 判据会误报");
+            }
+        }
+        check(overTotal >= 2,
+              "分配③：顺序轮转基线至少有 2 台车「总分配 kg > 该车容量」而峰值合规"
+              "（§4.3 实证；禁止用总 kg 判可行性）");
+    }
+
+    // ---- ④ 每车从自己的 start_node / depart_time 空载出发、回同一基地；空车五项 0 ----
+    for (int f = 0; f < 3; ++f) {
+        const FleetPlan& fleet = *fleets[f];
+        const std::string tag = std::string(labels[f]) + "·分配④：";
+        for (std::size_t v = 0; v < cfg.vehicles.size() && v < fleet.vehicles.size(); ++v) {
+            const logistics::RoutePlan& plan = fleet.vehicles[v];
+            if (plan.nodes.empty()) {
+                check(false, tag + cfg.vehicles[v].id + " 路线非空");
+                continue;
+            }
+            check(plan.nodes.front() == cfg.vehicles[v].startNodeId,
+                  tag + cfg.vehicles[v].id + " 从自己的 start_node 出发");
+            check(plan.nodes.back() == cfg.vehicles[v].startNodeId,
+                  tag + cfg.vehicles[v].id + " 回到同一基地");
+            check(!plan.nodeArrivalMin.empty()
+                      && plan.nodeArrivalMin.front() == cfg.vehicles[v].departTimeMin,
+                  tag + cfg.vehicles[v].id + " 按自己的 depart_time 出发");
+            check(plan.metrics.actionCount == 2 * fleet.vehicleOrderCount[v],
+                  tag + cfg.vehicles[v].id + " 动作数 = 2 × 分配单数（空载出发、每单取送各一次）");
+            if (fleet.vehicleOrderCount[v] == 0) {
+                check(fixtures::nearlyEqual(plan.totalDistanceKm, 0.0)
+                          && fixtures::nearlyEqual(plan.totalCostYuan, 0.0)
+                          && plan.totalPenaltyMin == 0 && plan.metrics.stopCount == 0
+                          && plan.metrics.actionCount == 0,
+                      tag + cfg.vehicles[v].id + " 空车五项全 0");
+                check(plan.returnArrivalMin == cfg.vehicles[v].departTimeMin,
+                      tag + cfg.vehicles[v].id + " 空车返回时刻 = 发车时刻");
+            }
+        }
+    }
+
+    // ---- ⑤ 确定性：同输入同输出；tieKey 三层（车辆 ID 升序 → 停靠序列 → 枚举序）----
+    {
+        const FleetPlan again = planFleet(cfg.graph, cfg.vehicles, cfg.orders, WeightType::Distance);
+        check(again.allocationOrderIds == fleets[0]->allocationOrderIds
+                  && again.allocationVehicleIndex == fleets[0]->allocationVehicleIndex,
+              "分配⑤：同输入同输出（分配表逐项相同）");
+        bool sameNodes = again.vehicles.size() == fleets[0]->vehicles.size();
+        for (std::size_t v = 0; sameNodes && v < again.vehicles.size(); ++v) {
+            sameNodes = again.vehicles[v].nodes == fleets[0]->vehicles[v].nodes;
+        }
+        check(sameNodes, "分配⑤：同输入同输出（逐车节点序列逐字相同）");
+        std::vector<logistics::Order> shuffled;
+        for (std::size_t i = 0; i < cfg.orders.size(); ++i) {
+            shuffled.push_back(cfg.orders[(i * 7 + 3) % cfg.orders.size()]);
+        }
+        const FleetPlan byShuffle =
+            planFleet(cfg.graph, cfg.vehicles, shuffled, WeightType::Distance);
+        check(byShuffle.allocationVehicleIndex == fleets[0]->allocationVehicleIndex,
+              "分配⑤：打乱订单传入顺序不改变分配（ID/簇/车辆三层排序在枚举之前）");
+        std::printf("      分配⑤：候选键留痕 %zu 行（默认 3 簇 3 车应为 6 行）\n",
+                    fleets[0]->candidateKeyLog.size());
+        check(fleets[0]->candidateKeyLog.size() == 6,
+              "分配⑤：枚举 6 种「簇 -> 车」排列（默认 3 簇 3 车）");
+    }
+
+    // ---- ⑧ 第三阶段守卫：逐条读改派日志核对「完工耗时不变差」+「键严格变优」 ----
+    {
+        int records = 0;
+        for (int f = 0; f < 3; ++f) {
+            const FleetPlan& fleet = *fleets[f];
+            for (std::size_t i = 0; i < fleet.relocations.size(); ++i) {
+                const RelocateRecord& rec = fleet.relocations[i];
+                ++records;
+                check(rec.completionAfterMin <= rec.completionBeforeMin + 1e-9,
+                      std::string(labels[f]) + "·分配⑧：改派 " + rec.orderId + " "
+                          + rec.fromVehicleId + "→" + rec.toVehicleId + " 完工耗时不变差（"
+                          + std::to_string(rec.completionBeforeMin) + " -> "
+                          + std::to_string(rec.completionAfterMin) + "）");
+                const bool better = rec.penaltyAfter < rec.penaltyBefore
+                                    || (rec.penaltyAfter == rec.penaltyBefore
+                                        && (rec.weightAfter < rec.weightBefore - 1e-9
+                                            || (fixtures::nearlyEqual(rec.weightAfter,
+                                                                     rec.weightBefore)
+                                                && rec.balanceAfter < rec.balanceBefore - 1e-9)));
+                check(better, std::string(labels[f]) + "·分配⑧：改派 " + rec.orderId
+                                  + " 的车队键严格变优");
+                std::printf("      分配⑧：%s 轮 %d %s %s→%s 完工 %f→%f 键 (%d,%f,%f)→(%d,%f,%f)\n",
+                            labels[f], rec.round, rec.orderId.c_str(),
+                            rec.fromVehicleId.c_str(), rec.toVehicleId.c_str(),
+                            rec.completionBeforeMin, rec.completionAfterMin, rec.penaltyBefore,
+                            rec.weightBefore, rec.balanceBefore, rec.penaltyAfter,
+                            rec.weightAfter, rec.balanceAfter);
+            }
+        }
+        // **守卫必须真的测到了东西**：默认数据至少有一条被接受的改派。
+        check(records >= 1, "分配⑧：改派日志非空（守卫在这份数据上真的被消费过）");
+    }
+
+    // ---- ⑨ 基线确定性：分配只由「订单 ID 升序 + 车队行序」决定，与策略/容量/窗口无关 ----
+    {
+        check(baseDistance.allocationOrderIds == baseCost.allocationOrderIds
+                  && baseDistance.allocationVehicleIndex == baseCost.allocationVehicleIndex,
+              "分配⑨：基线换策略（距离 -> 成本）不改变分配");
+        check(baseDistance.allocationOrderIds == baseTime.allocationOrderIds
+                  && baseDistance.allocationVehicleIndex == baseTime.allocationVehicleIndex,
+              "分配⑨：基线换策略（距离 -> 时间）不改变分配");
+        // 与测试自算的顺序轮转映射逐单核对（读被测实现的分配 vs 独立算的分配）。
+        const std::vector<std::vector<logistics::Order> > expected = roundRobinAssignment(cfg);
+        for (std::size_t v = 0; v < expected.size(); ++v) {
+            for (std::size_t i = 0; i < expected[v].size(); ++i) {
+                std::size_t at = baseDistance.allocationOrderIds.size();
+                for (std::size_t k = 0; k < baseDistance.allocationOrderIds.size(); ++k) {
+                    if (baseDistance.allocationOrderIds[k] == expected[v][i].id) {
+                        at = k;
+                    }
+                }
+                check(at < baseDistance.allocationOrderIds.size()
+                          && baseDistance.allocationVehicleIndex[at] == v,
+                      "分配⑨：基线把 " + expected[v][i].id + " 分给第 " + std::to_string(v)
+                          + " 台车（ID 升序轮转）");
+            }
+        }
+        // 改容量 / 改窗口：分配不变。
+        Config widened = cfg;
+        for (std::size_t i = 0; i < widened.orders.size(); ++i) {
+            widened.orders[i].windowStartMin = 0;
+            widened.orders[i].windowEndMin = 1440;
+        }
+        widened.vehicles[0].capacityKg = cfg.vehicles[0].capacityKg + 100.0;
+        const FleetPlan byVariant = planFleetSequentialBaseline(
+            widened.graph, widened.vehicles, widened.orders, WeightType::Distance);
+        check(byVariant.allocationVehicleIndex == baseDistance.allocationVehicleIndex,
+              "分配⑨：改容量 / 改窗口不改变基线分配");
+        // 三阶段分配与基线**必须不同**（否则 #40 没生效）。
+        check(fleets[0]->allocationVehicleIndex != baseDistance.allocationVehicleIndex,
+              "分配⑨：三阶段分配与顺序轮转基线不同（#40 生效）");
+    }
+
+    // 逐策略摘要打印（人工核对用）。
+    for (int f = 0; f < 3; ++f) {
+        const FleetPlan& fleet = *fleets[f];
+        std::string alloc;
+        for (std::size_t i = 0; i < fleet.allocationOrderIds.size(); ++i) {
+            const std::size_t v = fleet.allocationVehicleIndex[i];
+            if (!alloc.empty()) {
+                alloc += ",";
+            }
+            alloc += fleet.allocationOrderIds[i] + "="
+                     + (v < cfg.vehicles.size() ? cfg.vehicles[v].id : std::string("-"));
+        }
+        std::printf("      %s ALLOC %s\n", labels[f], alloc.c_str());
+        std::printf("      %s 均衡度（峰值利用率极差）= %.3f；改派 %zu 次\n", labels[f],
+                    fleet.balanceSpread, fleet.relocations.size());
+    }
+    std::printf("      基线 ALLOC（顺序轮转）逐车单数：");
+    for (std::size_t v = 0; v < baseDistance.vehicleOrderCount.size(); ++v) {
+        std::printf(" %s=%d", cfg.vehicles[v].id.c_str(), baseDistance.vehicleOrderCount[v]);
+    }
+    std::printf("\n");
 }
 
 // 载重远小于总需求时：**仍是单条连续路线**（边取边送 + 前缀载重），
@@ -907,7 +1210,10 @@ void checkEmptyVehicleRules(const Config& cfg) {
     // 只留一张单：顺序轮转下它必然归第 0 台车（i mod 2 == 0），第 1 台必然空车。
     std::vector<logistics::Order> firstOnly;
     firstOnly.push_back(cfg.orders.front());
-    const FleetPlan fleet = planFleet(cfg.graph, two, firstOnly, WeightType::Distance);
+    // 空车规则是**车队汇总**语义（与分配算法无关）：这里用顺序轮转基线，
+    // 「1 张单必然归第 0 台车」才是这条用例的前提。
+    const FleetPlan fleet =
+        planFleetSequentialBaseline(cfg.graph, two, firstOnly, WeightType::Distance);
     check(fleet.vehicles.size() == 2, "空车车队：逐车计划数 == 2");
     if (fleet.vehicles.size() == 2) {
         check(fleet.vehicles[1].metrics.stopCount == 0,
@@ -1092,6 +1398,22 @@ int main() {
     const FleetPlan byTime = planFleetForWeight(cfg, WeightType::Time, "最短耗时策略");
 
     checkDataQualityInvariants(cfg, byDistance, byCost, byTime);
+
+    // ---- 规格二 §4 / #40：9 条分配不变量（三策略 + 顺序轮转基线）----
+    const FleetPlan baseDistance =
+        planFleetSequentialBaseline(cfg.graph, cfg.vehicles, cfg.orders, WeightType::Distance);
+    const FleetPlan baseCost =
+        planFleetSequentialBaseline(cfg.graph, cfg.vehicles, cfg.orders, WeightType::Cost);
+    const FleetPlan baseTime =
+        planFleetSequentialBaseline(cfg.graph, cfg.vehicles, cfg.orders, WeightType::Time);
+    const FleetPlan* threeFleets[3] = {&byDistance, &byCost, &byTime};
+    const char* threeLabels[3] = {"最短距离策略", "最低成本策略", "最短耗时策略"};
+    checkAllocationInvariants(cfg, threeFleets, threeLabels, baseDistance, baseCost, baseTime);
+
+    // 阶段二的 6 种排列留痕（默认 3 簇 3 车）——人工核对「各自怎么取优」。
+    for (std::size_t i = 0; i < byDistance.candidateKeyLog.size(); ++i) {
+        std::printf("      排列[%zu] %s\n", i, byDistance.candidateKeyLog[i].c_str());
+    }
 
     // 车队专属规则（规格二 §3.4 / §3.6）：空车与「慢车因子」两条。
     checkEmptyVehicleRules(cfg);

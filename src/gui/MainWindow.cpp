@@ -2020,6 +2020,10 @@ void MainWindow::updatePanels() {
                          .arg(rateText(vm.pickupOnTimeCount, vm.pickupTotal))
                          .arg(rateText(vm.deliveryOnTimeCount, vm.deliveryTotal));
         }
+        // 均衡度（规格二 §4.3 / #40）：峰值利用率极差，越小越均衡。**纯增量一行**，
+        // 不新增控件；分母按全部车（空车 utilization 记 0）。计划级结果，与页签运行态不同源。
+        route += QStringLiteral("均衡度（峰值利用率极差）：%1\n")
+                     .arg(fleetPlan_.balanceSpread, 0, 'f', 2);
         if (!fleetPlan_.allOk) {
             route += QStringLiteral("不可行车辆：%1\n")
                          .arg(QString::fromStdString(fleetPlan_.reason));

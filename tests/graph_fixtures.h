@@ -196,6 +196,15 @@ inline logistics::Node makeNode(const std::string& id, logistics::NodeType type,
     return n;
 }
 
+// 带子网络编号的节点（规格二 §4.2 的聚类判据：簇 = 取货点 A 的 subNetworkId）。
+// 仓库 = 0（不参与聚类）；聚类夹具的配送点用 1 / 2 / 3。
+inline logistics::Node makeSubNode(const std::string& id, logistics::NodeType type,
+                                   const std::string& name, int subNetworkId) {
+    logistics::Node n = makeNode(id, type, name);
+    n.subNetworkId = subNetworkId;
+    return n;
+}
+
 inline logistics::Edge makeEdge(const std::string& from, const std::string& to,
                                double km, double minutes, double yuan) {
     logistics::Edge e;

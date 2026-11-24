@@ -203,6 +203,105 @@ bool near(double a, double b, double tol) {
     return std::fabs(a - b) <= tol + 1e-9;
 }
 
+// ---- 规格二 §4（#40）：--dump-plan 的 ALLOC / ASSIGN 行（用户可见输出）----
+//
+//   ALLOC  <orderId>=<vehicleId>,…      按订单 ID 升序
+//   ASSIGN <vehicleId> <簇N | 跨簇 | 空车> <订单数>
+//
+// 这是**分配的可核对视图**：ALLOC 给逐单归属，ASSIGN 给逐车汇总。
+// 守卫读这两行 + 既有的 PLAN/STOP 行，不读规划器内部状态。
+struct AllocDump {
+    bool hasAlloc = false;
+    bool hasAssign = false;
+    std::vector<std::string> orderIds;      // ALLOC 的订单 ID（应升序）
+    std::vector<std::string> vehicleIds;    // 与 orderIds 一一对应
+    std::vector<std::string> assignVehicle; // ASSIGN 行的车辆
+    std::vector<std::string> assignLabel;   // 簇N / 跨簇 / 空车
+    std::vector<int> assignCount;           // 该行订单数
+    // 每台车**送达**的订单 ID（STOP 行的 deliveries 列），用于与 ALLOC 双向对拍。
+    std::map<std::string, std::vector<std::string> > deliveredByVehicle;
+};
+
+std::vector<std::string> splitSpaces(const std::string& line) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : line) {
+        if (c == ' ' || c == '\t') {
+            if (!cur.empty()) {
+                out.push_back(cur);
+                cur.clear();
+            }
+        } else {
+            cur.push_back(c);
+        }
+    }
+    if (!cur.empty()) {
+        out.push_back(cur);
+    }
+    return out;
+}
+
+AllocDump parseAllocDump(const std::string& text) {
+    AllocDump d;
+    std::string curVehicle;
+    for (const std::string& line : splitLines(text)) {
+        const std::vector<std::string> tok = splitSpaces(line);
+        if (tok.empty()) {
+            continue;
+        }
+        if (tok[0] == "PLAN" && tok.size() >= 2) {
+            curVehicle = tok[1];
+        } else if (tok[0] == "STOP" && !curVehicle.empty() && tok.size() >= 9) {
+            if (tok[8] != "-") {
+                std::string item;
+                for (char c : tok[8]) {
+                    if (c == ',') {
+                        const std::size_t colon = item.find(':');
+                        d.deliveredByVehicle[curVehicle].push_back(
+                            colon == std::string::npos ? item : item.substr(0, colon));
+                        item.clear();
+                    } else {
+                        item.push_back(c);
+                    }
+                }
+                if (!item.empty()) {
+                    const std::size_t colon = item.find(':');
+                    d.deliveredByVehicle[curVehicle].push_back(
+                        colon == std::string::npos ? item : item.substr(0, colon));
+                }
+            }
+        } else if (tok[0] == "ALLOC" && tok.size() >= 2) {
+            d.hasAlloc = true;
+            std::string item;
+            for (char c : tok[1]) {
+                if (c == ',') {
+                    const std::size_t eq = item.find('=');
+                    if (eq != std::string::npos) {
+                        d.orderIds.push_back(item.substr(0, eq));
+                        d.vehicleIds.push_back(item.substr(eq + 1));
+                    }
+                    item.clear();
+                } else {
+                    item.push_back(c);
+                }
+            }
+            if (!item.empty()) {
+                const std::size_t eq = item.find('=');
+                if (eq != std::string::npos) {
+                    d.orderIds.push_back(item.substr(0, eq));
+                    d.vehicleIds.push_back(item.substr(eq + 1));
+                }
+            }
+        } else if (tok[0] == "ASSIGN" && tok.size() >= 4) {
+            d.hasAssign = true;
+            d.assignVehicle.push_back(tok[1]);
+            d.assignLabel.push_back(tok[2]);
+            d.assignCount.push_back(std::atoi(tok[3].c_str()));
+        }
+    }
+    return d;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -234,6 +333,9 @@ int main(int argc, char** argv) {
     } else {
         strategies = {strategy};
     }
+
+    std::map<std::string, std::vector<std::string> > allocByStrategy;
+    std::map<std::string, Parsed> parsedByStrategy;
 
     for (const std::string& name : strategies) {
         const plan_golden::StrategyGolden* g = nullptr;
@@ -412,10 +514,128 @@ int main(int argc, char** argv) {
                   tag + "·L3 逐车指标齐全（" + v.id + "：距离/耗时/成本/利用率）");
         }
 
+        // ---- G11（#40）：--dump-plan 的 ALLOC / ASSIGN 让分配可核对 ----
+        //
+        // ALLOC 给逐单归属（按订单 ID 升序），ASSIGN 给逐车汇总；两者都要与
+        // 逐车 STOP 的送达动作**双向对拍**。守卫读的是用户可见输出，不读规划器内部。
+        {
+            const AllocDump ad = parseAllocDump(dumpText);
+            check(ad.hasAlloc, tag + "·G11 转储含 ALLOC 行");
+            check(ad.hasAssign, tag + "·G11 转储含 ASSIGN 行");
+            check(ad.orderIds.size() == static_cast<std::size_t>(orderCount),
+                  tag + "·G11 ALLOC 覆盖全部订单（" + std::to_string(ad.orderIds.size()) + " / "
+                      + std::to_string(orderCount) + "）");
+            bool sortedIds = true;
+            for (std::size_t i = 1; i < ad.orderIds.size(); ++i) {
+                if (!(ad.orderIds[i - 1] < ad.orderIds[i])) {
+                    sortedIds = false;
+                }
+            }
+            check(sortedIds, tag + "·G11 ALLOC 按订单 ID 升序");
+
+            // 每张单恰好一次归属，且归属车真的送达了它（ALLOC ↔ STOP 双向对拍）。
+            bool allocMatchesStops = true;
+            for (const logistics::Order& o : cfg.orders) {
+                int hits = 0;
+                std::string vid;
+                for (std::size_t i = 0; i < ad.orderIds.size(); ++i) {
+                    if (ad.orderIds[i] == o.id) {
+                        ++hits;
+                        vid = ad.vehicleIds[i];
+                    }
+                }
+                if (hits != 1) {
+                    allocMatchesStops = false;
+                }
+                int delivered = 0;
+                for (std::map<std::string, std::vector<std::string> >::const_iterator it =
+                         ad.deliveredByVehicle.begin();
+                     it != ad.deliveredByVehicle.end(); ++it) {
+                    int here = 0;
+                    for (std::size_t k = 0; k < it->second.size(); ++k) {
+                        if (it->second[k] == o.id) {
+                            ++here;
+                        }
+                    }
+                    delivered += here;
+                    if (it->first == vid && here != 1) {
+                        allocMatchesStops = false;
+                    }
+                }
+                if (delivered != 1) {
+                    allocMatchesStops = false;
+                }
+            }
+            check(allocMatchesStops, tag + "·G11 每单恰好一台车，且 ALLOC 与逐车 STOP 送达一致");
+
+            // ASSIGN 的单数 == 该车 STOP 送达数；标签只能是 簇N / 跨簇 / 空车。
+            bool assignOk = true;
+            for (const logistics::Vehicle& v : cfg.vehicles) {
+                int assigned = 0;
+                bool hasLabel = false;
+                for (std::size_t i = 0; i < ad.assignVehicle.size(); ++i) {
+                    if (ad.assignVehicle[i] != v.id) {
+                        continue;
+                    }
+                    hasLabel = true;
+                    assigned += ad.assignCount[i];
+                    const std::string& lab = ad.assignLabel[i];
+                    const bool clusterLabel = lab.size() > 3 && lab.compare(0, 3, "簇") == 0
+                                              && std::atoi(lab.c_str() + 3) >= 1;
+                    if (!clusterLabel && lab != "跨簇" && lab != "空车") {
+                        assignOk = false;
+                    }
+                }
+                if (!hasLabel) {
+                    assignOk = false;
+                }
+                int delivered = 0;
+                const std::map<std::string, std::vector<std::string> >::const_iterator it =
+                    ad.deliveredByVehicle.find(v.id);
+                if (it != ad.deliveredByVehicle.end()) {
+                    delivered = static_cast<int>(it->second.size());
+                }
+                if (assigned != delivered) {
+                    assignOk = false;
+                }
+            }
+            check(assignOk, tag + "·G11 ASSIGN 每车单数 == 该车 STOP 送达数，标签为 簇N/跨簇/空车");
+            check(ad.assignVehicle.size() >= cfg.vehicles.size(),
+                  tag + "·G11 每台车至少一条 ASSIGN（空车也打「空车 0」）");
+            allocByStrategy[name] = ad.vehicleIds;
+            parsedByStrategy[name] = p;
+        }
+
         std::printf("    %-8s 距离 %.3f | 完工耗时 %.3f | 成本 %.3f | penalty %d | S %d A %d "
                     "| 平均在车 %.1f 峰值 %.1f | 车 %d 台\n",
                     name.c_str(), p.distance, p.time, p.cost, p.penalty, p.stops, p.actions,
                     p.avgLoad, p.peak, vehicleCount);
+    }
+
+    // ---- G12（#40 验收）：三策略两两分化 + 各自在**自身目标**上不劣于另两条 ----
+    //
+    // 口径与用户看到的一致：距离 / 成本是 Σ（--plan-summary 第 1 行），
+    // 耗时是**完工耗时**（#19 Q5 主口径，same 第 1 行的「总耗时」）。
+    if (strategies.size() == 3) {
+        check(allocByStrategy["distance"] != allocByStrategy["cost"],
+              "G12 距离与成本的 ALLOC 分配映射不同（三策略分化）");
+        check(allocByStrategy["distance"] != allocByStrategy["time"],
+              "G12 距离与时间的 ALLOC 分配映射不同");
+        check(allocByStrategy["cost"] != allocByStrategy["time"],
+              "G12 成本与时间的 ALLOC 分配映射不同");
+        const double tol = 1e-6;
+        check(parsedByStrategy["distance"].distance
+                  <= parsedByStrategy["cost"].distance + tol
+                  && parsedByStrategy["distance"].distance
+                         <= parsedByStrategy["time"].distance + tol,
+              "G12 距离策略的总距离不劣于成本/时间策略");
+        check(parsedByStrategy["cost"].cost <= parsedByStrategy["distance"].cost + tol
+                  && parsedByStrategy["cost"].cost <= parsedByStrategy["time"].cost + tol,
+              "G12 成本策略的总成本不劣于距离/时间策略");
+        check(parsedByStrategy["time"].time <= parsedByStrategy["distance"].time + tol
+                  && parsedByStrategy["time"].time <= parsedByStrategy["cost"].time + tol,
+              "G12 时间策略的完工耗时不劣于距离/成本策略");
+        std::printf("    G12 三策略分配映射两两不同；自身目标各自最优（车端口径）\n");
     }
 
     return testutil::summarize("cli_plan_summary");
