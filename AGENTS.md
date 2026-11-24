@@ -29,7 +29,7 @@ bash 启动软件.sh                  # 启动 GUI（首次会自动 CMake 配�
 
 ## 3. 不变量（改坏了必须立刻发现）
 
-- **三策略黄金值**（`./build/app --plan-summary distance|cost|time`；口径：**#43 工作区实测**，
+- **三策略黄金值**（`./build/app --plan-summary distance|cost|time`；口径：**#43 已提交基线实测**，
   2026-11-24，三车 V01 400kg·1.00·1.50 / V02·V03 160kg·1.25·0.80，`config/default.ini`）。
   输出 **9 行** = 车队汇总 / 车队率 / **每车 7 项 ×3** / 逐单超时 / **每车路线 ×3**（格式见
   `docs/设计.md` §7.4）。**102 个常量**（车队 13×3 + 每车 7×3×3）落 `tests/plan_golden.h`：
@@ -46,7 +46,7 @@ bash 启动软件.sh                  # 启动 GUI（首次会自动 CMake 配�
     （打印但不冻结）、每车两率的紧急/普通分列（只在车队级分列）。
   - 规格一 39 常数（115.100 / 415.200 / 141.900 等单车 V01 200kg 口径）与更早「6 趟」三行
     **已作废、只留历史**（见 `tests/plan_golden.h` 注释）。
-- `ctest` 全绿；**四套断言口径，不许混**（2026-11-24 实测，`spec/pdp-fleet` 工作区）：
+- `ctest` 全绿；**四套断言口径，不许混**（2026-11-24 实测，`spec/pdp-fleet`，#43 已提交基线）：
   ① 9 个 C++ 测试二进制自报合计 **3603 项**（core 101 / config 681 / minheap 28 / simevent 53 /
   dijkstra 19 / routeplanner 1466 / integration 1122 / traffic 99 / graphedit 34）；
   ② `cli_plan_summary`（L2 文本守卫）**515 项**；③ `cli_demo_transfer` **6 项**；
