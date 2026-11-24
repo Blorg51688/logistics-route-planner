@@ -59,11 +59,13 @@ public:
         double                              loadKg = 0.0;
         std::vector<logistics::OnboardItem> onboard;
 
-        // 趟次
-        int    tripNumber = 1;            // 正在跑第几趟（绝对编号，1 起）
-        double tripLoadKg = 0.0;          // 本趟出发时装了多少（驶离后冻结）
-        bool   departed = false;          // 本趟是否已驶离
-        int    completedTrips = 0;        // 已跑完几趟
+        // 趟次（规格一 MC-A01：趟结构已退役，单条连续路线 ⇒ 恒为第 1 趟）
+        // 三个字段保留**只为界面文案与探针不改造**（列数与文本归 #37）；
+        // 语义固定为「1 / 出发时装载 / 是否已驶离」。
+        int    tripNumber = 1;            // 恒为 1
+        double tripLoadKg = 0.0;          // 出发时装载（驶离后冻结）
+        bool   departed = false;          // 是否已驶离
+        int    completedTrips = 0;        // 恒为 0（单条路线不"跑完几趟"）
 
         // 累计量
         int    servedStops = 0;           // 已送达停靠点总数
@@ -88,14 +90,13 @@ public:
         // 比较口径与旧字符串键一致（同站同点同整数 kg 视为同一件事）。
         // 取回不再进这个键（由本趟 pickups/reclaim 状态单独判定，reclaim 字段已退役）。
         // 同样是**物理事实**，跨重规划保留。
+        // 降载去重键（规格一 MC-A05：按**订单**记账）。同一张单的降载只发生一次。
         struct OffloadKey {
             std::string station;
-            std::string nodeId;
-            double      kg = 0.0;     // 已 lround 到整数，延续旧键的去重口径
+            std::string orderId;
             bool operator<(const OffloadKey& o) const {
                 if (station != o.station)  return station < o.station;
-                if (nodeId != o.nodeId)    return nodeId < o.nodeId;
-                return kg < o.kg;
+                return orderId < o.orderId;
             }
         };
         std::set<OffloadKey> appliedOffloads;
@@ -248,6 +249,8 @@ private:
 
     std::string        currentPositionId() const;
     QString            orderIdsAt(const std::string& nodeId) const;
+    // 某张订单的货量（降载/取回日志用；按订单查，不按节点查）。
+    double             orderKg(const std::string& orderId) const;
     // 车辆**当前**载着的货量（随送达递减），不是本趟出发时的装载量
     double             currentLoadKg() const;
     // 车辆此刻**已经载在车上**的货（显式状态，不从计划反推）。
@@ -309,17 +312,13 @@ private:
         int         arrivalMin = 0;
         int         penaltyMin = 0;   // 窗口止在渲染时由订单反查，Stop 里没有这个字段
     };
-    // 车辆当前所在的趟在 plan_.trips 里的下标
-    std::size_t currentTripIndex() const;
+
 
     // ---- 状态转移：只有这几处能改 state_ ----
     //
-    // 装载：车在仓库时，按计划的当前趟把货装上车（并冻结本趟装载量）
-    // 装载指定的一趟。**必须显式给趟号**：车停在仓库时，nodeIndex_ 指向的是
-    // "刚刚跑完的那一趟"（该趟终点就是仓库），用它去找"当前趟"会装错货。
-    void loadForTrip(std::size_t tripIndex);
-    // 车在仓库时装载它**即将开始**的那一趟（= 当前趟 + 1）
-    void loadForCurrentTrip();
+    // 装载：单条连续路线下，全部订单都是 A→B 取送 ⇒ 车辆空载出发，
+    // 货在取货点 A 装车（onAdvanceStop 的取货动作）。仓库不再装货，
+    // 因此**没有** loadForTrip / loadForCurrentTrip（规格一 MC-A01/MC-A02 退役）。
     // 换计划后的统一收尾（三处重规划路径共用）
     void afterPlanReplaced();
     // 到达：更新位置与时刻；车回到仓库 = 一趟跑完，推进趟次并装载下一趟

@@ -196,7 +196,9 @@ def stops_from_route_nodes(route_nodes, orders):
     route_nodes: 被测方给出的完整节点序列（含首尾仓库）。
     orders: [{"id": .., "pickup": A, "delivery": B, "ws": .., "we": ..}, ...]
     规则：送达先于取货（合并停靠内先卸后装）；同一节点既是某单取货点又是另一单
-    送达点时并成一次停靠；重访节点只承接尚未完成的动作。
+    送达点时并成一次停靠；重访节点只承接尚未完成的动作——
+    某次访问只能送达**已经取到**的货，否则该动作留给后续访问（规格一 #18 Q13 的
+    「先取后送强制重访」：D01 第一次是取货，第二次才是送达）。
     """
     by_pickup, by_delivery = {}, {}
     for o in orders:
@@ -211,7 +213,7 @@ def stops_from_route_nodes(route_nodes, orders):
             if o["id"] in delivered:
                 continue
             if o["id"] not in picked:
-                raise ValueError("订单 %s 在取货前被送达（序列非法）" % o["id"])
+                continue   # 还没取到：这次访问不送达它（留给后续重访）
             deliveries.append((o["id"], o["ws"], o["we"]))
             delivered.add(o["id"])
         for o in by_pickup.get(node, []):
@@ -300,6 +302,82 @@ def show(title, result):
     print(f"  totalTime     = {result['total_time']}")
     print(f"  totalCost     = {result['total_cost']}")
     print(f"  totalPenalty  = {result['total_penalty']}")
+
+
+def _clock_minutes(text):
+    hh, mm = text.split(":")
+    return int(hh) * 60 + int(mm)
+
+
+def _read_ini_sections(path):
+    """按节读 INI（手写：default.ini 的数据行本身就是逗号分隔的裸行，
+    configparser 会把它们当成语法错误）。"""
+    sections = {}
+    current = None
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or line.startswith(";"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                current = line[1:-1].strip()
+                sections[current] = ""
+                continue
+            if current is not None:
+                sections[current] += line + "\n"
+    return sections
+
+
+def _cli_route(argv):
+    """oracle 的命令行入口（oracle 算术对拍）：
+
+        python3 tools/oracle.py --route <kind> <start> <return> <startTime> <节点序列...>
+
+    节点序列由 app 的 --plan-summary 第 4 行给出；订单表与边表从 config/default.ini 读。
+    oracle 只对**给定序列**复算算术，不实现选路。
+    """
+    import os
+    kind = argv[0]
+    start = argv[1]
+    ret = argv[2]
+    start_time = int(argv[3])
+    route_nodes = argv[4:]
+    ini = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "config", "default.ini")
+    sections = _read_ini_sections(ini)
+    orders = []
+    for raw in sections.get("orders", "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) < 7:
+            continue
+        orders.append({"id": parts[0], "pickup": parts[1], "delivery": parts[2],
+                       "kg": float(parts[3]), "ws": _clock_minutes(parts[4]),
+                       "we": _clock_minutes(parts[5])})
+    g = Graph()
+    for raw in sections.get("edges", "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) < 5:
+            continue
+        g.two_way(parts[0], parts[1], float(parts[2]), float(parts[3]), float(parts[4]))
+    stops = stops_from_route_nodes(route_nodes, orders)
+    res = route_metrics(g, start, ret, start_time, stops, kind)
+    if res is None:
+        print("不可达")
+        return 1
+    print("total_distance = %.3f" % res["total_distance"])
+    print("total_time     = %.3f" % res["total_time"])
+    print("total_cost     = %.3f" % res["total_cost"])
+    print("total_penalty  = %d" % res["total_penalty"])
+    print("stops          = %d" % len(res["stops"]))
+    actions = sum(len(r["pickups"]) + len(r["deliveries"]) for r in res["stops"])
+    print("actions        = %d" % actions)
+    return 0
 
 
 def self_check():
@@ -506,6 +584,9 @@ def fixture_w_d1_congested(increase):
 def main():
     if "--check" in sys.argv:
         return self_check()
+    if "--route" in sys.argv:
+        i = sys.argv.index("--route")
+        return _cli_route(sys.argv[i + 1:])
 
     print("=" * 72)
     print("Dijkstra 夹具（tests/dijkstra_tests.cpp）")

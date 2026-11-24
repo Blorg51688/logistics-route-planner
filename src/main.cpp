@@ -190,35 +190,62 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "配置中没有车辆\n");
             return 1;
         }
+        const logistics::Vehicle& vehicle = config.vehicles.front();
         const logistics::RoutePlan plan =
-            logistics::planRoute(config.graph, config.vehicles.front(), config.orders,
-                                 planWeight);
+            logistics::planRoute(config.graph, vehicle, config.orders, planWeight);
         if (plan.status != logistics::PlanStatus::Ok) {
             std::printf("不可行：%s\n", plan.reason.c_str());
             return 0;
         }
-        std::printf("总距离 %.3f km | 总耗时 %.3f min | 总成本 %.3f 元 | "
-                    "总 penalty %d min | 停靠 %zu 站",
-                    plan.totalDistanceKm, plan.totalTimeMin, plan.totalCostYuan,
-                    plan.totalPenaltyMin, plan.stops.size());
-        if (plan.trips.size() > 1) {
-            std::printf(" | 共 %zu 趟", plan.trips.size());
-        }
-        std::printf("\n");
+        const logistics::RouteMetrics& m = plan.metrics;
 
-        // 超时停靠点：向导据此显示"应看到什么"，避免把具体站点写死在脚本里
-        // （数据一改就过期，第 6 轮的第 8 关就是这么误报的）
+        // 第 1 行：五项汇总 + 停靠点数 · 动作数（规格一 §6.3）。
+        std::printf("总距离 %.3f km | 总耗时 %.3f min | 总成本 %.3f 元 | "
+                    "总 penalty %d min | 停靠 %d 站 · 动作 %d 次\n",
+                    plan.totalDistanceKm, plan.totalTimeMin, plan.totalCostYuan,
+                    plan.totalPenaltyMin, m.stopCount, m.actionCount);
+
+        // 第 2 行：三项新指标。分母为 0 的率打印「—」（不是 0%/100%）。
+        const auto rateText = [](int hit, int total) -> std::string {
+            if (total <= 0) {
+                return "—";
+            }
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%.1f", 100.0 * static_cast<double>(hit) / total);
+            return std::string(buf) + "%";
+        };
+        const auto ratioText = [](int hit, int total) -> std::string {
+            return std::to_string(hit) + "/" + std::to_string(total);
+        };
+        std::printf("取货准时率 %s（%s） | 送达准时率 %s（%s；紧急 %s · 普通 %s） | "
+                    "平均在车 %.1f kg（利用率 %.1f%% · 峰值 %.1f kg）\n",
+                    rateText(m.pickupOnTimeCount, m.pickupTotal).c_str(),
+                    ratioText(m.pickupOnTimeCount, m.pickupTotal).c_str(),
+                    rateText(m.deliveryOnTimeCount, m.deliveryTotal).c_str(),
+                    ratioText(m.deliveryOnTimeCount, m.deliveryTotal).c_str(),
+                    rateText(m.urgentOnTimeCount, m.urgentTotal).c_str(),
+                    rateText(m.normalOnTimeCount, m.normalTotal).c_str(),
+                    m.avgLoadKg, m.loadUtilization * 100.0, m.peakLoadKg);
+
+        // 第 3 行：**逐单**超时（一个停靠上可能一单一迟一早，按停靠列会掩盖）。
         std::string late;
-        for (const logistics::Stop& s : plan.stops) {
-            if (!s.late) {
+        for (const logistics::OrderMetric& om : m.orders) {
+            if (!om.late) {
                 continue;
             }
             if (!late.empty()) {
                 late += "、";
             }
-            late += s.nodeId + "(+" + std::to_string(s.penaltyMin) + "min)";
+            late += om.orderId + "@" + om.nodeId + "(+" + std::to_string(om.penaltyMin) + "min)";
         }
-        std::printf("超时停靠点：%s\n", late.empty() ? "（无）" : late.c_str());
+        std::printf("超时订单：%s\n", late.empty() ? "（无）" : late.c_str());
+
+        // 第 4 行：完整节点序列（oracle 算术对拍需要；GUI 不显示这一行）。
+        std::printf("路线");
+        for (const std::string& id : plan.nodes) {
+            std::printf(" %s", id.c_str());
+        }
+        std::printf("\n");
         return 0;
     }
 
