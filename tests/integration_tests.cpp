@@ -200,30 +200,14 @@ void checkPlanInvariants(const Config& cfg, const RoutePlan& plan, const std::st
     }
     check(hardOk, tag + "硬优先：紧急停靠全部先于普通停靠");
 
-    // 不变量 ⑦：同阶段同节点至多一次停靠；重复时那一停只含一个动作（强制重访）。
-    bool uniqueOk = true;
-    std::string badNode;
-    for (std::size_t i = 0; i < plan.stops.size() && uniqueOk; ++i) {
-        for (std::size_t j = i + 1; j < plan.stops.size(); ++j) {
-            if (plan.stops[i].nodeId != plan.stops[j].nodeId
-                || plan.stops[i].phase != plan.stops[j].phase) {
-                continue;
-            }
-            const bool transit =
-                plan.stops[i].isTransitStop() || plan.stops[j].isTransitStop();
-            const std::size_t actions = plan.stops[j].pickups.size()
-                                        + plan.stops[j].deliveries.size()
-                                        + plan.stops[j].offloads.size()
-                                        + plan.stops[j].reclaims.size();
-            if (transit || actions != 1) {
-                uniqueOk = false;
-                badNode = plan.stops[j].nodeId;
-                break;
-            }
-        }
-    }
-    check(uniqueOk, tag + "同阶段同节点至多一次停靠，重复时只含一个动作"
-                        + (badNode.empty() ? std::string() : "（" + badNode + "）"));
+    // 不变量 ⑦（规格字面）：**同阶段同节点至多一次停靠**；唯一例外是强制重访 ——
+    // 把重访停靠的那一个动作并入该节点首次停靠后，F2（先取后送）/ F5（紧急 FIFO）/
+    // F3（前缀载重、先卸后装）**失败**。默认数据集要求**非强制重复为 0**。
+    // 判据与实现同源：tests/graph_fixtures.h 的 fixtures::nonForcedRevisitStops。
+    const int nonForced =
+        fixtures::nonForcedRevisitStops(plan.stops, cfg.orders, cfg.vehicles[0].capacityKg, 0.0);
+    check(nonForced == 0, tag + "非强制重复停靠必须为 0（并入首次停靠后 F2/F5/F3 都过的重复"
+                              "一律算违规），实际 " + std::to_string(nonForced));
 
     // 不变量 ⑧ ⑨：停靠零耗时、逐单 penalty。
     bool zeroDwell = true;

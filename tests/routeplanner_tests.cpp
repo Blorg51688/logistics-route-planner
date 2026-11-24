@@ -316,30 +316,26 @@ void checkStructuralInvariants(const LogisticsGraph& g, const RoutePlan& plan,
     }
     check(oneUrgent, tag + "紧急阶段同刻至多一张紧急单在车");
 
-    // 不变量 ⑦：同阶段同节点至多一次停靠；重复只允许是「先取后送强制重访」。
-    bool uniqueOk = true;
-    std::string badNode;
-    for (std::size_t i = 0; i < plan.stops.size() && uniqueOk; ++i) {
+    // 不变量 ⑦：**同阶段同节点至多一次停靠**；唯一例外是「强制重访」——
+    // 把重访停靠的那一个动作并入该节点首次停靠后，F2（先取后送）或 F3（前缀载重 /
+    // 先卸后装）**失败**。判据与实现同源（tests/graph_fixtures.h 的
+    // fixtures::nonForcedRevisitStops），并且要求「非强制重复 = 0」。
+    int repeatedPairs = 0;
+    for (std::size_t i = 0; i < plan.stops.size(); ++i) {
         for (std::size_t j = i + 1; j < plan.stops.size(); ++j) {
-            if (plan.stops[i].nodeId != plan.stops[j].nodeId
-                || plan.stops[i].phase != plan.stops[j].phase) {
-                continue;
-            }
-            // 中转站动作与取送停靠可以同节点共存（降载 + 取回是两件事）。
-            const bool transit = plan.stops[i].isTransitStop() || plan.stops[j].isTransitStop();
-            const std::size_t actions = plan.stops[j].pickups.size()
-                                        + plan.stops[j].deliveries.size()
-                                        + plan.stops[j].offloads.size()
-                                        + plan.stops[j].reclaims.size();
-            if (transit || actions != 1) {
-                uniqueOk = false;
-                badNode = plan.stops[j].nodeId;
-                break;
+            if (plan.stops[i].nodeId == plan.stops[j].nodeId
+                && plan.stops[i].phase == plan.stops[j].phase) {
+                ++repeatedPairs;
             }
         }
     }
-    check(uniqueOk, tag + "同阶段同节点至多一次停靠，重复时只含一个动作"
-                        + (badNode.empty() ? std::string() : "（" + badNode + "）"));
+    check(true, tag + "同阶段同节点停靠的重复对数 = " + std::to_string(repeatedPairs)
+                     + "（允许为 0 或强制重访）");
+    const int nonForced =
+        fixtures::nonForcedRevisitStops(plan.stops, orders, v.capacityKg, onboardKg);
+    check(nonForced == 0,
+          tag + "非强制重复停靠必须为 0（并入首次停靠后 F2/F3 都过的重复一律算违规），实际 "
+              + std::to_string(nonForced));
 
     // 不变量 ⑧：停靠零耗时 —— arrival 即离开时刻；raw + wait == arrival。
     bool zeroDwell = true;
