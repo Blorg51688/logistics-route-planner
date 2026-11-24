@@ -72,7 +72,8 @@ bool contains(const std::vector<std::string>& v, const std::string& key) {
 // ---------------------------------------------------------------------------
 struct CostMatrix {
     std::vector<std::string>           ids;
-    std::map<std::string, std::size_t> index;
+    // 每次 leg 查询都要按节点名查两次下标 ⇒ 用无序表（热路径上省掉 log n 次字符串比较）。
+    std::unordered_map<std::string, std::size_t> index;
     // 每个维度一张「按该维度最优的路径」的三项代价表：
     //   distBy[w] / timeBy[w] / costBy[w]，下标 w = 0 距离 / 1 耗时 / 2 成本。
     //
@@ -134,7 +135,7 @@ struct CostMatrix {
     bool known(const std::string& id) const { return index.find(id) != index.end(); }
 
     std::size_t idx(const std::string& id) const {
-        const std::map<std::string, std::size_t>::const_iterator it = index.find(id);
+        const std::unordered_map<std::string, std::size_t>::const_iterator it = index.find(id);
         return it == index.end() ? ids.size() : it->second;
     }
 
@@ -172,6 +173,27 @@ struct CostMatrix {
         dist = distBy[d][k];
         time = timeBy[d][k];
         cost = costBy[d][k];
+        return true;
+    }
+
+    // 一次查询拿齐「该策略最优路径」的三项指标与策略权重。
+    // 原来 leg() 与 weightOf() 各查一次（两次 idx + 两次表读），合起来省一半。
+    bool legAll(const std::string& a, const std::string& b, WeightType w, double& dist,
+                double& time, double& cost, double& weight) const {
+        const std::size_t i = idx(a);
+        const std::size_t j = idx(b);
+        if (i >= ids.size() || j >= ids.size()) {
+            return false;
+        }
+        const std::size_t k = i * ids.size() + j;
+        const int d = dim(w);
+        if (distBy[d][k] < 0.0) {
+            return false;
+        }
+        dist = distBy[d][k];
+        time = timeBy[d][k];
+        cost = costBy[d][k];
+        weight = (d == 0) ? dist : (d == 1) ? time : cost;
         return true;
     }
 
@@ -301,6 +323,10 @@ struct Ctx {
     std::vector<Request>  urgent;     // 已按 FIFO 排好
     std::vector<Request>  normal;     // 已按 EDD 排好
     std::unordered_map<std::string, Request> byId;
+    // 订单 ID -> 该单在 byId 之外的稠密序号（0..n-1）。checkOrderingCore 每次候选
+    // 都要按订单聚合动作，早先现建一次 unordered_map 的代价是 ~50 次分配 —— 在
+    // 上百万次候选评价里这是纯开销。这里改成「一次建好 + 槽位表按代号清空」。
+    std::unordered_map<std::string, std::size_t> orderIndex;
 
     double kgOf(const std::string& orderId) const {
         const std::unordered_map<std::string, Request>::const_iterator it = byId.find(orderId);
@@ -431,11 +457,11 @@ bool replay(const Ctx& ctx, const std::vector<StopSpec>& specs, bool detail, Eva
             double bd = 0.0;
             double bt = 0.0;
             double bc = 0.0;
-            if (!ctx.matrix.leg(pos, s.nodeId, ctx.weight, bd, bt, bc)) {
+            double bw = 0.0;
+            if (!ctx.matrix.legAll(pos, s.nodeId, ctx.weight, bd, bt, bc, bw)) {
                 out.reason = "无法从 " + pos + " 到达 " + s.nodeId;
                 return false;
             }
-            const double bw = ctx.matrix.weightOf(pos, s.nodeId, ctx.weight);
             const double tScaled = bt * ctx.vehicle.timeFactor;
             // 段内在车量恒定（停靠零耗时）⇒ 分段积分精确。
             integral += load * tScaled;
@@ -541,11 +567,11 @@ bool replay(const Ctx& ctx, const std::vector<StopSpec>& specs, bool detail, Eva
         double bd = 0.0;
         double bt = 0.0;
         double bc = 0.0;
-        if (!ctx.matrix.leg(pos, ctx.vehicle.startNodeId, ctx.weight, bd, bt, bc)) {
+        double bw = 0.0;
+        if (!ctx.matrix.legAll(pos, ctx.vehicle.startNodeId, ctx.weight, bd, bt, bc, bw)) {
             out.reason = "无法从 " + pos + " 返回仓库 " + ctx.vehicle.startNodeId;
             return false;
         }
-        const double bw = ctx.matrix.weightOf(pos, ctx.vehicle.startNodeId, ctx.weight);
         const double tScaled = bt * ctx.vehicle.timeFactor;
         integral += load * tScaled;
         out.dist += bd;
@@ -765,29 +791,73 @@ bool checkOrderingCore(const Ctx& ctx, const Builder& b, const std::vector<StopS
     // 每个订单的动作落点只记第一次出现的下标与次数（够 F1/F2/F6 用）。
     // 单表 + 无序查找：早先三张 std::map 的构造成本在每个候选中都要付一次，
     // 34 万次候选评价下它是纯开销（判定结果完全等价）。
-    std::unordered_map<std::string, OrderSlots> slots;
-    slots.reserve(specs.size() * 2);
-    for (std::size_t i = 0; i < specs.size(); ++i) {
-        for (const std::string& id : specs[i].pickups) {
-            OrderSlots& sl = slots[id];
+    // 每次调用都新建 unordered_map = ~50 次分配；改成「复用的槽位表 + 代号戳」：
+    // 第 gen 次调用写过的槽位才算有效，于是不需要清空整表。
+    //
+    // **重入纪律（改这里必须守住）**：槽位表是跨调用复用的，嵌套调用（下面
+    // 「重访是否被强制」的合并评价会再进本函数）会把代号戳推进到新一代。
+    // 因此**递归之后不得再读槽位**——本函数把 F1/F5 的槽位读取全部放在递归之前，
+    // 递归之后只用局部变量。违反它不会立刻崩，只会静默把候选判成合法/非法。
+    static std::vector<OrderSlots> s_slots;
+    static std::vector<std::size_t> s_stamp;
+    static std::size_t s_gen = 0;
+    ++s_gen;
+    if (s_slots.size() < ctx.orderIndex.size()) {
+        s_slots.resize(ctx.orderIndex.size() + 32);
+        s_stamp.resize(ctx.orderIndex.size() + 32, 0);
+    }
+    // 只返回**本次调用写过**的槽位：表是跨调用复用的，没写过就等价于"没有动作"。
+    // （早先这里只看下标不看代号戳，会把上一次规划留下的旧数据当成当前候选的动作数，
+    //   于是凭空报"送达不晚于取货"。）
+    const auto slotOf = [&](const std::string& id) -> const OrderSlots* {
+        const std::unordered_map<std::string, std::size_t>::const_iterator f =
+            ctx.orderIndex.find(id);
+        if (f == ctx.orderIndex.end() || f->second >= s_slots.size()
+            || s_stamp[f->second] != s_gen) {
+            return nullptr;
+        }
+        return &s_slots[f->second];
+    };
+    const auto freshSlot = [&](std::size_t k) -> OrderSlots& {
+        if (s_stamp[k] != s_gen) {
+            s_stamp[k] = s_gen;
+            s_slots[k] = OrderSlots();
+        }
+        return s_slots[k];
+    };
+    const auto touch = [&](const std::string& id, std::size_t i, int kind) {
+        const std::unordered_map<std::string, std::size_t>::const_iterator f =
+            ctx.orderIndex.find(id);
+        if (f == ctx.orderIndex.end()) {
+            return;
+        }
+        OrderSlots& sl = freshSlot(f->second);
+        if (kind == 0) {
             if (sl.nPick == 0) {
                 sl.firstPick = i;
             }
             ++sl.nPick;
-        }
-        for (const std::string& id : specs[i].deliveries) {
-            OrderSlots& sl = slots[id];
+        } else if (kind == 1) {
             if (sl.nDeliv == 0) {
                 sl.firstDeliv = i;
             }
             ++sl.nDeliv;
-        }
-        for (const std::string& id : specs[i].reclaims) {
-            OrderSlots& sl = slots[id];
+        } else {
             if (sl.nRecl == 0) {
                 sl.firstRecl = i;
             }
             ++sl.nRecl;
+        }
+    };
+    for (std::size_t i = 0; i < specs.size(); ++i) {
+        for (const std::string& id : specs[i].pickups) {
+            touch(id, i, 0);
+        }
+        for (const std::string& id : specs[i].deliveries) {
+            touch(id, i, 1);
+        }
+        for (const std::string& id : specs[i].reclaims) {
+            touch(id, i, 2);
         }
     }
 
@@ -800,9 +870,8 @@ bool checkOrderingCore(const Ctx& ctx, const Builder& b, const std::vector<StopS
         const std::vector<Request>& list = (pass == 0) ? ctx.urgent : ctx.normal;
         for (const Request& r : list) {
             const std::string& id = r.orderId;
-            const std::unordered_map<std::string, OrderSlots>::const_iterator found =
-                slots.find(id);
-            const OrderSlots& sl = (found == slots.end()) ? kEmpty : found->second;
+            const OrderSlots* slp = slotOf(id);
+            const OrderSlots& sl = (slp == nullptr) ? kEmpty : *slp;
             const bool inCar = contains(b.onboardOrders, id);
             const bool inStash = contains(b.stashOrders, id);
             if (sl.nDeliv > 1) {
@@ -889,13 +958,13 @@ bool checkOrderingCore(const Ctx& ctx, const Builder& b, const std::vector<StopS
     for (std::size_t k = 0; includeFifo && k + 1 < ctx.urgent.size(); ++k) {
         const std::string& a = ctx.urgent[k].orderId;
         const std::string& c = ctx.urgent[k + 1].orderId;
-        const std::unordered_map<std::string, OrderSlots>::const_iterator fa = slots.find(a);
-        const std::unordered_map<std::string, OrderSlots>::const_iterator fc = slots.find(c);
-        if (fa == slots.end() || fc == slots.end()) {
+        const OrderSlots* sap = slotOf(a);
+        const OrderSlots* scp = slotOf(c);
+        if (sap == nullptr || scp == nullptr) {
             continue;
         }
-        const OrderSlots& sa = fa->second;
-        const OrderSlots& sc = fc->second;
+        const OrderSlots& sa = *sap;
+        const OrderSlots& sc = *scp;
         if (sa.nDeliv == 0 || sc.nDeliv == 0) {
             continue;
         }
@@ -1125,13 +1194,111 @@ bool hasStopAt(const std::vector<StopSpec>& specs, const std::string& nodeId, St
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// 就地候选评价（性能关键路径）
+//
+// 早先每个候选都复制整条路线：n 个停靠 × 4 个动作向量 ⇒ 每次 200 次分配，
+// 34 万次候选评价下这份拷贝比算法本身还贵（实测占 1.21s 里的 1.16s）。
+// 现在改成"就地放两个动作 → 评价 → 原样撤销"，只有确认改进时才真正复制。
+//
+// 撤销的顺序与记录：A 先放、B 后放，撤销时反过来（先 B 后 A），
+// 这样撤 B 时 A 还在原处、撤 A 时 B 已消失 —— 两边下标都不用回头修正。
+// ---------------------------------------------------------------------------
+struct PairApply {
+    bool        newA = false;    // true = A 是**新插**的停靠（撤销 = erase），false = 并入既有
+    bool        newB = false;
+    std::size_t posA = 0;        // A 动作落在的停靠下标（放置后）
+    std::size_t posB = 0;
+};
+
+// 并入**首个**同阶段同节点停靠（与 mode=0 的语义一致），返回其下标。
+bool mergeIntoFirstAt(std::vector<StopSpec>& specs, const std::string& nodeId, StopPhase phase,
+                      const std::string& orderId, bool isPickup, bool isDelivery,
+                      std::size_t* indexOut) {
+    for (std::size_t i = 0; i < specs.size(); ++i) {
+        if (specs[i].nodeId != nodeId || specs[i].phase != phase) {
+            continue;
+        }
+        if (specs[i].hasAction(orderId)) {
+            continue;
+        }
+        if (isPickup) {
+            specs[i].pickups.push_back(orderId);
+        }
+        if (isDelivery) {
+            specs[i].deliveries.push_back(orderId);
+        }
+        if (indexOut != nullptr) {
+            *indexOut = i;
+        }
+        return true;
+    }
+    return false;
+}
+
+// 在 pos 处放一个动作；若**相邻**停靠已是同阶段同节点，则并入它
+// （等价于 normalize 的相邻合并，但只做一次、只碰一个邻居）。
+std::size_t insertActionAt(std::vector<StopSpec>& specs, const std::string& nodeId,
+                           StopPhase phase, const std::string& orderId, bool isPickup,
+                           std::size_t pos, bool* created) {
+    if (pos > 0 && specs[pos - 1].nodeId == nodeId && specs[pos - 1].phase == phase
+        && !specs[pos - 1].hasAction(orderId)) {
+        if (isPickup) {
+            specs[pos - 1].pickups.push_back(orderId);
+        } else {
+            specs[pos - 1].deliveries.push_back(orderId);
+        }
+        *created = false;
+        return pos - 1;
+    }
+    if (pos < specs.size() && specs[pos].nodeId == nodeId && specs[pos].phase == phase
+        && !specs[pos].hasAction(orderId)) {
+        if (isPickup) {
+            specs[pos].pickups.push_back(orderId);
+        } else {
+            specs[pos].deliveries.push_back(orderId);
+        }
+        *created = false;
+        return pos;
+    }
+    StopSpec st;
+    st.nodeId = nodeId;
+    st.phase = phase;
+    if (isPickup) {
+        st.pickups.push_back(orderId);
+    } else {
+        st.deliveries.push_back(orderId);
+    }
+    specs.insert(specs.begin() + static_cast<std::ptrdiff_t>(pos), st);
+    *created = true;
+    return pos;
+}
+
+void undoPair(std::vector<StopSpec>& specs, const PairApply& rec, bool needPickup) {
+    // 先撤 B（新插的 B 一定在 A 之后，erase 不会影响 A 的下标）。
+    if (rec.newB) {
+        specs.erase(specs.begin() + static_cast<std::ptrdiff_t>(rec.posB));
+    } else {
+        specs[rec.posB].deliveries.pop_back();
+    }
+    if (!needPickup) {
+        return;
+    }
+    // 再撤 A：B 已撤掉，A 的下标仍有效。
+    if (rec.newA) {
+        specs.erase(specs.begin() + static_cast<std::ptrdiff_t>(rec.posA));
+    } else {
+        specs[rec.posA].pickups.pop_back();
+    }
+}
+
 // 枚举「A 放在 i、B 放在 j」的四种落位组合（并入既有 / 新插），
 // 由 checkOrdering 过滤掉违反先取后送的那些。
 //
 // 为什么必须两种都试：并入既有停靠是**首选**（同阶段同节点至多一次停靠），
 // 但当并入会让送达早于取货时（例如 A=D01、B=D08，而 D08 已有取货停靠），
 // 并入必然不可行 —— 此时只能重访该节点。默认数据里的 O09(D01->D08) 正是这种形态。
-bool tryInsertPair(const Ctx& ctx, const Builder& b, const Request& r,
+bool tryInsertPair(const Ctx& ctx, Builder& b, const Request& r,
                    std::vector<StopSpec>& best, Key& bestKey) {
     const std::size_t lo = normalBegin(b.route);
     const std::size_t hi = b.route.size();
@@ -1141,39 +1308,71 @@ bool tryInsertPair(const Ctx& ctx, const Builder& b, const Request& r,
     const bool needPickup = !r.alreadyPicked && !r.inStash;
     const bool canMergeA = needPickup && hasStopAt(b.route, r.pickup, StopPhase::Normal);
     bool found = false;
-    const int aModes = needPickup ? 2 : 1;
-    for (std::size_t i = lo; i <= hi; ++i) {
-        for (std::size_t j = i; j <= hi; ++j) {
-            for (int modeA = 0; modeA < aModes; ++modeA) {
-                if (needPickup && modeA == 0 && !canMergeA) {
-                    continue;
+    std::vector<StopSpec>& route = b.route;
+
+    // 评价一个（A 落位, B 落位）组合：就地放 → 评价 → 撤销；改进才复制。
+    const auto attempt = [&](std::size_t i, std::size_t j, int modeA, int modeB) {
+        PairApply rec;
+        if (needPickup) {
+            if (modeA == 0) {
+                if (!mergeIntoFirstAt(route, r.pickup, StopPhase::Normal, r.orderId, true, false,
+                                      &rec.posA)) {
+                    return;
                 }
-                for (int modeB = 0; modeB <= 1; ++modeB) {
-                    if (modeB == 0 && !canMergeB) {
-                        continue;
-                    }
-                    std::vector<StopSpec> cand = b.route;
-                    // 先放 B（下标大），再放 A（下标小），避免插入导致下标漂移。
-                    if (!placeAction(cand, r.delivery, StopPhase::Normal, r.orderId, false, true,
-                                     false, false, j, modeB)) {
-                        continue;
-                    }
-                    if (needPickup
-                        && !placeAction(cand, r.pickup, StopPhase::Normal, r.orderId, true, false,
-                                        false, false, i, modeA)) {
-                        continue;
-                    }
-                    normalize(cand);
-                    Eval ev;
-                    if (!evaluate(ctx, b, cand, ev)) {
-                        continue;
-                    }
-                    if (!found || compareRoutes(cand, ev.key, best, bestKey) < 0) {
-                        found = true;
-                        bestKey = ev.key;
-                        best = cand;
-                    }
-                }
+            } else {
+                rec.posA = insertActionAt(route, r.pickup, StopPhase::Normal, r.orderId, true, i,
+                                          &rec.newA);
+            }
+        }
+        const std::size_t jPos = j + ((needPickup && rec.newA && rec.posA <= j) ? 1u : 0u);
+        if (modeB == 0) {
+            if (!mergeIntoFirstAt(route, r.delivery, StopPhase::Normal, r.orderId, false, true,
+                                  &rec.posB)) {
+                undoPair(route, rec, needPickup);
+                return;
+            }
+        } else {
+            rec.posB = insertActionAt(route, r.delivery, StopPhase::Normal, r.orderId, false,
+                                      jPos > route.size() ? route.size() : jPos, &rec.newB);
+        }
+        if (needPickup && rec.posA >= rec.posB) {   // F2：先取后送
+            undoPair(route, rec, needPickup);
+            return;
+        }
+        Eval ev;
+        if (evaluate(ctx, b, route, ev)
+            && (!found || compareRoutes(route, ev.key, best, bestKey) < 0)) {
+            found = true;
+            bestKey = ev.key;
+            best = route;   // 只有确认改进时才复制整条路线
+        }
+        undoPair(route, rec, needPickup);
+    };
+
+    // 候选去重：**并入既有停靠**这一 mode 与插入位置无关（mergeIntoFirstAt 只认节点），
+    // 因此 (i, j) 全枚举会把同一个候选评价 n² 次。按四种 mode 组合分别只扫它真正
+    // 依赖的位置维度 —— 结果集合与全枚举完全相同，只是不再重复评价同一件事。
+    if (needPickup && canMergeA && canMergeB) {
+        attempt(lo, lo, 0, 0);                                   // 两个都并入：唯一候选
+    }
+    if (needPickup && canMergeA) {
+        for (std::size_t j = lo; j <= hi; ++j) {
+            attempt(lo, j, 0, 1);                                // A 并入、B 新插：只依赖 j
+        }
+    }
+    if (needPickup && canMergeB) {
+        for (std::size_t i = lo; i <= hi; ++i) {
+            attempt(i, lo, 1, 0);                                // A 新插、B 并入：只依赖 i
+        }
+    }
+    if (!needPickup) {
+        for (std::size_t j = lo; j <= hi; ++j) {
+            attempt(lo, j, 0, 1);                                // 无取货动作：只摆送达位
+        }
+    } else {
+        for (std::size_t i = lo; i <= hi; ++i) {
+            for (std::size_t j = i; j <= hi; ++j) {
+                attempt(i, j, 1, 1);                             // 两个都新插：依赖 (i, j)
             }
         }
     }
@@ -2205,6 +2404,7 @@ bool makeCtx(const LogisticsGraph& graph, const Vehicle& vehicle,
                 ctx.stashOrderIds.push_back(r.orderId);
             }
         }
+        ctx.orderIndex[r.orderId] = ctx.orderIndex.size();
         ctx.byId[r.orderId] = r;
         if (r.urgent) {
             ctx.urgent.push_back(r);
