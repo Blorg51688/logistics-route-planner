@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <string>
 #include <vector>
@@ -304,6 +305,87 @@ AllocDump parseAllocDump(const std::string& text) {
 
 } // namespace
 
+
+// --dump-plan 的 TRANSIT 行（规格二 §5.3 / #41）：**只加行、不改既有行**。
+// 用一个小夹具配置跑真二进制：时间策略接受（V02 在 T01 卸、V01 取走），
+// 距离/成本策略不启用 ⇒ 没有 TRANSIT 行。断言读的是 stdout 文本。
+void checkDumpPlanTransitLines(const std::string& appPath) {
+    const std::string tmp = "/tmp/cli_plan_summary_transit_"
+                            + std::to_string(static_cast<long long>(getpid())) + ".ini";
+    {
+        std::ofstream f(tmp.c_str());
+        f << "[general]\n"
+             "event_interval_min = 1440\n"
+             "event_level_traffic = high\n"
+             "event_level_customer = medium\n"
+             "event_level_urgent = low\n"
+             "event_level_closure = extra_low\n"
+             "\n[nodes]\n"
+             "W01, warehouse, 80, 160, 中央仓库, 0\n"
+             "T01, transit, 380, 200, 中转站甲, 1\n"
+             "D01, delivery, 180, 90, 客户01, 1\n"
+             "D02, delivery, 200, 180, 客户02, 1\n"
+             "D03, delivery, 250, 280, 客户03, 1\n"
+             "D18, delivery, 620, 120, 客户18, 2\n"
+             "\n[edges]\n"
+             "W01, T01, 1.0, 1.0, 1.0\n"
+             "T01, W01, 1.0, 1.0, 1.0\n"
+             "W01, D01, 1.0, 1.0, 1.0\n"
+             "D01, W01, 1.0, 1.0, 1.0\n"
+             "D01, T01, 1.0, 1.0, 1.0\n"
+             "T01, D01, 1.0, 1.0, 1.0\n"
+             "W01, D02, 1.0, 1.0, 1.0\n"
+             "D02, W01, 1.0, 1.0, 1.0\n"
+             "D02, T01, 2.0, 2.0, 2.0\n"
+             "T01, D02, 2.0, 2.0, 2.0\n"
+             "T01, D18, 1.0, 1.0, 1.0\n"
+             "D18, T01, 1.0, 1.0, 1.0\n"
+             "D18, D03, 1.0, 1.0, 1.0\n"
+             "D03, D18, 1.0, 1.0, 1.0\n"
+             "\n[vehicles]\n"
+             "V01, W01, 400, 08:00, 1.00, 1.50\n"
+             "V02, W01, 160, 08:00, 1.25, 0.80\n"
+             "\n[orders]\n"
+             "O2, D02, D03, 10, 00:00, 23:59, 0\n"
+             "O1, D01, D18, 10, 00:00, 23:59, 0\n";
+    }
+    const std::string timeOut =
+        runCapture("'" + appPath + "' --config '" + tmp + "' --dump-plan time 2>/dev/null");
+    const std::vector<std::string> timeLines = splitLines(timeOut);
+    int transitLines = 0;
+    bool shapeOk = true;
+    for (const std::string& line : timeLines) {
+        if (line.rfind("TRANSIT ", 0) != 0) {
+            continue;
+        }
+        ++transitLines;
+        // TRANSIT <订单> <站> <kg> <卸入车> <HH:MM> <取走车> <HH:MM> <dwell> <状态>
+        const std::vector<std::string> tokens = splitSpaces(line);
+        if (tokens.size() != 10 || tokens[0] != "TRANSIT" || tokens[1] != "O1"
+            || tokens[2] != "T01" || tokens[4] == tokens[6] || tokens[9] != "已送达") {
+            shapeOk = false;
+        }
+        const int dwell = std::atoi(tokens[8].c_str());
+        if (dwell < 0 || dwell > 60) {
+            shapeOk = false;
+        }
+    }
+    check(transitLines == 1,
+          "TRANSIT：时间策略下 --dump-plan 恰有一行 TRANSIT（实际 "
+              + std::to_string(transitLines) + "）");
+    check(shapeOk, "TRANSIT：字段与账本同序（订单/站/kg/卸入/取走/等待/状态），in≠out、dwell≤60");
+    const std::string distanceOut =
+        runCapture("'" + appPath + "' --config '" + tmp + "' --dump-plan distance 2>/dev/null");
+    bool noTransit = true;
+    for (const std::string& line : splitLines(distanceOut)) {
+        if (line.rfind("TRANSIT ", 0) == 0) {
+            noTransit = false;
+        }
+    }
+    check(noTransit, "TRANSIT：距离策略两版并列 ⇒ 保留禁转运版（无 TRANSIT 行）");
+    std::remove(tmp.c_str());
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::printf("用法: cli_plan_summary <app 路径> <策略|all>\n");
@@ -326,6 +408,9 @@ int main(int argc, char** argv) {
     // TODO(#43): 三车 102 常量第二轮冻结后，去掉这个门控。
     const bool singleVehicleBaseline = (cfg.vehicles.size() == 1);
     const int vehicleCount = static_cast<int>(cfg.vehicles.size());
+
+    // 转运账本行（独立入口：--dump-plan，不影响 --plan-summary 六行）。
+    checkDumpPlanTransitLines(appPath);
 
     std::vector<std::string> strategies;
     if (strategy == "all") {

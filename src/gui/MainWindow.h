@@ -111,6 +111,21 @@ public:
         }
     };
 
+    // 转运账本的一行（**只记已实际执行的卸入**，规格二 §7.5⑥）。
+    // 计划期的转运候选不在这里：它由 FleetPlan::transitLegs 提供，不参与面板；
+    // 只有车真的到站、真的卸下，才追加一行（未执行的计划卸入在重规划时作废）。
+    struct TransitLedgerEntry {
+        std::string orderId;
+        std::string stationId;
+        double      kg = 0.0;
+        std::string inVehicleId;
+        int         inTimeMin = 0;
+        std::string outVehicleId;   // 计划里的取走车（取走前也可显示，取走时刻留空）
+        int         outTimeMin = -1; // -1 = 尚未取走
+        bool        pickedUp = false;
+        bool        delivered = false;
+    };
+
     // 每车一份运行状态（规格二 §6.1 / #39）：位置/时刻/在车货/已送达/已发生 penalty/
     // 当前停靠游标 + **该车自己的**计划。所有状态转移只经由 advanceFleetTo 里的
     // onAdvanceStopFor(v)；重规划只读它、绝不改写。
@@ -184,6 +199,12 @@ public:
     // 列出某目录下"算作自动日志"的文件（按名升序 = 时间戳升序）。静态、不写盘，
     // 供 --self-check-actions 核对命名判定与淘汰规则。
     static QStringList autoLogCandidates(const QString& dir);
+    // 转运账本面板（规格二 §7.5⑥）：7 列表头与**已执行**逐笔内容的文本快照。
+    // 供 --ui-probe 校验表头与 --self-check-actions 校验「两端非空 / in≠out / dwell≤60 / 期末0」。
+    QString     transitLedgerSummary() const;
+    QStringList transitLedgerHeaders() const;
+    int         transitLedgerRowCount() const;
+
     // 中转站面板的文本快照，供 --ui-probe 在无头环境下确定性核对
     QString transitPanelSummary() const;
     // 中转站面板**真实表头**（供 --ui-probe 校验「当前暂存货」列确实在界面上）。
@@ -231,6 +252,8 @@ private slots:
     void onWeightChanged();
     void onSimulateTraffic();
     void onInsertUrgentOrder();
+    // 手动「插入普通订单…」（规格二 §7.6 / #25 Q9）：跨簇演示入口，来源 manual_normal / 前缀 M。
+    void onInsertNormalOrder();
     void onAddRandomCustomer();
     void onCloseRandomRoad();
     void onAdvanceStop();
@@ -409,6 +432,9 @@ private:
     QLabel*        clockLabel_ = nullptr;
     QTableWidget*  orderTable_ = nullptr;
     QTableWidget*  transitTable_ = nullptr;
+    QTableWidget*  transitLedgerTable_ = nullptr;
+    // 已实际执行的转运账本（跨重规划保留；计划期候选不在这里）。
+    std::vector<TransitLedgerEntry> transitLedger_;
     QTableWidget*  stopTable_ = nullptr;
     // 道路封闭不再用 tick 计数节流——它现在是加权事件的一种（权重最低）。
     QTableWidget*  lateTable_ = nullptr;

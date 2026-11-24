@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -36,17 +37,25 @@ enum class StopPhase {
     Normal    // 普通阶段：普通单的 A/B、暂存取回停靠
 };
 
-// 一次停靠。**动作集是真源**：取货 / 送达 / 降载 / 取回都记在这里，
+// 一次停靠。**动作集是真源**：取货 / 送达 / 降载 / 取回 / 转运卸入 / 转运取走都记在这里，
 // GUI 的 onAdvanceStop 按动作集执行状态转移（规格一 MC-E09）。
 //
-// 停靠内执行顺序恒为「先全部卸（deliveries + offloads），再全部装（pickups + reclaims）」，
+// 停靠内执行顺序恒为「先全部卸（deliveries + offloads + transitUnloads），
+// 再全部装（pickups + reclaims + transitPickups）」，
 // 因此停靠内的载重峰值取「卸后 / 装后」较大者（#18 §3）。
 struct Stop {
     std::string               nodeId;
     std::vector<StopDelivery> deliveries;   // 送达（含顺路交货）
     std::vector<std::string>  pickups;      // 取货（订单 ID）
-    std::vector<std::string>  offloads;     // 降载卸到本中转站的订单 ID
-    std::vector<std::string>  reclaims;     // 从本中转站取回的订单 ID
+    std::vector<std::string>  offloads;     // 降载卸到本中转站的订单 ID（同车取回）
+    std::vector<std::string>  reclaims;     // 从本中转站取回的订单 ID（降载取回）
+    // 跨车转运（规格二 §5 / #28）：**转运卸入**与**转运取走**是两种不同的动作。
+    // 降载与转运的分界就是「取走车 == 卸入车？」：
+    //   · offloads + reclaims ⇒ 同一台车（降载，OffloadLeg）；
+    //   · transitUnloads + 另一台车的 transitPickups ⇒ 转运（TransitLeg，inVehicle ≠ outVehicle）。
+    // 站停靠无窗口、不计 penalty、零耗时（departure = arrival），并计入停靠点数。
+    std::vector<std::string>  transitUnloads;  // 本车在此站整单卸下、交给另一台车
+    std::vector<std::string>  transitPickups;  // 本车在此站整单取走（由另一台车卸入）
     StopPhase                 phase = StopPhase::Normal;
     int    rawArrivalMin = 0;               // 未经等待修正的到达时刻
     int    waitMin       = 0;               // 早到等待时长
@@ -59,8 +68,11 @@ struct Stop {
     // = 到达在车量 − 送达 − offload + 取货 + reclaim（#29 §2.1 第 3 条）。
     double remainingLoadKg = 0.0;
 
-    // 本停靠是否只是中转站动作（降载 / 取回），不含取送动作。
-    bool isTransitStop() const { return !offloads.empty() || !reclaims.empty(); }
+    // 本停靠是否只是中转站动作（降载 / 取回 / 转运卸入 / 转运取走），不含取送动作。
+    bool isTransitStop() const {
+        return !offloads.empty() || !reclaims.empty() || !transitUnloads.empty()
+               || !transitPickups.empty();
+    }
     // 排序后的动作订单 ID（tieKey 的第二个分量，见 #18 §5）。
     std::vector<std::string> sortedActionOrderIds() const;
 };
@@ -77,6 +89,25 @@ struct OffloadLeg {
     double      kg = 0.0;
     int         offloadTimeMin = 0;   // 卸下时刻
     int         reclaimTimeMin = -1;  // 取回时刻（-1 = 尚未取回；计划结束时必须已取回）
+};
+
+// 站内等待上限（规格二 §5.5 / #28 Q6=A）：**代码常量，不加配置键**。
+// outTimeMin − inTimeMin > kTransferMaxDwellMin ⇒ 该转运候选不可行（构造期过滤）。
+// 为什么用可行性而不是指标管住等待：站无窗口、停靠零耗时 ⇒ 货在站里等多久不产生
+// 耗时、不产生 penalty；若不管，转运可以把等待搬进站里让完工耗时变好看，而货实际更晚到。
+constexpr int kTransferMaxDwellMin = 60;
+
+// 转运账本的最小记录单位（规格二 §5.3 / #28 §5.1）。**两端都必填**：
+// 没有「只卸不取」的合法记录；无 outVehicleId 的候选在构造期就被丢弃。
+// 与 OffloadLeg 的分型判据：inVehicleId ≠ outVehicleId（同车卸又取回永远算降载）。
+struct TransitLeg {
+    std::string orderId;      // 整单转运：kg 即该单全部需求
+    std::string stationId;    // 中转站
+    double      kg = 0.0;     // = 订单需求
+    std::string inVehicleId;  // 卸入车（≠ outVehicleId）
+    int         inTimeMin = 0;    // 卸入时刻（软件内时间）
+    std::string outVehicleId; // 取走车
+    int         outTimeMin = 0;   // 取走时刻
 };
 
 // 逐单指标（#29 §2.1 / ADR 0006）。取货准时判据：
@@ -127,6 +158,9 @@ struct RoutePlan {
     std::vector<Stop>        stops;
     // 本计划的降载/取回记录（custody：订单、站、kg、卸下时刻、取回时刻）。
     std::vector<OffloadLeg>  offloads;
+    // 转运动作的 kg（订单 -> 需求），账本渲染用；由 finalize 从 Ctx 填。
+    // 与 Stop::transitUnloads / transitPickups 一一对应。
+    std::map<std::string, double> transitKg;
     double totalDistanceKm = 0.0;
     double totalTimeMin    = 0.0;         // 返回仓库时刻 − 起始时刻（含等待）
     // 抵达起始仓库的时刻（路线汇总字段之一，供界面与测试核对配送结束时间）。
@@ -231,6 +265,16 @@ struct FleetPlan {
 
     // 阶段二的枚举留痕：每种「簇 -> 车」排列一行，供人工核对「6 种排列各自怎么取优」。
     std::vector<std::string> candidateKeyLog;
+
+    // ---- 跨车转运（规格二 §5 / #28）----
+    //
+    // 账本：每笔**两端齐全**的转运记录（按卸入时刻、订单 ID 升序）。
+    // 只记规划产物；「已实际执行」的过滤由 GUI 运行态账本负责（§7.5⑥）。
+    // 默认数据上三条判据全部不触发 ⇒ 恒为空（§5.13，这是「绝不更差」的最强证据）。
+    std::vector<TransitLeg> transitLegs;
+    // 转运分级播报（判据 / 轮次 / 接受或退回及原因）。GUI 直接追加到运行日志；
+    // **不进 --plan-summary**（六行格式不动）。
+    std::vector<std::string> transitLog;
 };
 
 // 类型感知三阶段分配（规格二 §4，**默认入口**）。
@@ -275,6 +319,15 @@ MarginalCost marginalCost(const LogisticsGraph& graph, const Vehicle& vehicle,
 FleetPlan aggregateFleet(const std::vector<Vehicle>& vehicles,
                          const std::vector<RoutePlan>& plans);
 
+// ---- 跨车转运（规格二 §5 / #28）----
+//
+// 从各车计划里**反查**转运账本：扫描 Stop::transitUnloads / transitPickups，
+// 按订单把卸入车与取走车配对，读出两端时刻与 kg。构造上保证两端齐全；
+// 若出现只有一端（不该发生）则跳过并**不伪造**另一端。按 (inTimeMin, orderId) 升序。
+// 这是账本口径的**唯一**实现（--dump-plan、GUI 面板、测试都读它）。
+std::vector<TransitLeg> buildTransitLedger(const std::vector<Vehicle>& vehicles,
+                                           const std::vector<RoutePlan>& plans);
+
 // 车辆**此刻已经载在车上**的货（订单 + 目的 B + 货量 + 订单号）。
 // 规格一 MC-A05：按**订单**记账（同节点多单下按 nodeId 扣货会把别的单一起扣掉）。
 struct OnboardItem {
@@ -290,6 +343,36 @@ struct StashState {
     std::string              station;
     std::vector<OnboardItem> items;
 };
+
+// 一车的转运候选构造起点（静态规划 = 仓库空车；中途重规划 = 当前位置/在车货/暂存）。
+struct VehicleStartState {
+    std::string              startNodeId;
+    int                      startTimeMin = 0;
+    std::vector<OnboardItem> onboard;
+    StashState               stash;
+};
+
+struct FleetTransitResult {
+    std::vector<RoutePlan>   plans;      // 未启用时 == basePlans（同一份内容）
+    std::vector<TransitLeg>  legs;       // buildTransitLedger 的结果
+    std::vector<std::string> log;        // 分级播报
+    int acceptedRounds = 0;              // 被接受的候选总数（≤ 3 判据 × 3 轮）
+};
+
+// 跨车整单转运层（规格二 §5 / #28）——**后置的有界改进**，不改分配、不改构造器。
+//
+// 输入 = 禁转运版（basePlans，由规格一构造 + #40 分配得到）+ 每车的构造起点。
+// 判据固定顺序：① 跨簇 ② 容量腾挪（禁转运版里有降载） ③ 紧急响应（紧急单 penalty>0）。
+// 每类最多 R = 3 轮、每轮至多接受一个 key 最优候选；**严格字典序更优**才替换，
+// 完全并列保留禁转运版（关键：本图 84.2% 点对存在精确零绕行站 + 停靠零耗时，
+// 用「不更差即启用」会把默认数据改成到处零收益转运）。
+// 「绝不更差」是构造保证：plan 只会被逐轮严格变优替换。
+FleetTransitResult applyTransitLayer(const LogisticsGraph& graph,
+                                     const std::vector<Vehicle>& vehicles,
+                                     const std::vector<std::vector<Order> >& vehicleOrders,
+                                     const std::vector<RoutePlan>& basePlans,
+                                     const std::vector<VehicleStartState>& starts,
+                                     WeightType weight);
 
 // 从指定位置与指定时刻出发，对剩余未服务订单重新规划，最后返回车辆起始仓库。
 RoutePlan replan(const LogisticsGraph& graph,

@@ -62,6 +62,15 @@ bool parseWeight(const std::string& text, logistics::WeightType& out) {
     return false;
 }
 
+std::string minuteClock(int minutes) {
+    if (minutes < 0) {
+        return "--:--";
+    }
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%02d:%02d", minutes / 60, minutes % 60);
+    return std::string(buf);
+}
+
 const char* weightLabel(logistics::WeightType weight) {
     switch (weight) {
         case logistics::WeightType::Distance: return "最短距离";
@@ -354,6 +363,15 @@ int main(int argc, char** argv) {
             }
             printMetrics("METRICS", vehicle.id, plan, vehicle.capacityKg);
         }
+        // 跨车转运账本（规格二 §5.3 / #28）：**只加行，不改既有行格式**（oracle 跳过未知行）。
+        //   TRANSIT <订单> <中转站> <kg> <卸入车> <HH:MM> <取走车> <HH:MM> <站内等待min> <状态>
+        // 字段与界面「转运账本」7 列同序；规划产物两端齐全、期末必为「已送达」。
+        for (const logistics::TransitLeg& leg : fleet.transitLegs) {
+            std::printf("TRANSIT %s %s %.1f %s %s %s %s %d 已送达\n", leg.orderId.c_str(),
+                        leg.stationId.c_str(), leg.kg, leg.inVehicleId.c_str(),
+                        minuteClock(leg.inTimeMin).c_str(), leg.outVehicleId.c_str(),
+                        minuteClock(leg.outTimeMin).c_str(), leg.outTimeMin - leg.inTimeMin);
+        }
         // 规格二 §4（#40）分配可核对：**只加行，不改既有行格式**（oracle 会跳过未知行）。
         //   ALLOC  <orderId>=<vehicleId>,…      按**订单 ID 升序**
         //   ASSIGN <vehicleId> <簇N | 跨簇 | 空车> <订单数>
@@ -514,14 +532,15 @@ int main(int argc, char** argv) {
         std::printf("[ui-probe] 面板: %s\n", window.dockTitles().toUtf8().constData());
         // 下限随模拟模式重做同步：原「Debug 模式」更名并新增「推进一刻」「按时间模拟」，
         // 工具栏动作由 15 个增至 17 个（见 docs/records/specs/sim-time-events.md §7.1）。
-        if (actions < 17 || docks < 5) {
+        if (actions < 18 || docks < 6) {
             std::fprintf(stderr,
-                         "[ui-probe] UI 不完整：预期至少 17 个工具栏动作、5 个停靠面板\n");
+                         "[ui-probe] UI 不完整：预期至少 18 个工具栏动作、6 个停靠面板\n");
             return 1;
         }
         // 动作名清单同步：这些名字是向导第 7 关让用户去点的按钮，必须**真实存在**。
         // 读的是界面上真正的动作名（findChildren<QAction*>），不是把预期列表再背一遍。
-        for (const char* need : {"按站模拟", "按时间模拟", "推进一刻", "推进一站"}) {
+        for (const char* need : {"按站模拟", "按时间模拟", "推进一刻", "推进一站",
+                                 "插入普通订单…"}) {
             const QString name = QString::fromUtf8(need);
             if (!actionTexts.contains(name)) {
                 std::fprintf(stderr, "[ui-probe] 工具栏缺少动作「%s」\n", need);
@@ -596,6 +615,38 @@ int main(int argc, char** argv) {
         std::printf("[ui-probe] 中转站面板（%s）:\n%s",
                     transitHeaders.join(QStringLiteral("|")).toUtf8().constData(),
                     transit.constData());
+        // 转运账本面板（G14 / 规格二 §7.5⑥）：7 列、列序固定；启动时账本为空
+        // （只记已实际执行的卸入，计划期候选不进表）。逐笔内容由
+        // --self-check-actions 在真的执行一次转运后核对。
+        {
+            const QStringList ledgerHeaders = window.transitLedgerHeaders();
+            const QStringList expectHeaders = {QStringLiteral("订单"),    QStringLiteral("中转站"),
+                                               QStringLiteral("kg"),     QStringLiteral("卸入"),
+                                               QStringLiteral("取走"),
+                                               QStringLiteral("站内等待(min)"),
+                                               QStringLiteral("状态")};
+            if (ledgerHeaders != expectHeaders) {
+                const QByteArray headers =
+                    ledgerHeaders.join(QStringLiteral(" | ")).toUtf8();
+                std::fprintf(stderr,
+                             "[ui-probe] 转运账本应有 7 列（订单|中转站|kg|卸入|取走|"
+                             "站内等待(min)|状态），实际 [%s]\n",
+                             headers.constData());
+                return 1;
+            }
+            if (!window.dockTitles().contains(QStringLiteral("转运账本"))) {
+                std::fprintf(stderr, "[ui-probe] 停靠面板缺少「转运账本」\n");
+                return 1;
+            }
+            if (window.transitLedgerRowCount() != 0) {
+                std::fprintf(stderr,
+                             "[ui-probe] 启动时转运账本应为空（只记已实际执行的卸入），实际 %d 行\n",
+                             window.transitLedgerRowCount());
+                return 1;
+            }
+            std::printf("[ui-probe] 转运账本（%s）：空（规划期候选不进表）\n",
+                        ledgerHeaders.join(QStringLiteral("|")).toUtf8().constData());
+        }
         // 车辆面板（G11）：页签数 == vehicles.size()，每页含「固定信息 / 运行状态」
         // 两块标题；**逐车**核对 ID / 容量 / 两因子与配置一致，且逐车
         // 「车上载重 ≤ 该车容量」（不得再用 vehicles.front() 一笔带过）。

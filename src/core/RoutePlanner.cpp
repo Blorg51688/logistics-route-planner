@@ -16,7 +16,8 @@ namespace logistics {
 
 std::vector<std::string> Stop::sortedActionOrderIds() const {
     std::vector<std::string> ids;
-    ids.reserve(pickups.size() + deliveries.size() + offloads.size() + reclaims.size());
+    ids.reserve(pickups.size() + deliveries.size() + offloads.size() + reclaims.size()
+                + transitUnloads.size() + transitPickups.size());
     for (const std::string& id : pickups) {
         ids.push_back(id);
     }
@@ -27,6 +28,12 @@ std::vector<std::string> Stop::sortedActionOrderIds() const {
         ids.push_back(id);
     }
     for (const std::string& id : reclaims) {
+        ids.push_back(id);
+    }
+    for (const std::string& id : transitUnloads) {
+        ids.push_back(id);
+    }
+    for (const std::string& id : transitPickups) {
         ids.push_back(id);
     }
     // 手写插入排序（AGENTS §1：排序/选择的判定逻辑必须自己写）。
@@ -262,24 +269,31 @@ struct StopSpec {
     std::vector<std::string> deliveries;
     std::vector<std::string> offloads;
     std::vector<std::string> reclaims;
+    std::vector<std::string> transitUnloads;   // 转运卸入（交给另一台车）
+    std::vector<std::string> transitPickups;   // 转运取走（由另一台车卸入）
     StopPhase                phase = StopPhase::Normal;
 
     bool empty() const {
-        return pickups.empty() && deliveries.empty() && offloads.empty() && reclaims.empty();
+        return pickups.empty() && deliveries.empty() && offloads.empty() && reclaims.empty()
+               && transitUnloads.empty() && transitPickups.empty();
     }
-    // 只含中转站动作（降载 / 取回），不含取送动作。
+    // 只含中转站动作（降载 / 取回 / 转运卸入 / 转运取走），不含取送动作。
     bool isTransitOnly() const {
         return pickups.empty() && deliveries.empty()
-               && (!offloads.empty() || !reclaims.empty());
+               && (!offloads.empty() || !reclaims.empty() || !transitUnloads.empty()
+                   || !transitPickups.empty());
     }
     // 排序后的动作订单 ID（tieKey 的第二个分量，见 #18 §5）。手写插入排序。
     std::vector<std::string> sortedActionIds() const {
         std::vector<std::string> ids;
-        ids.reserve(pickups.size() + deliveries.size() + offloads.size() + reclaims.size());
+        ids.reserve(pickups.size() + deliveries.size() + offloads.size() + reclaims.size()
+                    + transitUnloads.size() + transitPickups.size());
         ids.insert(ids.end(), pickups.begin(), pickups.end());
         ids.insert(ids.end(), deliveries.begin(), deliveries.end());
         ids.insert(ids.end(), offloads.begin(), offloads.end());
         ids.insert(ids.end(), reclaims.begin(), reclaims.end());
+        ids.insert(ids.end(), transitUnloads.begin(), transitUnloads.end());
+        ids.insert(ids.end(), transitPickups.begin(), transitPickups.end());
         for (std::size_t i = 1; i < ids.size(); ++i) {
             const std::string key = ids[i];
             std::size_t j = i;
@@ -303,6 +317,12 @@ struct StopSpec {
             if (id == orderId) return true;
         }
         for (const std::string& id : reclaims) {
+            if (id == orderId) return true;
+        }
+        for (const std::string& id : transitUnloads) {
+            if (id == orderId) return true;
+        }
+        for (const std::string& id : transitPickups) {
             if (id == orderId) return true;
         }
         return false;
@@ -526,6 +546,9 @@ bool replay(const Ctx& ctx, const std::vector<StopSpec>& specs, bool detail, Eva
         for (const std::string& oid : s.offloads) {
             load -= ctx.kgOf(oid);
         }
+        for (const std::string& oid : s.transitUnloads) {
+            load -= ctx.kgOf(oid);
+        }
         if (load < -kEps) {
             out.reason = "在 " + s.nodeId + " 卸货后载重为负（" + std::to_string(load) + "kg）";
             return false;
@@ -537,6 +560,9 @@ bool replay(const Ctx& ctx, const std::vector<StopSpec>& specs, bool detail, Eva
             load += ctx.kgOf(oid);
         }
         for (const std::string& oid : s.reclaims) {
+            load += ctx.kgOf(oid);
+        }
+        for (const std::string& oid : s.transitPickups) {
             load += ctx.kgOf(oid);
         }
         if (load > ctx.capacityKg + kEps) {
@@ -552,6 +578,10 @@ bool replay(const Ctx& ctx, const std::vector<StopSpec>& specs, bool detail, Eva
                 out.orderPickup[oid] = static_cast<int>(std::lround(arrival));
             }
             for (const std::string& oid : s.reclaims) {
+                out.orderPickup[oid] = static_cast<int>(std::lround(arrival));
+            }
+            // 转运取走：取货时刻就是站停靠到达（站无窗口、零耗时）。
+            for (const std::string& oid : s.transitPickups) {
                 out.orderPickup[oid] = static_cast<int>(std::lround(arrival));
             }
             StopDetail d;
@@ -723,6 +753,16 @@ void normalize(std::vector<StopSpec>& specs) {
                     a.reclaims.push_back(id);
                 }
             }
+            for (const std::string& id : b.transitUnloads) {
+                if (!a.hasAction(id)) {
+                    a.transitUnloads.push_back(id);
+                }
+            }
+            for (const std::string& id : b.transitPickups) {
+                if (!a.hasAction(id)) {
+                    a.transitPickups.push_back(id);
+                }
+            }
             specs.erase(specs.begin() + static_cast<std::ptrdiff_t>(i + 1));
             changed = true;
             break;
@@ -767,6 +807,18 @@ std::map<std::string, double> loadStateAt(const Ctx& ctx, const std::vector<Stop
             load += kg;
         }
         for (const std::string& id : s.reclaims) {
+            const double kg = ctx.kgOf(id);
+            inCar[id] = kg;
+            load += kg;
+        }
+        for (const std::string& id : s.transitUnloads) {
+            const std::map<std::string, double>::iterator f = inCar.find(id);
+            if (f != inCar.end()) {
+                load -= f->second;
+                inCar.erase(f);
+            }
+        }
+        for (const std::string& id : s.transitPickups) {
             const double kg = ctx.kgOf(id);
             inCar[id] = kg;
             load += kg;
@@ -2300,6 +2352,8 @@ void finalize(const Ctx& ctx, const Outcome& out, RoutePlan& plan) {
         s.pickups = specs[i].pickups;
         s.offloads = specs[i].offloads;
         s.reclaims = specs[i].reclaims;
+        s.transitUnloads = specs[i].transitUnloads;
+        s.transitPickups = specs[i].transitPickups;
         s.phase = specs[i].phase;
         if (i < ev.details.size()) {
             s.rawArrivalMin = ev.details[i].rawArrivalMin;
@@ -2409,6 +2463,13 @@ void finalize(const Ctx& ctx, const Outcome& out, RoutePlan& plan) {
             leg.reclaimTimeMin = -1;
             plan.offloads.push_back(leg);
         }
+        // 转运动作的 kg（账本渲染用；订单需求，整单不可拆）。
+        for (const std::string& id : specs[i].transitUnloads) {
+            plan.transitKg[id] = ctx.kgOf(id);
+        }
+        for (const std::string& id : specs[i].transitPickups) {
+            plan.transitKg[id] = ctx.kgOf(id);
+        }
         for (const std::string& id : specs[i].reclaims) {
             for (OffloadLeg& leg : plan.offloads) {
                 if (leg.orderId == id && leg.station == specs[i].nodeId
@@ -2433,12 +2494,40 @@ void finalize(const Ctx& ctx, const Outcome& out, RoutePlan& plan) {
     m.actionCount = pickupActions + deliveryActions;
 
     // 逐单指标：penalty / 准时（取货判据 = t_pick + shortestTime_vehicle(A->B) <= we）。
+    //
+    // **只统计「本车真的送达了」的订单**（不变量 8）：转运单的送达在取走车上，
+    // 取货车只做了取货与站内卸下 —— 若照 ctx 订单表全算，同一张单会在两台车的
+    // 指标里各出现一次（penalty / 两率的分母都翻倍）。
+    std::vector<std::string> deliveredIds;
+    for (const StopSpec& s : specs) {
+        for (const std::string& id : s.deliveries) {
+            deliveredIds.push_back(id);
+        }
+    }
     std::vector<std::string> ids;
     for (const Request& r : ctx.urgent) {
-        ids.push_back(r.orderId);
+        bool delivered = false;
+        for (const std::string& id : deliveredIds) {
+            if (id == r.orderId) {
+                delivered = true;
+                break;
+            }
+        }
+        if (delivered) {
+            ids.push_back(r.orderId);
+        }
     }
     for (const Request& r : ctx.normal) {
-        ids.push_back(r.orderId);
+        bool delivered = false;
+        for (const std::string& id : deliveredIds) {
+            if (id == r.orderId) {
+                delivered = true;
+                break;
+            }
+        }
+        if (delivered) {
+            ids.push_back(r.orderId);
+        }
     }
     for (const std::string& id : ids) {
         const std::unordered_map<std::string, Request>::const_iterator it = ctx.byId.find(id);
@@ -3063,6 +3152,8 @@ FleetPlan aggregateFleet(const std::vector<Vehicle>& vehicles,
     }
     // 均衡度（规格二 §4.3）：分母按**全部车**，空车 utilization = 0 参与极差。
     fleet.balanceSpread = fleetBalanceSpreadOf(vehicles, plans);
+    // 转运账本（规格二 §5.3）：从各车停靠动作反查。默认数据上恒为空。
+    fleet.transitLegs = buildTransitLedger(vehicles, plans);
     return fleet;
 }
 
@@ -3108,6 +3199,916 @@ FleetPlan planFleetSequentialBaseline(const LogisticsGraph& graph,
     FleetPlan fleet = aggregateFleet(vehicles, plans);
     fillAllocationFields(fleet, graph, vehicles, orders, assigned);
     return fleet;
+}
+
+// ---- 跨车转运账本的反查（规格二 §5.3；唯一实现）----
+std::vector<TransitLeg> buildTransitLedger(const std::vector<Vehicle>& vehicles,
+                                           const std::vector<RoutePlan>& plans) {
+    std::vector<TransitLeg> legs;
+    if (vehicles.size() != plans.size()) {
+        return legs;
+    }
+    struct Acc {
+        TransitLeg leg;
+        bool hasIn = false;
+        bool hasOut = false;
+    };
+    std::map<std::string, Acc> byOrder;
+    for (std::size_t v = 0; v < plans.size(); ++v) {
+        const RoutePlan& plan = plans[v];
+        if (plan.status != PlanStatus::Ok) {
+            continue;
+        }
+        for (const Stop& s : plan.stops) {
+            for (const std::string& id : s.transitUnloads) {
+                Acc& a = byOrder[id];
+                a.leg.orderId = id;
+                a.leg.stationId = s.nodeId;
+                const std::map<std::string, double>::const_iterator kg = plan.transitKg.find(id);
+                a.leg.kg = (kg != plan.transitKg.end()) ? kg->second : 0.0;
+                a.leg.inVehicleId = vehicles[v].id;
+                a.leg.inTimeMin = s.arrivalMin;
+                a.hasIn = true;
+            }
+            for (const std::string& id : s.transitPickups) {
+                Acc& a = byOrder[id];
+                a.leg.orderId = id;
+                if (a.leg.stationId.empty()) {
+                    a.leg.stationId = s.nodeId;
+                }
+                a.leg.outVehicleId = vehicles[v].id;
+                a.leg.outTimeMin = s.arrivalMin;
+                a.hasOut = true;
+            }
+        }
+    }
+    // 两端齐全且 in != out 才是账本记录（§5.3：只卸不取不是合法记录）。
+    for (std::map<std::string, Acc>::const_iterator it = byOrder.begin(); it != byOrder.end();
+         ++it) {
+        if (!it->second.hasIn || !it->second.hasOut) {
+            continue;
+        }
+        if (it->second.leg.inVehicleId == it->second.leg.outVehicleId) {
+            continue;   // 同车卸又取回 = 降载，不是转运（§5.2 的分界）
+        }
+        if (it->second.leg.outTimeMin < it->second.leg.inTimeMin) {
+            continue;   // 时刻链不成立
+        }
+        legs.push_back(it->second.leg);
+    }
+    // 按 (卸入时刻, 订单 ID) 升序（手写插入排序）。
+    for (std::size_t i = 1; i < legs.size(); ++i) {
+        const TransitLeg key = legs[i];
+        std::size_t j = i;
+        while (j > 0 && (legs[j - 1].inTimeMin > key.inTimeMin
+                         || (legs[j - 1].inTimeMin == key.inTimeMin
+                             && legs[j - 1].orderId > key.orderId))) {
+            legs[j] = legs[j - 1];
+            --j;
+        }
+        legs[j] = key;
+    }
+    return legs;
+}
+
+namespace {
+
+// 站点时钟文本（HH:MM，软件内分钟数）。只用于日志 / 账本，不参与任何算术。
+std::string minuteClockText(int minute) {
+    if (minute < 0) {
+        return "--:--";
+    }
+    const int hh = minute / 60;
+    const int mm = minute % 60;
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%02d:%02d", hh, mm);
+    return std::string(buf);
+}
+
+// 把最终计划里的一处停靠转回构造期真源（转运候选只在既有计划上改两处动作）。
+StopSpec specFromStop(const Stop& s) {
+    StopSpec spec;
+    spec.nodeId = s.nodeId;
+    spec.pickups = s.pickups;
+    for (const StopDelivery& d : s.deliveries) {
+        spec.deliveries.push_back(d.orderId);
+    }
+    spec.offloads = s.offloads;
+    spec.reclaims = s.reclaims;
+    spec.transitUnloads = s.transitUnloads;
+    spec.transitPickups = s.transitPickups;
+    spec.phase = s.phase;
+    return spec;
+}
+
+std::vector<StopSpec> specsFromPlan(const RoutePlan& plan) {
+    std::vector<StopSpec> specs;
+    specs.reserve(plan.stops.size());
+    for (const Stop& s : plan.stops) {
+        specs.push_back(specFromStop(s));
+    }
+    return specs;
+}
+
+void eraseId(std::vector<std::string>& v, const std::string& id) {
+    for (std::size_t i = 0; i < v.size();) {
+        if (v[i] == id) {
+            v.erase(v.begin() + static_cast<std::ptrdiff_t>(i));
+        } else {
+            ++i;
+        }
+    }
+}
+
+// 把一张订单从 v 的路线里摘走（保留取货动作）：转运卸入、容量腾挪都走这一条。
+// 删除送达 / 降载 / 取回 / 旧的转运动作；空的停靠一并删掉。
+void detachOrderFromRoute(std::vector<StopSpec>& specs, const std::string& orderId) {
+    for (std::size_t i = 0; i < specs.size(); ++i) {
+        StopSpec& s = specs[i];
+        eraseId(s.deliveries, orderId);
+        eraseId(s.offloads, orderId);
+        eraseId(s.reclaims, orderId);
+        eraseId(s.transitUnloads, orderId);
+        eraseId(s.transitPickups, orderId);
+    }
+    for (std::size_t i = 0; i < specs.size();) {
+        if (specs[i].empty()) {
+            specs.erase(specs.begin() + static_cast<std::ptrdiff_t>(i));
+        } else {
+            ++i;
+        }
+    }
+}
+
+bool hasPickup(const std::vector<StopSpec>& specs, const std::string& orderId) {
+    for (std::size_t i = 0; i < specs.size(); ++i) {
+        for (const std::string& id : specs[i].pickups) {
+            if (id == orderId) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+long long pickupIndexOf(const std::vector<StopSpec>& specs, const std::string& orderId) {
+    for (std::size_t i = 0; i < specs.size(); ++i) {
+        for (const std::string& id : specs[i].pickups) {
+            if (id == orderId) {
+                return static_cast<long long>(i);
+            }
+        }
+    }
+    return -1;
+}
+
+bool onboardHas(const std::vector<OnboardItem>& onboard, const std::string& orderId) {
+    for (const OnboardItem& it : onboard) {
+        if (it.orderId == orderId) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void insertStationAction(std::vector<StopSpec>& specs, std::size_t at, const std::string& station,
+                         const std::string& orderId, bool unload) {
+    if (at < specs.size() && specs[at].nodeId == station
+        && specs[at].phase == StopPhase::Normal) {
+        if (unload) {
+            specs[at].transitUnloads.push_back(orderId);
+        } else {
+            specs[at].transitPickups.push_back(orderId);
+        }
+        return;
+    }
+    StopSpec s;
+    s.nodeId = station;
+    s.phase = StopPhase::Normal;
+    if (unload) {
+        s.transitUnloads.push_back(orderId);
+    } else {
+        s.transitPickups.push_back(orderId);
+    }
+    specs.insert(specs.begin() + static_cast<std::ptrdiff_t>(at), s);
+}
+
+bool finishSpecs(const Ctx& ctx, const std::vector<StopSpec>& specs, RoutePlan& plan) {
+    Eval ev;
+    if (!replay(ctx, specs, false, ev)) {
+        return false;
+    }
+    Outcome out;
+    out.ok = true;
+    out.route = specs;
+    finalize(ctx, out, plan);
+    return plan.status == PlanStatus::Ok;
+}
+
+// v 侧候选：摘掉订单的送达/降载/取回，在取货动作之后插入一次「站内卸入」。
+// 位置枚举全量扫描（标准做法：每个候选整条重放），按该车自己的三键取最优。
+bool buildUnloadSpecs(const Ctx& ctx, const std::vector<StopSpec>& base,
+                      const std::string& orderId, const std::string& station,
+                      std::vector<StopSpec>& best, bool& found) {
+    const long long pickup = pickupIndexOf(base, orderId);
+    if (pickup < 0 && !onboardHas(ctx.onboard, orderId)) {
+        return false;   // 既不在路线里取货、也不在车上：这单根本不在本车
+    }
+    const std::size_t first = (pickup < 0) ? 0 : static_cast<std::size_t>(pickup) + 1;
+    bool have = false;
+    Key bestKey;
+    for (std::size_t at = first; at <= base.size(); ++at) {
+        std::vector<StopSpec> cand = base;
+        insertStationAction(cand, at, station, orderId, true);
+        normalize(cand);
+        Eval ev;
+        if (!replay(ctx, cand, false, ev)) {
+            continue;
+        }
+        if (!have || compareRoutes(cand, ev.key, best, bestKey) < 0) {
+            have = true;
+            best = cand;
+            bestKey = ev.key;
+        }
+    }
+    found = have;
+    return have;
+}
+
+// w 侧候选：插入「站内取走」与送达停靠（若路线里已有该 B 停靠则合并到它）。
+// 两处位置都全量枚举；站必须先于送达。按该车自己的三键取最优。
+bool buildPickupSpecs(const Ctx& ctx, const std::vector<StopSpec>& base,
+                      const std::string& orderId, const std::string& station,
+                      const std::string& deliveryNode, std::vector<StopSpec>& best, bool& found) {
+    // 已有的 B 停靠（普通段第一个）。它可能同时是取货点（顺路交付）。
+    long long deliveryIdx = -1;
+    for (std::size_t i = 0; i < base.size(); ++i) {
+        if (base[i].nodeId == deliveryNode && base[i].phase == StopPhase::Normal) {
+            deliveryIdx = static_cast<long long>(i);
+            break;
+        }
+    }
+    long long stationIdxExisting = -1;
+    for (std::size_t i = 0; i < base.size(); ++i) {
+        if (base[i].nodeId == station && base[i].phase == StopPhase::Normal) {
+            stationIdxExisting = static_cast<long long>(i);
+            break;
+        }
+    }
+    bool have = false;
+    Key bestKey;
+    // 站停靠的位置：已有则只试它，否则对每个插入位置各试一次。
+    std::vector<std::pair<std::size_t, bool> > stationPositions;   // (下标, 是否已存在)
+    if (stationIdxExisting >= 0) {
+        stationPositions.push_back(std::make_pair(
+            static_cast<std::size_t>(stationIdxExisting), true));
+    } else {
+        for (std::size_t at = 0; at <= base.size(); ++at) {
+            stationPositions.push_back(std::make_pair(at, false));
+        }
+    }
+    for (std::size_t sp = 0; sp < stationPositions.size(); ++sp) {
+        std::vector<StopSpec> withStation = base;
+        std::size_t stationIdx = stationPositions[sp].first;
+        insertStationAction(withStation, stationIdx, station, orderId, false);
+        if (!stationPositions[sp].second) {
+            normalize(withStation);
+        }
+        // 合并/插入可能让下标平移（相邻同站合并）；重新定位 S 停靠。
+        long long sIdx = -1;
+        for (std::size_t i = 0; i < withStation.size(); ++i) {
+            for (const std::string& id : withStation[i].transitPickups) {
+                if (id == orderId) {
+                    sIdx = static_cast<long long>(i);
+                    break;
+                }
+            }
+            if (sIdx >= 0) {
+                break;
+            }
+        }
+        if (sIdx < 0) {
+            continue;
+        }
+        // B 停靠：已有则必须位于 S 之后；否则枚举插入位置（严格在 S 之后）。
+        if (deliveryIdx >= 0) {
+            // 重新定位 B（插站/normalize 都可能让下标变）——不能拿插站前的旧下标判序。
+            long long bIdxCheck = -1;
+            for (std::size_t i = 0; i < withStation.size(); ++i) {
+                if (withStation[i].nodeId == deliveryNode
+                    && withStation[i].phase == StopPhase::Normal) {
+                    bIdxCheck = static_cast<long long>(i);
+                    break;
+                }
+            }
+            if (bIdxCheck < 0 || bIdxCheck <= sIdx) {
+                continue;
+            }
+            // 重新定位 B（normalize 可能让下标变）
+            long long bIdx = -1;
+            for (std::size_t i = static_cast<std::size_t>(sIdx) + 1; i < withStation.size(); ++i) {
+                if (withStation[i].nodeId == deliveryNode
+                    && withStation[i].phase == StopPhase::Normal) {
+                    bIdx = static_cast<long long>(i);
+                    break;
+                }
+            }
+            if (bIdx < 0) {
+                continue;
+            }
+            std::vector<StopSpec> cand = withStation;
+            cand[static_cast<std::size_t>(bIdx)].deliveries.push_back(orderId);
+            normalize(cand);
+            Eval ev;
+            if (!replay(ctx, cand, false, ev)) {
+                continue;
+            }
+            if (!have || compareRoutes(cand, ev.key, best, bestKey) < 0) {
+                have = true;
+                best = cand;
+                bestKey = ev.key;
+            }
+        } else {
+            for (std::size_t at = static_cast<std::size_t>(sIdx) + 1; at <= withStation.size();
+                 ++at) {
+                std::vector<StopSpec> cand = withStation;
+                // 该位置已有同节点普通停靠时直接合并（顺路交付）。
+                if (at < cand.size() && cand[at].nodeId == deliveryNode
+                    && cand[at].phase == StopPhase::Normal) {
+                    cand[at].deliveries.push_back(orderId);
+                } else {
+                    StopSpec b;
+                    b.nodeId = deliveryNode;
+                    b.phase = StopPhase::Normal;
+                    b.deliveries.push_back(orderId);
+                    cand.insert(cand.begin() + static_cast<std::ptrdiff_t>(at), b);
+                }
+                normalize(cand);
+                Eval ev;
+                if (!replay(ctx, cand, false, ev)) {
+                    continue;
+                }
+                if (!have || compareRoutes(cand, ev.key, best, bestKey) < 0) {
+                    have = true;
+                    best = cand;
+                    bestKey = ev.key;
+                }
+            }
+        }
+    }
+    found = have;
+    return have;
+}
+
+// 从一组计划里读出某笔转运的两端（订单 -> 卸入/取走/送达时刻与 kg）。
+bool readTransitLeg(const std::vector<Vehicle>& vehicles, const std::vector<RoutePlan>& plans,
+                    const std::string& orderId, TransitLeg& leg, int& deliveryTime,
+                    int& pickupTime) {
+    bool hasIn = false;
+    bool hasOut = false;
+    bool hasDel = false;
+    int pickTime = -1;
+    for (std::size_t v = 0; v < plans.size(); ++v) {
+        const RoutePlan& plan = plans[v];
+        for (const Stop& s : plan.stops) {
+            for (const std::string& id : s.transitUnloads) {
+                if (id != orderId) {
+                    continue;
+                }
+                leg.orderId = id;
+                leg.stationId = s.nodeId;
+                std::map<std::string, double>::const_iterator kg = plan.transitKg.find(id);
+                leg.kg = (kg != plan.transitKg.end()) ? kg->second : 0.0;
+                leg.inVehicleId = vehicles[v].id;
+                leg.inTimeMin = s.arrivalMin;
+                hasIn = true;
+            }
+            for (const std::string& id : s.transitPickups) {
+                if (id != orderId) {
+                    continue;
+                }
+                leg.outVehicleId = vehicles[v].id;
+                leg.outTimeMin = s.arrivalMin;
+                hasOut = true;
+            }
+            for (const StopDelivery& d : s.deliveries) {
+                if (d.orderId == orderId) {
+                    deliveryTime = s.arrivalMin;
+                    hasDel = true;
+                }
+            }
+            for (const std::string& id : s.pickups) {
+                if (id == orderId) {
+                    pickTime = s.arrivalMin;
+                }
+            }
+        }
+    }
+    pickupTime = pickTime;
+    return hasIn && hasOut && hasDel && leg.inVehicleId != leg.outVehicleId;
+}
+
+bool keyStrictlyBetter(const FleetKey& cand, const FleetKey& base) {
+    // 接受判据：**目标三键**严格更优；完全并列 ⇒ 保留禁转运版（§5.7 的关键一条）。
+    // tieKey 只用于「同目标的候选之间」裁决，不用来把零收益转运塞进默认数据。
+    return compareFleetKey(cand, base) < 0;
+}
+
+int orderPenaltyOf(const std::vector<RoutePlan>& plans, const std::string& orderId) {
+    for (std::size_t v = 0; v < plans.size(); ++v) {
+        for (const OrderMetric& om : plans[v].metrics.orders) {
+            if (om.orderId == orderId) {
+                return om.penaltyMin;
+            }
+        }
+    }
+    return -1;   // 不在任何车的送达指标里（不可行）
+}
+
+std::string vehicleOfOrderInPlans(const std::vector<RoutePlan>& plans,
+                                  const std::string& orderId) {
+    for (std::size_t v = 0; v < plans.size(); ++v) {
+        for (const Stop& s : plans[v].stops) {
+            for (const std::string& id : s.transitPickups) {
+                if (id == orderId) {
+                    return std::string();   // 已在途中（取走车）
+                }
+            }
+            for (const StopDelivery& d : s.deliveries) {
+                if (d.orderId == orderId) {
+                    return std::string("?") + std::to_string(v);
+                }
+            }
+        }
+    }
+    return std::string();
+}
+
+bool planHasTransit(const std::vector<RoutePlan>& plans, const std::string& orderId) {
+    for (std::size_t v = 0; v < plans.size(); ++v) {
+        for (const Stop& s : plans[v].stops) {
+            for (const std::string& id : s.transitUnloads) {
+                if (id == orderId) {
+                    return true;
+                }
+            }
+            for (const std::string& id : s.transitPickups) {
+                if (id == orderId) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// 某车计划里出现过的订单 ID（取货或送达；用于建 Ctx 的全局订单表）。
+void collectPlanOrderIds(const RoutePlan& plan, std::vector<std::string>& ids) {
+    for (const Stop& s : plan.stops) {
+        for (const std::string& id : s.pickups) {
+            bool seen = false;
+            for (const std::string& x : ids) {
+                if (x == id) {
+                    seen = true;
+                }
+            }
+            if (!seen) {
+                ids.push_back(id);
+            }
+        }
+        for (const StopDelivery& d : s.deliveries) {
+            bool seen = false;
+            for (const std::string& x : ids) {
+                if (x == d.orderId) {
+                    seen = true;
+                }
+            }
+            if (!seen) {
+                ids.push_back(d.orderId);
+            }
+        }
+    }
+}
+
+// 把「车队的全部订单」补进某车的 Ctx（只为 kg / 逐单指标；不做可达性检查）。
+// 转运会把一张单的送达挪到另一台车：那台车的 Ctx 必须知道该单的 kg 与窗口，
+// 否则 replay 的载重是 0、finalize 的指标也缺这一单（不变量 8 直接失守）。
+void appendFleetOrders(Ctx& ctx, const std::vector<Order>& all) {
+    std::vector<Request> extraNormal;
+    std::vector<Request> extraUrgent;
+    for (std::size_t i = 0; i < all.size(); ++i) {
+        const Order& o = all[i];
+        if (ctx.byId.find(o.id) != ctx.byId.end()) {
+            continue;
+        }
+        Request r;
+        r.orderId = o.id;
+        r.pickup = o.pickupNodeId;
+        r.delivery = o.nodeId;
+        r.kg = o.demandKg;
+        r.ws = o.windowStartMin;
+        r.we = o.windowEndMin;
+        r.urgent = o.urgent;
+        r.seq = ctx.byId.size();
+        ctx.orderIndex[r.orderId] = ctx.orderIndex.size();
+        ctx.byId[r.orderId] = r;
+        if (r.urgent) {
+            extraUrgent.push_back(r);
+        } else {
+            extraNormal.push_back(r);
+        }
+    }
+    for (std::size_t i = 0; i < extraNormal.size(); ++i) {
+        ctx.normal.push_back(extraNormal[i]);
+    }
+    for (std::size_t i = 0; i < extraUrgent.size(); ++i) {
+        ctx.urgent.push_back(extraUrgent[i]);
+    }
+    sortFifo(ctx.urgent);
+    sortEdd(ctx.normal);
+}
+
+bool zeroDetour(const CostMatrix& matrix, const std::string& a, const std::string& s,
+                const std::string& b, WeightType weight) {
+    double ad = 0.0;
+    double at = 0.0;
+    double ac = 0.0;
+    double as = 0.0;
+    double sd = 0.0;
+    double st = 0.0;
+    double sc = 0.0;
+    double bd = 0.0;
+    double bt = 0.0;
+    double bc = 0.0;
+    if (!matrix.leg(a, s, weight, ad, at, ac) || !matrix.leg(s, b, weight, sd, st, sc)
+        || !matrix.leg(a, b, weight, bd, bt, bc)) {
+        return false;
+    }
+    double direct = 0.0;
+    double via = 0.0;
+    switch (weight) {
+        case WeightType::Distance: direct = bd; via = ad + sd; break;
+        case WeightType::Time:     direct = bt; via = at + st; break;
+        case WeightType::Cost:     direct = bc; via = ac + sc; break;
+    }
+    return via <= direct + 1e-9;
+}
+
+struct TriggerOrder {
+    std::string orderId;
+    std::size_t inVehicle = 0;
+    std::string station;   // 判据②：卸货车自然路线上的降载站
+};
+
+// 候选统计（只用于日志）。
+struct GenerateStats {
+    int generated = 0;
+    bool found = false;
+};
+
+} // namespace
+
+FleetTransitResult applyTransitLayer(const LogisticsGraph& graph,
+                                     const std::vector<Vehicle>& vehicles,
+                                     const std::vector<std::vector<Order> >& vehicleOrders,
+                                     const std::vector<RoutePlan>& basePlans,
+                                     const std::vector<VehicleStartState>& starts,
+                                     WeightType weight) {
+    FleetTransitResult result;
+    result.plans = basePlans;
+    if (vehicles.empty() || basePlans.size() != vehicles.size()
+        || starts.size() != vehicles.size() || vehicleOrders.size() != vehicles.size()) {
+        return result;
+    }
+    for (std::size_t v = 0; v < basePlans.size(); ++v) {
+        if (basePlans[v].status != PlanStatus::Ok) {
+            return result;   // 禁转运版本身不可行：转运层不负责救（升级链归 #42）
+        }
+    }
+    // 全车队订单并集（含跨车送达的可能对象）。判别用 ID 汇总，顺序按传入。
+    std::vector<Order> allOrders;
+    std::map<std::string, Order> orderById;
+    for (std::size_t v = 0; v < vehicleOrders.size(); ++v) {
+        for (std::size_t i = 0; i < vehicleOrders[v].size(); ++i) {
+            const Order& o = vehicleOrders[v][i];
+            if (orderById.find(o.id) == orderById.end()) {
+                orderById[o.id] = o;
+                allOrders.push_back(o);
+            }
+        }
+    }
+    // 每车构造上下文（起点/在车货/暂存 + 全局订单表）。矩阵每车一份（与 planRoute 同口径）。
+    std::vector<Ctx> ctxs(vehicles.size());
+    for (std::size_t v = 0; v < vehicles.size(); ++v) {
+        std::string reason;
+        if (!makeCtx(graph, vehicles[v], vehicleOrders[v], starts[v].startNodeId,
+                     starts[v].startTimeMin, weight, starts[v].onboard, starts[v].stash, ctxs[v],
+                     reason)) {
+            return result;
+        }
+        appendFleetOrders(ctxs[v], allOrders);
+    }
+    const std::vector<std::size_t> byId = vehiclesSortedById(vehicles);
+    std::vector<RoutePlan> plans = basePlans;
+    FleetKey baseKey = fleetKeyOf(vehicles, plans, weight);
+    std::vector<std::string> moved;
+    auto alreadyMoved = [&](const std::string& id) {
+        for (std::size_t i = 0; i < moved.size(); ++i) {
+            if (moved[i] == id) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // 候选：给定触发器、订单、站、接收车，构造两版并读出账本两端。
+    struct Candidate {
+        std::vector<RoutePlan> plans;
+        TransitLeg leg;
+        std::string orderId;
+    };
+    auto makeCandidate = [&](const TriggerOrder& t, const std::string& station,
+                             std::size_t outIdx, Candidate& out) -> bool {
+        const std::size_t inIdx = t.inVehicle;
+        if (outIdx >= plans.size() || inIdx >= plans.size() || outIdx == inIdx) {
+            return false;
+        }
+        if (plans[outIdx].status != PlanStatus::Ok) {
+            return false;
+        }
+        std::vector<StopSpec> baseV = specsFromPlan(plans[inIdx]);
+        detachOrderFromRoute(baseV, t.orderId);
+        std::vector<StopSpec> unloadSpecs;
+        bool haveUnload = false;
+        if (!buildUnloadSpecs(ctxs[inIdx], baseV, t.orderId, station, unloadSpecs, haveUnload)
+            || !haveUnload) {
+            return false;
+        }
+        std::vector<StopSpec> baseW = specsFromPlan(plans[outIdx]);
+        std::vector<StopSpec> pickupSpecs;
+        bool havePickup = false;
+        const Order& o = orderById[t.orderId];
+        if (!buildPickupSpecs(ctxs[outIdx], baseW, t.orderId, station, o.nodeId, pickupSpecs,
+                              havePickup)
+            || !havePickup) {
+            return false;
+        }
+        std::vector<RoutePlan> cand = plans;
+        if (!finishSpecs(ctxs[inIdx], unloadSpecs, cand[inIdx])) {
+            return false;
+        }
+        if (!finishSpecs(ctxs[outIdx], pickupSpecs, cand[outIdx])) {
+            return false;
+        }
+        TransitLeg leg;
+        int deliveryTime = 0;
+        int pickupTime = -1;
+        if (!readTransitLeg(vehicles, cand, t.orderId, leg, deliveryTime, pickupTime)) {
+            return false;
+        }
+        const int dwell = leg.outTimeMin - leg.inTimeMin;
+        if (dwell < 0 || dwell > kTransferMaxDwellMin) {
+            return false;   // 站内等待上限：构造期过滤（不是「更差」，是不存在）
+        }
+        // 时刻链：取货(A) ≤ 卸入(S) ≤ 取走(S) ≤ 送达(B)
+        const int pick = (pickupTime >= 0) ? pickupTime : starts[inIdx].startTimeMin;
+        if (!(pick <= leg.inTimeMin && leg.inTimeMin <= leg.outTimeMin
+              && leg.outTimeMin <= deliveryTime)) {
+            return false;
+        }
+        // 整单不可拆 / 非负：同一订单只允许一笔「未取走」记录。
+        // 构造上每轮只动一张从未转运过的单 ⇒ C1 自动成立。
+        out.plans = cand;
+        out.leg = leg;
+        out.orderId = t.orderId;
+        return true;
+    };
+
+    // 生成某判据下的全部候选并取最优。并列规则：站 ID、接收车 ID 升序（生成顺序即升序），
+    // 目标三键完全并列时按 tieKey，再按生成序先到者胜。
+    auto runTrigger = [&](const char* tag, int triggerIndex,
+                          const std::vector<TriggerOrder>& triggers,
+                          bool urgentDoubleGate) -> void {
+        for (int round = 1; round <= 3; ++round) {
+            // 收集候选（固定顺序：订单 ID 升序 -> 站 ID 升序 -> 车辆 ID 升序）。
+            std::vector<TriggerOrder> sorted = triggers;
+            for (std::size_t i = 1; i < sorted.size(); ++i) {
+                const TriggerOrder key = sorted[i];
+                std::size_t j = i;
+                while (j > 0 && sorted[j - 1].orderId > key.orderId) {
+                    sorted[j] = sorted[j - 1];
+                    --j;
+                }
+                sorted[j] = key;
+            }
+            std::vector<std::string> stations;
+            for (const Node& n : graph.nodes()) {
+                if (n.type == NodeType::Transit) {
+                    stations.push_back(n.id);
+                }
+            }
+            for (std::size_t i = 1; i < stations.size(); ++i) {
+                const std::string key = stations[i];
+                std::size_t j = i;
+                while (j > 0 && stations[j - 1] > key) {
+                    stations[j] = stations[j - 1];
+                    --j;
+                }
+                stations[j] = key;
+            }
+            bool haveBest = false;
+            Candidate best;
+            FleetKey bestKey;
+            int generated = 0;
+            for (std::size_t ti = 0; ti < sorted.size(); ++ti) {
+                const TriggerOrder& t = sorted[ti];
+                if (alreadyMoved(t.orderId) || planHasTransit(plans, t.orderId)) {
+                    continue;
+                }
+                std::map<std::string, Order>::const_iterator oi = orderById.find(t.orderId);
+                if (oi == orderById.end()) {
+                    continue;
+                }
+                const Order& o = oi->second;
+                for (std::size_t si = 0; si < stations.size(); ++si) {
+                    const std::string& station = stations[si];
+                    if (triggerIndex != 1
+                        && !zeroDetour(ctxs[t.inVehicle].matrix, o.pickupNodeId, station, o.nodeId,
+                                       weight)) {
+                        continue;   // 零绕行站集合（①③）；② 用卸货车自然路线上的降载站
+                    }
+                    if (triggerIndex == 1 && station != t.station) {
+                        continue;
+                    }
+                    for (std::size_t t2 = 0; t2 < byId.size(); ++t2) {
+                        const std::size_t outIdx = byId[t2];
+                        if (outIdx == t.inVehicle) {
+                            continue;
+                        }
+                        Candidate cand;
+                        if (!makeCandidate(t, station, outIdx, cand)) {
+                            continue;
+                        }
+                        ++generated;
+                        // 候选优于当前最优？先比目标三键，再比 tieKey，再比生成序（先到者）。
+                        const FleetKey ck = fleetKeyOf(vehicles, cand.plans, weight);
+                        if (!ck.allOk) {
+                            continue;
+                        }
+                        bool take = false;
+                        if (!haveBest) {
+                            take = true;
+                        } else {
+                            const int kc = compareFleetKey(ck, bestKey);
+                            if (kc < 0) {
+                                take = true;
+                            } else if (kc == 0) {
+                                const int kt = compareFleetTie(cand.plans, best.plans, byId);
+                                if (kt < 0) {
+                                    take = true;
+                                }
+                            }
+                        }
+                        if (take) {
+                            haveBest = true;
+                            best = cand;
+                            bestKey = ck;
+                        }
+                    }
+                }
+            }
+            result.log.push_back(std::string("转运判据") + tag + " 第 " + std::to_string(round)
+                                 + " 轮：候选 " + std::to_string(generated) + " 个");
+            if (!haveBest) {
+                result.log.back() = std::string("转运判据") + tag + " 第 " + std::to_string(round)
+                                    + " 轮：无候选 ⇒ 停止该判据";
+                break;
+            }
+            // 接受判据：目标三键严格更优（完全并列保留禁转运版）。
+            if (!keyStrictlyBetter(bestKey, baseKey)) {
+                result.log.back() = std::string("转运判据") + tag + " 第 " + std::to_string(round)
+                                    + " 轮：最优候选不严格更优 ⇒ 保留禁转运版，停止该判据";
+                break;
+            }
+            // 紧急单双门槛：该单 penalty 必须严格下降，且整计划（目标键）严格更优。
+            if (urgentDoubleGate) {
+                const int before = orderPenaltyOf(plans, best.orderId);
+                const int after = orderPenaltyOf(best.plans, best.orderId);
+                if (!(before > 0 && after >= 0 && after < before)) {
+                    result.log.back() = std::string("转运判据") + tag + " 第 " + std::to_string(round)
+                                        + " 轮：该紧急单 penalty 未严格下降（"
+                                        + std::to_string(before) + " -> " + std::to_string(after)
+                                        + "）⇒ 双门槛不成立，停止该判据";
+                    break;
+                }
+            }
+            plans = best.plans;
+            baseKey = fleetKeyOf(vehicles, plans, weight);
+            moved.push_back(best.orderId);
+            ++result.acceptedRounds;
+            result.log.back() = std::string("转运判据") + tag + " 第 " + std::to_string(round)
+                                + " 轮：接受 " + best.orderId + " 经 "
+                                + best.leg.stationId + "（卸入 " + best.leg.inVehicleId + " "
+                                + minuteClockText(best.leg.inTimeMin) + " / 取走 "
+                                + best.leg.outVehicleId + " "
+                                + minuteClockText(best.leg.outTimeMin) + "，站内等待 "
+                                + std::to_string(best.leg.outTimeMin - best.leg.inTimeMin)
+                                + "min）";
+        }
+    };
+
+    bool anyTrigger = false;
+
+    // ---- 判据① 跨簇订单 ----
+    {
+        std::vector<TriggerOrder> triggers;
+        for (std::size_t v = 0; v < plans.size(); ++v) {
+            for (const Stop& s : plans[v].stops) {
+                for (const StopDelivery& d : s.deliveries) {
+                    std::map<std::string, Order>::const_iterator it = orderById.find(d.orderId);
+                    if (it == orderById.end()) {
+                        continue;
+                    }
+                    if (!isCrossCluster(graph, it->second)) {
+                        continue;
+                    }
+                    if (alreadyMoved(d.orderId) || planHasTransit(plans, d.orderId)) {
+                        continue;
+                    }
+                    TriggerOrder t;
+                    t.orderId = d.orderId;
+                    t.inVehicle = v;
+                    triggers.push_back(t);
+                }
+            }
+        }
+        if (!triggers.empty()) {
+            anyTrigger = true;
+            result.log.push_back("转运判据①（跨簇订单）：触发，涉及 "
+                                 + std::to_string(triggers.size()) + " 单");
+            runTrigger("①（跨簇订单）", 0, triggers, false);
+        }
+    }
+
+    // ---- 判据② 容量腾挪 ----
+    {
+        std::vector<TriggerOrder> triggers;
+        for (std::size_t v = 0; v < plans.size(); ++v) {
+            for (const OffloadLeg& leg : plans[v].offloads) {
+                if (alreadyMoved(leg.orderId) || planHasTransit(plans, leg.orderId)) {
+                    continue;
+                }
+                TriggerOrder t;
+                t.orderId = leg.orderId;
+                t.inVehicle = v;
+                t.station = leg.station;
+                triggers.push_back(t);
+            }
+        }
+        if (!triggers.empty()) {
+            anyTrigger = true;
+            result.log.push_back("转运判据②（容量腾挪）：触发，禁转运版有降载记录 "
+                                 + std::to_string(triggers.size()) + " 单");
+            runTrigger("②（容量腾挪）", 1, triggers, false);
+        }
+    }
+
+    // ---- 判据③ 紧急响应 ----
+    {
+        std::vector<TriggerOrder> triggers;
+        for (std::size_t v = 0; v < plans.size(); ++v) {
+            for (const OrderMetric& om : plans[v].metrics.orders) {
+                if (!om.urgent || om.penaltyMin <= 0) {
+                    continue;
+                }
+                if (alreadyMoved(om.orderId) || planHasTransit(plans, om.orderId)) {
+                    continue;
+                }
+                TriggerOrder t;
+                t.orderId = om.orderId;
+                t.inVehicle = v;
+                triggers.push_back(t);
+            }
+        }
+        if (!triggers.empty()) {
+            anyTrigger = true;
+            result.log.push_back("转运判据③（紧急响应）：触发，禁转运版有迟到紧急单 "
+                                 + std::to_string(triggers.size()) + " 单");
+            runTrigger("③（紧急响应）", 2, triggers, true);
+        }
+    }
+
+    if (result.acceptedRounds == 0) {
+        if (anyTrigger) {
+            result.log.push_back("转运层：未启用（三条判据均未产生严格更优解）");
+        }
+        result.plans = basePlans;
+        result.legs.clear();
+        return result;
+    }
+    result.plans = plans;
+    result.legs = buildTransitLedger(vehicles, result.plans);
+    return result;
 }
 
 // ---- 类型感知三阶段分配（规格二 §4，默认入口）----
@@ -3590,12 +4591,38 @@ FleetPlan planFleet(const LogisticsGraph& graph,
                                       + " 没有可行车 ⇒ 拒绝并报原因（兜底链 ④）");
     }
 
+    // ---- 后置有界改进 · 跨车转运（规格二 §5 / #28）----
+    //
+    // 只在三条判据之一成立时构造候选（默认数据全部不触发 ⇒ 一行候选都不生成，
+    // 这是 --plan-summary 仍 < 5s 的前提）。转运层**不改分配**：谁取货仍由 #40 决定，
+    // 只评估「给定分配下这一单改由另一台车送达是否严格更优」。
+    FleetTransitResult transitResult;
+    transitResult.plans = plans;
+    if (res.any) {
+        std::vector<VehicleStartState> starts(vehicles.size());
+        for (std::size_t v = 0; v < vehicles.size(); ++v) {
+            starts[v].startNodeId = vehicles[v].startNodeId;
+            starts[v].startTimeMin = vehicles[v].departTimeMin;
+        }
+        transitResult = applyTransitLayer(graph, vehicles, vehicleOrders, plans, starts, weight);
+        if (transitResult.acceptedRounds > 0) {
+            plans = transitResult.plans;
+        }
+    }
+
     // ---- 收口：汇总 + 分配产物（日志先存下，aggregateFleet 返回的是新对象）----
     const std::vector<std::string> allocLog = fleet.allocationLog;
     const std::vector<std::string> keyLog = fleet.candidateKeyLog;
     fleet = aggregateFleet(vehicles, plans);
     fleet.allocationLog = allocLog;
     fleet.candidateKeyLog = keyLog;
+    fleet.transitLegs = transitResult.legs;
+    fleet.transitLog = transitResult.log;
+    if (transitResult.acceptedRounds > 0) {
+        for (std::size_t i = 0; i < transitResult.log.size(); ++i) {
+            fleet.allocationLog.push_back(transitResult.log[i]);
+        }
+    }
     fillAllocationFields(fleet, graph, vehicles, orders, vehicleOrders);
     fleet.relocations = relocations;
     // 兜底链 ④：任何没被服务到的订单都要点名原因（不静默丢单）。

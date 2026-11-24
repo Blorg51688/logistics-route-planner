@@ -13,6 +13,7 @@
 #include <QDir>
 #include <QScreen>
 #include <QSignalBlocker>
+#include <QSpinBox>
 #include <QFileInfo>
 #include <QDialogButtonBox>
 #include <QFormLayout>
@@ -168,6 +169,10 @@ void MainWindow::buildActions() {
     // ---- 2. 事件注入：四类模拟事件 ----
     QToolBar* eventBar = makeBar(QStringLiteral("事件注入"));
     eventBar->addAction(QStringLiteral("插入紧急订单"), this, &MainWindow::onInsertUrgentOrder);
+    // 规格二 §7.6 / #25 Q9：紧跟「插入紧急订单」，名字带省略号表示会弹对话框。
+    // 来源 manual_normal / 前缀 M；不计入自动刷单额度。没有这个动作，默认数据上
+    // 三条转运判据全不触发 ⇒ 转运机制在验收现场根本不可演示。
+    eventBar->addAction(QStringLiteral("插入普通订单…"), this, &MainWindow::onInsertNormalOrder);
     eventBar->addAction(QStringLiteral("模拟新客户"), this, &MainWindow::onAddRandomCustomer);
     eventBar->addAction(QStringLiteral("模拟路况"), this, &MainWindow::onSimulateTraffic);
     eventBar->addAction(QStringLiteral("模拟道路封闭"), this, &MainWindow::onCloseRandomRoad);
@@ -275,6 +280,24 @@ void MainWindow::buildDocks() {
     transitDock->setWidget(transitTable_);
     addDockWidget(Qt::RightDockWidgetArea, transitDock);
 
+    // 转运账本（规格二 §7.5⑥）：新增 dock，与「中转站 / 集散」tabify 叠放，7 列。
+    // 与中转站面板第 4 列的分工：第 4 列是**降载暂存堆**（同车取回、聚合 kg）；
+    // 账本是**转运**（跨车、逐笔）。只记已实际执行的卸入；期末若有「在站」行 = 缺陷。
+    auto* ledgerDock = new QDockWidget(QStringLiteral("转运账本"), this);
+    ledgerDock->setMinimumWidth(360);
+    transitLedgerTable_ = new QTableWidget(0, 7, ledgerDock);
+    transitLedgerTable_->setHorizontalHeaderLabels(
+        {QStringLiteral("订单"), QStringLiteral("中转站"), QStringLiteral("kg"),
+         QStringLiteral("卸入"), QStringLiteral("取走"), QStringLiteral("站内等待(min)"),
+         QStringLiteral("状态")});
+    transitLedgerTable_->horizontalHeader()->setSectionResizeMode(
+        QHeaderView::ResizeToContents);
+    transitLedgerTable_->horizontalHeader()->setStretchLastSection(true);
+    transitLedgerTable_->verticalHeader()->setVisible(false);
+    transitLedgerTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    ledgerDock->setWidget(transitLedgerTable_);
+    addDockWidget(Qt::RightDockWidgetArea, ledgerDock);
+
     // 停靠明细（MC-E01）：**9 列**、按每车铺行（规格一阶段只有 1 台车，但车辆列
     // 不写死单值）：车辆 | 序号 | 阶段 | 配送点 | 动作（取<a>·送<b>）| 原始到达 |
     // 等待(分) | 送达 | 余货(kg)。趟结构已退役，**无「趟」列**；「动作」列显示**计数**
@@ -322,7 +345,9 @@ void MainWindow::buildDocks() {
     // 四个面板纵向平铺会把每个都压到不可用
     tabifyDockWidget(orderDock, lateDock);
     tabifyDockWidget(lateDock, transitDock);
-    tabifyDockWidget(transitDock, stopDock);
+    // 转运账本与「中转站 / 集散」叠放（§7.5⑥：不新增右侧栏纵向高度）。
+    tabifyDockWidget(transitDock, ledgerDock);
+    tabifyDockWidget(ledgerDock, stopDock);
     orderDock->raise();
 
     resizeDocks({routeDock, vehicleDock}, {240, 110}, Qt::Vertical);
@@ -677,12 +702,17 @@ void MainWindow::replanFleet() {
     }
 
     std::vector<logistics::RoutePlan> plans(fleet_.size());
+    std::vector<logistics::VehicleStartState> starts(fleet_.size());
     for (std::size_t v = 0; v < fleet_.size(); ++v) {
         VehicleRuntime& rt = fleet_[v];
         const logistics::Vehicle& vehicle = config_.vehicles[v];
         logistics::StashState stash;
         stash.station = rt.state.stashStation;
         stash.items = rt.state.stashItems;
+        starts[v].startNodeId = rt.state.atNodeId;
+        starts[v].startTimeMin = rt.state.atTimeMin;
+        starts[v].onboard = rt.state.onboard;
+        starts[v].stash = stash;
         rt.plan = logistics::replan(config_.graph, vehicle, assigned[v], rt.state.atNodeId,
                                     rt.state.atTimeMin, planWeight_, rt.state.onboard, stash);
         // 新计划从该车当前位置起算，游标归零；记账在 VehicleState 里（跨重规划保留）。
@@ -700,6 +730,27 @@ void MainWindow::replanFleet() {
             appendLog(QStringLiteral("车 %1 规划不可行：%2")
                           .arg(QString::fromStdString(vehicle.id))
                           .arg(QString::fromStdString(rt.plan.reason)));
+        }
+    }
+    // ---- 后置有界改进 · 跨车转运（规格二 §5 / #28）----
+    //
+    // 基线 = 上面按「顺序轮转 + 逐车 replan」得到的禁转运版（转运层不改分配）。
+    // 三条判据静态全不触发时它一行候选都不构造（默认数据零开销）。
+    // 接受 = 目标三键严格更优；完全并列保留禁转运版。
+    {
+        const logistics::FleetTransitResult transit = logistics::applyTransitLayer(
+            config_.graph, config_.vehicles, assigned, plans, starts, planWeight_);
+        if (transit.acceptedRounds > 0) {
+            for (std::size_t v = 0; v < fleet_.size(); ++v) {
+                veh(v).plan = transit.plans[v];
+                veh(v).nodeIndex = 0;
+                veh(v).stopCursor = 0;
+                plans[v] = veh(v).plan;
+            }
+        }
+        for (std::size_t i = 0; i < transit.log.size(); ++i) {
+            appendLog(QStringLiteral("[转运] %1")
+                          .arg(QString::fromStdString(transit.log[i])));
         }
     }
     fleetPlan_ = logistics::aggregateFleet(config_.vehicles, plans);
@@ -1056,6 +1107,118 @@ void MainWindow::onInsertUrgentOrder() {
     dialog.exec();
 }
 
+// 手动「插入普通订单…」（规格二 §7.6 / #25 Q9）：**跨簇演示入口**。
+//
+// 与「插入紧急订单」同形（一次填完 A / B / 货量，B 下拉始终排除当前 A），差别只有：
+//   · urgent = false、来源 manual_normal、前缀 M；
+//   · 货量整数 3–15 且**严格小于** min([vehicles].capacity_kg)；
+//   · 窗口 [当前软件内时刻, 24:00]（与自动刷单同构）；
+//   · 不计入自动刷单额度（额度只数事件来源的单，R6）。
+// 无头路径（--self-check-actions / --demo / offscreen）退化为随机 A/B，保持自动化可跑。
+void MainWindow::onInsertNormalOrder() {
+    if (QGuiApplication::platformName() == QStringLiteral("offscreen")) {
+        insertRandomOrder(false, logistics::OrderSource::ManualNormal, currentTimeMin());
+        return;
+    }
+
+    QStringList customers;
+    for (const logistics::Node& n : config_.graph.nodes()) {
+        if (n.type == logistics::NodeType::Delivery) {
+            customers << QString::fromStdString(n.id);
+        }
+    }
+    if (customers.size() < 2) {
+        appendLog(QStringLiteral("客户节点不足，无法插入普通取送单"));
+        return;
+    }
+
+    // 上限 = min(15, min(capacity) - 1)：整数 3–15 且 **<** 最小车载重上限。
+    double cap = 0.0;
+    for (const logistics::Vehicle& v : config_.vehicles) {
+        if (cap <= 0.0 || v.capacityKg < cap) {
+            cap = v.capacityKg;
+        }
+    }
+    int maxKg = 15;
+    const int capKg = static_cast<int>(std::floor(cap));
+    if (capKg - 1 < maxKg) {
+        maxKg = capKg - 1;
+    }
+    if (maxKg < 3) {
+        appendLog(QStringLiteral("最小车载重上限过小（%1kg），无法插入 3kg 普通取送单")
+                      .arg(cap, 0, 'f', 0));
+        return;
+    }
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("插入普通取送单"));
+
+    auto* aCombo = new QComboBox(&dialog);
+    aCombo->addItems(customers);
+    auto* bCombo = new QComboBox(&dialog);
+    auto* demand = new QSpinBox(&dialog);
+    demand->setRange(3, maxKg);
+    demand->setSingleStep(1);
+    demand->setValue(maxKg >= 8 ? 8 : 3);
+
+    auto refreshB = [&]() {
+        const QString a = aCombo->currentText();
+        const QString keep = bCombo->currentText();
+        bCombo->clear();
+        for (const QString& s : customers) {
+            if (s != a) {
+                bCombo->addItem(s);
+            }
+        }
+        if (!keep.isEmpty()) {
+            const int idx = bCombo->findText(keep);
+            if (idx >= 0) {
+                bCombo->setCurrentIndex(idx);
+            }
+        }
+    };
+    connect(aCombo, &QComboBox::currentTextChanged, &dialog,
+            [&](const QString&) { refreshB(); });
+    refreshB();
+
+    auto* form = new QFormLayout;
+    form->addRow(QStringLiteral("取货点 A"), aCombo);
+    form->addRow(QStringLiteral("送达点 B"), bCombo);
+    form->addRow(QStringLiteral("货量(kg)"), demand);
+
+    auto* box = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    connect(box, &QDialogButtonBox::accepted, &dialog, [&]() {
+        if (aCombo->currentText() == bCombo->currentText()) {
+            QMessageBox::warning(&dialog, QStringLiteral("插入普通取送单"),
+                                 QStringLiteral("取货点 A 与送达点 B 不能相同"));
+            return;
+        }
+        if (!(demand->value() >= 3 && demand->value() <= 15
+              && static_cast<double>(demand->value()) < cap - 1e-9)) {
+            QMessageBox::warning(&dialog, QStringLiteral("插入普通取送单"),
+                                 QStringLiteral("货量须为 3–15 的整数且小于最小车载重上限"));
+            return;
+        }
+        const std::string id = insertOrderAt(aCombo->currentText().toStdString(),
+                                             bCombo->currentText().toStdString(),
+                                             demand->value(), false,
+                                             logistics::OrderSource::ManualNormal,
+                                             currentTimeMin());
+        if (id.empty()) {
+            QMessageBox::warning(&dialog, QStringLiteral("插入普通取送单"),
+                                 QStringLiteral("插入失败（端点不可达或货量超限），详见运行日志"));
+            return;
+        }
+        dialog.accept();
+    });
+    connect(box, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    auto* layout = new QVBoxLayout(&dialog);
+    layout->addLayout(form);
+    layout->addWidget(box);
+    dialog.exec();
+}
+
 // R10 · 手动「模拟新客户」：建节点 X + 一张**普通取送单**（A = 随机现有配送点 -> B = X）。
 // 只由工具栏触发，**不进事件池、不受待处理上限**，但与自动刷单走**同一条插入链**
 // （insertOrderAt -> insertOrder -> 普通段 pair-insertion）。
@@ -1168,6 +1331,53 @@ void MainWindow::onAdvanceStopFor(std::size_t v) {
                     o.served = true;
                 }
             }
+            // 转运账本：送达 -> 状态「已送达」（只记已实际执行的卸入，§7.5⑥）。
+            for (TransitLedgerEntry& e : transitLedger_) {
+                if (e.orderId == d.orderId && !e.delivered) {
+                    e.delivered = true;
+                    if (e.outTimeMin < 0) {
+                        e.outTimeMin = hereStop->arrivalMin;
+                        e.pickedUp = true;
+                    }
+                }
+            }
+        }
+        for (const std::string& orderId : hereStop->transitUnloads) {
+            // 转运卸入（跨车）：货从本车挪到站，**不进降载暂存堆**；账本追加一行。
+            for (std::size_t i = 0; i < veh(v).state.onboard.size(); ++i) {
+                if (veh(v).state.onboard[i].orderId != orderId) {
+                    continue;
+                }
+                veh(v).state.onboard.erase(veh(v).state.onboard.begin()
+                                           + static_cast<std::ptrdiff_t>(i));
+                break;
+            }
+            const logistics::TransitLeg* planned = nullptr;
+            for (const logistics::TransitLeg& leg : fleetPlan_.transitLegs) {
+                if (leg.orderId == orderId && leg.stationId == hereStop->nodeId
+                    && leg.inVehicleId == vehicle.id) {
+                    planned = &leg;
+                    break;
+                }
+            }
+            TransitLedgerEntry e;
+            e.orderId = orderId;
+            e.stationId = hereStop->nodeId;
+            e.kg = orderKg(orderId);
+            e.inVehicleId = vehicle.id;
+            e.inTimeMin = hereStop->arrivalMin;
+            e.outVehicleId = (planned != nullptr) ? planned->outVehicleId : std::string();
+            e.outTimeMin = -1;
+            e.pickedUp = false;
+            e.delivered = false;
+            transitLedger_.push_back(e);
+            appendLog(QStringLiteral("转运卸入：在 %1 卸下订单 %2 的货 %3kg（等待 %4 取走）")
+                          .arg(QString::fromStdString(hereStop->nodeId))
+                          .arg(QString::fromStdString(orderId))
+                          .arg(e.kg, 0, 'f', 0)
+                          .arg(planned != nullptr
+                                   ? QString::fromStdString(planned->outVehicleId)
+                                   : QStringLiteral("另一台车")));
         }
         for (const std::string& orderId : hereStop->offloads) {
             VehicleState::OffloadKey key;
@@ -1235,6 +1445,43 @@ void MainWindow::onAdvanceStopFor(std::size_t v) {
                 break;
             }
         }
+        for (const std::string& orderId : hereStop->transitPickups) {
+            // 转运取走（跨车）：货从站上装到本车；账本只补「取走」两列与状态。
+            veh(v).state.pickedOrderIds.insert(orderId);
+            const Order* target = nullptr;
+            for (const Order& o : config_.orders) {
+                if (o.id == orderId) {
+                    target = &o;
+                }
+            }
+            if (target != nullptr) {
+                logistics::OnboardItem item;
+                item.nodeId = target->nodeId;
+                item.kg = target->demandKg;
+                item.orderId = target->id;
+                veh(v).state.onboard.push_back(item);
+                for (Order& o : config_.orders) {
+                    if (o.id == orderId) {
+                        o.picked = true;
+                    }
+                }
+            }
+            bool recorded = false;
+            for (TransitLedgerEntry& e : transitLedger_) {
+                if (e.orderId != orderId || e.pickedUp) {
+                    continue;
+                }
+                e.pickedUp = true;
+                e.outVehicleId = vehicle.id;
+                e.outTimeMin = hereStop->arrivalMin;
+                recorded = true;
+            }
+            appendLog(QStringLiteral("转运取走：在 %1 取走订单 %2 的货 %3kg，继续配送%4")
+                          .arg(QString::fromStdString(hereStop->nodeId))
+                          .arg(QString::fromStdString(orderId))
+                          .arg(orderKg(orderId), 0, 'f', 0)
+                          .arg(recorded ? QString() : QStringLiteral("（账本无对应卸入）")));
+        }
         if (veh(v).state.stashItems.empty()) {
             veh(v).state.stashStation.clear();
         }
@@ -1250,16 +1497,35 @@ void MainWindow::onAdvanceStopFor(std::size_t v) {
         ++veh(v).stopCursor;
         const bool transitOnly = stop.pickups.empty() && stop.deliveries.empty();
         if (transitOnly) {
+            QString actions;
+            const auto addAction = [&actions](const QString& text) {
+                if (text.isEmpty()) {
+                    return;
+                }
+                if (!actions.isEmpty()) {
+                    actions += QStringLiteral(" ");
+                }
+                actions += text;
+            };
+            addAction(stop.transitUnloads.empty()
+                          ? QString()
+                          : QStringLiteral("转运卸入 %1 张单").arg(stop.transitUnloads.size()));
+            addAction(stop.transitPickups.empty()
+                          ? QString()
+                          : QStringLiteral("转运取走 %1 张单").arg(stop.transitPickups.size()));
+            addAction(stop.offloads.empty()
+                          ? QString()
+                          : QStringLiteral("降载 %1 张单").arg(stop.offloads.size()));
+            addAction(stop.reclaims.empty()
+                          ? QString()
+                          : QStringLiteral("取回 %1 张单").arg(stop.reclaims.size()));
             appendLog(QStringLiteral("中转站 %1（到达 %2）：%3%4")
                           .arg(QString::fromStdString(stop.nodeId))
                           .arg(minutesToClock(stop.arrivalMin))
-                          .arg(stop.offloads.empty()
+                          .arg(actions)
+                          .arg(stop.transitUnloads.empty() && stop.transitPickups.empty()
                                    ? QString()
-                                   : QStringLiteral("降载 %1 张单 ")
-                                         .arg(stop.offloads.size()))
-                          .arg(stop.reclaims.empty()
-                                   ? QString()
-                                   : QStringLiteral("取回 %1 张单").arg(stop.reclaims.size())));
+                                   : QStringLiteral("（跨车转运，零耗时）")));
         } else if (!stop.pickups.empty() && stop.deliveries.empty()) {
             appendLog(QStringLiteral("取货停靠 %1（到达 %2）")
                           .arg(QString::fromStdString(stop.nodeId))
@@ -2253,6 +2519,43 @@ void MainWindow::updatePanels() {
         }
     }
 
+    // ---- 转运账本（§7.5⑥）：7 列，**逐笔**一行（只含已实际执行的卸入）----
+    // 列序：订单 | 中转站 | kg | 卸入(<车> <HH:MM>) | 取走(同形；未取走 —) |
+    //       站内等待(min)(未取走 —) | 状态(在站 / 已送达)
+    {
+        transitLedgerTable_->setRowCount(static_cast<int>(transitLedger_.size()));
+        for (std::size_t i = 0; i < transitLedger_.size(); ++i) {
+            const TransitLedgerEntry& e = transitLedger_[i];
+            const int row = static_cast<int>(i);
+            transitLedgerTable_->setItem(
+                row, 0, new QTableWidgetItem(QString::fromStdString(e.orderId)));
+            transitLedgerTable_->setItem(
+                row, 1, new QTableWidgetItem(QString::fromStdString(e.stationId)));
+            transitLedgerTable_->setItem(row, 2,
+                                         new QTableWidgetItem(QString::number(e.kg, 'f', 0)));
+            transitLedgerTable_->setItem(
+                row, 3, new QTableWidgetItem(QString::fromStdString(e.inVehicleId)
+                                             + QLatin1Char(' ')
+                                             + minutesToClock(e.inTimeMin)));
+            if (e.pickedUp) {
+                transitLedgerTable_->setItem(
+                    row, 4, new QTableWidgetItem(QString::fromStdString(e.outVehicleId)
+                                                 + QLatin1Char(' ')
+                                                 + minutesToClock(e.outTimeMin)));
+                transitLedgerTable_->setItem(
+                    row, 5,
+                    new QTableWidgetItem(QString::number(e.outTimeMin - e.inTimeMin)));
+            } else {
+                transitLedgerTable_->setItem(row, 4, new QTableWidgetItem(QStringLiteral("—")));
+                transitLedgerTable_->setItem(row, 5, new QTableWidgetItem(QStringLiteral("—")));
+            }
+            transitLedgerTable_->setItem(
+                row, 6,
+                new QTableWidgetItem(e.delivered ? QStringLiteral("已送达")
+                                                 : QStringLiteral("在站")));
+        }
+    }
+
     // ---- 超时订单（§7.5④）：8 列，**逐车铺行**、逐单一行 ----
     // 区分**已经发生**的超时（事实，跨重规划保留）与**剩余计划预计**的超时。
     {
@@ -2507,6 +2810,37 @@ QStringList MainWindow::transitPanelHeaders() const {
         }
     }
     return names;
+}
+
+QStringList MainWindow::transitLedgerHeaders() const {
+    QStringList names;
+    if (transitLedgerTable_ != nullptr) {
+        for (int col = 0; col < transitLedgerTable_->columnCount(); ++col) {
+            const QTableWidgetItem* item = transitLedgerTable_->horizontalHeaderItem(col);
+            names << (item != nullptr ? item->text() : QString());
+        }
+    }
+    return names;
+}
+
+QString MainWindow::transitLedgerSummary() const {
+    QString out;
+    if (transitLedgerTable_ == nullptr) {
+        return out;
+    }
+    for (int row = 0; row < transitLedgerTable_->rowCount(); ++row) {
+        QStringList cells;
+        for (int col = 0; col < transitLedgerTable_->columnCount(); ++col) {
+            const QTableWidgetItem* item = transitLedgerTable_->item(row, col);
+            cells << (item != nullptr ? item->text() : QString());
+        }
+        out += cells.join(QStringLiteral(" | ")) + QLatin1Char('\n');
+    }
+    return out;
+}
+
+int MainWindow::transitLedgerRowCount() const {
+    return transitLedgerTable_ != nullptr ? transitLedgerTable_->rowCount() : 0;
 }
 
 int MainWindow::vehicleTabCount() const {
@@ -3473,6 +3807,120 @@ int MainWindow::runActionSelfCheck() {
                    .arg(diffLines(snapA.split(QLatin1Char('\n')),
                                   snapB.split(QLatin1Char('\n')))));
         std::printf("[self-check] 等价性终态（两条路径一致）：\n%s", snapA.toUtf8().constData());
+    }
+
+    // ---- 9. 跨车转运（规格二 §5 / #28）：插入普通订单 → 时间策略接受 → 账本守恒 ----
+    //
+    // 为什么必须是独立窗口：前面的段落已经把订单集合、车辆状态、随机流推得很远。
+    // 这里用**干净配置**（事件间隔拉到很长，保证转运计划在执行期间不被事件重规划打断），
+    // 按 §7.7 的演示脚本做一遍：插入 D08→D18 的 8kg 普通单 -> 时间策略重规划 ->
+    // 推进到全队收工 -> 读**用户可见的**转运账本面板。
+    {
+        logistics::Config base = reloadInitialConfig();
+        base.general.eventIntervalMin = 24 * 60;   // 演示窗口内不触发事件
+        MainWindow transit(base, configPath_);
+        // 时间策略（§7.7 第 5 步）：D08（sub1）→D18（sub3）在顺序轮转基线下
+        // 时间键严格更优 ⇒ 转运被接受；距离策略下两版并列 ⇒ 保留禁转运版。
+        transit.strategyBox_->setCurrentIndex(1);
+        const int now = transit.currentTimeMin();
+        const std::size_t before = transit.config_.orders.size();
+        const std::string id = transit.insertOrderAt(
+            "D08", "D18", 8.0, false, logistics::OrderSource::ManualNormal, now);
+        expect(id == "M001", QStringLiteral("G18：手动普通单 ID 前缀 M + 递增号（实际 %1）")
+                                 .arg(QString::fromStdString(id)));
+        expect(transit.config_.orders.size() == before + 1,
+               QStringLiteral("G18：插入普通订单必须并入订单集合（不丢单）"));
+        const logistics::Order* inserted = transit.findOrderById(id);
+        expect(inserted != nullptr && !inserted->urgent
+                   && inserted->source == logistics::OrderSource::ManualNormal
+                   && inserted->windowStartMin == now && inserted->windowEndMin == 24 * 60
+                   && inserted->pickupNodeId == "D08" && inserted->nodeId == "D18",
+               QStringLiteral("G18：来源 manual_normal / 窗口 [now, 24:00]（%1-%2）")
+                   .arg(inserted != nullptr ? inserted->windowStartMin : -1)
+                   .arg(inserted != nullptr ? inserted->windowEndMin : -1));
+        // 订单表（用户可见）里必须能看到这张单。
+        bool inOrderTable = false;
+        for (int row = 0; row < transit.orderTable_->rowCount() && !inOrderTable; ++row) {
+            const QTableWidgetItem* item = transit.orderTable_->item(row, 0);
+            if (item != nullptr && item->text() == QString::fromStdString(id)) {
+                inOrderTable = true;
+            }
+        }
+        expect(inOrderTable, QStringLiteral("G18：插入后订单表出现该单 %1")
+                                 .arg(QString::fromStdString(id)));
+
+        // 计划期账本（TRANSIT / 面板的同一份数据）：两端非空、in≠out、dwell≤60、整单 kg。
+        expect(!transit.fleetPlan_.transitLegs.empty(),
+               QStringLiteral("转运：时间策略下应接受 D08→D18 一张跨簇单（计划期账本非空）"));
+        bool planLedgerOk = true;
+        for (const logistics::TransitLeg& leg : transit.fleetPlan_.transitLegs) {
+            const bool twoEnds = !leg.inVehicleId.empty() && !leg.outVehicleId.empty();
+            const int dwell = leg.outTimeMin - leg.inTimeMin;
+            if (!twoEnds || leg.inVehicleId == leg.outVehicleId || leg.orderId != id
+                || leg.kg < 8.0 - 1e-9 || dwell < 0 || dwell > logistics::kTransferMaxDwellMin) {
+                planLedgerOk = false;
+            }
+        }
+        expect(planLedgerOk,
+               QStringLiteral("转运段完整 / in≠out / kg=8 / 0≤dwell≤%1（计划期）")
+                   .arg(logistics::kTransferMaxDwellMin));
+
+        // 推进到全队收工：转运的卸入/取走/送达都必须**真的执行**。
+        int steps = 0;
+        while (!transit.atRouteEnd() && steps < 800) {
+            transit.onAdvanceStop();
+            ++steps;
+        }
+        expect(transit.atRouteEnd(), QStringLiteral("转运演示：全队走完路线（%1 步）").arg(steps));
+        const logistics::Order* after = transit.findOrderById(id);
+        expect(after != nullptr && after->served,
+               QStringLiteral("转运演示：跨车转运的订单最终送达"));
+
+        // 运行期账本 = 用户可见面板：只记已实际执行的卸入；期末全为「已送达」。
+        const int ledgerRows = transit.transitLedgerRowCount();
+        expect(ledgerRows >= 1,
+               QStringLiteral("转运账本面板出现已执行的卸入（实际 %1 行）").arg(ledgerRows));
+        bool runLedgerOk = true;
+        int inStationRows = 0;
+        for (const TransitLedgerEntry& e : transit.transitLedger_) {
+            if (!e.delivered) {
+                ++inStationRows;
+            }
+            const int dwell = e.outTimeMin - e.inTimeMin;
+            if (e.orderId.empty() || e.stationId.empty() || e.inVehicleId.empty()
+                || e.outVehicleId.empty() || e.inVehicleId == e.outVehicleId
+                || e.inTimeMin < 0 || e.outTimeMin < e.inTimeMin
+                || dwell > logistics::kTransferMaxDwellMin) {
+                runLedgerOk = false;
+            }
+        }
+        expect(runLedgerOk,
+               QStringLiteral("转运账本：每笔两端非空、in≠out、dwell≤%1")
+                   .arg(logistics::kTransferMaxDwellMin));
+        expect(inStationRows == 0,
+               QStringLiteral("期末账本无「在站」行（实际 %1 行）").arg(inStationRows));
+        const QString ledgerText = transit.transitLedgerSummary();
+        expect(ledgerText.contains(QString::fromStdString(id))
+                   && ledgerText.contains(QStringLiteral("已送达"))
+                   && !ledgerText.contains(QStringLiteral("| 在站")),
+               QStringLiteral("转运账本面板文本：含该单且状态为已送达\n%1")
+                   .arg(ledgerText));
+        std::printf("[self-check] 转运账本：\n%s", ledgerText.toUtf8().constData());
+
+        // G18 的动作本身（不是只调底层插单函数）：无头路径（offscreen）退化为随机 A/B，
+        // 走的是工具栏「插入普通订单…」同一入口。断读订单集合与来源/前缀。
+        const std::size_t beforeSlot = transit.config_.orders.size();
+        transit.onInsertNormalOrder();
+        expect(transit.config_.orders.size() == beforeSlot + 1,
+               QStringLiteral("G18：工具栏「插入普通订单…」无头路径可用（退化为随机 A/B，不丢单）"));
+        if (transit.config_.orders.size() == beforeSlot + 1) {
+            const Order& randomOrder = transit.config_.orders.back();
+            expect(randomOrder.source == logistics::OrderSource::ManualNormal
+                       && !randomOrder.urgent && !randomOrder.id.empty()
+                       && randomOrder.id[0] == 'M',
+                   QStringLiteral("G18：该动作来源 manual_normal / 前缀 M（实际 %1）")
+                       .arg(QString::fromStdString(randomOrder.id)));
+        }
     }
 
     return failures;

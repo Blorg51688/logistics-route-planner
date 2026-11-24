@@ -441,6 +441,53 @@ FleetPlan planFleetForWeight(const Config& cfg, WeightType weight, const char* l
 // 真实缺陷 —— ① 巡游 1048km / 28 小时；② 成本与距离完全线性相关。当时集成测试
 // 只有"非零 / 非负 / 结构正确"这类弱断言，两个缺陷是靠人眼看 printf 发现的。
 // 以下断言把"数据有效性"从"人眼观察"变成"机器守的契约"。
+
+// 转运默认不启用（规格二 §5.13 / #41）：默认数据 25 单全部簇内、每簇一批不超容量、
+// 无紧急单 ⇒ 三条判据**全部不触发**，转运层一行候选都不构造。
+// 这是「绝不更差」的最强经验证据：默认三策略的车队口径必须与 #40 基线逐项一致。
+void checkDefaultTransitNotTriggered(const Config& cfg, const FleetPlan& byDistance,
+                                     const FleetPlan& byCost, const FleetPlan& byTime) {
+    const FleetPlan* fleets[3] = {&byDistance, &byCost, &byTime};
+    const char* labels[3] = {"距离策略", "成本策略", "时间策略"};
+    for (int i = 0; i < 3; ++i) {
+        check(fleets[i]->transitLegs.empty(),
+              std::string(labels[i]) + "：默认数据上转运账本必须为空（三判据静态不触发）");
+        check(fleets[i]->transitLog.empty(),
+              std::string(labels[i]) + "：默认数据上转运层不产生任何候选日志（门控在工作）");
+    }
+    // 22 个车队级数字（3 × 距离/耗时/成本/penalty/停靠/动作）——**#40 基线**。
+    // 口径：本工作区实现、config/default.ini 三车 25 单（不是规格一单车黄金值）。
+    struct Base {
+        const char* label;
+        double distance;
+        double completion;
+        double cost;
+        int penalty;
+        int stops;
+        int actions;
+    };
+    const Base kBase[3] = {
+        {"距离", 139.900, 429.000, 172.970, 0, 28, 50},
+        {"成本", 145.400, 449.500, 160.260, 0, 32, 50},
+        {"时间", 170.400, 378.200, 243.090, 0, 30, 50},
+    };
+    for (int i = 0; i < 3; ++i) {
+        const FleetPlan& f = *fleets[i];
+        const Base& b = kBase[i];
+        check(fixtures::nearlyEqual(f.totalDistanceKm, b.distance, 0.001),
+              std::string(b.label) + "策略·默认数据总距离与 #40 基线一致（"
+                  + std::to_string(f.totalDistanceKm) + " vs " + std::to_string(b.distance) + "）");
+        check(fixtures::nearlyEqual(f.completionTimeMin, b.completion, 0.001),
+              std::string(b.label) + "策略·完工耗时与 #40 基线一致");
+        check(fixtures::nearlyEqual(f.totalCostYuan, b.cost, 0.001),
+              std::string(b.label) + "策略·总成本与 #40 基线一致");
+        check(f.totalPenaltyMin == b.penalty, std::string(b.label) + "策略·penalty 与 #40 基线一致");
+        check(f.stopCount == b.stops, std::string(b.label) + "策略·停靠数与 #40 基线一致");
+        check(f.actionCount == b.actions, std::string(b.label) + "策略·动作数与 #40 基线一致");
+    }
+    (void)cfg;
+}
+
 void checkDataQualityInvariants(const Config& cfg, const FleetPlan& byDistance,
                                 const FleetPlan& byCost, const FleetPlan& byTime) {
     const FleetPlan* fleets[] = {&byDistance, &byCost, &byTime};
@@ -1398,6 +1445,7 @@ int main() {
     const FleetPlan byTime = planFleetForWeight(cfg, WeightType::Time, "最短耗时策略");
 
     checkDataQualityInvariants(cfg, byDistance, byCost, byTime);
+    checkDefaultTransitNotTriggered(cfg, byDistance, byCost, byTime);
 
     // ---- 规格二 §4 / #40：9 条分配不变量（三策略 + 顺序轮转基线）----
     const FleetPlan baseDistance =
