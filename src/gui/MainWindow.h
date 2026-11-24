@@ -111,8 +111,38 @@ public:
         }
     };
 
-    // 供 --self-check-actions 核对
-    const VehicleState& vehicleState() const { return state_; }
+    // 每车一份运行状态（规格二 §6.1 / #39）：位置/时刻/在车货/已送达/已发生 penalty/
+    // 当前停靠游标 + **该车自己的**计划。所有状态转移只经由 advanceFleetTo 里的
+    // onAdvanceStopFor(v)；重规划只读它、绝不改写。
+    struct VehicleRuntime {
+        VehicleState         state;
+        logistics::RoutePlan plan;
+        std::size_t          nodeIndex = 0;    // 该车沿 plan.nodes 的下标
+        std::size_t          stopCursor = 0;   // 该车下一个待服务停靠
+        int                  departTimeMin = 0;  // 该车发车时刻（配置值）
+    };
+
+    // 供 --self-check-actions 核对（车队口径：活跃车的状态 + 全部车辆）
+    const VehicleState& vehicleState() const { return fleet_.empty() ? emptyState_ : active().state; }
+    const std::vector<VehicleRuntime>& fleet() const { return fleet_; }
+    std::size_t activeVehicle() const { return activeVehicle_; }
+    // 车队时钟（= 各车时刻的最大值；事件刻、窗口、penalty 的共同基准）
+    int fleetClockMin() const { return fleetClockMin_; }
+    // 各车发车时刻的最小值（完工耗时的下界，§3.4）
+    int minDepartMin() const;
+    // 该车下一站的节点 ID；无剩余则空串（页签「下一站」显示「—」）
+    std::string nextStopNodeId(std::size_t v) const;
+    // 该车阶段：紧急 / 普通 / 已收工（由剩余路线的阶段标记推出，§7.5②）
+    QString vehiclePhaseText(std::size_t v) const;
+    // 该车剩余待送货量（kg）：它自己还没送达的订单之和
+    double vehicleRemainingDemandKg(std::size_t v) const;
+    // 该车已送达订单数（物理事实，跨重规划保留）
+    int vehicleServedOrderCount(std::size_t v) const;
+    // 画布归属快照（G15）：每条车路线边 -> 归属车（行序最前）+ 是否属于选中车。
+    // 格式：`<from>-><to> owner=<VID> selected=<0|1>`，逐行。
+    QString canvasOwnershipSnapshot() const;
+    // 当前页签（= 画布选中车）
+    int selectedVehicleIndex() const;
 
 public:
     // configPath 用于「等价性守卫」里**重新加载配置**构造第二个独立窗口
@@ -298,18 +328,39 @@ private:
     std::string           configPath_;
     GraphScene*           scene_ = nullptr;
     QGraphicsView*        view_ = nullptr;
-    // 车辆物理状态（唯一权威来源，重规划不得改写）
-    VehicleState          state_;
-    logistics::RoutePlan  plan_;
-    // 车辆当前位置与当前时刻必须**显式保存**：重规划会用一个全新的
-    // plan_ 覆盖旧计划，此时按下标回查 plan_.stops 会索引错位
-    // （新计划里的停靠点全都没送过），进而取到错误的时刻、penalty 暴涨。
-    std::string           currentNodeId_;
-    int                   currentTimeMin_ = 0;
-    // 车辆沿 plan_.nodes 逐个节点前进（含仓库与中转站），而不再只跳配送点。
-    // nodeIndex_ 指向车辆当前所在的节点，stopCursor_ 指向下一个待服务的停靠记录。
-    std::size_t           nodeIndex_ = 0;
-    std::size_t           stopCursor_ = 0;
+    // 车队物理状态（唯一权威来源，重规划不得改写）：**每车一份**。
+    //
+    // 规格二 §6.1：每车一份游标（nodeIndex/stopCursor）与一份 VehicleState；
+    // 所有状态转移只发生在 advanceFleetTo() -> onAdvanceStopFor(v)。
+    std::vector<VehicleRuntime> fleet_;
+    VehicleState                emptyState_;   // 无车辆配置时的只读占位
+    // 车队时钟：全局唯一，= 各车时刻的最大值（事件刻/窗口/penalty 的共同基准）。
+    int                         fleetClockMin_ = 0;
+    // 页签选中的车（手动动作、单车站位显示的作用对象；默认 0 = 队首）。
+    std::size_t                 activeVehicle_ = 0;
+    // 车队级汇总（每次 replan 后由 planFleet/逐车计划重算；GUI 与 CLI 同口径）
+    logistics::FleetPlan        fleetPlan_;
+
+    VehicleRuntime&       active() { return fleet_[activeVehicle_]; }
+    const VehicleRuntime& active() const { return fleet_[activeVehicle_]; }
+    VehicleRuntime&       veh(std::size_t i) { return fleet_[i]; }
+    const VehicleRuntime& veh(std::size_t i) const { return fleet_[i]; }
+    // 该车路线是否已走完（含计划不可行/为空）
+    bool vehAtEnd(std::size_t v) const;
+    // 该车下一节点的到达时刻（走完则返回 INT_MAX）
+    int  vehNextArrival(std::size_t v) const;
+    // **全队**下一到达时刻（所有车的最小值；全走完返回 INT_MAX）
+    int  nextFleetArrival() const;
+    // 单一车队时钟原语（规格二 §6.1 的最小版；五级升级链归 #42）：
+    //   repeat: Tnext = min(各车下一节点到达)；if 无或 Tnext > T: break
+    //           所有「下一到达 == Tnext」的车一起 onAdvanceStopFor(v)
+    //           settleEventsUpTo(Tnext)
+    // 两条推进路径（推进一站 / 推进一刻）都只经由它改状态。
+    void advanceFleetTo(int targetMin);
+    // 该车前进一个节点并执行该节点的动作集（唯一的状态转移点）
+    void onAdvanceStopFor(std::size_t v);
+    // 按顺序轮转基线把「剩余未送达订单」重新分给各车，并逐车从当前位置重规划。
+    void replanFleet();
     logistics::Rng        rng_{20260914u};
     logistics::WeightType planWeight_ = logistics::WeightType::Distance;
 
@@ -343,10 +394,10 @@ private:
     // 因此**没有** loadForTrip / loadForCurrentTrip（规格一 MC-A01/MC-A02 退役）。
     // 换计划后的统一收尾（三处重规划路径共用）
     void afterPlanReplaced();
-    // 到达：更新位置与时刻（回到仓库只是"已驶离"复位，趟结构已退役）
-    void arriveAt(const std::string& nodeId, int timeMin);
-    // 送达：把该点的货从车上卸下、记账（含超时惩罚与已送达计数）
-    void deliverAt(const logistics::Stop& stop);
+    // 到达：更新**该车**位置与时刻（回到仓库只是"已驶离"复位，趟结构已退役）
+    void arriveAt(std::size_t v, const std::string& nodeId, int timeMin);
+    // 送达：把该点的货从**该车**卸下、记账（含超时惩罚与已送达计数）
+    void deliverAt(std::size_t v, const logistics::Stop& stop);
 
     QTextBrowser*  routeInfo_ = nullptr;
     // 车辆信息（MC-E04）：**每车一个页签**，页签数 == config_.vehicles.size()，

@@ -95,6 +95,18 @@ void EdgeItem::setHighlighted(bool on) {
     update();
 }
 
+void EdgeItem::setRouteStyle(bool owned, const QColor& color, bool selectedVehicleRoute) {
+    // 归属与加粗**分别**设置：颜色归属行序最前那台车，加粗只看"是否属于选中车"。
+    if (routeOwned_ == owned && routeColor_ == color && routeSelected_ == selectedVehicleRoute) {
+        return;
+    }
+    routeOwned_ = owned;
+    routeColor_ = color;
+    routeSelected_ = selectedVehicleRoute;
+    setZValue((owned ? 0.5 : 0.0) + (selectedVehicleRoute ? 0.1 : 0.0));
+    update();
+}
+
 void EdgeItem::setLabelVisible(bool on) {
     if (labelVisible_ == on) {
         return;
@@ -131,11 +143,25 @@ void EdgeItem::paint(QPainter* painter, const QStyleOptionGraphicsItem*, QWidget
     const QPointF unit(dir.x() / len, dir.y() / len);
     const QPointF perp(-unit.y(), unit.x());
 
-    const QColor color = highlighted_ ? QColor(214, 45, 32) : QColor(130, 130, 130);
-    QPen pen(color);
-    pen.setWidthF(highlighted_ ? 3.0 : 1.2);
+    // 车队三色（§7.5⑤）：选中车 不透明度 1.00 / 线宽 3；其余车 0.45 / 1.5；
+    // 未被任何车使用的边保持中性灰。**权重标签内容仍是基础边权**（不按车缩放）。
+    QColor color(130, 130, 130);
+    qreal width = 1.2;
+    qreal alpha = 1.0;
+    if (routeOwned_) {
+        color = routeColor_;
+        width = routeSelected_ ? 3.0 : 1.5;
+        alpha = routeSelected_ ? 1.00 : 0.45;
+    } else if (highlighted_) {
+        color = QColor(214, 45, 32);
+        width = 3.0;
+    }
+    QColor stroke = color;
+    stroke.setAlphaF(alpha);
+    QPen pen(stroke);
+    pen.setWidthF(width);
     painter->setPen(pen);
-    painter->setBrush(color);
+    painter->setBrush(stroke);
 
     painter->drawLine(sourcePoint_, targetPoint_);
 
@@ -157,7 +183,7 @@ void EdgeItem::paint(QPainter* painter, const QStyleOptionGraphicsItem*, QWidget
     painter->setBrush(QColor(255, 255, 255, 230));
     painter->drawRoundedRect(box, 3.0, 3.0);
 
-    painter->setPen(highlighted_ ? QColor(160, 30, 20) : QColor(60, 60, 60));
+    painter->setPen(routeOwned_ ? QColor(40, 40, 40) : QColor(60, 60, 60));
     QFont font = painter->font();
     font.setPointSizeF(7.0);
     painter->setFont(font);

@@ -70,6 +70,43 @@ void GraphScene::clearHighlight() {
     highlightRoute({});
 }
 
+// 车队三色（规格二 §7.5⑤）：按 [vehicles] 行序取色，超出 3 台循环。
+QColor GraphScene::vehicleColor(int vehicleIndex) {
+    switch (((vehicleIndex % 3) + 3) % 3) {
+        case 0:  return QColor(0xC0, 0x39, 0x2B);   // V01 红
+        case 1:  return QColor(0x1F, 0x6F, 0xEB);   // V02 蓝
+        default: return QColor(0x1A, 0x7F, 0x37);   // V03 绿
+    }
+}
+
+void GraphScene::setFleetRoutes(const std::vector<std::vector<std::string> >& routes,
+                                int selectedVehicle) {
+    fleetRoutes_ = routes;
+    selectedVehicle_ = selectedVehicle;
+    for (EdgeItem* edge : edges_) {
+        // 共享边归**行序最前**那台车：按 routes 顺序扫，首个命中者即 owner。
+        int owner = -1;
+        for (std::size_t v = 0; v < routes.size(); ++v) {
+            if (logistics::isEdgeOnRoute(routes[v], edge->fromId(), edge->toId())) {
+                owner = static_cast<int>(v);
+                break;
+            }
+        }
+        const bool owned = owner >= 0;
+        const QColor color = owned ? vehicleColor(owner) : QColor(130, 130, 130);
+        // 加粗 = 该边属于**选中车**（与颜色归属解耦）。
+        bool selected = false;
+        if (owned && selectedVehicle >= 0
+            && static_cast<std::size_t>(selectedVehicle) < routes.size()) {
+            selected = logistics::isEdgeOnRoute(routes[static_cast<std::size_t>(selectedVehicle)],
+                                                edge->fromId(), edge->toId());
+        }
+        edge->setRouteStyle(owned, color, selected);
+    }
+    refreshLabelVisibility();
+    update();
+}
+
 void GraphScene::setVehiclePosition(const std::string& nodeId) {
     vehicleNodeId_ = nodeId;
     for (NodeItem* node : nodes_) {
@@ -92,7 +129,8 @@ void GraphScene::setAllLabelsVisible(bool on) {
 //      否则会把标签整个丢掉。
 void GraphScene::refreshLabelVisibility() {
     for (EdgeItem* edge : edges_) {
-        bool visible = allLabelsVisible_ || edge->highlighted();
+        // 权重标签：被**任意车**使用的边都显示（内容仍是基础边权，不按车缩放）。
+        bool visible = allLabelsVisible_ || edge->highlighted() || edge->routeOwned();
         if (visible) {
             for (EdgeItem* other : edges_) {
                 if (other == edge) {
@@ -103,7 +141,8 @@ void GraphScene::refreshLabelVisibility() {
                 if (!isTwin) {
                     continue;
                 }
-                const bool twinVisible = allLabelsVisible_ || other->highlighted();
+                const bool twinVisible =
+                    allLabelsVisible_ || other->highlighted() || other->routeOwned();
                 if (twinVisible && edge->fromId() > other->fromId()) {
                     visible = false;   // 让字典序较小的一端保留标签
                 }

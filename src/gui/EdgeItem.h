@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QColor>
 #include <QGraphicsItem>
 #include <QRectF>
 #include <QString>
@@ -33,6 +34,14 @@ public:
     void setHighlighted(bool on);
     bool highlighted() const { return highlighted_; }
 
+    // ---- 车队三色 + 选中加粗（规格二 §7.5⑤）----
+    // 颜色 = 归属车的行序颜色（共享边取**行序最前**那台车）；加粗 = 该边是否属于
+    // **选中车**（与颜色归属解耦）。两者分别设置，互不推导。
+    void setRouteStyle(bool owned, const QColor& color, bool selectedVehicleRoute);
+    bool routeOwned() const { return routeOwned_; }
+    const QColor& routeColor() const { return routeColor_; }
+    bool routeSelected() const { return routeSelected_; }
+
     // 权重标签默认只在被高亮的边上显示，避免密集网络里 72 个标签互相遮挡
     void setLabelVisible(bool on);
 
@@ -55,6 +64,9 @@ private:
     logistics::WeightType weight_;
     bool                  highlighted_ = false;
     bool                  labelVisible_ = false;
+    bool                  routeOwned_ = false;      // 是否属于某台车的路线（有归属）
+    bool                  routeSelected_ = false;   // 是否属于**选中车**的路线（加粗）
+    QColor                routeColor_ = QColor(214, 45, 32);
     QPointF               sourcePoint_;
     QPointF               targetPoint_;
     QPointF               labelCenter_;

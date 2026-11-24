@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QColor>
 #include <QGraphicsScene>
 
 #include <string>
@@ -27,6 +28,15 @@ public:
     void highlightRoute(const std::vector<std::string>& routeNodes);
     void clearHighlight();
 
+    // ---- 车队三色 + 选中加粗（规格二 §7.5⑤）----
+    // routes[i] = 第 i 台车（= [vehicles] 行序）**剩余**路线的节点序列；空车传空序列。
+    // 颜色按行序取（超出 3 台循环）；**共享边**归行序最前那台车、不重复绘制；
+    // 加粗判定 = 该边是否属于 selectedVehicle（与颜色归属解耦）。
+    void setFleetRoutes(const std::vector<std::vector<std::string> >& routes,
+                        int selectedVehicle);
+    // 每车路线颜色（代码常量，按行序循环；报告/探针共用同一份）
+    static QColor vehicleColor(int vehicleIndex);
+
     // 标记车辆当前所在节点（空串表示不标记任何节点）
     void setVehiclePosition(const std::string& nodeId);
     // 当前被标记为"车辆所在"的节点 ID —— 供自检核对画布与状态一致
@@ -43,6 +53,8 @@ private:
     logistics::WeightType weight_ = logistics::WeightType::Distance;
     bool allLabelsVisible_ = false;
     std::string vehicleNodeId_;
+    std::vector<std::vector<std::string> > fleetRoutes_;
+    int selectedVehicle_ = 0;
 
     void refreshLabelVisibility();
 };
