@@ -254,7 +254,15 @@ void testCongestionTriggersReplanAndChangesTimes() {
     check(before.status == logistics::PlanStatus::Ok, "拥堵前规划成功");
     check(fixtures::nearlyEqual(before.totalTimeMin, 70.0),
           "拥堵前总耗时 70，实际 " + std::to_string(before.totalTimeMin));
-    check(before.stops.size() == 1 && before.stops[0].waitMin == 50, "拥堵前等待 50");
+    // 新模型：A=W 是取货停靠（起点原地取货），B=D1 是送达停靠，共 2 站。
+    check(before.stops.size() == 2 && before.stops[0].nodeId == "W"
+              && before.stops[0].pickups.size() == 1,
+          "拥堵前 2 个停靠（W 取货 + D1 送达），实际 " + std::to_string(before.stops.size()));
+    check(before.stops.size() == 2 && before.stops[1].nodeId == "D1"
+              && before.stops[1].waitMin == 50,
+          "拥堵前送达停靠等待 50，实际 "
+              + (before.stops.size() == 2 ? std::to_string(before.stops[1].waitMin)
+                                          : std::string("n/a")));
 
     // 所有边耗时 +50%（10 -> 15）
     const TrafficReport report = simulateTrafficChange(g, 1.0, 0.5, 0.5, 7u, 0.0);
@@ -276,9 +284,9 @@ void testCongestionTriggersReplanAndChangesTimes() {
     check(after.status == logistics::PlanStatus::Ok, "重规划成功");
     check(after.nodes == std::vector<std::string>{"W", "D1", "W"},
           "重规划序列不变（只有一条路可走）");
-    check(after.stops.size() == 1, "1 个停靠点");
-    if (after.stops.size() == 1) {
-        const logistics::Stop& s = after.stops[0];
+    check(after.stops.size() == 2, "2 个停靠点（W 取货 + D1 送达）");
+    if (after.stops.size() == 2) {
+        const logistics::Stop& s = after.stops[1];
         check(s.rawArrivalMin == 495, "raw 495，实际 " + std::to_string(s.rawArrivalMin));
         check(s.waitMin == 45, "等待 45，实际 " + std::to_string(s.waitMin));
         check(s.arrivalMin == 540, "arrival 540，实际 " + std::to_string(s.arrivalMin));
@@ -303,23 +311,64 @@ void testInsertUrgentOrderIsServedFirstAndServedNodesExcluded() {
     addTwoWay(g, "D0", "D1", 2.0, 4.0, 2.0);
 
     const Vehicle v = makeVehicle("W", 1000.0, 480);
-    const std::vector<logistics::Order> remaining = {makeOrder("O1", "W", "D1", 10.0, 0, 1440)};
-    // 刻意传 urgent=false：按 §5.3，插入的订单必须被标记为紧急。
-    // 取送式紧急单：A=D1 取货、B=D2 送达。
-    logistics::Order incoming = makeOrder("O2", "W", "D2", 10.0, 0, 1440, false);
-    incoming.pickupNodeId = "D1";
+    // 剩余订单也是一张 A→B 取送对（新模型 A 从不在仓库）。
+    const std::vector<logistics::Order> remaining = {makeOrder("O1", "D2", "D1", 10.0, 0, 1440)};
+    // 刻意传 urgent=false：按 §5.3，插入的订单必须被强制标记为紧急。
+    logistics::Order incoming = makeOrder("O2", "D1", "D2", 10.0, 0, 1440, false);
 
     const logistics::InsertResult r = logistics::insertUrgentOrder(
         g, v, remaining, incoming, "W", 480, logistics::WeightType::Distance);
 
     check(r.warning.empty(), "窗口充裕时不应有警告，实际: " + r.warning);
-    check(r.plan.status == logistics::PlanStatus::Ok, "规划成功");
-    check(r.plan.stops.size() == remaining.size() + 1,
-          "停靠点数 = 剩余订单数 + 新插订单数，实际 "
-              + std::to_string(r.plan.stops.size()));
-    check(!r.plan.stops.empty() && r.plan.stops[0].nodeId == "D2",
-          "新插单即使用 urgent=false 传入也必须被优先服务，实际首个停靠 "
+    check(r.plan.status == logistics::PlanStatus::Ok, "规划成功: " + r.plan.reason);
+    if (r.plan.status != logistics::PlanStatus::Ok) {
+        return;
+    }
+
+    // 逐单覆盖（新模型按订单断言，停靠数 ≠ 订单数：合并停靠会少）。
+    std::size_t o1Deliv = 0;
+    std::size_t o2Deliv = 0;
+    std::size_t o2PickIdx = r.plan.stops.size();
+    std::size_t o2DelivIdx = r.plan.stops.size();
+    for (std::size_t k = 0; k < r.plan.stops.size(); ++k) {
+        for (const std::string& id : r.plan.stops[k].pickups) {
+            if (id == "O2" && o2PickIdx == r.plan.stops.size()) {
+                o2PickIdx = k;
+            }
+        }
+        for (const logistics::StopDelivery& d : r.plan.stops[k].deliveries) {
+            if (d.orderId == "O1") {
+                ++o1Deliv;
+            }
+            if (d.orderId == "O2") {
+                ++o2Deliv;
+                if (o2DelivIdx == r.plan.stops.size()) {
+                    o2DelivIdx = k;
+                }
+            }
+        }
+    }
+    check(o1Deliv == 1, "剩余普通单 O1 恰好送达一次（实际 " + std::to_string(o1Deliv) + "）");
+    check(o2Deliv == 1, "新插单 O2 恰好送达一次（实际 " + std::to_string(o2Deliv) + "）");
+    check(o2PickIdx < o2DelivIdx, "新插紧急单先取后送");
+
+    // 强制 urgent + 硬优先：紧急停靠全部先于普通停靠，且首个停靠就是紧急取货点。
+    check(!r.plan.stops.empty() && r.plan.stops[0].phase == logistics::StopPhase::Urgent,
+          "首个停靠属于紧急阶段");
+    check(!r.plan.stops.empty() && r.plan.stops[0].nodeId == incoming.pickupNodeId,
+          "新插单即使用 urgent=false 传入也必须被优先服务（首个停靠 = 紧急取货点 A="
+              + incoming.pickupNodeId + "），实际首个停靠 "
               + (r.plan.stops.empty() ? std::string("(无)") : r.plan.stops[0].nodeId));
+    bool seenNormal = false;
+    bool hardOk = true;
+    for (const logistics::Stop& s : r.plan.stops) {
+        if (s.phase == logistics::StopPhase::Normal) {
+            seenNormal = true;
+        } else if (seenNormal) {
+            hardOk = false;
+        }
+    }
+    check(hardOk, "紧急停靠全部先于普通停靠");
 
     for (const logistics::Stop& s : r.plan.stops) {
         check(s.nodeId != "D0", "已服务节点 D0 不得出现在新计划的停靠点中");
@@ -327,9 +376,16 @@ void testInsertUrgentOrderIsServedFirstAndServedNodesExcluded() {
     for (const std::string& n : r.plan.nodes) {
         check(n != "D0", "已服务节点 D0 不得出现在完整序列中");
     }
+    check(!r.plan.nodes.empty() && r.plan.nodes.front() == "W"
+              && r.plan.nodes.back() == "W",
+          "完整序列从仓库出发并回到仓库");
 
-    // oracle 值：紧急取送趟 W→D1(取)→D2(送)→D1→W，随后普通趟 W→D1→W。
-    check(r.plan.nodes == std::vector<std::string>{"W", "D1", "D2", "D1", "W", "D1", "W"},
+    // 新模型下的期望序列（emergency 段在前、普通段在后）：
+    //   W → D1（紧急取货 O2）→ D2（紧急送达 O2）→ D2（普通取货 O1，跨阶段重访同一节点）
+    //   → D1（普通送达 O1）→ W
+    // 后两个 D2 是**同一节点的两次停靠**：硬优先禁止普通取货落进紧急停靠，
+    // 所以跨阶段重访是唯一合法形态（不变量 4 + 7 的例外）。
+    check(r.plan.nodes == std::vector<std::string>{"W", "D1", "D2", "D2", "D1", "W"},
           "完整序列，实际 " + [&] {
               std::string s;
               for (std::size_t i = 0; i < r.plan.nodes.size(); ++i) {
@@ -337,10 +393,12 @@ void testInsertUrgentOrderIsServedFirstAndServedNodesExcluded() {
               }
               return s;
           }());
-    check(fixtures::nearlyEqual(r.plan.totalDistanceKm, 8.0),
-          "总距离 8.0，实际 " + std::to_string(r.plan.totalDistanceKm));
-    check(fixtures::nearlyEqual(r.plan.totalTimeMin, 16.0),
-          "总耗时 16.0，实际 " + std::to_string(r.plan.totalTimeMin));
+    // 算术：W-D1 1km + D1-D2 2km + D2-D1 2km + D1-W 1km = 6km；
+    // 时刻：2 + 4 + 0（同点）+ 4 + 2 = 12min（停靠零耗时）。
+    check(fixtures::nearlyEqual(r.plan.totalDistanceKm, 6.0),
+          "总距离 6.0，实际 " + std::to_string(r.plan.totalDistanceKm));
+    check(fixtures::nearlyEqual(r.plan.totalTimeMin, 12.0),
+          "总耗时 12.0，实际 " + std::to_string(r.plan.totalTimeMin));
 }
 
 // 切片 E：新订单必然超时时给出警告，但按 D13 仍纳入规划并记录 penalty
