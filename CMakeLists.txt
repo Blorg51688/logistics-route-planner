@@ -134,6 +134,13 @@ if(Qt6_FOUND)
                  COMMAND ${CMAKE_COMMAND} -E env QT_QPA_PLATFORM=offscreen
                          $<TARGET_FILE:cli_plan_summary> $<TARGET_FILE:app> all)
     endif()
+    # L2 文本守卫（#43 / G20）：无头演示 --demo N --render-window --export-log 必须 exit 0，
+    # 且导出日志含固定步骤横幅 [演示] k/N …（只钉横幅，不钉数字）。
+    add_executable(cli_demo_transfer tests/cli_demo_transfer.cpp)
+    target_link_libraries(cli_demo_transfer PRIVATE io)
+    add_test(NAME cli_demo_transfer
+             COMMAND ${CMAKE_COMMAND} -E env QT_QPA_PLATFORM=offscreen
+                     $<TARGET_FILE:cli_demo_transfer> $<TARGET_FILE:app>)
 else()
     message(STATUS "未找到 Qt6 Widgets，跳过 GUI 目标（app）")
 endif()

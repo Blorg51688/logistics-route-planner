@@ -38,6 +38,7 @@
 #include <QRegularExpression>
 #include <QTextBrowser>
 #include <QTimer>
+#include <vector>
 #include <QTemporaryDir>
 #include <QToolBar>
 #include <QToolButton>
@@ -3005,13 +3006,40 @@ void MainWindow::onExportRunLog() {    // 「另存为…」：给需要长期�
 }
 
 void MainWindow::runDemoActions(int rounds) {
+    // 演示序列的**固定步骤横幅**（规格二 §7.9 G20）：只钉「有没有跳过一步」，
+    // **不钉**「哪台车接单 / 转运增益几分钟」等随实现与数据变的数值。
+    // 先把本轮要执行的步骤排成清单，再逐条执行：k/N 的顺序与动作一一对应，
+    // 与动作是否真的产生副作用无关（事件抽签失败也照打横幅）。
+    std::vector<QString> steps;
     for (int i = 0; i < rounds; ++i) {
+        steps.push_back(QStringLiteral("推进一站"));
+        steps.push_back(QStringLiteral("模拟路况"));
+        if (i % 2 == 1) {
+            steps.push_back(QStringLiteral("插入紧急订单"));
+        }
+        if (i % 3 == 2) {
+            steps.push_back(QStringLiteral("封闭道路"));
+        }
+    }
+    std::size_t k = 0;
+    for (int i = 0; i < rounds; ++i) {
+        const auto banner = [&](const QString& action) {
+            ++k;
+            appendLog(QStringLiteral("[演示] %1/%2 %3")
+                          .arg(k)
+                          .arg(steps.size())
+                          .arg(action));
+        };
+        banner(QStringLiteral("推进一站"));
         onAdvanceStop();
+        banner(QStringLiteral("模拟路况"));
         onSimulateTraffic();
         if (i % 2 == 1) {
+            banner(QStringLiteral("插入紧急订单"));
             onInsertUrgentOrder();
         }
         if (i % 3 == 2) {
+            banner(QStringLiteral("封闭道路"));
             onCloseRandomRoad();
         }
         QCoreApplication::processEvents();
