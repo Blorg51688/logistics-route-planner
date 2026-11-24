@@ -566,90 +566,135 @@ void checkDataQualityInvariants(const Config& cfg, const FleetPlan& byDistance,
                   + std::to_string(lateOrders) + " / " + std::to_string(cfg.orders.size()));
     }
 
-    // ⑤ 三策略 × 13 字段的黄金值：**单一真值表** tests/plan_golden.h。
-    //
-    // **门控（#39 / 规格二 §7.1 两轮捕获）**：真值表里冻结的是**规格一单车基线**
-    // （V01 200kg·1.00·1.00）。三车数据下这些数值必然不同，而 102 个常量的第二轮
-    // 捕获归 #43。所以这里按 vehicles.size() == 1 门控：
-    //   · 单车（规格一基线数据）：照旧逐项比对真值表；
-    //   · 多车：只断结构/格式/恒等式（车队 Σ、完工=max−min、Σ车时=车时合计、
-    //     分母 = 订单数、G7 逐单之和），**不比对冻结常量**。
-    // TODO(#43): 三车 102 常量第二轮冻结后，把多车分支改成消费真值表。
-    const bool singleVehicleBaseline = (cfg.vehicles.size() == 1);
+    // ⑤ **102 个常量 + 每车路线序列**（规格二 §7.1–§7.3）：**单一真值表**
+    // tests/plan_golden.h。车队级 13×3 + 每车 7×3×3 = 102 个数值，**全部**逐项比对；
+    // 第 7–9 行的节点序列逐字比对（G17）。三车是冻结口径：车辆数变了就必须重捕，
+    // 所以先把「车辆数 == 真值表的车辆数」作为前置断言（防止静默跳过 63 项）。
+    check(cfg.vehicles.size() == static_cast<std::size_t>(plan_golden::kVehicleCount),
+          std::string("默认数据车辆数 == 真值表冻结车辆数（实际 ")
+              + std::to_string(cfg.vehicles.size()) + " vs "
+              + std::to_string(plan_golden::kVehicleCount) + "）");
     for (int i = 0; i < 3; ++i) {
         const logistics::RouteMetrics& m = fleets[i]->metrics;
         const plan_golden::StrategyGolden& g = plan_golden::kAll[i];
         const std::string tag = std::string(labels[i]) + "·黄金[" + g.name + "]：";
 
-        if (singleVehicleBaseline) {
-            // 第 1–3 项：距离 / 耗时 / 成本（0.001）。
-            check(fixtures::nearlyEqual(fleets[i]->totalDistanceKm, g.distanceKm,
-                                        plan_golden::kTolMetric),
-                  tag + "总距离 " + std::to_string(fleets[i]->totalDistanceKm) + " vs "
-                      + std::to_string(g.distanceKm));
-            check(fixtures::nearlyEqual(fleets[i]->completionTimeMin, g.timeMin,
-                                        plan_golden::kTolMetric),
-                  tag + "总耗时 " + std::to_string(fleets[i]->completionTimeMin) + " vs "
-                      + std::to_string(g.timeMin));
-            check(fixtures::nearlyEqual(fleets[i]->totalCostYuan, g.costYuan,
-                                        plan_golden::kTolMetric),
-                  tag + "总成本 " + std::to_string(fleets[i]->totalCostYuan) + " vs "
-                      + std::to_string(g.costYuan));
-            // 第 4–6 项：penalty / 停靠 / 动作（整数）。
-            check(fleets[i]->totalPenaltyMin == g.penaltyMin, tag + "总 penalty");
-            check(m.stopCount == g.stopCount, tag + "停靠点数 S");
-            check(m.actionCount == g.actionCount, tag + "动作数 A");
-            // 第 7–8、10 项：两率（0.1）。
-            const double pickupRate = 100.0 * static_cast<double>(m.pickupOnTimeCount)
-                                      / static_cast<double>(m.pickupTotal);
-            const double deliveryRate = 100.0 * static_cast<double>(m.deliveryOnTimeCount)
-                                        / static_cast<double>(m.deliveryTotal);
-            const double normalRate = 100.0 * static_cast<double>(m.normalOnTimeCount)
-                                      / static_cast<double>(m.normalTotal);
-            check(fixtures::nearlyEqual(pickupRate, g.pickupRatePct, plan_golden::kTolRate),
-                  tag + "取货准时率");
-            check(fixtures::nearlyEqual(deliveryRate, g.deliveryRatePct, plan_golden::kTolRate),
-                  tag + "送达准时率·总");
-            check(fixtures::nearlyEqual(normalRate, g.normalRatePct, plan_golden::kTolRate),
-                  tag + "送达准时率·普通");
-            // 第 9 项：紧急送达准时率。真值表用 -1 表示「分母 0 记 —」。
-            if (g.urgentRatePct == plan_golden::kNoDenominatorSentinel) {
-                check(m.urgentTotal == 0, tag + "无紧急单时紧急准时率分母为 0（记「—」）");
-            } else {
-                check(m.urgentTotal > 0
-                          && fixtures::nearlyEqual(
-                                 100.0 * static_cast<double>(m.urgentOnTimeCount)
-                                     / static_cast<double>(m.urgentTotal),
-                                 g.urgentRatePct, plan_golden::kTolRate),
-                      tag + "送达准时率·紧急");
-            }
-            // 第 11–13 项：平均在车 / 利用率 / 峰值（0.1）。
-            check(fixtures::nearlyEqual(m.avgLoadKg, g.avgLoadKg, plan_golden::kTolRate),
-                  tag + "平均在车货量");
-            check(fixtures::nearlyEqual(m.loadUtilization * 100.0, g.utilizationPct,
-                                        plan_golden::kTolRate),
-                  tag + "载重利用率");
-            check(fixtures::nearlyEqual(m.peakLoadKg, g.peakLoadKg, plan_golden::kTolRate),
-                  tag + "峰值在车量");
+        // 车队级 13 字段（0.001 / 0.1 / 整数）。
+        check(fixtures::nearlyEqual(fleets[i]->totalDistanceKm, g.distanceKm,
+                                    plan_golden::kTolMetric),
+              tag + "总距离 " + std::to_string(fleets[i]->totalDistanceKm) + " vs "
+                  + std::to_string(g.distanceKm));
+        check(fixtures::nearlyEqual(fleets[i]->completionTimeMin, g.timeMin,
+                                    plan_golden::kTolMetric),
+              tag + "总耗时 " + std::to_string(fleets[i]->completionTimeMin) + " vs "
+                  + std::to_string(g.timeMin));
+        check(fixtures::nearlyEqual(fleets[i]->totalCostYuan, g.costYuan,
+                                    plan_golden::kTolMetric),
+              tag + "总成本 " + std::to_string(fleets[i]->totalCostYuan) + " vs "
+                  + std::to_string(g.costYuan));
+        check(fleets[i]->totalPenaltyMin == g.penaltyMin, tag + "总 penalty");
+        check(m.stopCount == g.stopCount, tag + "停靠点数 S");
+        check(m.actionCount == g.actionCount, tag + "动作数 A");
+        const double pickupRate = 100.0 * static_cast<double>(m.pickupOnTimeCount)
+                                  / static_cast<double>(m.pickupTotal);
+        const double deliveryRate = 100.0 * static_cast<double>(m.deliveryOnTimeCount)
+                                    / static_cast<double>(m.deliveryTotal);
+        const double normalRate = 100.0 * static_cast<double>(m.normalOnTimeCount)
+                                  / static_cast<double>(m.normalTotal);
+        check(fixtures::nearlyEqual(pickupRate, g.pickupRatePct, plan_golden::kTolRate),
+              tag + "取货准时率");
+        check(fixtures::nearlyEqual(deliveryRate, g.deliveryRatePct, plan_golden::kTolRate),
+              tag + "送达准时率·总");
+        check(fixtures::nearlyEqual(normalRate, g.normalRatePct, plan_golden::kTolRate),
+              tag + "送达准时率·普通");
+        // 第 9 项：紧急送达准时率。真值表用 -1 表示「分母 0 记 —」。
+        if (g.urgentRatePct == plan_golden::kNoDenominatorSentinel) {
+            check(m.urgentTotal == 0, tag + "无紧急单时紧急准时率分母为 0（记「—」）");
         } else {
-            // 多车：结构/恒等式（数值常量留给 #43 第二轮捕获）。
-            check(fleets[i]->completionTimeMin > 0.0, tag + "完工耗时为正");
-            check(fleets[i]->sumVehicleTimeMin > 0.0, tag + "车时合计为正");
-            check(m.actionCount == 2 * static_cast<int>(cfg.orders.size()),
-                  tag + "动作数 = 2 × 取送对数（结构性恒等）");
-            check(m.stopCount <= m.actionCount, tag + "停靠点数 S ≤ 动作数 A（G3）");
-            check(m.avgLoadKg <= m.peakLoadKg + 1e-9, tag + "平均在车 <= 峰值（G5）");
-            // 峰值不得超过**最大**车容量（逐车更严的版本在 checkPlanInvariants 里）。
-            double maxCapacity = 0.0;
-            for (const Vehicle& v : cfg.vehicles) {
-                if (v.capacityKg > maxCapacity) {
-                    maxCapacity = v.capacityKg;
+            check(m.urgentTotal > 0
+                      && fixtures::nearlyEqual(
+                             100.0 * static_cast<double>(m.urgentOnTimeCount)
+                                 / static_cast<double>(m.urgentTotal),
+                             g.urgentRatePct, plan_golden::kTolRate),
+                  tag + "送达准时率·紧急");
+        }
+        check(fixtures::nearlyEqual(m.avgLoadKg, g.avgLoadKg, plan_golden::kTolRate),
+              tag + "平均在车货量");
+        check(fixtures::nearlyEqual(m.loadUtilization * 100.0, g.utilizationPct,
+                                    plan_golden::kTolRate),
+              tag + "载重利用率");
+        check(fixtures::nearlyEqual(m.peakLoadKg, g.peakLoadKg, plan_golden::kTolRate),
+              tag + "峰值在车量");
+
+        // 每车 7 字段 × 3 车（规格二 §7.2）：这一层是 ADR 0008 的核心——
+        // V02↔V03 整条路线互换时，车队级 13 项**一个都不变**，只有这里会红。
+        for (std::size_t v = 0; v < cfg.vehicles.size()
+                                && v < static_cast<std::size_t>(plan_golden::kVehicleCount);
+             ++v) {
+            const logistics::RoutePlan& plan = fleets[i]->vehicles[v];
+            const plan_golden::VehicleGolden& vg = g.vehicles[v];
+            const std::string vtag = tag + "车 " + vg.id + "：";
+            check(cfg.vehicles[v].id == vg.id, vtag + "车辆行序与真值表一致");
+            check(fixtures::nearlyEqual(plan.totalDistanceKm, vg.distanceKm,
+                                        plan_golden::kTolMetric),
+                  vtag + "距离 " + std::to_string(plan.totalDistanceKm) + " vs "
+                      + std::to_string(vg.distanceKm));
+            check(fixtures::nearlyEqual(plan.totalTimeMin, vg.timeMin, plan_golden::kTolMetric),
+                  vtag + "耗时 " + std::to_string(plan.totalTimeMin) + " vs "
+                      + std::to_string(vg.timeMin));
+            check(fixtures::nearlyEqual(plan.totalCostYuan, vg.costYuan,
+                                        plan_golden::kTolMetric),
+                  vtag + "成本 " + std::to_string(plan.totalCostYuan) + " vs "
+                      + std::to_string(vg.costYuan));
+            check(plan.totalPenaltyMin == vg.penaltyMin, vtag + "penalty");
+            check(fixtures::nearlyEqual(plan.metrics.loadUtilization * 100.0,
+                                        vg.utilizationPct, plan_golden::kTolRate),
+                  vtag + "载重利用率（÷ 该车 capacity）");
+            const auto perVehicleRate = [](int hit, int total, double& out) -> bool {
+                if (total <= 0) {
+                    return false;
+                }
+                out = 100.0 * static_cast<double>(hit) / static_cast<double>(total);
+                return true;
+            };
+            double pRate = 0.0;
+            double dRate = 0.0;
+            const bool pHas = perVehicleRate(plan.metrics.pickupOnTimeCount,
+                                             plan.metrics.pickupTotal, pRate);
+            const bool dHas = perVehicleRate(plan.metrics.deliveryOnTimeCount,
+                                             plan.metrics.deliveryTotal, dRate);
+            check(pHas, vtag + "取货率分母 = 该车订单数（> 0）");
+            check(dHas, vtag + "送达率分母 = 该车订单数（> 0）");
+            if (pHas) {
+                check(fixtures::nearlyEqual(pRate, vg.pickupRatePct, plan_golden::kTolRate),
+                      vtag + "取货准时率");
+            }
+            if (dHas) {
+                check(fixtures::nearlyEqual(dRate, vg.deliveryRatePct,
+                                            plan_golden::kTolRate),
+                      vtag + "送达准时率");
+            }
+
+            // G17：每车路线序列**逐字**（空车只有起点，与 §7.4 的路线行一致）。
+            std::string route;
+            if (plan.nodes.empty()) {
+                route = cfg.vehicles[v].startNodeId;
+            } else {
+                for (std::size_t n = 0; n < plan.nodes.size(); ++n) {
+                    if (n > 0) {
+                        route += " ";
+                    }
+                    route += plan.nodes[n];
                 }
             }
-            check(m.peakLoadKg <= maxCapacity + 1e-6, tag + "车队峰值 <= 最大车载重");
+            check(route == g.routeNodes[v],
+                  vtag + "路线序列逐字一致（G17）\n        实际: " + route
+                      + "\n        真值: " + g.routeNodes[v]);
+            std::printf("      %s 车 %s 路线（G17）: %s\n", labels[i], vg.id,
+                        route.c_str());
         }
 
-        // G7：总 penalty == 逐单 penalty 之和（与黄金值并行保留，两种门控都跑）。
+        // G7：总 penalty == 逐单 penalty 之和。
         int penaltySum = 0;
         for (const logistics::OrderMetric& om : m.orders) {
             penaltySum += om.penaltyMin;

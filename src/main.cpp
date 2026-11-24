@@ -90,7 +90,9 @@ void usage() {
         "  --render PATH.png          离屏渲染图形场景成 PNG 后退出\n"
         "  --render-window PATH.png   离屏渲染完整窗口（工具栏+侧栏）成 PNG 后退出\n"
         "                              （注意 --width/--height 对交互窗口无效——它总是最大化）\n"
-        "  --demo N                   渲染窗口前先自动执行 N 次「推进一站」（按站模拟；验证交互后状态）\n"
+        "  --demo N                   渲染窗口前先自动执行 N 轮演示（推进一站 + 路况 + 隔轮插紧急单 +\n"
+        "                             隔三轮封路）；**无头运行必须同时给 --render-window**，单独 --demo N\n"
+        "                             会在事件循环里挂死（实测超时）\n"
         "  --export-log PATH          导出本次运行的日志（事件触发 + 到达配送点时的载重明细）\n"
         "  --dump-graph [list|matrix|both]  输出邻接表 / 邻接矩阵后退出（B3）\n"
         "  --ui-probe                 检查工具栏与侧栏是否完整构造后退出\n"
@@ -195,8 +197,8 @@ int main(int argc, char** argv) {
     // 程序没有任何入口能让人看到，验收时无法展示。
     // 供命令行核对：把规划的汇总值打出来，
     // 这样数据集调整后向导的期望值不会过期
-    // 供命令行核对：车队口径的规划汇总（规格二 §7.4 的**前六行**）。
-    // 逐车指标行（第 3–5 行）归 #43；本票先把路线行按车铺开（#43 的 102 常量需要它）。
+    // 供命令行核对：车队口径的规划汇总（规格二 §7.4 的 **9 行**，行序固定）：
+    //   1 车队汇总 / 2 车队率 / 3–5 每车 7 项 / 6 逐单超时 / 7–9 每车路线序列。
     if (!opt.planSummary.empty()) {
         logistics::WeightType planWeight = logistics::WeightType::Distance;
         if (!parseWeight(opt.planSummary, planWeight)) {
@@ -243,7 +245,33 @@ int main(int argc, char** argv) {
                     rateText(m.normalOnTimeCount, m.normalTotal).c_str(),
                     m.avgLoadKg, m.loadUtilization * 100.0, m.peakLoadKg);
 
-        // 第 3 行：**逐单**超时 + **车辆**（规格二 §7.4：多车下"哪台车迟了"是必要信息）。
+        // 第 3–5 行（#43）：每车一行 7 项指标，行序 = [vehicles] 行序。
+        // 与车队第 1–2 行同一把尺：距离/耗时/成本 3 位、百分数与在车量 1 位、
+        // penalty/停靠整数；分母 0 的率打印「—」。每车「停靠 s」打印但**不冻结**
+        // （§7.2：逐车路线序列已冻结，停靠数是它的函数）。
+        const auto vehicleRateText = [](int hit, int total) -> std::string {
+            if (total <= 0) {
+                return "—";
+            }
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%.1f", 100.0 * static_cast<double>(hit) / total);
+            return std::string(buf);
+        };
+        for (std::size_t vi = 0; vi < fleet.vehicles.size(); ++vi) {
+            const logistics::RoutePlan& plan = fleet.vehicles[vi];
+            const logistics::RouteMetrics& vm = plan.metrics;
+            std::printf("车 %s | 距离 %.3f km | 耗时 %.3f min | 成本 %.3f 元 | penalty %d | "
+                        "停靠 %d | 利用率 %.1f%% | 取货 %s%%（%d/%d） · 送达 %s%%（%d/%d）\n",
+                        config.vehicles[vi].id.c_str(), plan.totalDistanceKm,
+                        plan.totalTimeMin, plan.totalCostYuan, plan.totalPenaltyMin,
+                        vm.stopCount, vm.loadUtilization * 100.0,
+                        vehicleRateText(vm.pickupOnTimeCount, vm.pickupTotal).c_str(),
+                        vm.pickupOnTimeCount, vm.pickupTotal,
+                        vehicleRateText(vm.deliveryOnTimeCount, vm.deliveryTotal).c_str(),
+                        vm.deliveryOnTimeCount, vm.deliveryTotal);
+        }
+
+        // 第 6 行：**逐单**超时 + **车辆**（规格二 §7.4：多车下"哪台车迟了"是必要信息）。
         std::string late;
         for (std::size_t vi = 0; vi < fleet.vehicles.size(); ++vi) {
             const logistics::RoutePlan& plan = fleet.vehicles[vi];
