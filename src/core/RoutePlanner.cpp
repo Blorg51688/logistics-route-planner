@@ -2659,6 +2659,132 @@ RoutePlan planRoute(const LogisticsGraph& graph,
                   std::vector<OnboardItem>(), StashState());
 }
 
+// ---- 车队规划（规格二 §3 / #39）----
+//
+// 分配 = **顺序轮转基线**（规格二 §4.5）：订单 ID 升序、第 i 单 -> 第 (i mod k) 台车，
+// 车辆序 = 传入 vehicles 的行序。这是**对照基线**：#40 的类型感知分配会保留它用于比较，
+// 所以这里不跳车、不重分配、不做可行性预判。每车随后**独立**跑既有的 planRoute，
+// 因此每车用自己的 time_factor / cost_factor / capacity 重放（#33 已落地）。
+FleetPlan aggregateFleet(const std::vector<Vehicle>& vehicles,
+                         const std::vector<RoutePlan>& plans) {
+    FleetPlan fleet;
+    if (vehicles.empty() || vehicles.size() != plans.size()) {
+        fleet.allOk = false;
+        fleet.reason = "车辆与计划不匹配";
+        return fleet;
+    }
+    fleet.vehicles = plans;
+    int minDepartMin = vehicles[0].departTimeMin;
+    // 完工耗时按**实值**返回时刻算：返回时刻 = 该车发车时刻 + 该车耗时
+    // （= 计划里的 totalTimeMin；整数 returnArrivalMin 只是它的显示取整）。
+    // 单车时这正好等于 plan.totalTimeMin，与规格一的「总耗时」口径连续。
+    double maxReturnMin = -1.0;
+    double integralLoadKgMin = 0.0;   // Σ_v (平均在车 × 该车耗时)
+    double totalVehicleTimeMin = 0.0;
+    double capacityTimeMin = 0.0;     // Σ_v (capacity × 该车耗时)
+    for (std::size_t v = 0; v < vehicles.size(); ++v) {
+        const Vehicle& vehicle = vehicles[v];
+        const RoutePlan& plan = plans[v];
+        if (vehicle.departTimeMin < minDepartMin) {
+            minDepartMin = vehicle.departTimeMin;
+        }
+        if (plan.status != PlanStatus::Ok) {
+            fleet.allOk = false;
+            if (!fleet.reason.empty()) {
+                fleet.reason += "；";
+            }
+            fleet.reason += vehicle.id + "：" + plan.reason;
+            continue;
+        }
+        // ---- 可加项：Σ 每车 == 车队（§3.6-8）----
+        fleet.totalDistanceKm += plan.totalDistanceKm;
+        fleet.totalCostYuan += plan.totalCostYuan;
+        fleet.totalPenaltyMin += plan.totalPenaltyMin;
+        fleet.stopCount += plan.metrics.stopCount;
+        fleet.actionCount += plan.metrics.actionCount;
+        fleet.sumVehicleTimeMin += plan.totalTimeMin;
+        const double returnAt = static_cast<double>(vehicle.departTimeMin) + plan.totalTimeMin;
+        if (returnAt > maxReturnMin) {
+            maxReturnMin = returnAt;
+        }
+        // ---- 车队级指标：两率 Σ/Σ；平均在车/利用率按时间加权 ----
+        fleet.metrics.orders.insert(fleet.metrics.orders.end(), plan.metrics.orders.begin(),
+                                    plan.metrics.orders.end());
+        fleet.metrics.pickupOnTimeCount += plan.metrics.pickupOnTimeCount;
+        fleet.metrics.pickupTotal += plan.metrics.pickupTotal;
+        fleet.metrics.deliveryOnTimeCount += plan.metrics.deliveryOnTimeCount;
+        fleet.metrics.deliveryTotal += plan.metrics.deliveryTotal;
+        fleet.metrics.urgentOnTimeCount += plan.metrics.urgentOnTimeCount;
+        fleet.metrics.urgentTotal += plan.metrics.urgentTotal;
+        fleet.metrics.normalOnTimeCount += plan.metrics.normalOnTimeCount;
+        fleet.metrics.normalTotal += plan.metrics.normalTotal;
+        if (plan.metrics.peakLoadKg > fleet.metrics.peakLoadKg) {
+            fleet.metrics.peakLoadKg = plan.metrics.peakLoadKg;
+        }
+        if (plan.totalTimeMin > 0.0) {
+            integralLoadKgMin += plan.metrics.avgLoadKg * plan.totalTimeMin;
+            totalVehicleTimeMin += plan.totalTimeMin;
+            capacityTimeMin += vehicle.capacityKg * plan.totalTimeMin;
+        }
+    }
+    fleet.metrics.stopCount = fleet.stopCount;
+    fleet.metrics.actionCount = fleet.actionCount;
+    if (totalVehicleTimeMin > 0.0) {
+        fleet.metrics.avgLoadKg = integralLoadKgMin / totalVehicleTimeMin;
+    }
+    if (capacityTimeMin > 0.0) {
+        fleet.metrics.loadUtilization = integralLoadKgMin / capacityTimeMin;
+    }
+    // 完工耗时 = max(返回) − min(发车)；空车返回 = 发车，不抬升 max。
+    if (maxReturnMin >= 0.0) {
+        fleet.completionTimeMin = maxReturnMin - static_cast<double>(minDepartMin);
+    }
+    return fleet;
+}
+
+// ---- 车队规划（规格二 §3 / #39）----
+//
+// 分配 = **顺序轮转基线**（规格二 §4.5）：订单 ID 升序、第 i 单 -> 第 (i mod k) 台车，
+// 车辆序 = 传入 vehicles 的行序。这是**对照基线**：#40 的类型感知分配会保留它用于比较，
+// 所以这里不跳车、不重分配、不做可行性预判。每车随后**独立**跑既有的 planRoute，
+// 因此每车用自己的 time_factor / cost_factor / capacity 重放（#33 已落地）。
+FleetPlan planFleet(const LogisticsGraph& graph,
+                    const std::vector<Vehicle>& vehicles,
+                    const std::vector<Order>& orders,
+                    WeightType weight) {
+    if (vehicles.empty()) {
+        FleetPlan fleet;
+        fleet.allOk = false;
+        fleet.reason = "没有车辆";
+        return fleet;
+    }
+    // 订单 ID 升序（手写插入排序：算法主体不得交给 STL，见 AGENTS §1）。
+    std::vector<std::size_t> orderIndex(orders.size());
+    for (std::size_t i = 0; i < orders.size(); ++i) {
+        orderIndex[i] = i;
+    }
+    for (std::size_t i = 1; i < orderIndex.size(); ++i) {
+        const std::size_t key = orderIndex[i];
+        std::size_t j = i;
+        while (j > 0 && orders[key].id < orders[orderIndex[j - 1]].id) {
+            orderIndex[j] = orderIndex[j - 1];
+            --j;
+        }
+        orderIndex[j] = key;
+    }
+    const std::size_t k = vehicles.size();
+    std::vector<std::vector<Order> > assigned(k);
+    for (std::size_t i = 0; i < orderIndex.size(); ++i) {
+        assigned[i % k].push_back(orders[orderIndex[i]]);
+    }
+    std::vector<RoutePlan> plans;
+    plans.reserve(k);
+    for (std::size_t v = 0; v < k; ++v) {
+        plans.push_back(planRoute(graph, vehicles[v], assigned[v], weight));
+    }
+    return aggregateFleet(vehicles, plans);
+}
+
 InsertResult insertOrder(const LogisticsGraph& graph,
                           const Vehicle& vehicle,
                           const std::vector<Order>& remainingOrders,

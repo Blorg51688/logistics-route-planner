@@ -142,6 +142,46 @@ RoutePlan planRoute(const LogisticsGraph& graph,
                     const std::vector<Order>& orders,
                     WeightType weight);
 
+// ---- 车队（规格二 §3 / #39）----
+//
+// 每车一条**连续路线**（自己的 start_node / depart_time 空载出发，回同一基地）；
+// 本票的分配是**顺序轮转基线**（规格二 §4.5）：订单 ID 升序、第 i 单 -> 第 (i mod k)
+// 台车、车辆序 = [vehicles] 行序，不跳车、不重分配、不做可行性预判。
+// #40 会保留这条基线作对照，**不要删**。
+struct FleetPlan {
+    // 与传入 vehicles 下标**一一对应**（失败的车上也留一个占位计划，便于定长对齐）。
+    std::vector<RoutePlan> vehicles;
+    // 车队汇总（规格二 §3.4）：
+    double totalDistanceKm = 0.0;      // Σ 每车距离
+    double totalCostYuan = 0.0;        // Σ 每车成本
+    int    totalPenaltyMin = 0;        // Σ 每车 penalty
+    int    stopCount = 0;              // Σ 每车停靠数
+    int    actionCount = 0;            // Σ 每车动作数
+    // **总耗时主口径 = 完工耗时** = max(各车返回时刻) − min(各车发车时刻)；
+    // 返回时刻按实值（发车 + 该车耗时）计；空车返回 = 发车，不抬升完工耗时，
+    // 但参与 min(发车时刻)。整数 returnArrivalMin 只是它的显示取整。
+    double completionTimeMin = 0.0;
+    // 参考口径 = Σ 每车耗时（含早到等待）。与完工耗时**并列**，不得互相顶替。
+    double sumVehicleTimeMin = 0.0;
+    bool   allOk = true;
+    std::string reason;
+    // 车队级聚合指标（§29 的 Σ/Σ 口径）：
+    //   两率 = Σ命中 / Σ分母；平均在车 / 利用率按**时间加权**跨车积分；
+    //   峰值 = max(各车峰值)。
+    RouteMetrics metrics;
+};
+
+FleetPlan planFleet(const LogisticsGraph& graph,
+                    const std::vector<Vehicle>& vehicles,
+                    const std::vector<Order>& orders,
+                    WeightType weight);
+
+// 把**已经算好的**逐车计划聚合成车队汇总（规格二 §3.4 的可加口径）。
+// planFleet 用它，GUI 的中途重规划也用它 —— 汇总口径只有这一处实现。
+// plans 与 vehicles 必须等长且按下标对应。
+FleetPlan aggregateFleet(const std::vector<Vehicle>& vehicles,
+                         const std::vector<RoutePlan>& plans);
+
 // 车辆**此刻已经载在车上**的货（订单 + 目的 B + 货量 + 订单号）。
 // 规格一 MC-A05：按**订单**记账（同节点多单下按 nodeId 扣货会把别的单一起扣掉）。
 struct OnboardItem {
