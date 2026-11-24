@@ -1244,6 +1244,70 @@ void testUrgentFitsLeavesOffloadsEmpty() {
     checkStructuralInvariants(g, p, all, v, "装得下不降载");
 }
 
+// E（评审修复）：降载选货**不卸目的地恰为触发单 A/B 的货**（chooseOffloadOrders 的
+// avoidA/avoidB）。构造：在车普通单 O1 的目的地 D4 恰是紧急单 U1 的送达点 B；need=40。
+// 不看 avoidB 时按 kg 降序会先卸 O1(50)；正确行为必须跳过 O1、改卸 O2(40)。
+void testOffloadNeverUnloadsOrderDestinedForTriggerStop() {
+    const LogisticsGraph g = makeOffloadGraph();
+    const Vehicle v = makeVehicle("W", 100.0, 480);
+
+    std::vector<Order> pending;
+    pending.push_back(makeOrder("O1", "W", "D4", 50.0, 0, 1440));   // 目的地 = U1 的 B
+    pending.push_back(makeOrder("O2", "W", "D1", 40.0, 0, 1440));
+    const std::vector<logistics::OnboardItem> onboard{{"D4", 50.0, "O1"}, {"D1", 40.0, "O2"}};
+
+    Order urgent;
+    urgent.id = "U1";
+    urgent.pickupNodeId = "D3";
+    urgent.nodeId = "D4";   // 触发单送达点 B = D4
+    urgent.demandKg = 50.0;
+    urgent.windowStartMin = 0;
+    urgent.windowEndMin = 1440;
+    urgent.urgent = true;
+
+    const InsertResult res =
+        insertOrder(g, v, pending, urgent, "W", 480, WeightType::Distance, onboard);
+    const RoutePlan& p = res.plan;
+    check(p.status == PlanStatus::Ok, "降载避开 B 目的地：规划可行 " + p.reason);
+    check(!p.offloads.empty(), "降载避开 B 目的地：确实发生降载（need 40kg）");
+
+    bool offloadedO1 = false;
+    double offloadKg = 0.0;
+    std::vector<std::string> offloadOrders;
+    for (const logistics::OffloadLeg& leg : p.offloads) {
+        offloadKg += leg.kg;
+        offloadOrders.push_back(leg.orderId);
+        if (leg.orderId == "O1") {
+            offloadedO1 = true;
+        }
+    }
+    check(!offloadedO1, "降载绝不卸目的地为触发单 B（D4）的普通单 O1");
+    check(offloadOrders.size() == 1 && offloadOrders[0] == "O2",
+          "降载改选 O2（40kg）：实际 "
+              + (offloadOrders.empty() ? std::string("(空)") : offloadOrders[0]));
+    check(fixtures::nearlyEqual(offloadKg, 40.0),
+          "降载量 40kg，实际 " + std::to_string(offloadKg));
+
+    // 对照：O1 应在 U1 的送达停靠点 D4 顺路交货（只送一次）。
+    int o1Deliveries = 0;
+    bool o1AtD4 = false;
+    for (const Stop& s : p.stops) {
+        for (const StopDelivery& d : s.deliveries) {
+            if (d.orderId == "O1") {
+                ++o1Deliveries;
+                if (s.nodeId == "D4") {
+                    o1AtD4 = true;
+                }
+            }
+        }
+    }
+    check(o1Deliveries == 1 && o1AtD4, "O1 在 D4 顺路交货且只送一次");
+
+    std::vector<Order> all = pending;
+    all.push_back(urgent);
+    checkStructuralInvariants(g, p, all, v, "降载避开 B 目的地");
+}
+
 // 顺路交货：紧急停靠点上若恰有在车普通货的目的地，且不增加等待 ⇒ 一并交付。
 // 且该普通单**只送达一次**（不二次配送）。
 void testIncidentalDeliveryMergesIntoUrgentStop() {
@@ -4113,6 +4177,7 @@ int main() {
     RUN(testNodeIndexAtTimeOnEmptyPlanAndClamp);
     RUN(testOffloadConservesAndReclaims);
     RUN(testUrgentFitsLeavesOffloadsEmpty);
+    RUN(testOffloadNeverUnloadsOrderDestinedForTriggerStop);
     RUN(testIncidentalDeliveryMergesIntoUrgentStop);
     RUN(testIncidentalDeliverySkippedWhenItWouldDelay);
     RUN(testUrgentFifoOrder);
