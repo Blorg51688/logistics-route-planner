@@ -42,11 +42,14 @@ using logistics::Order;
 using logistics::PlanStatus;
 using logistics::RoutePlan;
 using logistics::Stop;
+using logistics::StopDelivery;
 using logistics::StopPhase;
 using logistics::Vehicle;
 using logistics::WeightType;
 using logistics::nodeIndexAtTime;
 using logistics::planRoute;
+using logistics::planFleet;
+using logistics::FleetPlan;
 using logistics::replan;
 using logistics::replanIncremental;
 using logistics::insertOrder;
@@ -1854,6 +1857,189 @@ void testMetricsDefinition() {
     check(pu.metrics.urgentTotal == 1, "紧急分母 1");
 }
 
+// ---------------------------------------------------------------------------
+// 车队夹具（规格二 §3 / #39）：空车、两车同簇、慢车因子、顺序轮转基线。
+// ---------------------------------------------------------------------------
+
+// 空车（0 单）：五项全 0、返回时刻 = 发车时刻、不抬升完工耗时、参与 min(发车)。
+void testFleetEmptyVehicleHasZeroMetrics() {
+    const LogisticsGraph g = makeWtoD1Graph();
+    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 10.0, 0, 1440, false)};
+    Vehicle fast = makeVehicle("W", 1000.0, 480);
+    fast.id = "V01";
+    Vehicle idle = makeVehicle("W", 1000.0, 470);   // 更早发车：参与 min(发车)
+    idle.id = "V02";
+    // 顺序轮转：1 张单 -> 第 0 台车；第 1 台必然空车。
+    const FleetPlan fleet = planFleet(g, {fast, idle}, orders, WeightType::Distance);
+    check(fleet.vehicles.size() == 2, "车队逐车计划数 == 2");
+    check(fleet.allOk, "两台车都可规划");
+    const RoutePlan& empty = fleet.vehicles[1];
+    check(fixtures::nearlyEqual(empty.totalDistanceKm, 0.0)
+              && fixtures::nearlyEqual(empty.totalCostYuan, 0.0)
+              && empty.totalPenaltyMin == 0 && empty.metrics.stopCount == 0
+              && empty.metrics.actionCount == 0,
+          "空车五项全 0");
+    check(fixtures::nearlyEqual(empty.totalTimeMin, 0.0), "空车耗时 = 0");
+    check(empty.returnArrivalMin == idle.departTimeMin, "空车返回时刻 = 发车时刻");
+    // 完工耗时 = 有货车的返回 − **空车**的发车（空车不抬升 max，但参与 min 发车）。
+    const double expect = static_cast<double>(fast.departTimeMin)
+                          + fleet.vehicles[0].totalTimeMin
+                          - static_cast<double>(idle.departTimeMin);
+    check(fixtures::nearlyEqual(fleet.completionTimeMin, expect),
+          "完工耗时 = max(返回) − min(发车)，空车不抬升 max："
+              + std::to_string(fleet.completionTimeMin) + " vs " + std::to_string(expect));
+    check(fixtures::nearlyEqual(fleet.sumVehicleTimeMin, fleet.vehicles[0].totalTimeMin),
+          "车时合计 = Σ每车耗时（空车贡献 0）");
+    check(fleet.completionTimeMin > fleet.sumVehicleTimeMin,
+          "空车更早发车时完工耗时 > 车时合计（两口径不互相顶替）");
+}
+
+// 两车同簇：同一批订单按顺序轮转分给两台车，两车各自的路线都必须覆盖自己的订单，
+// 且 Σ每车 == 车队（距离/成本/penalty/停靠/动作）。
+void testFleetTwoVehiclesSameCluster() {
+    const LogisticsGraph g = makeWtoD1Graph();
+    // 4 张单、同一簇（都从 W 取、送 D1 附近的不同节点；这里复用 W-D1 边，两两不同 ID）。
+    std::vector<Order> orders;
+    orders.push_back(makeOrder("O1", "W", "D1", 5.0, 0, 1440, false));
+    orders.push_back(makeOrder("O2", "W", "D1", 6.0, 0, 1440, false));
+    orders.push_back(makeOrder("O3", "W", "D1", 7.0, 0, 1440, false));
+    orders.push_back(makeOrder("O4", "W", "D1", 8.0, 0, 1440, false));
+    Vehicle a = makeVehicle("W", 100.0, 480);
+    a.id = "V01";
+    Vehicle b = makeVehicle("W", 100.0, 480);
+    b.id = "V02";
+    const FleetPlan fleet = planFleet(g, {a, b}, orders, WeightType::Distance);
+    check(fleet.allOk, "同簇两台车都可规划");
+    if (!fleet.allOk) {
+        return;
+    }
+    // 顺序轮转：O1/O3 -> V01，O2/O4 -> V02（ID 升序、第 i 单 -> 第 i%2 台）。
+    check(fleet.vehicles[0].metrics.actionCount == 4,
+          "V01 恰好服务 2 单（4 个动作），实际 "
+              + std::to_string(fleet.vehicles[0].metrics.actionCount));
+    check(fleet.vehicles[1].metrics.actionCount == 4,
+          "V02 恰好服务 2 单（4 个动作），实际 "
+              + std::to_string(fleet.vehicles[1].metrics.actionCount));
+    double sumDist = 0.0;
+    double sumCost = 0.0;
+    int sumPenalty = 0;
+    int sumStops = 0;
+    int sumActions = 0;
+    double sumTime = 0.0;
+    for (const RoutePlan& p : fleet.vehicles) {
+        sumDist += p.totalDistanceKm;
+        sumCost += p.totalCostYuan;
+        sumPenalty += p.totalPenaltyMin;
+        sumStops += p.metrics.stopCount;
+        sumActions += p.metrics.actionCount;
+        sumTime += p.totalTimeMin;
+    }
+    check(fixtures::nearlyEqual(fleet.totalDistanceKm, sumDist), "Σ每车距离 == 车队");
+    check(fixtures::nearlyEqual(fleet.totalCostYuan, sumCost), "Σ每车成本 == 车队");
+    check(fleet.totalPenaltyMin == sumPenalty, "Σ每车 penalty == 车队");
+    check(fleet.stopCount == sumStops, "Σ每车停靠数 == 车队");
+    check(fleet.actionCount == sumActions, "Σ每车动作数 == 车队");
+    check(fixtures::nearlyEqual(fleet.sumVehicleTimeMin, sumTime), "Σ每车耗时 == 车时合计");
+    // 完工耗时 = max(返回) − min(发车)（两车同刻发车 ⇒ = max 每车耗时）。
+    double maxTime = fleet.vehicles[0].totalTimeMin;
+    if (fleet.vehicles[1].totalTimeMin > maxTime) {
+        maxTime = fleet.vehicles[1].totalTimeMin;
+    }
+    check(fixtures::nearlyEqual(fleet.completionTimeMin, maxTime),
+          "完工耗时 = max(每车耗时)（同刻发车）");
+    // 每张订单恰好出现在**一台**车的路线上。
+    for (const Order& o : orders) {
+        int owners = 0;
+        for (const RoutePlan& p : fleet.vehicles) {
+            bool hit = false;
+            for (const Stop& s : p.stops) {
+                for (const StopDelivery& d : s.deliveries) {
+                    if (d.orderId == o.id) {
+                        hit = true;
+                    }
+                }
+            }
+            if (hit) {
+                ++owners;
+            }
+        }
+        check(owners == 1, "订单 " + o.id + " 恰好由一台车送达（实际 "
+                               + std::to_string(owners) + " 台）");
+    }
+}
+
+// 慢车因子（§3.3）：同一节点序列下慢车到达 = 基础 ×1.25、成本 ×cost_factor、距离不变；
+// 且**车队汇总**用的是各车缩放后的量（不能先按基础权重排好再乘）。
+void testFleetSlowVehicleFactorOnArrivals() {
+    const LogisticsGraph g = makeWtoD1Graph();   // W<->D1 5.0km / 10min / 4元
+    const std::vector<Order> orders = {makeOrder("O1", "W", "D1", 10.0, 0, 1440, false)};
+    Vehicle fast = makeVehicle("W", 1000.0, 480);
+    fast.id = "V01";
+    Vehicle slow = makeVehicle("W", 1000.0, 480);
+    slow.id = "V02";
+    slow.timeFactor = 1.25;
+    slow.costFactor = 0.80;
+    // 两台车各分到 0 单会掩盖因子；这里用 planFleet 的单车分支（vehicles 只传慢车）
+    // 验证**汇总**也走缩放后的量。
+    const FleetPlan onlySlow = planFleet(g, {slow}, orders, WeightType::Distance);
+    const FleetPlan onlyFast = planFleet(g, {fast}, orders, WeightType::Distance);
+    check(onlySlow.allOk && onlyFast.allOk, "单台慢车/快车都可规划");
+    const RoutePlan& pf = onlyFast.vehicles[0];
+    const RoutePlan& ps = onlySlow.vehicles[0];
+    check(pf.nodes == ps.nodes, "同一节点序列（因子不改变 leg 选择）");
+    check(fixtures::nearlyEqual(pf.totalDistanceKm, ps.totalDistanceKm), "距离不变");
+    check(fixtures::nearlyEqual(ps.totalTimeMin, pf.totalTimeMin * 1.25),
+          "慢车耗时 = 基础 ×1.25：" + std::to_string(ps.totalTimeMin) + " vs "
+              + std::to_string(pf.totalTimeMin));
+    check(fixtures::nearlyEqual(ps.totalCostYuan, pf.totalCostYuan * 0.80),
+          "慢车成本 = 基础 ×0.80：" + std::to_string(ps.totalCostYuan) + " vs "
+              + std::to_string(pf.totalCostYuan));
+    check(fixtures::nearlyEqual(onlySlow.totalDistanceKm, onlyFast.totalDistanceKm),
+          "车队汇总距离 == 基础（与车型无关）");
+    check(fixtures::nearlyEqual(onlySlow.completionTimeMin, onlyFast.completionTimeMin * 1.25),
+          "车队完工耗时也按该车缩放后的耗时算");
+    // 到达时刻：慢车 25min 回仓（480 + 25 = 505），快车 500。
+    check(pf.returnArrivalMin == 500 && ps.returnArrivalMin == 505,
+          "回仓时刻：快车 500 / 慢车 505（实际 " + std::to_string(pf.returnArrivalMin)
+              + " / " + std::to_string(ps.returnArrivalMin) + "）");
+}
+
+// 顺序轮转基线（§4.5）：订单 ID 升序、第 i 单 -> 第 (i mod k) 台车；**不跳车、不重分配**。
+// 用 3 台车 + 5 张单验证：第 0/3 单 -> V01、第 1/4 单 -> V02、第 2 单 -> V03。
+void testFleetRoundRobinBaseline() {
+    const LogisticsGraph g = makeWtoD1Graph();
+    std::vector<Order> orders;
+    for (int i = 1; i <= 5; ++i) {
+        char id[8];
+        std::snprintf(id, sizeof(id), "O%02d", i);
+        orders.push_back(makeOrder(id, "W", "D1", 1.0, 0, 1440, false));
+    }
+    // 故意乱序传入：planFleet 必须先按 ID 升序再轮转（确定性 tieKey）。
+    std::vector<Order> shuffled = {orders[3], orders[0], orders[4], orders[2], orders[1]};
+    Vehicle a = makeVehicle("W", 100.0, 480);
+    a.id = "V01";
+    Vehicle b = makeVehicle("W", 100.0, 480);
+    b.id = "V02";
+    Vehicle c = makeVehicle("W", 100.0, 480);
+    c.id = "V03";
+    const FleetPlan fleet = planFleet(g, {a, b, c}, shuffled, WeightType::Distance);
+    check(fleet.allOk, "三台车都可规划");
+    const int expect[3] = {2, 2, 1};   // O01/O04、O02/O05、O03
+    for (int v = 0; v < 3; ++v) {
+        const int actions = fleet.vehicles[static_cast<std::size_t>(v)].metrics.actionCount;
+        check(actions == 2 * expect[v],
+              "第 " + std::to_string(v) + " 台车动作数 " + std::to_string(actions)
+                  + " == 2 × " + std::to_string(expect[v]));
+    }
+    // 确定性：同输入同输出（含传入顺序不同也应一致，因为先按 ID 排序）。
+    const FleetPlan again = planFleet(g, {a, b, c}, orders, WeightType::Distance);
+    bool same = again.vehicles.size() == fleet.vehicles.size();
+    for (std::size_t v = 0; same && v < fleet.vehicles.size(); ++v) {
+        same = fleet.vehicles[v].nodes == again.vehicles[v].nodes;
+    }
+    check(same, "确定性：传入顺序不同也得到同一分配与同一路线（ID 升序轮转）");
+}
+
 } // namespace
 
 int main() {
@@ -1893,6 +2079,10 @@ int main() {
     RUN(testRepairNeverWorsensKey);
     RUN(testFallbackProducesCompleteRoute);
     RUN(testMetricsDefinition);
+    RUN(testFleetEmptyVehicleHasZeroMetrics);
+    RUN(testFleetTwoVehiclesSameCluster);
+    RUN(testFleetSlowVehicleFactorOnArrivals);
+    RUN(testFleetRoundRobinBaseline);
 
     return testutil::summarize("routeplanner_tests");
 }
