@@ -54,6 +54,7 @@
 #include "core/GraphEdit.h"
 #include "core/Traffic.h"
 #include "gui/GraphScene.h"
+#include "io/ConfigLoader.h"
 
 using logistics::Config;
 using logistics::Order;
@@ -73,6 +74,11 @@ QString typeText(logistics::NodeType type) {
     return QStringLiteral("?");
 }
 
+// R6 · 自动刷单的待处理额度（**代码常量**，不新增 [general] 键，见 #24 §1.9 决策 3）。
+// 计数口径 = 事件来源且未送达（含已取在车）；初始单与手动动作单不计。
+constexpr int kMaxPendingNormalOrders = 6;
+constexpr int kMaxPendingUrgentOrders = 2;
+
 QString minutesToClock(int minutes) {
     const int h = minutes / 60;
     const int m = minutes % 60;
@@ -83,8 +89,9 @@ QString minutesToClock(int minutes) {
 
 } // namespace
 
-MainWindow::MainWindow(Config config, QWidget* parent)
-    : QMainWindow(parent), config_(std::move(config)) {
+MainWindow::MainWindow(Config config, const std::string& configPath, QWidget* parent)
+    : QMainWindow(parent), config_(std::move(config)), initialConfig_(config_),
+      configPath_(configPath) {
     setWindowTitle(QStringLiteral("电商物流配送路径规划系统"));
 
     scene_ = new GraphScene(this);
@@ -457,7 +464,7 @@ void MainWindow::syncScene() {
 }
 
 // 换计划之后必须做的三件事，只此一处。三处重规划路径（replan /
-// replanIncremental / insertUrgentOrder）都调它，避免各写一份而漏改。
+// replanIncremental / insertOrder）都调它，避免各写一份而漏改。
 void MainWindow::afterPlanReplaced() {
     nodeIndex_ = 0;      // 新路线从车辆当前位置起算，推进游标归零
     stopCursor_ = 0;
@@ -521,6 +528,11 @@ void MainWindow::onWeightChanged() {
 }
 
 void MainWindow::onSimulateTraffic() {
+    simulateTrafficAction(-1);
+}
+
+void MainWindow::simulateTrafficAction(int atMin) {
+    auto log = [this, atMin](const QString& text) { appendLog(text, atMin); };
     const logistics::TrafficReport report = logistics::simulateTrafficChange(
         config_.graph, config_.general.trafficChangeRatio, config_.general.trafficTimeIncreaseMin,
         config_.general.trafficTimeIncreaseMax, rng_.nextU32());
@@ -534,20 +546,20 @@ void MainWindow::onSimulateTraffic() {
             ++clearedCount;
         }
     }
-    appendLog(QStringLiteral("路况变化：改动 %1 条边（新增拥堵 %2 条，转为畅通 %3 条）")
-                  .arg(report.changes.size())
-                  .arg(congestedCount)
-                  .arg(clearedCount));
+    log(QStringLiteral("路况变化：改动 %1 条边（新增拥堵 %2 条，转为畅通 %3 条）")
+            .arg(report.changes.size())
+            .arg(congestedCount)
+            .arg(clearedCount));
 
     const bool trigger = logistics::needsReplan(plan_.nodes, report,
                                                 config_.general.trafficTimeIncreaseMin);
     if (!trigger) {
-        appendLog(QStringLiteral("受影响边不在当前路径或增幅不足 -> 不触发重规划"));
+        log(QStringLiteral("受影响边不在当前路径或增幅不足 -> 不触发重规划"));
         syncScene();   // 拥堵标记需要重绘
         return;
     }
 
-    appendLog(QStringLiteral("受影响边位于当前路径且增幅达标 -> 自动触发重规划"));
+    log(QStringLiteral("受影响边位于当前路径且增幅达标 -> 自动触发重规划"));
 
     // 增量式重规划（D22）：只把**尚未走完的那一段**交给它，
     // 它会按停靠点切段、仅重算走过被命中边的段，停靠顺序不变。
@@ -568,9 +580,9 @@ void MainWindow::onSimulateTraffic() {
                                          report, config_.general.trafficTimeIncreaseMin,
                                          onboardGoods(), &usedIncremental, stashInc);
     afterPlanReplaced();
-    appendLog(usedIncremental
-                  ? QStringLiteral("  → 顺序不变版重放：停靠顺序不变，按新边权重重新放一遍")
-                  : QStringLiteral("  → 重放不可行（序列不全或路段已不可达），退回全量重算"));
+    log(usedIncremental
+            ? QStringLiteral("  → 顺序不变版重放：停靠顺序不变，按新边权重重新放一遍")
+            : QStringLiteral("  → 重放不可行（序列不全或路段已不可达），退回全量重算"));
     syncScene();
     updatePanels();
 }
@@ -593,10 +605,12 @@ std::string MainWindow::nextFreeId(const char* prefix) const {
     return std::string(prefix) + "999";
 }
 
-std::string MainWindow::insertUrgentOrderAt(const std::string& a, const std::string& b,
-                                            double demand) {
+std::string MainWindow::insertOrderAt(const std::string& a, const std::string& b,
+                                     double demand, bool urgent,
+                                     logistics::OrderSource source, int windowBaseMin) {
+    const QString kindText = urgent ? QStringLiteral("紧急取送单") : QStringLiteral("取送单");
     if (config_.vehicles.empty()) {
-        appendLog(QStringLiteral("配置中没有车辆"));
+        appendLog(QStringLiteral("配置中没有车辆"), windowBaseMin);
         return std::string();
     }
     const logistics::Node* na = config_.graph.findNode(a);
@@ -604,16 +618,17 @@ std::string MainWindow::insertUrgentOrderAt(const std::string& a, const std::str
     if (na == nullptr || nb == nullptr
         || na->type != logistics::NodeType::Delivery
         || nb->type != logistics::NodeType::Delivery) {
-        appendLog(QStringLiteral("紧急取送单：取货点 A、送达点 B 必须是客户（配送）节点"));
+        appendLog(kindText + QStringLiteral("：取货点 A、送达点 B 必须是客户（配送）节点"),
+                  windowBaseMin);
         return std::string();
     }
     if (a == b) {
-        appendLog(QStringLiteral("紧急取送单：起点 A 与终点 B 不能相同"));
+        appendLog(kindText + QStringLiteral("：起点 A 与终点 B 不能相同"), windowBaseMin);
         return std::string();
     }
     const double cap = config_.vehicles.front().capacityKg;
     if (!(demand > 0.0) || demand > cap + 1e-9) {
-        appendLog(QStringLiteral("紧急取送单：送货量须在 (0, 载重上限] 内"));
+        appendLog(kindText + QStringLiteral("：送货量须在 (0, 载重上限] 内"), windowBaseMin);
         return std::string();
     }
     const logistics::PathResult toA = logistics::shortestPath(
@@ -621,49 +636,63 @@ std::string MainWindow::insertUrgentOrderAt(const std::string& a, const std::str
     const logistics::PathResult ab =
         logistics::shortestPath(config_.graph, a, b, logistics::WeightType::Time);
     if (!toA.found || !ab.found) {
-        appendLog(QStringLiteral("紧急取送单：取货点 A 或送达点 B 不可达"));
+        appendLog(kindText + QStringLiteral("：取货点 A 或送达点 B 不可达"), windowBaseMin);
         return std::string();
     }
 
-    Order urgent;
-    urgent.id = nextFreeId("U");
-    urgent.pickupNodeId = a;
-    urgent.nodeId = b;
-    urgent.demandKg = std::floor(demand);
-    urgent.windowStartMin = currentTimeMin();
-    urgent.windowEndMin = currentTimeMin() + 60;
-    urgent.urgent = true;
-    urgent.served = false;
+    Order order;
+    order.id = nextFreeId(logistics::orderIdPrefix(source));
+    order.pickupNodeId = a;
+    order.nodeId = b;
+    order.demandKg = std::floor(demand);
+    // R4：窗口基准是**这张单的基准时刻**（事件刷单 = 事件刻 mark；手动动作 = 当前时刻），
+    // 不是"结算发生的时刻"——批量结算时两者会差出好几个刻。
+    order.windowStartMin = windowBaseMin;
+    // 普通 [t, 24:00]；紧急 [t, min(t+60, 24:00)]（截断只为不产生跨日窗口，防御性）。
+    order.windowEndMin = urgent ? (windowBaseMin + 60 < 24 * 60 ? windowBaseMin + 60 : 24 * 60)
+                                : 24 * 60;
+    if (order.windowEndMin < order.windowStartMin) {
+        order.windowEndMin = order.windowStartMin;
+    }
+    order.urgent = urgent;
+    order.source = source;
+    order.served = false;
 
     const std::vector<Order> pending = remainingOrders();
     logistics::StashState stashIns;
     stashIns.station = state_.stashStation;
     stashIns.items = state_.stashItems;
-    const logistics::InsertResult inserted = logistics::insertUrgentOrder(
-        config_.graph, config_.vehicles.front(), pending, urgent, currentPositionId(),
+    // R8：紧急 -> 紧急段尾插（FIFO）；普通 -> 普通段 pair-insertion。urgent 由订单自己带。
+    const logistics::InsertResult inserted = logistics::insertOrder(
+        config_.graph, config_.vehicles.front(), pending, order, currentPositionId(),
         currentTimeMin(), planWeight_, onboardGoods(), stashIns);
 
-    // 必须并入 config_.orders，否则连续插单会丢单、订单表也看不见。
-    config_.orders.push_back(urgent);
+    // R9：通过输入校验即并入订单集合（插入失败也不丢单，保留未服务，后续事件/重规划再试）。
+    config_.orders.push_back(order);
 
-    appendLog(QStringLiteral("插入紧急取送单 %1：%2 取 → %3 送（货量 %4kg，%5 前送达）")
-                  .arg(QString::fromStdString(urgent.id))
-                  .arg(QString::fromStdString(urgent.pickupNodeId))
-                  .arg(QString::fromStdString(urgent.nodeId))
-                  .arg(urgent.demandKg, 0, 'f', 0)
-                  .arg(minutesToClock(urgent.windowEndMin)));
+    appendLog(QStringLiteral("插入%1 %2：%3 取 → %4 送（货量 %5kg，%6 前送达）")
+                  .arg(urgent ? QStringLiteral("紧急取送单") : QStringLiteral("普通取送单"))
+                  .arg(QString::fromStdString(order.id))
+                  .arg(QString::fromStdString(order.pickupNodeId))
+                  .arg(QString::fromStdString(order.nodeId))
+                  .arg(order.demandKg, 0, 'f', 0)
+                  .arg(minutesToClock(order.windowEndMin)),
+              windowBaseMin);
     if (!inserted.warning.empty()) {
-        appendLog(QStringLiteral("  ⚠ %1").arg(QString::fromStdString(inserted.warning)));
+        appendLog(QStringLiteral("  ⚠ %1").arg(QString::fromStdString(inserted.warning)),
+                  windowBaseMin);
     }
     plan_ = inserted.plan;
     afterPlanReplaced();
     syncScene();
     updatePanels();
-    return urgent.id;
+    return order.id;
 }
 
-std::string MainWindow::insertUrgentOrderAction() {
-    // 事件触发 / 自检 / 演示路径：随机取两个不同客户节点作 A、B，货量 3–10kg 整公斤。
+std::string MainWindow::insertRandomOrder(bool urgent, logistics::OrderSource source,
+                                          int windowBaseMin) {
+    // 事件刻刷单 / 手动「插入紧急订单」/ 自检共用：A、B 在**当前图全部配送点**里条件均匀抽取
+    // （R2：A 均匀、B 在剩余 n-1 个里一次抽出，固定消耗 2 次随机数）。
     std::vector<std::string> cust;
     for (const logistics::Node& n : config_.graph.nodes()) {
         if (n.type == logistics::NodeType::Delivery) {
@@ -671,24 +700,32 @@ std::string MainWindow::insertUrgentOrderAction() {
         }
     }
     if (cust.size() < 2) {
-        appendLog(QStringLiteral("客户节点不足，无法插入紧急取送单"));
+        // Q8：抽中了但客观不可执行 -> 照实播报原因、**不重抽**（该刻仍算已抽）。
+        appendLog(QStringLiteral("客户节点不足 %1 个，无法生成%2（本刻不重抽）")
+                      .arg(cust.size())
+                      .arg(urgent ? QStringLiteral("紧急订单") : QStringLiteral("普通订单")),
+                  windowBaseMin);
         return std::string();
     }
-    int ia = rng_.nextInt(0, static_cast<int>(cust.size()) - 1);
-    int ib = rng_.nextInt(0, static_cast<int>(cust.size()) - 1);
-    if (ib == ia) {
-        ib = (ib + 1) % static_cast<int>(cust.size());
+    int ia = 0;
+    int ib = 0;
+    if (!logistics::pickDistinctPair(static_cast<int>(cust.size()), rng_, ia, ib)) {
+        return std::string();   // 上面已排除 size() < 2，这里只是防御
     }
-    const double demand = std::floor(3.0 + rng_.nextRange(0.0, 8.0));
-    return insertUrgentOrderAt(cust[static_cast<std::size_t>(ia)],
-                               cust[static_cast<std::size_t>(ib)], demand);
+    // R3：普通 3–15kg、紧急 3–10kg，一律整公斤（floor）。区间上界用开区间，
+    // 故 high 分别是 13 / 8（3 + [0,13) / 3 + [0,8)），恰好覆盖到 15 / 10。
+    const double demand = std::floor(3.0 + rng_.nextRange(0.0, urgent ? 8.0 : 13.0));
+    return insertOrderAt(cust[static_cast<std::size_t>(ia)],
+                         cust[static_cast<std::size_t>(ib)], demand, urgent, source,
+                         windowBaseMin);
 }
 
 void MainWindow::onInsertUrgentOrder() {
     // 无头环境（--self-check-actions / --demo / offscreen 渲染）不能弹模态框：
     // 退化为随机 A/B，保持自动化路径可跑。
+    // 手动动作的窗口基准 = **当前软件内时刻**（不是事件刻，R4 只管自动刷单）。
     if (QGuiApplication::platformName() == QStringLiteral("offscreen")) {
-        insertUrgentOrderAction();
+        insertRandomOrder(true, logistics::OrderSource::ManualUrgent, currentTimeMin());
         return;
     }
 
@@ -751,9 +788,11 @@ void MainWindow::onInsertUrgentOrder() {
                                  QStringLiteral("取货点 A 与送达点 B 不能相同"));
             return;
         }
-        const std::string id = insertUrgentOrderAt(aCombo->currentText().toStdString(),
-                                                   bCombo->currentText().toStdString(),
-                                                   demand->value());
+        const std::string id = insertOrderAt(aCombo->currentText().toStdString(),
+                                             bCombo->currentText().toStdString(),
+                                             demand->value(), true,
+                                             logistics::OrderSource::ManualUrgent,
+                                             currentTimeMin());
         if (id.empty()) {
             QMessageBox::warning(&dialog, QStringLiteral("插入紧急取送单"),
                                  QStringLiteral("插入失败（端点不可达或货量超限），详见运行日志"));
@@ -769,57 +808,45 @@ void MainWindow::onInsertUrgentOrder() {
     dialog.exec();
 }
 
+// R10 · 手动「模拟新客户」：建节点 X + 一张**普通取送单**（A = 随机现有配送点 -> B = X）。
+// 只由工具栏触发，**不进事件池、不受待处理上限**，但与自动刷单走**同一条插入链**
+// （insertOrderAt -> insertOrder -> 普通段 pair-insertion）。
+// 新客户必然带来一个配送需求：只加节点而不加订单的话，规划器没有理由访问它——
+// 停靠点只由订单决定，新节点会永远不出现在路线里（人工测试第 11 关的缺陷）。
 std::string MainWindow::addRandomCustomerAction() {
+    // 候选 A 必须在**建节点之前**取：新节点 X 自己也是配送点，先取列表才不会抽到 X。
+    std::vector<std::string> cust;
+    for (const logistics::Node& n : config_.graph.nodes()) {
+        if (n.type == logistics::NodeType::Delivery) {
+            cust.push_back(n.id);
+        }
+    }
+
     const std::string nodeId = logistics::addRandomCustomer(config_.graph, rng_);
     if (nodeId.empty()) {
         appendLog(QStringLiteral("新增客户失败"));
         return std::string();
     }
-
-    // 新客户必然带来一个配送需求。
-    // 只加节点而不加订单的话，规划器没有理由访问它——停靠点只由订单决定，
-    // 新节点会永远不出现在路线里。这正是人工测试第 11 关发现的问题。
-    Order order;
-    order.id = nextFreeId("C");
-    order.nodeId = nodeId;
-    // 规格一起全部订单都是 A→B 取送式（#21 / ADR 0002）：取货点 A 必填。
-    // 新客户的货来自"最近的既有配送点"，取 A = 距新节点最近的既有客户节点。
-    std::string pickup = nodeId;
-    double best = -1.0;
-    for (const logistics::Node& n : config_.graph.nodes()) {
-        if (n.type != logistics::NodeType::Delivery || n.id == nodeId) {
-            continue;
-        }
-        const logistics::PathResult r =
-            logistics::shortestPath(config_.graph, n.id, nodeId, logistics::WeightType::Distance);
-        if (!r.found) {
-            continue;
-        }
-        if (best < 0.0 || r.totalWeight < best) {
-            best = r.totalWeight;
-            pickup = n.id;
-        }
+    const logistics::Node* created = config_.graph.findNode(nodeId);
+    if (created != nullptr) {
+        appendLog(QStringLiteral("模拟新客户：新增配送点 %1（%2，子网络 %3）")
+                      .arg(QString::fromStdString(nodeId))
+                      .arg(QString::fromStdString(created->name))
+                      .arg(created->subNetworkId));
     }
-    if (pickup == nodeId) {
-        appendLog(QStringLiteral("新增客户失败：找不到可作为取货点 A 的既有客户节点"));
-        return std::string();
+    if (cust.empty()) {
+        // Q8 同口径：动作客观不可执行时照实播报，不臆造取货点。
+        appendLog(QStringLiteral("新增客户失败：找不到可作为取货点 A 的既有配送点"));
+        return nodeId;
     }
-    order.pickupNodeId = pickup;
-    order.source = logistics::OrderSource::ManualCustomer;
-    // 同上：货量一律整公斤（nextRange + floor，理由见 insertUrgentOrderAction）；区间仍是 3–15kg。
-    order.demandKg = std::floor(3.0 + rng_.nextRange(0.0, 13.0));
-    order.windowStartMin = currentTimeMin();
-    order.windowEndMin = 24 * 60;
-    order.urgent = false;
-    order.served = false;
-    config_.orders.push_back(order);
 
-    appendLog(QStringLiteral("模拟新客户：新增配送点 %1 与订单 %2（%3 → %1，货量 %4kg）")
-                  .arg(QString::fromStdString(nodeId))
-                  .arg(QString::fromStdString(order.id))
-                  .arg(QString::fromStdString(pickup))
-                  .arg(order.demandKg, 0, 'f', 0));
-    replan();
+    // A = 随机现有配送点（R10）；kg 3–15 整公斤（普通单区间，R3）；
+    // 窗口 [当前时刻, 24:00]（手动动作的基准就是"用户此刻"，R4/§1.9-1）。
+    const int now = currentTimeMin();
+    const int ia = rng_.nextInt(0, static_cast<int>(cust.size()) - 1);
+    const double demand = std::floor(3.0 + rng_.nextRange(0.0, 13.0));
+    insertOrderAt(cust[static_cast<std::size_t>(ia)], nodeId, demand, false,
+                  logistics::OrderSource::ManualCustomer, now);
     return nodeId;
 }
 
@@ -828,12 +855,18 @@ void MainWindow::onAddRandomCustomer() {
 }
 
 void MainWindow::onCloseRandomRoad() {
+    closeRandomRoadAction(-1);
+}
+
+void MainWindow::closeRandomRoadAction(int atMin) {
     const std::string closed = logistics::closeRandomRoad(config_.graph, rng_);
     if (closed.empty()) {
-        appendLog(QStringLiteral("没有可封闭的道路"));
+        // Q8：抽中了封路但图里没有非桥边 -> 照实播报"无动作"，该刻仍算已抽，不重抽。
+        appendLog(QStringLiteral("没有可封闭的道路（本刻不重抽）"), atMin);
         return;
     }
-    appendLog(QStringLiteral("模拟道路封闭：%1（含反向）").arg(QString::fromStdString(closed)));
+    appendLog(QStringLiteral("模拟道路封闭：%1（含反向）").arg(QString::fromStdString(closed)),
+              atMin);
     replan();
 }
 
@@ -844,6 +877,29 @@ void MainWindow::onAdvanceStop() {
     if (nodeIndex_ + 1 >= plan_.nodes.size()) {
         reportRouteFinishedOnce();   // 终点只播报一次（原先每个 tick 都刷一遍）
         return;                      // 已结束，不再刷新
+    }
+
+    // ---- 先结算"到达之前"的事件刻（D24 §7.7 的严格版）----
+    //
+    // 一次推进可能跨过好几个事件刻（长途 leg）。**每个刻都在它自己的时刻结算**，
+    // 而不是等到达后统一按"到达时刻"结算：后者会让「按站模拟」抽到的同一串事件
+    // 全部落到更晚的时钟上（重规划锚点、窗口基准都会跟着漂），于是同一时刻在
+    // 「推进一刻」与「推进一站」下不是同一个世界——A1–A7 等价性断言就会红。
+    // 结算时车仍在**所在路段的起点**（半路显示语义），与「推进一刻」逐步走刻同构。
+    //
+    // 期间抽到的事件可能触发重规划并改写 plan_，所以每轮都要重新读计划
+    //（不能把 nodeArrivalMin 缓存在循环外）。
+    while (!atRouteEnd() && nodeIndex_ + 1 < plan_.nodeArrivalMin.size()
+           && nextEventMark_ < plan_.nodeArrivalMin[nodeIndex_ + 1]) {
+        advanceClockTo(nextEventMark_);
+        settleEventsUpTo(nextEventMark_);
+        if (plan_.status != logistics::PlanStatus::Ok || plan_.nodes.empty()) {
+            return;   // 事件把计划打成不可行：本刻无可推进
+        }
+    }
+    if (atRouteEnd()) {
+        reportRouteFinishedOnce();
+        return;
     }
 
     // 逐个节点前进。**状态转移只发生在这一处**：
@@ -1021,8 +1077,8 @@ void MainWindow::onAdvanceStop() {
                       .arg(minutesToClock(currentTimeMin_)));
     }
 
-    // 软件内时钟可能刚跨过一个事件刻：事件由"时间前进"驱动，与推进粒度无关。
-    // 必须放在 syncScene 之前 —— 事件可能触发重规划并改写 plan_。
+    // 恰好落在**到达时刻**上的事件刻：到达之后结算（与「推进一刻」在同一个位置、
+    // 同一个时钟上结算，顺序一致）。必须放在 syncScene 之前 —— 事件可能重规划。
     settleEventsUpTo(state_.atTimeMin);
 
     // 推进后必须刷新画布：车辆位置标记要跟着移动
@@ -1121,11 +1177,14 @@ void MainWindow::onAdvanceMoment() {
         onAdvanceStop();
     }
 
-    // 车卡在 i→i+1 途中：让时间走到 target，位置留在 i —— i 正是它所在路段的**起点**
-    // （用户要的"半路显示所在段的起点"就是这个语义，不需要额外换算）。
+    // 车卡在 i→i+1 途中：剩余的事件刻也**各按自己的时刻**结算（位置留在 i），
+    // 最后才把显示时钟推到 target —— 与「推进一站」在同一个刻、同一个位置结算。
+    while (!atRouteEnd() && nextEventMark_ <= target) {
+        advanceClockTo(nextEventMark_);
+        settleEventsUpTo(nextEventMark_);
+    }
     if (!atRouteEnd() && state_.atTimeMin < target) {
         advanceClockTo(target);
-        settleEventsUpTo(target);
     }
 
     syncScene();
@@ -1181,6 +1240,116 @@ void MainWindow::advanceClockTo(int timeMin) {
     currentTimeMin_ = timeMin;
 }
 
+// R6 计数：只数**事件来源**（event_normal / event_urgent）且未送达的订单。
+//   · "未送达" 含"已取在车"（picked && !served）——上限管的是待处理量，不是"还没取"；
+//   · 初始 25 单不占额度，否则普通额度开局即满（25 > 6），普通订单事件等于被关掉；
+//   · 手动动作（manual_customer / manual_urgent）是用户显式动作，同样不占额度。
+int MainWindow::pendingEventOrderCount(bool urgent) const {
+    const logistics::OrderSource want = urgent ? logistics::OrderSource::EventUrgent
+                                               : logistics::OrderSource::EventNormal;
+    int count = 0;
+    for (const Order& order : config_.orders) {
+        if (order.served || order.source != want) {
+            continue;
+        }
+        ++count;
+    }
+    return count;
+}
+
+logistics::Config MainWindow::reloadInitialConfig() const {
+    logistics::Config config;
+    std::string error;
+    if (!configPath_.empty() && logistics::ConfigLoader::load(configPath_, config, error)) {
+        return config;
+    }
+    return initialConfig_;
+}
+
+// 等价性守卫 A1 的取数口径：运行日志里所有「[事件] …」行（含时刻前缀）。
+// 与「导出运行日志」看到的是同一批行；不经过任何显示函数的再加工。
+QStringList MainWindow::eventLogLines() const {
+    QStringList out;
+    for (const QString& line : runLog_) {
+        if (line.contains(QStringLiteral("[事件]"))) {
+            out << line;
+        }
+    }
+    return out;
+}
+
+// 等价性守卫 A2–A7 的终态快照：逐项列出**界面面板同源的事实**
+//（订单表的已送达集合、超时面板的已发生 penalty、车辆面板的在车货、
+//  停靠面板的已执行账本、状态栏的位置与时刻、事件刻）。
+// 刻意不调用 nodeIndexAtTime 这类"显示用"函数反推——那会把断言变成自证。
+QString MainWindow::equivalenceSnapshot() const {
+    QString out;
+
+    // A2 已送达订单集合（订单表「状态」列的数据源）
+    QStringList served;
+    for (const Order& order : config_.orders) {
+        if (order.served) {
+            served << QString::fromStdString(order.id);
+        }
+    }
+    out += QStringLiteral("A2 已送达订单: %1\n").arg(served.join(QLatin1Char(',')));
+
+    // A3 已发生 penalty（车辆面板 / 超时面板的数据源）
+    out += QStringLiteral("A3 已发生 penalty: %1 min\n").arg(state_.incurredPenaltyMin);
+    QStringList lateList;
+    for (const VehicleState::LateStop& late : state_.deliveredLate) {
+        lateList << QStringLiteral("%1@%2:+%3")
+                        .arg(QString::fromStdString(late.orderId))
+                        .arg(QString::fromStdString(late.nodeId))
+                        .arg(late.penaltyMin);
+    }
+    out += QStringLiteral("A3 已发生超时明细: %1\n").arg(lateList.join(QLatin1Char(',')));
+
+    // A4 在车货（订单 + kg）
+    QStringList onboard;
+    for (const logistics::OnboardItem& item : state_.onboard) {
+        onboard << QStringLiteral("%1:%2kg@%3")
+                       .arg(QString::fromStdString(item.orderId))
+                       .arg(item.kg, 0, 'f', 0)
+                       .arg(QString::fromStdString(item.nodeId));
+    }
+    out += QStringLiteral("A4 在车货: %1（合计 %2kg / 载重 %3kg）\n")
+               .arg(onboard.join(QLatin1Char(',')))
+               .arg(state_.sumOnboard(), 0, 'f', 0)
+               .arg(state_.loadKg, 0, 'f', 0);
+
+    // A5 车内/站内的已执行账本（停靠面板 + 中转站面板的数据源）
+    QStringList picked;
+    for (const std::string& id : state_.pickedOrderIds) {
+        picked << QString::fromStdString(id);
+    }
+    QStringList offloaded;
+    for (const VehicleState::OffloadKey& key : state_.appliedOffloads) {
+        offloaded << (QString::fromStdString(key.station) + QLatin1Char('/')
+                      + QString::fromStdString(key.orderId));
+    }
+    QStringList stash;
+    for (const logistics::OnboardItem& item : state_.stashItems) {
+        stash << QStringLiteral("%1:%2kg").arg(QString::fromStdString(item.orderId))
+                     .arg(item.kg, 0, 'f', 0);
+    }
+    out += QStringLiteral("A5 已送达停靠 %1 ｜ 已取货 [%2] ｜ 已降载 [%3] ｜ 暂存站 %4 [%5]\n")
+               .arg(state_.servedStops)
+               .arg(picked.join(QLatin1Char(',')))
+               .arg(offloaded.join(QLatin1Char(',')))
+               .arg(QString::fromStdString(state_.stashStation))
+               .arg(stash.join(QLatin1Char(',')));
+
+    // A6 位置与时刻（状态栏时钟 + 地图车辆位置的数据源）
+    out += QStringLiteral("A6 位置 %1 @ %2\n")
+               .arg(QString::fromStdString(state_.atNodeId))
+               .arg(minutesToClock(state_.atTimeMin));
+
+    // A7 下一个事件刻
+    out += QStringLiteral("A7 下一个事件刻 %1\n").arg(minutesToClock(nextEventMark_));
+    return out;
+}
+
 // 结算所有 <= timeMin 的**事件刻**，每刻恰抽 1 个事件。
 //
 // 这一层刻意挂在"软件时间前进"上、而不是挂在某个按钮上：因此「按站模拟」（一站一步）
@@ -1199,19 +1368,33 @@ void MainWindow::settleEventsUpTo(int timeMin) {
         w.customer = logistics::eventLevelWeight(config_.general.eventLevelCustomer);
         w.closure  = logistics::eventLevelWeight(config_.general.eventLevelClosure);
 
-        // 紧急订单已达"待处理上限"时**改抽其余事件**，保证不出现空刻。
-        std::size_t pendingUrgent = 0;
-        for (const Order& order : config_.orders) {
-            if (!order.served && order.urgent) {
-                ++pendingUrgent;
-            }
+        // R6/R7：抽签前**只**把"已达上限"的类别权重置 0（不预扫"动作可不可执行"），
+        // 两类都满时仍每刻恰 1 抽、不出现空刻。额度只数事件来源、未送达（含在车）。
+        const bool normalCapped =
+            pendingEventOrderCount(false) >= kMaxPendingNormalOrders;
+        const bool urgentCapped =
+            pendingEventOrderCount(true) >= kMaxPendingUrgentOrders;
+        if (normalCapped) {
+            w.customer = 0;
         }
-        const std::size_t kMaxPendingUrgent = 2;
-        const bool urgentCapped = pendingUrgent >= kMaxPendingUrgent;
         if (urgentCapped) {
             w.urgent = 0;
         }
+        QString capNote;
+        if (normalCapped && urgentCapped) {
+            capNote = QStringLiteral("（普通订单待处理已满 %1、紧急订单待处理已满 %2，"
+                                     "本次抽签不含这两类）")
+                          .arg(kMaxPendingNormalOrders)
+                          .arg(kMaxPendingUrgentOrders);
+        } else if (normalCapped) {
+            capNote = QStringLiteral("（普通订单待处理已满 %1，本次抽签不含普通订单）")
+                          .arg(kMaxPendingNormalOrders);
+        } else if (urgentCapped) {
+            capNote = QStringLiteral("（紧急订单待处理已满 %1，本次抽签不含紧急订单）")
+                          .arg(kMaxPendingUrgentOrders);
+        }
 
+        // **每刻恰 1 次抽签、1 次抽签恰消耗 1 次随机数**（含全零权重的保底分支）。
         const logistics::SimEventKind kind = logistics::pickEvent(w, rng_);
         // **传事件刻 mark**：一次推进可能跨过好几个事件刻（"推进一刻"或按站模拟跨 15min），
         // 那些事件是在同一瞬间被批量结算的。若用当前时刻做前缀，导出文件会写成
@@ -1220,16 +1403,25 @@ void MainWindow::settleEventsUpTo(int timeMin) {
         appendLog(QStringLiteral("[事件] %1 抽取：%2%3")
                       .arg(minutesToClock(mark))
                       .arg(QString::fromUtf8(logistics::simEventName(kind)))
-                      .arg(urgentCapped
-                               ? QStringLiteral("（紧急订单待处理已满，本次抽签不含紧急订单）")
-                               : QString()),
+                      .arg(capNote),
                   mark);
 
+        // Q8：抽中后动作客观不可执行（配送点 <2、无非桥边）时，动作函数**照实播报原因**、
+        // 本刻仍算已抽、**不重抽** —— 抽签次数确定，等价性断言才成立。
+        // 四个动作都把**事件刻**当日志前缀传进去（批量结算时不会全记成同一时刻）。
         switch (kind) {
-            case logistics::SimEventKind::Traffic:     onSimulateTraffic();       break;
-            case logistics::SimEventKind::UrgentOrder: insertUrgentOrderAction(); break;
-            case logistics::SimEventKind::NewCustomer: addRandomCustomerAction(); break;
-            case logistics::SimEventKind::RoadClosure: onCloseRandomRoad();       break;
+            case logistics::SimEventKind::Traffic:
+                simulateTrafficAction(mark);
+                break;
+            case logistics::SimEventKind::UrgentOrder:
+                insertRandomOrder(true, logistics::OrderSource::EventUrgent, mark);
+                break;
+            case logistics::SimEventKind::NormalOrder:
+                insertRandomOrder(false, logistics::OrderSource::EventNormal, mark);
+                break;
+            case logistics::SimEventKind::RoadClosure:
+                closeRandomRoadAction(mark);
+                break;
         }
     }
 }
@@ -2019,7 +2211,8 @@ int MainWindow::runActionSelfCheck() {
         const std::string A = cust[0];
         const std::string B = cust[1];
         const std::size_t before = config_.orders.size();
-        const std::string id = insertUrgentOrderAt(A, B, 5.0);
+        const std::string id = insertOrderAt(A, B, 5.0, true,
+                                            logistics::OrderSource::ManualUrgent, currentTimeMin());
         expect(!id.empty(), QStringLiteral("紧急取送单应插入成功"));
         expect(config_.orders.size() == before + 1,
                QStringLiteral("紧急单必须并入订单集合（不丢单）"));
@@ -2077,11 +2270,14 @@ int MainWindow::runActionSelfCheck() {
         expect(served, QStringLiteral("到达送达点 B 后紧急取送单应完成"));
     }
 
-    // ---- 2. 连续插两张紧急单：都不丢，且都在计划里 ----
+    // ---- 2. 事件刻刷单：连续两张紧急单都不丢；**窗口基准 = 事件刻**（不是结算时刻）----
     {
+        // 用一个**真事件刻**当基准；它严格大于当前软件内时刻，因此
+        // "把基准错写成结算时刻（currentTimeMin()）"会让下面的断言立刻变红。
+        const int mark = nextEventMark_;
         const std::size_t before = config_.orders.size();
-        const std::string id1 = insertUrgentOrderAction();
-        const std::string id2 = insertUrgentOrderAction();
+        const std::string id1 = insertRandomOrder(true, logistics::OrderSource::EventUrgent, mark);
+        const std::string id2 = insertRandomOrder(true, logistics::OrderSource::EventUrgent, mark);
         expect(!id1.empty() && !id2.empty(), QStringLiteral("连续插单应都成功"));
         expect(config_.orders.size() == before + 2,
                QStringLiteral("连续两次插单不得丢单"));
@@ -2102,37 +2298,88 @@ int MainWindow::runActionSelfCheck() {
         expect(unserved > 0 && inPlan == unserved,
                QStringLiteral("全部未完成紧急单都必须出现在计划停靠点里（%1/%2）")
                    .arg(inPlan).arg(unserved));
-        // 事件随机参数：A≠B、3–10kg 整数、窗口 60min
-        auto paramOk = [](const Order& o) {
+        // 事件刷单参数（R2–R5，读订单集合状态）
+        auto paramOk = [mark](const Order& o) {
             return o.urgent && o.pickupNodeId != o.nodeId
                    && o.demandKg >= 3.0 - 1e-9 && o.demandKg <= 10.0 + 1e-9
                    && std::fabs(o.demandKg - std::floor(o.demandKg)) < 1e-9
-                   && (o.windowEndMin - o.windowStartMin) == 60;
+                   // 窗口基准 = **该事件的事件刻**，止 = min(mark+60, 24:00)
+                   && o.windowStartMin == mark
+                   && o.windowEndMin == (mark + 60 < 24 * 60 ? mark + 60 : 24 * 60)
+                   && o.source == logistics::OrderSource::EventUrgent
+                   && !o.id.empty() && o.id[0] == 'U';
         };
         const std::size_t n = config_.orders.size();
         expect(n >= 2 && paramOk(config_.orders[n - 2]) && paramOk(config_.orders[n - 1]),
-               QStringLiteral("事件随机紧急单参数：A≠B、3–10kg 整数、窗口 60min"));
+               QStringLiteral("事件刷单参数 R2–R5：A≠B、3–10kg 整数、窗口 [事件刻 %1, +60]、"
+                              "来源 event_urgent / 前缀 U")
+                   .arg(minutesToClock(mark)));
+        expect(mark > currentTimeMin(),
+               QStringLiteral("（前提）事件刻 %1 严格晚于当前时刻 %2 —— 窗口基准断言才有区分力")
+                   .arg(minutesToClock(mark))
+                   .arg(minutesToClock(currentTimeMin())));
     }
 
     // ---- 3. 非法输入被拒（A==B / 超载），且不得并入订单集合 ----
     {
         const std::size_t before = config_.orders.size();
-        const std::string bad1 = insertUrgentOrderAt("D01", "D01", 5.0);
+        const std::string bad1 = insertOrderAt("D01", "D01", 5.0, true,
+                                              logistics::OrderSource::ManualUrgent, currentTimeMin());
         const double cap = config_.vehicles.empty() ? 0.0 : config_.vehicles.front().capacityKg;
-        const std::string bad2 = insertUrgentOrderAt("D01", "D02", cap + 100.0);
+        const std::string bad2 = insertOrderAt("D01", "D02", cap + 100.0, true,
+                                              logistics::OrderSource::ManualUrgent, currentTimeMin());
         expect(bad1.empty() && bad2.empty(),
                QStringLiteral("A==B 与超载必须被拒绝"));
         expect(config_.orders.size() == before,
                QStringLiteral("被拒绝的紧急单不得并入订单集合"));
     }
 
-    // ---- 4. 新客户：必须带来订单并被纳入配送 ----
+    // ---- 4. 手动「模拟新客户」：建节点 X + 一张 B=X 的普通单，且 X 被纳入配送（R10）----
     {
         const std::size_t before = config_.orders.size();
+        const int now = currentTimeMin();
         const std::string node = addRandomCustomerAction();
         expect(!node.empty(), QStringLiteral("模拟新客户应成功"));
         expect(config_.orders.size() == before + 1,
                QStringLiteral("新客户必须带来一张订单"));
+
+        // 订单 B = X（货送到新客户），A = 随机**既有**配送点（≠X）
+        const Order* customerOrder = nullptr;
+        for (const Order& order : config_.orders) {
+            if (order.source == logistics::OrderSource::ManualCustomer) {
+                customerOrder = &order;
+            }
+        }
+        expect(customerOrder != nullptr,
+               QStringLiteral("新客户订单必须以 manual_customer 来源并入订单集合"));
+        if (customerOrder != nullptr) {
+            expect(customerOrder->nodeId == node,
+                   QStringLiteral("新客户订单的送达点 B 必须是新节点 X（B=%1 / X=%2）")
+                       .arg(QString::fromStdString(customerOrder->nodeId))
+                       .arg(QString::fromStdString(node)));
+            expect(customerOrder->pickupNodeId != node && !customerOrder->pickupNodeId.empty(),
+                   QStringLiteral("新客户订单的取货点 A 必须是另一个既有配送点"));
+            const logistics::Node* pickupNode =
+                config_.graph.findNode(customerOrder->pickupNodeId);
+            expect(pickupNode != nullptr
+                       && pickupNode->type == logistics::NodeType::Delivery,
+                   QStringLiteral("取货点 A 必须是配送点"));
+            expect(customerOrder->demandKg >= 3.0 - 1e-9
+                       && customerOrder->demandKg <= 15.0 + 1e-9
+                       && std::fabs(customerOrder->demandKg - std::floor(customerOrder->demandKg))
+                              < 1e-9,
+                   QStringLiteral("新客户订单货量必须是 3–15kg 整数（实际 %1kg）")
+                       .arg(customerOrder->demandKg, 0, 'f', 0));
+            expect(customerOrder->windowStartMin == now && customerOrder->windowEndMin == 24 * 60,
+                   QStringLiteral("新客户订单窗口 = [当前时刻 %1, 24:00]")
+                       .arg(minutesToClock(now)));
+            expect(!customerOrder->urgent && !customerOrder->id.empty()
+                       && customerOrder->id[0] == 'C',
+                   QStringLiteral("新客户订单必须是普通单、前缀 C（实际 %1）")
+                       .arg(QString::fromStdString(customerOrder->id)));
+        }
+
+        // X 必须真的进路线（只看"新增节点"太弱：节点加了但没被配送等于没有需求）
         bool inPlan = false;
         for (const std::string& n : plan_.nodes) {
             if (n == node) {
@@ -2140,7 +2387,13 @@ int MainWindow::runActionSelfCheck() {
                 break;
             }
         }
-        expect(inPlan, QStringLiteral("新客户节点必须出现在路线里"));
+        expect(inPlan, QStringLiteral("新客户节点 X 必须出现在路线里（B=X 的结果）"));
+
+        // 子网络编号继承（#30 缺陷）：新节点必须落进某个已有子网络，不能是 0
+        const logistics::Node* created = config_.graph.findNode(node);
+        expect(created != nullptr && created->subNetworkId != 0,
+               QStringLiteral("新节点子网络编号必须非 0（继承最近邻，实际 %1）")
+                   .arg(created != nullptr ? created->subNetworkId : -1));
     }
 
     // ---- 5. 重规划绝不改写车辆物理状态 ----
@@ -2208,7 +2461,8 @@ int MainWindow::runActionSelfCheck() {
             A = cust.front();
             B = cust[cust.size() > 1 ? 1 : 0];
         }
-        const std::string id = insertUrgentOrderAt(A, B, offloadDemand);
+        const std::string id = insertOrderAt(A, B, offloadDemand, true,
+                                            logistics::OrderSource::ManualUrgent, currentTimeMin());
         expect(!id.empty(), QStringLiteral("接近满载的紧急取送单应插入成功"));
         if (!id.empty()) {
             // 计划层（确定性）：降载账本的暂存守恒与载重不变量。
@@ -2298,6 +2552,295 @@ int MainWindow::runActionSelfCheck() {
                        QStringLiteral("执行降载后日志应出现「降载」"));
             }
         }
+    }
+
+    // ---- 7. 自动刷单额度 R6/R7 与 Q8（独立窗口：额度/随机流都不受前六段影响）----
+    //
+    // 读的是**用户可见输出**（运行日志里的「[事件] … 抽取：…」行）与订单集合状态，
+    // 不断言内部计数器自身的实现。
+    {
+        MainWindow rules(reloadInitialConfig(), configPath_);
+        std::vector<std::string> deliveryIds;
+        for (const logistics::Node& n : rules.config_.graph.nodes()) {
+            if (n.type == logistics::NodeType::Delivery) {
+                deliveryIds.push_back(n.id);
+            }
+        }
+        expect(deliveryIds.size() >= 4,
+               QStringLiteral("（前置）额度守卫需要至少 4 个配送点（实际 %1）")
+                   .arg(deliveryIds.size()));
+
+        // R6 计数口径：初始 25 单是 initial 来源 -> 不占额度
+        expect(rules.pendingEventOrderCount(false) == 0
+                   && rules.pendingEventOrderCount(true) == 0,
+               QStringLiteral("R6：配置里的初始单不占事件刷单额度（普通 0 / 紧急 0）"));
+
+        // R2–R5（普通单）：事件刻刷一张普通单 —— A≠B、3–15kg 整数、窗口 [事件刻, 24:00]、
+        // 来源 event_normal / 前缀 N（读订单集合状态）。
+        const int normalMark = rules.nextEventMark_;
+        const std::size_t beforeNormal = rules.config_.orders.size();
+        const std::string normalId =
+            rules.insertRandomOrder(false, logistics::OrderSource::EventNormal, normalMark);
+        expect(!normalId.empty() && rules.config_.orders.size() == beforeNormal + 1,
+               QStringLiteral("R1/R9：事件刻刷普通单必须并入订单集合（不丢单）"));
+        if (rules.config_.orders.size() == beforeNormal + 1) {
+            const Order& order = rules.config_.orders.back();
+            expect(order.source == logistics::OrderSource::EventNormal && !order.urgent
+                       && !order.id.empty() && order.id[0] == 'N',
+                   QStringLiteral("R5：事件普通单来源 event_normal / 前缀 N（实际 %1）")
+                       .arg(QString::fromStdString(order.id)));
+            expect(order.pickupNodeId != order.nodeId,
+                   QStringLiteral("R2：事件普通单 A != B（%1 / %2）")
+                       .arg(QString::fromStdString(order.pickupNodeId))
+                       .arg(QString::fromStdString(order.nodeId)));
+            expect(order.demandKg >= 3.0 - 1e-9 && order.demandKg <= 15.0 + 1e-9
+                       && std::fabs(order.demandKg - std::floor(order.demandKg)) < 1e-9,
+                   QStringLiteral("R3：事件普通单货量 3–15kg 整数（实际 %1kg）")
+                       .arg(order.demandKg, 0, 'f', 0));
+            expect(order.windowStartMin == normalMark && order.windowEndMin == 24 * 60,
+                   QStringLiteral("R4：事件普通单窗口 [事件刻 %1, 24:00]")
+                       .arg(minutesToClock(normalMark)));
+        }
+        expect(rules.pendingEventOrderCount(false) == 1,
+               QStringLiteral("R6：事件刻刷出的普通单占 1 个额度"));
+
+        // R1/R9：连走 15 个事件刻（此刻普通额度未满），逐刻比对订单集合增量：
+        //   ① 1 个刻至多生 1 张单；② 抽中订单类事件**恰生 1 张**、路况/封路不生单。
+        const int marksForOrderRules = 15;
+        const int orderRulesBaseline = rules.eventLogLines().size();
+        int addedTotal = 0;
+        int maxAddedOrderRules = 0;
+        for (int i = 0; i < marksForOrderRules; ++i) {
+            const std::size_t before = rules.config_.orders.size();
+            rules.settleEventsUpTo(rules.nextEventMark_);
+            const int added = static_cast<int>(rules.config_.orders.size())
+                              - static_cast<int>(before);
+            addedTotal += added;
+            if (added > maxAddedOrderRules) {
+                maxAddedOrderRules = added;
+            }
+        }
+        const QStringList orderRuleLines = rules.eventLogLines().mid(orderRulesBaseline);
+        int normalDraws = 0;
+        int urgentDraws = 0;
+        for (const QString& line : orderRuleLines) {
+            if (line.contains(QStringLiteral("抽取：普通订单"))) {
+                ++normalDraws;
+            } else if (line.contains(QStringLiteral("抽取：紧急订单"))) {
+                ++urgentDraws;
+            }
+        }
+        expect(orderRuleLines.size() == marksForOrderRules,
+               QStringLiteral("R7：每刻恰 1 次抽签、不出现空刻（%1 刻 -> %2 行）")
+                   .arg(marksForOrderRules)
+                   .arg(orderRuleLines.size()));
+        expect(maxAddedOrderRules <= 1,
+               QStringLiteral("R1：1 个事件刻最多生 1 张单（实测单刻最多 %1 张，共 +%2）")
+                   .arg(maxAddedOrderRules)
+                   .arg(addedTotal));
+        expect(addedTotal == normalDraws + urgentDraws,
+               QStringLiteral("R1/R9：抽中订单类事件恰生 1 张单、路况/封路不生单"
+                              "（普通抽签 %1 + 紧急抽签 %2 -> 订单 +%3）")
+                   .arg(normalDraws)
+                   .arg(urgentDraws)
+                   .arg(addedTotal));
+        expect(normalDraws + urgentDraws >= 1,
+               QStringLiteral("（非空跑）%1 个刻里至少抽中一次订单类事件（实测 %2 次）")
+                   .arg(marksForOrderRules)
+                   .arg(normalDraws + urgentDraws));
+
+        // 补满普通额度：不足 6 张时补**事件来源、未送达**的普通单（只补差额，不越过额度）
+        for (int i = 0; rules.pendingEventOrderCount(false) < kMaxPendingNormalOrders; ++i) {
+            char id[16];
+            std::snprintf(id, sizeof(id), "N%03d", 900 + i);
+            Order order;
+            order.id = id;
+            order.pickupNodeId = deliveryIds[0];
+            order.nodeId = deliveryIds[1];
+            order.demandKg = 5.0;
+            order.windowStartMin = 480;
+            order.windowEndMin = 24 * 60;
+            order.urgent = false;
+            order.source = logistics::OrderSource::EventNormal;
+            rules.config_.orders.push_back(order);
+        }
+        expect(rules.pendingEventOrderCount(false) == kMaxPendingNormalOrders,
+               QStringLiteral("R6：普通额度 6 已填满（初始/手动单不计、只数事件来源未送达）"));
+
+        // "已取在车、尚未送达"仍占额度（计数口径 = 未送达，不是"还没取"）
+        rules.config_.orders.back().picked = true;
+        expect(rules.pendingEventOrderCount(false) == kMaxPendingNormalOrders,
+               QStringLiteral("R6：已取在车（未送达）的事件单仍占额度"));
+        rules.config_.orders.back().picked = false;
+
+        // 满额后连走 30 个事件刻：每刻恰 1 抽，且抽签里不再有普通订单。
+        // 同时逐刻比对订单集合增量，守卫 R1（1 刻至多 1 单）与 R9（抽中就该生单）。
+        const int marksFullNormal = 30;
+        const int baselineLines = rules.eventLogLines().size();
+        int maxAddedCapWindow = 0;
+        for (int i = 0; i < marksFullNormal; ++i) {
+            const std::size_t before = rules.config_.orders.size();
+            rules.settleEventsUpTo(rules.nextEventMark_);
+            const int added = static_cast<int>(rules.config_.orders.size())
+                              - static_cast<int>(before);
+            if (added > maxAddedCapWindow) {
+                maxAddedCapWindow = added;
+            }
+        }
+        expect(maxAddedCapWindow <= 1,
+               QStringLiteral("R1：满额窗口里 1 个事件刻仍至多生 1 张单（实测最多 %1 张）")
+                   .arg(maxAddedCapWindow));
+        const QStringList normalCappedLines = rules.eventLogLines().mid(baselineLines);
+        expect(normalCappedLines.size() == marksFullNormal,
+               QStringLiteral("R7：每刻恰 1 次抽签、不出现空刻（%1 刻 -> %2 行）")
+                   .arg(marksFullNormal)
+                   .arg(normalCappedLines.size()));
+        bool normalDrawn = false;
+        bool normalCapNoted = false;
+        for (const QString& line : normalCappedLines) {
+            if (line.contains(QStringLiteral("抽取：普通订单"))) {
+                normalDrawn = true;
+            }
+            if (line.contains(QStringLiteral("普通订单待处理已满"))) {
+                normalCapNoted = true;
+            }
+        }
+        expect(!normalDrawn,
+               QStringLiteral("R6：普通额度满额后抽签不再含普通订单（连走 %1 刻）")
+                   .arg(marksFullNormal));
+        expect(normalCapNoted,
+               QStringLiteral("R7：满额原因必须在事件行里注明（「普通订单待处理已满 6」）"));
+
+        // 再把紧急额度填满：两类都满 -> 只剩路况/封路，仍每刻 1 抽
+        for (int i = 1; i <= kMaxPendingUrgentOrders; ++i) {
+            char id[16];
+            std::snprintf(id, sizeof(id), "U%03d", 900 + i);
+            Order order;
+            order.id = id;
+            order.pickupNodeId = deliveryIds[0];
+            order.nodeId = deliveryIds[1];
+            order.demandKg = 5.0;
+            order.windowStartMin = 480;
+            order.windowEndMin = 540;
+            order.urgent = true;
+            order.source = logistics::OrderSource::EventUrgent;
+            rules.config_.orders.push_back(order);
+        }
+        expect(rules.pendingEventOrderCount(true) >= kMaxPendingUrgentOrders,
+               QStringLiteral("R6：紧急额度已填满（>= 2，实际 %1）")
+                   .arg(rules.pendingEventOrderCount(true)));
+
+        const int marksBothCapped = 20;
+        for (int i = 0; i < marksBothCapped; ++i) {
+            rules.settleEventsUpTo(rules.nextEventMark_);
+        }
+        const QStringList bothLines = rules.eventLogLines().mid(baselineLines + marksFullNormal);
+        expect(bothLines.size() == marksBothCapped,
+               QStringLiteral("R7：两类都满仍每刻 1 抽、不空刻（%1 刻 -> %2 行）")
+                   .arg(marksBothCapped)
+                   .arg(bothLines.size()));
+        bool orderDrawn = false;
+        bool bothNoted = true;
+        for (const QString& line : bothLines) {
+            if (line.contains(QStringLiteral("抽取：普通订单"))
+                || line.contains(QStringLiteral("抽取：紧急订单"))) {
+                orderDrawn = true;
+            }
+            if (!line.contains(QStringLiteral("本次抽签不含这两类"))) {
+                bothNoted = false;
+            }
+        }
+        expect(!orderDrawn,
+               QStringLiteral("R7：普通/紧急两类都满时只抽路况与封路"));
+        expect(bothNoted,
+               QStringLiteral("R7：两类都满的每一刻都注明「本次抽签不含这两类」"));
+
+        // Q8：抽中但动作客观不可执行（可用配送点 < 2）-> 照实播报原因、**不重抽**、不丢既有单
+        logistics::Config tiny = reloadInitialConfig();
+        std::vector<std::string> dropIds;
+        for (const logistics::Node& n : tiny.graph.nodes()) {
+            if (n.type == logistics::NodeType::Delivery && n.id != deliveryIds.front()) {
+                dropIds.push_back(n.id);
+            }
+        }
+        for (const std::string& id : dropIds) {
+            tiny.graph.removeNode(id);
+        }
+        MainWindow tinyWindow(tiny, configPath_);
+        const std::size_t tinyBefore = tinyWindow.config_.orders.size();
+        const std::string failed =
+            tinyWindow.insertRandomOrder(false, logistics::OrderSource::EventNormal, 495);
+        expect(failed.empty(),
+               QStringLiteral("Q8：配送点 < 2 时刷单动作不可执行 -> 不生成订单（不重抽）"));
+        expect(tinyWindow.config_.orders.size() == tinyBefore,
+               QStringLiteral("Q8：不可执行时不生单、也不丢既有单"));
+        expect(tinyWindow.runLogText().contains(QStringLiteral("客户节点不足")),
+               QStringLiteral("Q8：失败原因必须照实播报（运行日志含「客户节点不足」）"));
+    }
+
+    // ---- 8. 等价性守卫 A1–A7：一次「推进一刻」== 逐个「推进一站」到同一时刻 ----
+    //
+    // 两条路径各自**重新加载配置**、各构造一个**独立的 MainWindow**：不深拷贝同一个
+    // MainWindow 对象，也不共享 rng_ / state_。两条路径都推进到**路线终点**——此时
+    // 车队时钟必然同值（末节点到达时刻），是唯一能严格对齐的 T（按站推进的
+    // "到达 >= T" 会越过 T，而推进一刻恰好停在刻上）。
+    // 断言全部只读**用户可见输出**（运行日志 / 面板同源事实），不经显示函数反推。
+    {
+        MainWindow pathA(reloadInitialConfig(), configPath_);
+        MainWindow pathB(reloadInitialConfig(), configPath_);
+
+        int stepsA = 0;
+        while (!pathA.atRouteEnd() && stepsA < 4000) {
+            pathA.onAdvanceMoment();   // 路径 A：反复推进一刻
+            ++stepsA;
+        }
+        int stepsB = 0;
+        while (!pathB.atRouteEnd() && stepsB < 4000) {
+            pathB.onAdvanceStop();     // 路径 B：反复推进一站
+            ++stepsB;
+        }
+        expect(pathA.atRouteEnd() && pathB.atRouteEnd() && stepsA > 0 && stepsB > 0,
+               QStringLiteral("两条路径都推进到路线终点（推进一刻 %1 步 / 推进一站 %2 步）")
+                   .arg(stepsA)
+                   .arg(stepsB));
+        expect(pathA.state_.atTimeMin == pathB.state_.atTimeMin,
+               QStringLiteral("到达终点时车队时钟一致（A %1 / B %2）")
+                   .arg(minutesToClock(pathA.state_.atTimeMin))
+                   .arg(minutesToClock(pathB.state_.atTimeMin)));
+
+        auto diffLines = [](const QStringList& a, const QStringList& b) -> QString {
+            const int n = static_cast<int>(a.size() < b.size() ? a.size() : b.size());
+            for (int i = 0; i < n; ++i) {
+                if (a[i] != b[i]) {
+                    return QStringLiteral("第 %1 行 A=「%2」 / B=「%3」")
+                        .arg(i + 1)
+                        .arg(a[i], b[i]);
+                }
+            }
+            if (a.size() != b.size()) {
+                return QStringLiteral("行数 A=%1 / B=%2").arg(a.size()).arg(b.size());
+            }
+            return QString();
+        };
+
+        // A1 事件日志序列（逐字/逐值，含时刻前缀）。先证明这条守卫不是空跑。
+        const QStringList eventsA = pathA.eventLogLines();
+        const QStringList eventsB = pathB.eventLogLines();
+        expect(eventsA.size() >= 20,
+               QStringLiteral("A1 事件日志至少 20 行（实际 %1 行，确保守卫真的抽到了事件）")
+                   .arg(eventsA.size()));
+        expect(eventsA == eventsB,
+               QStringLiteral("A1 事件日志序列逐字一致（差异：%1）")
+                   .arg(diffLines(eventsA, eventsB)));
+
+        // A2–A7 终态快照逐字一致
+        const QString snapA = pathA.equivalenceSnapshot();
+        const QString snapB = pathB.equivalenceSnapshot();
+        expect(snapA == snapB,
+               QStringLiteral("A2–A7 终态逐字一致（差异：%1）")
+                   .arg(diffLines(snapA.split(QLatin1Char('\n')),
+                                  snapB.split(QLatin1Char('\n')))));
+        std::printf("[self-check] 等价性终态（两条路径一致）：\n%s", snapA.toUtf8().constData());
     }
 
     return failures;

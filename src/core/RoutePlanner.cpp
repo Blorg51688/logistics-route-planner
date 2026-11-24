@@ -2659,43 +2659,43 @@ RoutePlan planRoute(const LogisticsGraph& graph,
                   std::vector<OnboardItem>(), StashState());
 }
 
-InsertResult insertUrgentOrder(const LogisticsGraph& graph,
-                               const Vehicle& vehicle,
-                               const std::vector<Order>& remainingOrders,
-                               const Order& newOrder,
-                               const std::string& currentPositionId,
-                               int currentTimeMin,
-                               WeightType weight,
-                               const std::vector<OnboardItem>& onboard,
-                               const StashState& stash) {
+InsertResult insertOrder(const LogisticsGraph& graph,
+                          const Vehicle& vehicle,
+                          const std::vector<Order>& remainingOrders,
+                          const Order& newOrder,
+                          const std::string& currentPositionId,
+                          int currentTimeMin,
+                          WeightType weight,
+                          const std::vector<OnboardItem>& onboard,
+                          const StashState& stash) {
     InsertResult result;
 
-    // 插入的订单一律按紧急处理，调用方传入的 urgent 不作数
-    Order inserted = newOrder;
-    inserted.urgent = true;
+    // urgent 标记**由调用方给出、本函数照用**（MC-B04 退役了「强制 urgent」）。
+    // 紧急单 -> 紧急段尾插；普通单 -> 普通段 pair-insertion；两条链都在 replan 的构造器里。
+    const Order& inserted = newOrder;
 
     std::vector<Order> all = remainingOrders;
     all.push_back(inserted);
 
     // 可达性与窗口：按 current -> A(取货) -> B(送达) 的**该车缩放后**耗时估计。
     if (inserted.pickupNodeId.empty()) {
-        result.warning = "紧急取送单缺少取货点 A";
+        result.warning = "取送单 " + inserted.id + " 缺少取货点 A";
     } else {
         const PathResult toA =
             shortestPath(graph, currentPositionId, inserted.pickupNodeId, WeightType::Time);
         const PathResult ab =
             shortestPath(graph, inserted.pickupNodeId, inserted.nodeId, WeightType::Time);
         if (!toA.found) {
-            result.warning = "紧急取货点 A 不可达: " + inserted.pickupNodeId;
+            result.warning = "取货点 A 不可达: " + inserted.pickupNodeId;
         } else if (!ab.found) {
-            result.warning = "紧急送达点 B 不可达: " + inserted.nodeId;
+            result.warning = "送达点 B 不可达: " + inserted.nodeId;
         } else {
             const double scaled =
                 (toA.totalWeight + ab.totalWeight) * vehicle.timeFactor;
             const int earliestArrival =
                 currentTimeMin + static_cast<int>(std::lround(scaled));
             if (inserted.windowEndMin < earliestArrival) {
-                result.warning = "紧急订单 " + inserted.id + " 无法在窗口内送达（窗口止 "
+                result.warning = "订单 " + inserted.id + " 无法在窗口内送达（窗口止 "
                                  + std::to_string(inserted.windowEndMin) + "，最早到达 "
                                  + std::to_string(earliestArrival) + "）";
             }

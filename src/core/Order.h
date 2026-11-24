@@ -8,15 +8,22 @@ namespace logistics {
 // 配置文件只描述静态订单（initial），其余来源由事件刻刷单 / 手动动作在运行时写入。
 // ID 前缀随之区分：initial=O、event_normal=N、event_urgent=U、manual_customer=C；
 // 规格二预留 manual_normal=M（手动「插入普通取送单」），四个既有来源语义不变。
+//
+// manual_urgent 是 R5 四类之外**唯一新增的一类**：工具栏「插入紧急订单」这个手动动作
+// 也生成紧急单（前缀仍是 U），但它**不占 R6 的待处理额度**（额度只数事件来源的单）。
+// 若不区分，手动插的紧急单会被算进"事件来源"，额度提前耗尽；若共用 Initial，
+// 订单表就分不清它是配置里的静态单还是用户刚点的。仅此一处，别再加来源。
 enum class OrderSource {
     Initial,         // 配置文件静态订单（O）
     EventNormal,     // 事件刻刷出的普通订单（N）
     EventUrgent,     // 事件刻刷出的紧急订单（U）
     ManualCustomer,  // 手动「模拟新客户」（C）
     ManualNormal,    // 预留：手动「插入普通取送单」（M，规格二）
+    ManualUrgent,    // 手动「插入紧急订单」（U；不占自动刷单额度）
 };
 
 // 来源对应的 ID 前缀（单字符，供生成订单 ID 时拼接）。
+// 前缀按**紧急与否**区分而不是按来源逐一分：手动紧急单与事件紧急单同为 U。
 inline const char* orderIdPrefix(OrderSource source) {
     switch (source) {
         case OrderSource::Initial:        return "O";
@@ -24,6 +31,7 @@ inline const char* orderIdPrefix(OrderSource source) {
         case OrderSource::EventUrgent:    return "U";
         case OrderSource::ManualCustomer: return "C";
         case OrderSource::ManualNormal:   return "M";
+        case OrderSource::ManualUrgent:   return "U";
     }
     return "O";
 }

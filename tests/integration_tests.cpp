@@ -24,7 +24,7 @@ using logistics::planRoute;
 using logistics::replan;
 using logistics::simulateTrafficChange;
 using logistics::needsReplan;
-using logistics::insertUrgentOrder;
+using logistics::insertOrder;
 using logistics::InsertResult;
 using logistics::TrafficReport;
 using testutil::check;
@@ -631,7 +631,7 @@ void checkTrafficAndUrgentOrderOnRealData(const Config& cfg) {
     urgent.windowEndMin = nowMin + 60;
     urgent.urgent = true;
 
-    const InsertResult inserted = insertUrgentOrder(g, v, remaining, urgent, here, nowMin, WeightType::Distance);
+    const InsertResult inserted = insertOrder(g, v, remaining, urgent, here, nowMin, WeightType::Distance);
     check(inserted.plan.status == PlanStatus::Ok, "插入紧急订单后仍可行");
     // 窗口基准 = 事件刻（而不是结算时刻）：60 分钟窗口必须原样带进计划。
     check(urgent.windowEndMin - urgent.windowStartMin == 60, "紧急单窗口 = 事件刻 + 60min");

@@ -173,22 +173,27 @@ struct InsertResult {
     std::string warning;   // 空表示无冲突
 };
 
-// 动态插入紧急订单（§5.3）：
-//   把 newOrder **强制标记为紧急**（无论调用方传入什么）后并入剩余订单，
-//   以车辆当前位置、当前时刻为起点重算路线（紧急单按 FIFO 追加到紧急段尾）。
+// 动态插入一张订单（规格一 MC-B04：通用插单，取代只服务紧急单的 insertUrgentOrder）。
+//
+// **走哪条链由订单自己的 urgent 标记决定**（用参数区分，不再复制两个函数）：
+//   · urgent == true  -> 紧急段**尾插**（订单级 FIFO，#18 §7；后来的紧急单排在后面）；
+//   · urgent == false -> 普通段 **pair-insertion 链**（#18 §8：试插取送对 -> repair(≤3)
+//                        -> 全量兜底 -> 降载）。
+// 调用方负责把来源（OrderSource）与 ID 前缀带进 newOrder；本函数只读 urgent。
+// 以车辆当前位置、当前时刻为起点重算路线。
 // 冲突判定：若新订单窗口止早于"从当前位置出发的最早到达时刻"（按该车缩放后的
 // 耗时维度计算），则无论怎么排都会超时，此时在 warning 中给出提示。
 // 按 D13（超时不弃、只记 penalty），订单**仍会被纳入规划**。
-InsertResult insertUrgentOrder(const LogisticsGraph& graph,
-                               const Vehicle& vehicle,
-                               const std::vector<Order>& remainingOrders,
-                               const Order& newOrder,
-                               const std::string& currentPositionId,
-                               int currentTimeMin,
-                               WeightType weight,
-                               const std::vector<OnboardItem>& onboard
-                                   = std::vector<OnboardItem>(),
-                               const StashState& stash = StashState());
+InsertResult insertOrder(const LogisticsGraph& graph,
+                          const Vehicle& vehicle,
+                          const std::vector<Order>& remainingOrders,
+                          const Order& newOrder,
+                          const std::string& currentPositionId,
+                          int currentTimeMin,
+                          WeightType weight,
+                          const std::vector<OnboardItem>& onboard
+                              = std::vector<OnboardItem>(),
+                          const StashState& stash = StashState());
 
 // 从已规划好的单条路线中切出"尚未走完的部分"（规格一 MC-A01/A10）：
 // 节点序列从 fromNodeIndex 起，停靠只保留该下标及其之后的。

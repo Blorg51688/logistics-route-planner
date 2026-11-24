@@ -119,7 +119,11 @@ public:
     const VehicleState& vehicleState() const { return state_; }
 
 public:
-    explicit MainWindow(logistics::Config config, QWidget* parent = nullptr);
+    // configPath 用于「等价性守卫」里**重新加载配置**构造第二个独立窗口
+    // （不深拷贝同一个 MainWindow 对象；见 runActionSelfCheck 第 7 段）。
+    explicit MainWindow(logistics::Config config,
+                        const std::string& configPath = std::string(),
+                        QWidget* parent = nullptr);
 
     // 关窗即**自动保存**本次运行日志到 `logs/`（只保留最近 kRunLogKeep 份）。
     // 放在关窗路径上：用户跑完模拟直接关窗是最常见的收尾动作，不必记得手动导出。
@@ -214,10 +218,20 @@ private:
     void buildActions();
     void buildDocks();
 
-    std::string insertUrgentOrderAction();
-    // 以显式给定的取货点 A、送达点 B、送货量插入一张紧急取送单（GUI 手选与自检共用）。
-    std::string insertUrgentOrderAt(const std::string& a, const std::string& b, double demand);
+    // 事件刷单 / 手动动作共用的一条插入链（规格一 MC-B04 / R8–R10）。
+    // urgent=true 走紧急段尾插（FIFO），false 走普通段 pair-insertion；
+    // 来源与前缀由调用方带入，窗口基准 = 事件刻（自动刷单）或当前时刻（手动动作）。
+    std::string insertOrderAt(const std::string& a, const std::string& b, double demand,
+                              bool urgent, logistics::OrderSource source, int windowBaseMin);
+    // 随机取送单：A/B 条件均匀（R2，固定消耗 2 次随机数）、kg 3–15/3–10 整数（R3）、
+    // 窗口 [基准, 24:00] / [基准, 基准+60]（R4）。事件刻刷单与手动「插入紧急订单」共用。
+    std::string insertRandomOrder(bool urgent, logistics::OrderSource source, int windowBaseMin);
     std::string addRandomCustomerAction();
+    // 四个事件动作的"带时刻"版本：事件刻结算时把**该事件刻**当日志前缀传进来
+    // （批量结算跨越多个刻时，用"结算时刻"做前缀会把好几个事件记成同一时刻）。
+    // 工具栏按钮走 -1 = 当前软件内时刻。
+    void simulateTrafficAction(int atMin);
+    void closeRandomRoadAction(int atMin);
     std::string nextFreeId(const char* prefix) const;
 
     void replan();
@@ -238,6 +252,16 @@ private:
     // 事件由**软件时间前进**驱动，而不是由"你按了哪个按钮"决定：因此
     // 「推进一站」与「推进一刻」看到的是同一串事件（等价性断言的前提）。
     void settleEventsUpTo(int timeMin);   // 结算所有 <= timeMin 的事件刻（每刻恰 1 个事件）
+    // 待处理额度计数（R6）：**只数事件来源**（event_normal / event_urgent）且未送达的单，
+    // 含"已取在车"（picked 但未 served）；初始单与手动动作单不占额度。
+    int  pendingEventOrderCount(bool urgent) const;
+    // 等价性/事件规则守卫用：**重新加载配置**得到一份独立配置（两遍运行互不影响）；
+    // 没有配置路径（测试内构造）时退回构造快照 initialConfig_。
+    logistics::Config reloadInitialConfig() const;
+    // 等价性守卫 A1 的取数口径：用户可见运行日志里所有「[事件] …」行（含时刻前缀）。
+    QStringList eventLogLines() const;
+    // 等价性守卫 A2–A7 的终态快照（与界面面板同源的事实，不重算任何公式）。
+    QString equivalenceSnapshot() const;
     void advanceClockTo(int timeMin);     // 让"时间流逝"走到 timeMin（车留在所在段的起点）
     bool atRouteEnd() const;              // 路线是否已走完（**含"计划不可行/为空"**）
     // 与 atRouteEnd() 的区别：只有"计划可行且路线真的走完"才算**配送完成**。
@@ -262,6 +286,10 @@ private:
     std::vector<logistics::Order> remainingOrders() const;
 
     logistics::Config     config_;
+    // 构造时的配置快照与路径：等价性守卫据此**重新加载**出一份独立配置
+    // （两个窗口各跑一遍，随机源同种子、互不影响）。
+    logistics::Config     initialConfig_;
+    std::string           configPath_;
     GraphScene*           scene_ = nullptr;
     QGraphicsView*        view_ = nullptr;
     // 车辆物理状态（唯一权威来源，重规划不得改写）

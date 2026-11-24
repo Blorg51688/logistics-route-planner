@@ -297,7 +297,7 @@ void testCongestionTriggersReplanAndChangesTimes() {
     check(after.totalTimeMin > before.totalTimeMin, "拥堵后总耗时必须增加");
 }
 
-// 切片 D：插入紧急订单 —— 新单优先服务，已服务订单不进入新路线。
+// 切片 D：插入**紧急**订单（urgent=true）—— 新单优先服务，已服务订单不进入新路线。
 // 图中额外放入 D0 并在剩余集合中排除它，用以验证"已服务节点不再规划"。
 void testInsertUrgentOrderIsServedFirstAndServedNodesExcluded() {
     LogisticsGraph g;
@@ -313,10 +313,11 @@ void testInsertUrgentOrderIsServedFirstAndServedNodesExcluded() {
     const Vehicle v = makeVehicle("W", 1000.0, 480);
     // 剩余订单也是一张 A→B 取送对（新模型 A 从不在仓库）。
     const std::vector<logistics::Order> remaining = {makeOrder("O1", "D2", "D1", 10.0, 0, 1440)};
-    // 刻意传 urgent=false：按 §5.3，插入的订单必须被强制标记为紧急。
-    logistics::Order incoming = makeOrder("O2", "D1", "D2", 10.0, 0, 1440, false);
+    // MC-B04 起 insertOrder **照用订单自己的 urgent 标记**（不再强制 urgent）：
+    // 这里传 urgent=true -> 走紧急段尾插（FIFO），所以新单被优先服务。
+    logistics::Order incoming = makeOrder("O2", "D1", "D2", 10.0, 0, 1440, true);
 
-    const logistics::InsertResult r = logistics::insertUrgentOrder(
+    const logistics::InsertResult r = logistics::insertOrder(
         g, v, remaining, incoming, "W", 480, logistics::WeightType::Distance);
 
     check(r.warning.empty(), "窗口充裕时不应有警告，实际: " + r.warning);
@@ -352,11 +353,11 @@ void testInsertUrgentOrderIsServedFirstAndServedNodesExcluded() {
     check(o2Deliv == 1, "新插单 O2 恰好送达一次（实际 " + std::to_string(o2Deliv) + "）");
     check(o2PickIdx < o2DelivIdx, "新插紧急单先取后送");
 
-    // 强制 urgent + 硬优先：紧急停靠全部先于普通停靠，且首个停靠就是紧急取货点。
+    // 硬优先：紧急停靠全部先于普通停靠，且首个停靠就是紧急取货点。
     check(!r.plan.stops.empty() && r.plan.stops[0].phase == logistics::StopPhase::Urgent,
           "首个停靠属于紧急阶段");
     check(!r.plan.stops.empty() && r.plan.stops[0].nodeId == incoming.pickupNodeId,
-          "新插单即使用 urgent=false 传入也必须被优先服务（首个停靠 = 紧急取货点 A="
+          "新插紧急单必须被优先服务（首个停靠 = 紧急取货点 A="
               + incoming.pickupNodeId + "），实际首个停靠 "
               + (r.plan.stops.empty() ? std::string("(无)") : r.plan.stops[0].nodeId));
     bool seenNormal = false;
@@ -401,6 +402,70 @@ void testInsertUrgentOrderIsServedFirstAndServedNodesExcluded() {
           "总耗时 12.0，实际 " + std::to_string(r.plan.totalTimeMin));
 }
 
+// 切片 D2（MC-B04）：urgent=false 的插单走**普通段 pair-insertion**，不再被强制紧急。
+// 这是 insertOrder 与旧 insertUrgentOrder 的语义分界：
+//   · urgent=true  -> 紧急段尾插（上面切片 D 的硬优先断言守着）；
+//   · urgent=false -> 普通段插入（本用例守着：没有紧急停靠、仍先取后送、恰送达一次）。
+void testInsertOrderNormalFlagUsesPairInsertion() {
+    LogisticsGraph g;
+    g.addNode(makeNode("W", NodeType::Warehouse, "仓库"));
+    g.addNode(makeNode("D1", NodeType::Delivery, "客户1"));
+    g.addNode(makeNode("D2", NodeType::Delivery, "客户2"));
+    addTwoWay(g, "W", "D1", 1.0, 2.0, 1.0);
+    addTwoWay(g, "W", "D2", 5.0, 10.0, 5.0);
+    addTwoWay(g, "D1", "D2", 2.0, 4.0, 2.0);
+
+    const Vehicle v = makeVehicle("W", 1000.0, 480);
+    const std::vector<logistics::Order> remaining = {makeOrder("O1", "D2", "D1", 10.0, 0, 1440)};
+    logistics::Order incoming = makeOrder("N2", "D1", "D2", 10.0, 0, 1440, false);
+
+    const logistics::InsertResult r = logistics::insertOrder(
+        g, v, remaining, incoming, "W", 480, logistics::WeightType::Distance);
+    check(r.warning.empty(), "窗口充裕时不应有警告，实际: " + r.warning);
+    check(r.plan.status == logistics::PlanStatus::Ok, "规划成功: " + r.plan.reason);
+    if (r.plan.status != logistics::PlanStatus::Ok) {
+        return;
+    }
+
+    bool allNormalPhase = true;
+    bool n2Picked = false;
+    bool n2Delivered = false;
+    bool o1Delivered = false;
+    std::size_t n2PickIdx = r.plan.stops.size();
+    std::size_t n2DelivIdx = r.plan.stops.size();
+    for (std::size_t k = 0; k < r.plan.stops.size(); ++k) {
+        const logistics::Stop& s = r.plan.stops[k];
+        if (s.phase != logistics::StopPhase::Normal) {
+            allNormalPhase = false;
+        }
+        for (const std::string& id : s.pickups) {
+            if (id == "N2") {
+                n2Picked = true;
+                if (n2PickIdx == r.plan.stops.size()) {
+                    n2PickIdx = k;
+                }
+            }
+        }
+        for (const logistics::StopDelivery& d : s.deliveries) {
+            if (d.orderId == "N2") {
+                n2Delivered = true;
+                if (n2DelivIdx == r.plan.stops.size()) {
+                    n2DelivIdx = k;
+                }
+            }
+            if (d.orderId == "O1") {
+                o1Delivered = true;
+            }
+        }
+    }
+    check(allNormalPhase,
+          "urgent=false 的插单不得产生任何紧急阶段停靠（不得被强制成紧急单）");
+    check(n2Picked, "普通插单的取货停靠必须存在");
+    check(n2Delivered, "普通插单必须恰好送达一次");
+    check(o1Delivered, "原普通单 O1 仍必须送达一次");
+    check(n2PickIdx < n2DelivIdx, "普通插单同样先取后送");
+}
+
 // 切片 E：新订单必然超时时给出警告，但按 D13 仍纳入规划并记录 penalty
 void testInsertUrgentOrderWarnsButStillPlansWhenWindowCannotBeMet() {
     const LogisticsGraph g = makeGreedyGraph();
@@ -411,7 +476,7 @@ void testInsertUrgentOrderWarnsButStillPlansWhenWindowCannotBeMet() {
     const logistics::Order tight = makeOrder("O2", "W", "D2", 10.0, 400, 500, true);
     logistics::Order tightP = tight;
     tightP.pickupNodeId = "D1";
-    const logistics::InsertResult bad = logistics::insertUrgentOrder(
+    const logistics::InsertResult bad = logistics::insertOrder(
         g, v, none, tightP, "W", 600, logistics::WeightType::Distance);
 
     check(!bad.warning.empty(), "必然超时必须给出警告");
@@ -434,7 +499,7 @@ void testInsertUrgentOrderWarnsButStillPlansWhenWindowCannotBeMet() {
     const logistics::Order wide = makeOrder("O3", "W", "D2", 10.0, 0, 1440, true);
     logistics::Order wideP = wide;
     wideP.pickupNodeId = "D1";
-    const logistics::InsertResult ok = logistics::insertUrgentOrder(
+    const logistics::InsertResult ok = logistics::insertOrder(
         g, v, none, wideP, "W", 600, logistics::WeightType::Distance);
     check(ok.warning.empty(), "窗口充裕时不应有警告，实际: " + ok.warning);
     check(ok.plan.totalPenaltyMin == 0, "窗口充裕时 penalty 为 0");
@@ -512,6 +577,7 @@ int main() {
     testNeedsReplanOnlyForCongestedEdgesOnTheRoute();
     testCongestionTriggersReplanAndChangesTimes();
     testInsertUrgentOrderIsServedFirstAndServedNodesExcluded();
+    testInsertOrderNormalFlagUsesPairInsertion();
     testInsertUrgentOrderWarnsButStillPlansWhenWindowCannotBeMet();
     testTrafficInvariantsHoldAcrossSeeds();
     return testutil::summarize("traffic_tests");

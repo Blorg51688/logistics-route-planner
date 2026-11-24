@@ -83,7 +83,8 @@ void usage() {
         "  --export-log PATH          导出本次运行的日志（事件触发 + 到达配送点时的载重明细）\n"
         "  --dump-graph [list|matrix|both]  输出邻接表 / 邻接矩阵后退出（B3）\n"
         "  --ui-probe                 检查工具栏与侧栏是否完整构造后退出\n"
-        "  --self-check-actions       自动验证插单不丢单 / 新客户会被配送后退出\n"
+        "  --self-check-actions       自动验证插单不丢单 / 新客户会被配送 / 事件刷单规则 /\n"
+        "                             事件刻结算的等价性（A1–A7）后退出\n"
         "  --plan-summary distance|time|cost  打印该策略的规划汇总后退出（供命令行核对）\n"
         "  --width N --height N       窗口/图像尺寸\n");
 }
@@ -324,7 +325,7 @@ int main(int argc, char** argv) {
     // 结果正常启动时工具栏、四个侧栏、日志、Debug 开关全都不存在——
     // 而当时的验证只用 --render-window，恰好走的是正确的那条路径，
     // 因此完全没有发现。把它们合并到同一处，从结构上杜绝再次分叉。
-    MainWindow window(config);
+    MainWindow window(config, opt.configPath);
 
     if (opt.selfCheckActions) {
         return window.runActionSelfCheck() == 0 ? 0 : 1;

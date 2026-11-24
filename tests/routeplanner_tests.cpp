@@ -49,7 +49,7 @@ using logistics::nodeIndexAtTime;
 using logistics::planRoute;
 using logistics::replan;
 using logistics::replanIncremental;
-using logistics::insertUrgentOrder;
+using logistics::insertOrder;
 using logistics::InsertResult;
 using logistics::TrafficChange;
 using logistics::TrafficReport;
@@ -1111,7 +1111,7 @@ void testOffloadConservesAndReclaims() {
     urgent.windowEndMin = 1440;
     urgent.urgent = true;
 
-    const InsertResult res = insertUrgentOrder(g, v, pending, urgent, "W", 480,
+    const InsertResult res = insertOrder(g, v, pending, urgent, "W", 480,
                                                WeightType::Distance, onboard);
     const RoutePlan& p = res.plan;
 
@@ -1200,7 +1200,7 @@ void testUrgentFitsLeavesOffloadsEmpty() {
     urgent.windowEndMin = 1440;
     urgent.urgent = true;
 
-    const InsertResult res = insertUrgentOrder(g, v, pending, urgent, "W", 480,
+    const InsertResult res = insertOrder(g, v, pending, urgent, "W", 480,
                                                WeightType::Distance, onboard);
     const RoutePlan& p = res.plan;
 
@@ -1262,7 +1262,7 @@ void testIncidentalDeliveryMergesIntoUrgentStop() {
     urgent.windowEndMin = 1440;
     urgent.urgent = true;
 
-    const InsertResult res = insertUrgentOrder(g, v, pending, urgent, "W", 480,
+    const InsertResult res = insertOrder(g, v, pending, urgent, "W", 480,
                                                WeightType::Distance, onboard);
     const RoutePlan& p = res.plan;
 
@@ -1349,7 +1349,7 @@ void testIncidentalDeliverySkippedWhenItWouldDelay() {
     urgent.windowEndMin = 1440;
     urgent.urgent = true;
 
-    const InsertResult res = insertUrgentOrder(g, v, pending, urgent, "W", 480,
+    const InsertResult res = insertOrder(g, v, pending, urgent, "W", 480,
                                                WeightType::Distance, onboard);
     const RoutePlan& p = res.plan;
     check(p.status == PlanStatus::Ok, "场景规划可行: " + p.reason);

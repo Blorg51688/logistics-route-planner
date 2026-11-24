@@ -4,7 +4,7 @@ namespace logistics {
 
 SimEventKind pickEvent(const EventWeights& weights, Rng& rng) {
     const SimEventKind kinds[4] = {SimEventKind::Traffic, SimEventKind::UrgentOrder,
-                                   SimEventKind::NewCustomer, SimEventKind::RoadClosure};
+                                   SimEventKind::NormalOrder, SimEventKind::RoadClosure};
     const int kindWeights[4] = {weights.traffic, weights.urgent,
                                 weights.customer, weights.closure};
 
@@ -43,6 +43,21 @@ SimEventKind pickEvent(const EventWeights& weights, Rng& rng) {
     return SimEventKind::Traffic;
 }
 
+bool pickDistinctPair(int count, Rng& rng, int& a, int& b) {
+    if (count < 2) {
+        return false;   // 凑不出 A != B；不消耗随机数（见头文件：两条推进路径同时进入）
+    }
+    // 第 1 次：A 在 n 个里均匀。第 2 次：B 在 n-1 个"除 A 以外"的槽位里均匀，
+    // 再把 >= a 的槽位后移一位映射回真实下标 —— 每个 B != A 的概率都是 1/(n-1)，
+    // 且**不再有**旧实现 (ib==ia → (ib+1)%n) 那种"紧邻 A 的点概率翻倍"的偏差。
+    a = rng.nextInt(0, count - 1);
+    b = rng.nextInt(0, count - 2);
+    if (b >= a) {
+        ++b;
+    }
+    return true;
+}
+
 int nextEventTimeMin(int nowMin, int intervalMin) {
     if (intervalMin <= 0) {
         // 防御分支：间隔非法时至少保证"严格前进"，调用方不会卡在同一个时刻。
@@ -68,7 +83,7 @@ const char* simEventName(SimEventKind kind) {
     switch (kind) {
         case SimEventKind::Traffic:     return "路况变化";
         case SimEventKind::UrgentOrder: return "紧急订单";
-        case SimEventKind::NewCustomer: return "新客户";
+        case SimEventKind::NormalOrder: return "普通订单";
         case SimEventKind::RoadClosure: return "道路封闭";
     }
     return "未知事件";

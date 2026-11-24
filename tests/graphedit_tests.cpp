@@ -31,10 +31,13 @@ LogisticsGraph makeSmallNetwork() {
     LogisticsGraph g;
     Node w = makeNode("W", NodeType::Warehouse, "仓库");
     w.x = 0;    w.y = 0;
+    w.subNetworkId = 0;   // 仓库不属任何业务子网络（编号 0 = 无）
     Node d1 = makeNode("D1", NodeType::Delivery, "客户1");
     d1.x = 100; d1.y = 0;
+    d1.subNetworkId = 1;
     Node d2 = makeNode("D2", NodeType::Delivery, "客户2");
     d2.x = 300; d2.y = 200;
+    d2.subNetworkId = 2;
     g.addNode(w);
     g.addNode(d1);
     g.addNode(d2);
@@ -98,6 +101,9 @@ void testAddRandomCustomerProperties() {
     bool twoWayOk = true;
     bool weightOk = true;
     bool outEdgeOk = true;
+    bool subNetworkOk = true;
+    int  subNetworkInherited = 0;   // 最近邻本身非 0 -> 直接继承
+    int  subNetworkFallback = 0;    // 最近邻是仓库（0）-> 回落到最近的非 0 节点
 
     for (unsigned int seed = 1; seed <= kSeeds; ++seed) {
         LogisticsGraph g = makeSmallNetwork();
@@ -146,6 +152,35 @@ void testAddRandomCustomerProperties() {
         if (e == nullptr || e->distanceKm <= 0.0 || e->timeMin <= 0.0 || e->costYuan <= 0.0) {
             weightOk = false;
         }
+
+        // 子网络编号继承（#30 缺陷 / MC-C04）：新节点必须落进某个已有子网络。
+        // 规则（实现的注释里写死）：① 继承最近邻的编号；② 最近邻是仓库（0）时回落到
+        // 「最近的、编号非 0 的配送点/中转站」。期望值在这里**独立重算**，不看实现。
+        int expectedSub = nearest->subNetworkId;
+        if (expectedSub == 0) {
+            ++subNetworkFallback;
+            const Node* fallback = nullptr;
+            double fallbackDist = 0.0;
+            for (const std::string& id : beforeIds) {
+                const Node* n = g.findNode(id);
+                if (n == nullptr || n->subNetworkId == 0 || n->type == NodeType::Warehouse) {
+                    continue;
+                }
+                const double dd = distanceBetween(*created, *n);
+                if (fallback == nullptr || dd < fallbackDist) {
+                    fallback = n;
+                    fallbackDist = dd;
+                }
+            }
+            if (fallback != nullptr) {
+                expectedSub = fallback->subNetworkId;
+            }
+        } else {
+            ++subNetworkInherited;
+        }
+        if (created->subNetworkId != expectedSub || created->subNetworkId == 0) {
+            subNetworkOk = false;
+        }
     }
 
     check(countOk, "30 个种子下：节点数均 +1 且返回非空 ID");
@@ -154,6 +189,10 @@ void testAddRandomCustomerProperties() {
     check(nearOk, "30 个种子下：均能确定最近既有节点");
     check(twoWayOk, "30 个种子下：均与**最近**节点双向连通");
     check(weightOk, "30 个种子下：新边距离/耗时/成本均为正");
+    check(subNetworkOk, "30 个种子下：新节点 subNetworkId == 最近邻（仓库则回落到最近非 0 节点）且 != 0");
+    check(subNetworkInherited > 0 && subNetworkFallback > 0,
+          "30 个种子同时覆盖两条继承分支：直接继承 " + std::to_string(subNetworkInherited)
+              + " 次、仓库回落 " + std::to_string(subNetworkFallback) + " 次");
 
     // 确定性：同种子必得相同结果
     LogisticsGraph a = makeSmallNetwork();

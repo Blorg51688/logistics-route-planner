@@ -176,6 +176,34 @@ std::string addRandomCustomer(LogisticsGraph& graph, Rng& rng) {
     }
     const std::string neighborId = nearest->id;
 
+    // 子网络编号的继承（规格一 MC-C04 / #30 缺陷）：新节点**必须**落进某个已有子网络，
+    // 否则 sub_network_id 恒为 0 —— 这个字段在按子网络聚类的分配算法（ADR 0005）里
+    // 是簇键，0 是一个**不存在的子网络**，新客户单会无处归簇。
+    //
+    // 规则（必须确定，故并列按节点 ID 取小）：
+    //   ① 继承**最近既有节点**的编号（可能是中转站，也可能是配送点）；
+    //   ② 最近节点是仓库（编号 0）时，回落到「最近的、编号非 0 的配送点或中转站」；
+    //   ③ 整张图没有任何非 0 编号（如测试用小图）时保持 0 —— 无从继承，不臆造编号。
+    created.subNetworkId = nearest->subNetworkId;
+    if (created.subNetworkId == 0) {
+        const Node* fallback = nullptr;
+        double fallbackDist = 0.0;
+        for (const Node& node : graph.nodes()) {
+            if (node.type == NodeType::Warehouse || node.subNetworkId == 0) {
+                continue;
+            }
+            const double d = distanceBetween(created, node);
+            if (fallback == nullptr || d < fallbackDist - 1e-12
+                || (d <= fallbackDist + 1e-12 && node.id < fallback->id)) {
+                fallback = &node;
+                fallbackDist = d;
+            }
+        }
+        if (fallback != nullptr) {
+            created.subNetworkId = fallback->subNetworkId;
+        }
+    }
+
     if (!graph.addNode(created)) {
         return std::string();
     }
