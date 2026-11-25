@@ -136,8 +136,12 @@ if(Qt6_FOUND)
     endif()
     # L2 文本守卫（#43 / G20）：无头演示 --demo N --render-window --export-log 必须 exit 0，
     # 且导出日志含固定步骤横幅 [演示] k/N …（只钉横幅，不钉数字）。
+    # #47 扩到 M2：默认数据 + 跨簇单的三段接力断言需要读默认配置（拼临时 ini），
+    # 故补 DEFAULT_CONFIG_PATH（与其它测试目标同一口径）。
     add_executable(cli_demo_transfer tests/cli_demo_transfer.cpp)
     target_link_libraries(cli_demo_transfer PRIVATE io)
+    target_compile_definitions(cli_demo_transfer PRIVATE
+        DEFAULT_CONFIG_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/default.ini")
     add_test(NAME cli_demo_transfer
              COMMAND ${CMAKE_COMMAND} -E env QT_QPA_PLATFORM=offscreen
                      $<TARGET_FILE:cli_demo_transfer> $<TARGET_FILE:app>)

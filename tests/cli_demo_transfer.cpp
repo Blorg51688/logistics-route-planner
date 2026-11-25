@@ -1,5 +1,13 @@
 // L2 文本守卫（#43 / 规格二 §7.9 G20）：无头演示序列跑通 + 固定步骤横幅顺序正确。
 //
+// #47 扩到 **M2**（规格三 §7：跨车转运在默认数据上可演示）：
+//   「插入一张跨簇普通单 → 账本出现一笔三段接力」。
+//   用一份「默认配置 + O26（D08→D18 8kg）」的临时 ini 跑 --dump-plan，
+//   断言 TRANSIT 行出现且卸入车 ≠ 取走车、dwell ≤ 60、期末无在站。
+//   为什么不跑 GUI 演示路径：--demo 的插单动作是「插入紧急订单」（窗口 60min），
+//   它的跨簇单走快车直达特快通道、**不进接力**；而 M2 要演的是「普通单」的
+//   三段腿。两者是不同语义，拿快车直达当接力断言只会一直红。
+//
 // 用法（CMake 传参）：cli_demo_transfer <app 路径>
 //
 // 为什么必须带 --render-window：单独 --demo N 在无头环境下会进入交互事件循环并挂死
@@ -16,6 +24,10 @@
 #include <unistd.h>
 
 #include "test_util.h"
+
+#ifndef DEFAULT_CONFIG_PATH
+#error "缺少 DEFAULT_CONFIG_PATH 编译定义"
+#endif
 
 using testutil::check;
 
@@ -50,6 +62,98 @@ std::string readFile(const std::string& path) {
     std::string out((std::istreambuf_iterator<char>(f)),
                     std::istreambuf_iterator<char>());
     return out;
+}
+
+// M2 演示的可执行形式：默认配置 + 一张跨簇普通单（O26：D08→D18 8kg）。
+//
+// 为什么用 --dump-plan 而不是读 GUI 账本面板：--dump-plan 的 TRANSIT 行与 GUI 账本
+// 同源（buildTransitLedger 是唯一实现），且无需图形环境。守卫读的仍然是
+// 「用户能看到的输出」，不是内部函数。
+void checkM2RelayOnDefaultData(const std::string& appPath) {
+    char tmpPath[256];
+    std::snprintf(tmpPath, sizeof(tmpPath), "/tmp/cli_demo_m2_%d.ini",
+                  static_cast<int>(getpid()));
+    {
+        std::ifstream in(DEFAULT_CONFIG_PATH);
+        check(in.good(), "M2：能读到默认配置（" DEFAULT_CONFIG_PATH "）");
+        std::ofstream outFile(tmpPath);
+        std::string line;
+        while (std::getline(in, line)) {
+            outFile << line << "\n";
+        }
+        // 跨簇普通单：D08（子网 1）→ D18（子网 3）。
+        outFile << "O26, D08, D18, 8, 08:00, 13:00, 0\n";
+    }
+
+    const char* strategies[3] = {"distance", "cost", "time"};
+    for (int si = 0; si < 3; ++si) {
+        const std::string tag = std::string("M2·") + strategies[si];
+        const std::string cmd = "'" + appPath + "' --config '" + tmpPath + "' --dump-plan "
+                                + strategies[si] + " 2>/dev/null";
+        FILE* pipe = popen(cmd.c_str(), "r");
+        std::string out;
+        if (pipe != nullptr) {
+            char buf[4096];
+            while (std::fgets(buf, sizeof(buf), pipe) != nullptr) {
+                out += buf;
+            }
+            pclose(pipe);
+        }
+        const std::vector<std::string> lines = splitLines(out);
+
+        // ① 账本恰 1 笔 TRANSIT（跨簇普通单只能走三段腿，没有“直达”退路）。
+        std::string transit;
+        int transitCount = 0;
+        for (const std::string& line : lines) {
+            if (line.rfind("TRANSIT O26 ", 0) == 0) {
+                ++transitCount;
+                transit = line;
+            }
+        }
+        check(transitCount == 1,
+              tag + "：默认数据 + 跨簇单后账本恰 1 笔 TRANSIT（实际 "
+                  + std::to_string(transitCount) + "）");
+
+        // ② 形状：TRANSIT <订单> <站> <kg> <卸入车> <HH:MM> <取走车> <HH:MM> <dwell> <状态>
+        //    卸入车 ≠ 取走车（真转运，不是同车降载）、dwell ∈ [0,60]、状态「已送达」（期末无在站）。
+        if (transitCount == 1) {
+            std::vector<std::string> f;
+            std::size_t pos = 0;
+            while (pos <= transit.size()) {
+                const std::size_t sp = transit.find(' ', pos);
+                f.push_back(transit.substr(pos, sp == std::string::npos ? std::string::npos
+                                                                        : sp - pos));
+                if (sp == std::string::npos) {
+                    break;
+                }
+                pos = sp + 1;
+            }
+            const bool shapeOk = f.size() >= 10 && f[0] == "TRANSIT" && f[1] == "O26"
+                                 && !f[2].empty() && f[4] != "-" && f[6] != "-" && f[4] != f[6];
+            check(shapeOk, tag + "：TRANSIT 两端齐全且 inVehicle ≠ outVehicle（"
+                               + transit + "）");
+            if (f.size() >= 10) {
+                const int dwell = std::atoi(f[8].c_str());
+                check(dwell >= 0 && dwell <= 60,
+                      tag + "：dwell " + f[8] + "min ∈ [0, 60]（货物停留上限）");
+                check(f[9] == "已送达",
+                      tag + "：状态「已送达」（期末无在站，实际 " + f[9] + "）");
+            }
+            std::printf("      %s TRANSIT：%s\n", tag.c_str(), transit.c_str());
+        }
+
+        // ③ 三段腿都在：O26 恰 3 条 LEG（L1 本簇慢车 / L2 快车 / L3 对簇慢车）。
+        int legCount = 0;
+        for (const std::string& line : lines) {
+            if (line.rfind("LEG ", 0) == 0 && line.find(" O26 ") != std::string::npos) {
+                ++legCount;
+                std::printf("      %s LEG：%s\n", tag.c_str(), line.c_str());
+            }
+        }
+        check(legCount == 3,
+              tag + "：O26 恰 3 条 LEG 腿（实际 " + std::to_string(legCount) + "）");
+    }
+    std::remove(tmpPath);
 }
 
 } // namespace
@@ -139,5 +243,9 @@ int main(int argc, char** argv) {
 
     std::remove(png.c_str());
     std::remove(log.c_str());
+
+    // ---- M2：默认数据上「插一张跨簇普通单 → 账本一笔三段接力」----
+    checkM2RelayOnDefaultData(appPath);
+
     return testutil::summarize("cli_demo_transfer");
 }
