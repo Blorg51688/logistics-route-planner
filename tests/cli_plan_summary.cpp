@@ -581,14 +581,200 @@ void checkDumpPlanLegLines(const std::string& appPath) {
 } // namespace
 
 
-// --dump-plan 的 TRANSIT 行（规格二 §5.3 / #41）：**只加行、不改既有行**。
-// 用一个小夹具配置跑真二进制：时间策略接受（V02 在 T01 卸、V01 取走），
-// 距离/成本策略不启用 ⇒ 没有 TRANSIT 行。断言读的是 stdout 文本。
+// --dump-plan 的 TRANSIT 行 + 三段接力 + 有界前瞻（规格三 §3 / #48）：
+// **只加行、不改既有行**；守卫读的全部是 stdout。
+//
+// 夹具（W01 仓库 / T01 簇1 站 / T03 簇3 站 / D01,D08 簇1 客户 / D18,D20 簇3 客户；
+// V01 快车 400kg·1.00·1.50 / V02·V03 慢车 160kg·1.25·0.80，8:00 发车）：
+//   O1: D01->D08 10kg  簇1 本地单（把本簇慢车顺路带到 D08 ⇒ L1 几乎零绕行）
+//   O2: D20->D18 10kg  簇3 本地单（V03 的 T03->D20->D18 本来就要走 ⇒ L3 零绕行）
+//   M1: D08->D18  8kg  跨簇普通单（簇1 -> 簇3）
+//
+// 夹具 A = M1 窗口 0:00 起（货 08:13 就绪，快车 08:04 到站 ⇒ 前瞻 8min 后取走）；
+// 夹具 B = M1 窗口 10:00 起（货 10:01 才就绪，就绪差 ~117min > W=60 ⇒ **不得**纳入）。
+std::vector<std::string> splitCommaList(const std::string& s) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : s) {
+        if (c == ',') {
+            if (!cur.empty()) {
+                out.push_back(cur);
+                cur.clear();
+            }
+        } else {
+            cur.push_back(c);
+        }
+    }
+    if (!cur.empty()) {
+        out.push_back(cur);
+    }
+    return out;
+}
+
+// ---- 三段接力 / 有界前瞻的 --dump-plan 解析 ----
+// 只读用户可见 stdout：PLAN 分车、STOP 停靠、LEG 腿与就绪、TRANSIT 账本、METRICS 逐车指标。
+struct DumpTransit {
+    std::string orderId, station, inVehicle, outVehicle, status;
+    int inMin = 0, outMin = 0, dwell = 0;
+};
+struct DumpLeg {
+    int seq = 0;
+    std::string from, to, orderId, kind, vehicle;
+    int ready = 0;
+};
+struct DumpStop {
+    std::string vehicle, node, phase;
+    int idx = 0, raw = 0, wait = 0, arr = 0;
+    std::vector<std::string> pickups, deliveries;
+};
+struct DumpMetricRow {
+    double distance = 0.0, time = 0.0, cost = 0.0;
+    int penalty = 0, stopCount = 0, actionCount = 0;
+};
+struct DumpRelay {
+    bool ok = false;
+    std::vector<DumpTransit> transits;
+    std::vector<DumpLeg> legs;
+    std::vector<DumpStop> stops;
+    std::map<std::string, DumpMetricRow> metrics;
+};
+
+// HH:MM -> 分钟；形状不对返回 -1。
+int clockMinFromText(const std::string& s) {
+    if (s.size() != 5 || s[2] != ':') {
+        return -1;
+    }
+    return std::atoi(s.substr(0, 2).c_str()) * 60 + std::atoi(s.substr(3, 2).c_str());
+}
+
+DumpRelay parseRelayDump(const std::string& text) {
+    DumpRelay d;
+    std::string curVehicle;
+    for (const std::string& line : splitLines(text)) {
+        const std::vector<std::string> tok = splitSpaces(line);
+        if (tok.empty()) {
+            continue;
+        }
+        if (tok[0] == "PLAN" && tok.size() >= 5) {
+            curVehicle = tok[1];
+        } else if (tok[0] == "STOP" && tok.size() == 10 && !curVehicle.empty()) {
+            DumpStop s;
+            s.vehicle = curVehicle;
+            s.idx = std::atoi(tok[1].c_str());
+            s.node = tok[2];
+            s.phase = tok[3];
+            s.raw = std::atoi(tok[4].c_str());
+            s.wait = std::atoi(tok[5].c_str());
+            s.arr = std::atoi(tok[6].c_str());
+            if (tok[7] != "-") {
+                s.pickups = splitCommaList(tok[7]);
+            }
+            if (tok[8] != "-") {
+                for (const std::string& item : splitCommaList(tok[8])) {
+                    const std::size_t colon = item.find(':');
+                    s.deliveries.push_back(colon == std::string::npos ? item
+                                                                     : item.substr(0, colon));
+                }
+            }
+            d.stops.push_back(s);
+        } else if (tok[0] == "LEG" && tok.size() == 8) {
+            DumpLeg l;
+            l.seq = std::atoi(tok[1].c_str());
+            l.from = tok[2];
+            l.to = tok[3];
+            l.orderId = tok[4];
+            l.kind = tok[5];
+            l.ready = clockMinFromText(tok[6]);
+            l.vehicle = tok[7];
+            d.legs.push_back(l);
+        } else if (tok[0] == "TRANSIT" && tok.size() == 10) {
+            DumpTransit t;
+            t.orderId = tok[1];
+            t.station = tok[2];
+            t.inVehicle = tok[4];
+            t.inMin = clockMinFromText(tok[5]);
+            t.outVehicle = tok[6];
+            t.outMin = clockMinFromText(tok[7]);
+            t.dwell = std::atoi(tok[8].c_str());
+            t.status = tok[9];
+            d.transits.push_back(t);
+        } else if (tok[0] == "METRICS" && tok.size() >= 19) {
+            DumpMetricRow m;
+            m.distance = std::strtod(tok[2].c_str(), nullptr);
+            m.time = std::strtod(tok[3].c_str(), nullptr);
+            m.cost = std::strtod(tok[4].c_str(), nullptr);
+            m.penalty = std::atoi(tok[5].c_str());
+            m.stopCount = std::atoi(tok[6].c_str());
+            m.actionCount = std::atoi(tok[7].c_str());
+            d.metrics[tok[1]] = m;
+        }
+    }
+    for (const DumpStop& s : d.stops) {
+        d.ok = true;
+    }
+    return d;
+}
+
+std::vector<DumpLeg> legsOfOrder(const std::vector<DumpLeg>& legs, const std::string& orderId) {
+    std::vector<DumpLeg> out;
+    for (const DumpLeg& l : legs) {
+        if (l.orderId == orderId) {
+            out.push_back(l);
+        }
+    }
+    return out;
+}
+
+// 某车在某节点上的**第一个**停靠（夹具里每车每站只停一次）。
+const DumpStop* findStop(const std::vector<DumpStop>& stops, const std::string& vehicle,
+                         const std::string& node) {
+    for (const DumpStop& s : stops) {
+        if (s.vehicle == vehicle && s.node == node) {
+            return &s;
+        }
+    }
+    return nullptr;
+}
+
+bool hasDelivery(const std::vector<DumpStop>& stops, const std::string& vehicle,
+                 const std::string& node, const std::string& orderId) {
+    for (const DumpStop& s : stops) {
+        if (s.vehicle != vehicle || s.node != node) {
+            continue;
+        }
+        for (const std::string& id : s.deliveries) {
+            if (id == orderId) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// --dump-plan 的 TRANSIT 行 + 三段接力 + 有界前瞻（规格三 §3 / #48）：
+// **只加行、不改既有行**；守卫读的全部是 stdout。
+//
+// 三个夹具共用同一套图（走廊拓扑 W01 --4-- T01 --40-- T03，两簇各一个客户区）：
+//   O1: D08->D01 10kg  簇1 本地（把本簇慢车顺路带到 D08，L1 的取货点）
+//   O2: D20->D18 10kg  簇3 本地（D20 正好在 T03->D18 的路上，L3 零绕行）
+//   M1: D08->D18  8kg  跨簇普通单（簇1 -> 簇3）
+// 车队：V01/V02/V03 同容量 160kg、同时因子 1.00，V01 成本因子 1.50（接力车 = 容量最大、
+// 并列取成本因子高 ⇒ V01）。为什么夹具要让三车同容量同时因子：本票尚未做职责封闭
+// （#46），若快车又大又快，分配器会把远簇整簇塞给它，接力就必然被「不更差」兜底退回——
+// 那是 #46 的分配问题，不是本票的等待/前瞻语义。同容量同时因子下「簇 -> 车」由
+// 既有 tieKey 稳定落在「每簇一台慢车」，正是职责封闭要立的目标形态。
+//
+// 夹具 A（D08 距 T01 20min ⇒ L1 慢 26min）：等待可被读数看见（V01/V02 各等 28min）。
+// 夹具 T（D08 在 W01->T01 途中，3+1min）：链条紧，三策略（含**时间策略**）都走接力。
+// 夹具 B（同 A 的图 + M1 窗口 10:00 起）：就绪差 ~136min > W=60 ⇒ **不得**纳入。
 void checkDumpPlanTransitLines(const std::string& appPath) {
-    const std::string tmp = "/tmp/cli_plan_summary_transit_"
-                            + std::to_string(static_cast<long long>(getpid())) + ".ini";
-    {
-        std::ofstream f(tmp.c_str());
+    const std::string tmpA = "/tmp/cli_plan_summary_relayA_"
+                             + std::to_string(static_cast<long long>(getpid())) + ".ini";
+    const std::string tmpT = "/tmp/cli_plan_summary_relayT_"
+                             + std::to_string(static_cast<long long>(getpid())) + ".ini";
+    const std::string tmpB = "/tmp/cli_plan_summary_relayB_"
+                             + std::to_string(static_cast<long long>(getpid())) + ".ini";
+    auto header = [](std::ofstream& f) {
         f << "[general]\n"
              "event_interval_min = 1440\n"
              "event_level_traffic = high\n"
@@ -598,68 +784,202 @@ void checkDumpPlanTransitLines(const std::string& appPath) {
              "\n[nodes]\n"
              "W01, warehouse, 80, 160, 中央仓库, 0\n"
              "T01, transit, 380, 200, 中转站甲, 1\n"
-             "D01, delivery, 180, 90, 客户01, 1\n"
-             "D02, delivery, 200, 180, 客户02, 1\n"
-             "D03, delivery, 250, 280, 客户03, 1\n"
-             "D18, delivery, 620, 120, 客户18, 2\n"
-             "\n[edges]\n"
-             "W01, T01, 1.0, 1.0, 1.0\n"
-             "T01, W01, 1.0, 1.0, 1.0\n"
-             "W01, D01, 1.0, 1.0, 1.0\n"
-             "D01, W01, 1.0, 1.0, 1.0\n"
-             "D01, T01, 1.0, 1.0, 1.0\n"
-             "T01, D01, 1.0, 1.0, 1.0\n"
-             "W01, D02, 1.0, 1.0, 1.0\n"
-             "D02, W01, 1.0, 1.0, 1.0\n"
-             "D02, T01, 2.0, 2.0, 2.0\n"
-             "T01, D02, 2.0, 2.0, 2.0\n"
-             "T01, D18, 1.0, 1.0, 1.0\n"
-             "D18, T01, 1.0, 1.0, 1.0\n"
-             "D18, D03, 1.0, 1.0, 1.0\n"
-             "D03, D18, 1.0, 1.0, 1.0\n"
+             "T03, transit, 700, 330, 中转站丙, 3\n"
+             "D01, delivery, 120, 90, 客户01, 1\n"
+             "D08, delivery, 300, 220, 客户08, 1\n"
+             "D18, delivery, 620, 120, 客户18, 3\n"
+             "D20, delivery, 600, 300, 客户20, 3\n";
+    };
+    // w01ToD08 / t01ToD08：D08 与仓库/中转站的耗时（决定 L1 慢车有多晚到 T01）。
+    //   · 夹具 A：10 / 20 ⇒ L1 慢 26min，等待可见但仍在 W 内；
+    //   · 夹具 T：3 / 1  ⇒ L1 与快车几乎同时到 T01，链条紧（时间策略才容得下接力）；
+    //   · 夹具 B：100 / 100 ⇒ D08 在簇1 远端，L1 慢车最早也要 200min 才回到 T01
+    //     （就绪差 ~196min > W=60）⇒ 必须不纳入——无论哪台车当 L1 车都超过窗口。
+    auto writeFixture = [&header](const std::string& path, double w01ToD08, double t01ToD08,
+                                  int m1WindowStart) {
+        char m1[256];
+        std::snprintf(m1, sizeof(m1), "M1, D08, D18, 8, %02d:%02d, 23:59, 0\n",
+                      m1WindowStart / 60, m1WindowStart % 60);
+        std::ofstream f(path.c_str());
+        header(f);
+        char d08[4][96];
+        std::snprintf(d08[0], sizeof(d08[0]), "W01, D08, %.1f, %.1f, %.1f\n", w01ToD08,
+                      w01ToD08, w01ToD08 * 1.2);
+        std::snprintf(d08[1], sizeof(d08[1]), "D08, W01, %.1f, %.1f, %.1f\n", w01ToD08,
+                      w01ToD08, w01ToD08 * 1.2);
+        std::snprintf(d08[2], sizeof(d08[2]), "T01, D08, %.1f, %.1f, %.1f\n", t01ToD08,
+                      t01ToD08, t01ToD08 * 1.2);
+        std::snprintf(d08[3], sizeof(d08[3]), "D08, T01, %.1f, %.1f, %.1f\n", t01ToD08,
+                      t01ToD08, t01ToD08 * 1.2);
+        f << "\n[edges]\n"
+             "W01, T01, 4.0, 4.0, 6.0\n"
+             "T01, W01, 4.0, 4.0, 6.0\n"
+          << d08[0] << d08[1] << d08[2] << d08[3] << "W01, D01, 6.0, 6.0, 7.0\n"
+             "D01, W01, 6.0, 6.0, 7.0\n"
+             "T01, D01, 6.0, 6.0, 7.0\n"
+             "D01, T01, 6.0, 6.0, 7.0\n"
+             "T01, T03, 40.0, 40.0, 50.0\n"
+             "T03, T01, 40.0, 40.0, 50.0\n"
+             "T03, D20, 2.0, 2.0, 2.4\n"
+             "D20, T03, 2.0, 2.0, 2.4\n"
+             "D20, D18, 4.0, 4.0, 5.0\n"
+             "D18, D20, 4.0, 4.0, 5.0\n"
+             "T03, D18, 6.0, 6.0, 7.0\n"
+             "D18, T03, 6.0, 6.0, 7.0\n"
              "\n[vehicles]\n"
-             "V01, W01, 400, 08:00, 1.00, 1.50\n"
-             "V02, W01, 160, 08:00, 1.25, 0.80\n"
+             "V01, W01, 160, 08:00, 1.00, 1.50\n"
+             "V02, W01, 160, 08:00, 1.00, 0.80\n"
+             "V03, W01, 160, 08:00, 1.00, 0.80\n"
              "\n[orders]\n"
-             "O2, D02, D03, 10, 00:00, 23:59, 0\n"
-             "O1, D01, D18, 10, 00:00, 23:59, 0\n";
+             "O1, D08, D01, 10, 00:00, 23:59, 0\n"
+             "O2, D20, D18, 10, 00:00, 23:59, 0\n"
+          << m1;
+    };
+    writeFixture(tmpA, 10.0, 20.0, 0);
+    writeFixture(tmpT, 3.0, 1.0, 0);
+    writeFixture(tmpB, 100.0, 100.0, 0);
+
+    // ---- 夹具 T：**三策略**（含时间策略）都必须走完三段接力 ----
+    for (const char* strategy : {"distance", "cost", "time"}) {
+        const std::string tag = std::string("三段接力·") + strategy;
+        const DumpRelay d = parseRelayDump(
+            runCapture("'" + appPath + "' --config '" + tmpT + "' --dump-plan " + strategy
+                       + " 2>/dev/null"));
+        check(d.ok, tag + "：--dump-plan 可解析（PLAN/STOP/LEG/TRANSIT 行）");
+        // 账本恰 1 笔：跨簇普通单 M1 只能走三段腿。
+        check(d.transits.size() == 1,
+              tag + "：跨簇单 M1 恰有 1 笔 TRANSIT（实际 " + std::to_string(d.transits.size())
+                  + "）");
+        bool shapeOk = d.transits.size() == 1;
+        for (const DumpTransit& t : d.transits) {
+            shapeOk = shapeOk && t.orderId == "M1" && !t.station.empty()
+                      && t.inVehicle != "-" && t.outVehicle != "-"
+                      && t.inVehicle != t.outVehicle && t.dwell >= 0 && t.dwell <= 60
+                      && t.status == "已送达";
+        }
+        check(shapeOk,
+              tag + "：TRANSIT 形状（M1 / 站 / 卸入车 ≠ 取走车 / dwell ∈ [0,60] / 已送达）");
+
+        const std::vector<DumpLeg> m1 = legsOfOrder(d.legs, "M1");
+        check(m1.size() == 3,
+              tag + "：M1 恰有 3 条 LEG 腿（实际 " + std::to_string(m1.size()) + "）");
+        if (m1.size() == 3) {
+            check(m1[0].seq == 1 && m1[0].from == "D08" && m1[0].to == "T01"
+                      && m1[0].kind == "customer->station",
+                  tag + "：L1 = 本簇慢车 取 D08 -> 卸 T01（customer->station）");
+            check(m1[1].seq == 2 && m1[1].from == "T01" && m1[1].to == "T03"
+                      && m1[1].kind == "station->station",
+                  tag + "：L2 = 站间腿 T01 -> T03（station->station）");
+            check(m1[2].seq == 3 && m1[2].from == "T03" && m1[2].to == "D18"
+                      && m1[2].kind == "station->customer",
+                  tag + "：L3 = 对簇慢车 T03 -> 送 D18（station->customer）");
+            // 三段接力真的分给三台车：相邻两段的执行车不同（inVehicle ≠ outVehicle 的根）。
+            check(m1[0].vehicle != "-" && m1[1].vehicle != "-" && m1[2].vehicle != "-"
+                      && m1[0].vehicle != m1[1].vehicle && m1[1].vehicle != m1[2].vehicle,
+                  tag + "：三段腿的执行车可辨且相邻两段不同（" + m1[0].vehicle + " -> "
+                      + m1[1].vehicle + " -> " + m1[2].vehicle + "）");
+            // 站间腿归接力车（容量最大/成本因子最高 ⇒ V01），与 chooseLegVehicle 同判据。
+            check(m1[1].vehicle == "V01",
+                  tag + "：L2 由接力车 V01 执行（实际 " + m1[1].vehicle + "）");
+            // readyTime 就是接力链：L2.ready = L1 到 T01，L3.ready = L2 到 T03。
+            check(m1[0].ready < m1[1].ready && m1[1].ready < m1[2].ready,
+                  tag + "：readyTime 沿接力链严格递增（" + std::to_string(m1[0].ready) + " / "
+                      + std::to_string(m1[1].ready) + " / " + std::to_string(m1[2].ready)
+                      + " min）");
+            if (d.transits.size() == 1) {
+                const DumpTransit& t = d.transits[0];
+                check(t.station == m1[2].from && t.outVehicle == m1[2].vehicle,
+                      tag + "：TRANSIT 的站与取走车 == L3 的 from/执行车（站 " + t.station
+                          + " / " + t.outVehicle + "）");
+                check(t.inVehicle == m1[1].vehicle,
+                      tag + "：TRANSIT 的卸入车 == L2 的执行车（" + t.inVehicle + "）");
+                check(t.outMin == m1[2].ready,
+                      tag + "：账本取走时刻 == L3 的 readyTime（" + std::to_string(t.outMin)
+                          + "）");
+                check(m1[2].ready == m1[1].ready + 40,
+                      tag + "：L3.ready = L2.ready + 站间耗时 40min（就绪链真在往前走）");
+            }
+            // 期末无「在站」：M1 被 L3 车在 D18 送达。
+            check(hasDelivery(d.stops, m1[2].vehicle, "D18", "M1"),
+                  tag + "：M1 由 L3 车在 D18 送达（期末无在站货物）");
+        }
     }
-    const std::string timeOut =
-        runCapture("'" + appPath + "' --config '" + tmp + "' --dump-plan time 2>/dev/null");
-    const std::vector<std::string> timeLines = splitLines(timeOut);
-    int transitLines = 0;
-    bool shapeOk = true;
-    for (const std::string& line : timeLines) {
-        if (line.rfind("TRANSIT ", 0) != 0) {
-            continue;
+
+    // ---- 夹具 A：等待可被读数看见（且计入耗时、不计 penalty）----
+    for (const char* strategy : {"distance", "cost"}) {
+        const std::string tag = std::string("等待可见·") + strategy;
+        const DumpRelay d = parseRelayDump(
+            runCapture("'" + appPath + "' --config '" + tmpA + "' --dump-plan " + strategy
+                       + " 2>/dev/null"));
+        check(d.transits.size() == 1,
+              tag + "：跨簇单 M1 走完三段接力（TRANSIT 1 笔，实际 "
+                  + std::to_string(d.transits.size()) + "）");
+        const std::vector<DumpLeg> m1 = legsOfOrder(d.legs, "M1");
+        if (m1.size() == 3) {
+            // 快车在 T01 原地等货：raw < arrival，wait > 0。
+            const DumpStop* waitStop = findStop(d.stops, m1[1].vehicle, "T01");
+            check(waitStop != nullptr && waitStop->wait > 0 && waitStop->raw < waitStop->arr,
+                  tag + "：站间车在 T01 原地等货（STOP 行 raw < arrival，wait="
+                      + std::to_string(waitStop == nullptr ? -1 : waitStop->wait) + "min）");
+            if (waitStop != nullptr) {
+                check(waitStop->wait <= 60,
+                      tag + "：等待受前瞻窗口约束（" + std::to_string(waitStop->wait)
+                          + "min <= W=60）");
+            }
+            // 等待计入该车耗时：接力车只跑 W01->T01->T03->W01 = 88min（夹具常量），
+            // 多出来的就是等待。
+            const std::map<std::string, DumpMetricRow>::const_iterator mv =
+                d.metrics.find(m1[1].vehicle);
+            if (waitStop != nullptr && mv != d.metrics.end()) {
+                check(mv->second.time >= 88.0 + static_cast<double>(waitStop->wait) - 1.0,
+                      tag + "：等待计入该车耗时（" + m1[1].vehicle + " 耗时 "
+                          + std::to_string(mv->second.time) + "min >= 行驶 88 + 等待 "
+                          + std::to_string(waitStop->wait) + "）");
+                check(mv->second.penalty == 0,
+                      tag + "：等待不计 penalty（该车 penalty 0，等待不是迟到）");
+            }
+            // L3 车也在 T03 等货（货还没到站），同样 raw < arrival。
+            const DumpStop* wait3 = findStop(d.stops, m1[2].vehicle, "T03");
+            check(wait3 != nullptr && wait3->wait > 0,
+                  tag + "：L3 慢车在 T03 等货（wait="
+                      + std::to_string(wait3 == nullptr ? -1 : wait3->wait) + "min）");
+            check(hasDelivery(d.stops, m1[2].vehicle, "D18", "M1"),
+                  tag + "：M1 由 L3 车在 D18 送达");
         }
-        ++transitLines;
-        // TRANSIT <订单> <站> <kg> <卸入车> <HH:MM> <取走车> <HH:MM> <dwell> <状态>
-        const std::vector<std::string> tokens = splitSpaces(line);
-        if (tokens.size() != 10 || tokens[0] != "TRANSIT" || tokens[1] != "O1"
-            || tokens[2] != "T01" || tokens[4] == tokens[6] || tokens[9] != "已送达") {
-            shapeOk = false;
-        }
-        const int dwell = std::atoi(tokens[8].c_str());
-        if (dwell < 0 || dwell > 60) {
-            shapeOk = false;
+        if (d.transits.size() == 1) {
+            check(d.transits[0].dwell <= 60, tag + "：账本 dwell <= 60");
         }
     }
-    check(transitLines == 1,
-          "TRANSIT：时间策略下 --dump-plan 恰有一行 TRANSIT（实际 "
-              + std::to_string(transitLines) + "）");
-    check(shapeOk, "TRANSIT：字段与账本同序（订单/站/kg/卸入/取走/等待/状态），in≠out、dwell≤60");
-    const std::string distanceOut =
-        runCapture("'" + appPath + "' --config '" + tmp + "' --dump-plan distance 2>/dev/null");
-    bool noTransit = true;
-    for (const std::string& line : splitLines(distanceOut)) {
-        if (line.rfind("TRANSIT ", 0) == 0) {
-            noTransit = false;
+
+    // ---- 夹具 B：就绪时刻在 W 之外的腿**不得**纳入当前路线 ----
+    for (const char* strategy : {"distance", "cost", "time"}) {
+        const std::string tag = std::string("有界前瞻·") + strategy;
+        const DumpRelay d = parseRelayDump(
+            runCapture("'" + appPath + "' --config '" + tmpB + "' --dump-plan " + strategy
+                       + " 2>/dev/null"));
+        check(d.transits.empty(),
+              tag + "：M1 就绪差 > W=60 ⇒ 不纳入当前路线（无 TRANSIT 行，实际 "
+                  + std::to_string(d.transits.size()) + "）");
+        check(hasDelivery(d.stops, "V01", "D18", "M1"),
+              tag + "：M1 退回「直接给快车」的对照方案（V01 在 D18 送达）");
+        // 任何接力取货停靠的等待都必须在窗口内（W 改无界时这条与本组首条一起变红）。
+        bool bounded = true;
+        for (const DumpLeg& leg : d.legs) {
+            if (leg.kind == "customer->customer") {
+                continue;
+            }
+            const DumpStop* st = findStop(d.stops, leg.vehicle, leg.from);
+            if (st != nullptr && st->wait > 60) {
+                bounded = false;
+            }
         }
+        check(bounded, tag + "：所有接力取货停靠的等待都 <= W=60");
     }
-    check(noTransit, "TRANSIT：距离策略两版并列 ⇒ 保留禁转运版（无 TRANSIT 行）");
-    std::remove(tmp.c_str());
+    std::remove(tmpA.c_str());
+    std::remove(tmpT.c_str());
+    std::remove(tmpB.c_str());
 }
+
 
 int main(int argc, char** argv) {
     if (argc < 2) {
