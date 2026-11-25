@@ -1,0 +1,44 @@
+%%{init: {'theme':'base', 'flowchart': {'curve':'basis'}}}%%
+%% F8 三段接力与车等货（applyRelayLayer → L1 慢车 → t1 → L2 快车(W=60) → t2 → L3 对簇慢车
+%%    → replay 的「车等货」等待 → 账本/腿结构）
+%% 依据 src/core/RoutePlanner.cpp applyRelayLayer（接力层入口；RelayOutcome）
+%%      src/core/RoutePlanner.cpp buildRelayChain（RelayBuild：srcIdx / destIdx / t1 / t2）
+%%      src/core/RoutePlanner.cpp buildRelayOnwardSpecs（在既有路线上枚举「取/卸」落点）
+%%      src/core/RoutePlanner.cpp replay（wait = max(窗口等待, ready − raw)；超窗即不可行）
+%%      src/core/RoutePlanner.h   kLookaheadWindowMin = 60（车等货上限）
+%%      src/core/RoutePlanner.h   kTransferMaxDwellMin（货等车上限，同一处判定）
+%%      src/core/RoutePlanner.cpp relayChainConsistent（6 个 custody 锚点 + 相邻不同车 + 等待 ≤ W）
+%%      src/core/RoutePlanner.cpp buildTransitLedger（账本从最终计划反查，两端齐全）
+%%      src/core/RoutePlanner.cpp transitStopArrival / finishSpecs / evalKey / compareRoutes
+%%      src/core/RoutePlanner.cpp relayIdx = betterForStationLeg 选出的快车；slowVehiclesSortedById（匿名命名空间）
+%%      src/core/RoutePlanner.cpp legVehicleEligible（直达对照是否合法）
+%%      设计.md §5.8（腿模型与三段接力）/ §5.9 / §3（两常数各管一个方向）
+%% 落点只写符号名不写行号：行号会漂，符号名不会。
+flowchart TD
+    A(["applyRelayLayer(graph, vehicles, orders, weight, vehicleOrders,<br/>basePlans, relayOrders, out, starts)"]) --> B["relayIdx = 站间腿最合适的车（betterForStationLeg：容量最大 → 成本因子高 → ID 小）<br/>slow = 其余车按车辆 ID 升序；relayOrders 按订单 ID 升序（手写插入排序）"]
+    B --> C{"vehicles < 2 / relayOrders 为空？"}
+    C -->|是| Z(["整层不动：out.plans = basePlans"])
+    C -->|否| D["每车一份 Ctx：仓库 + 发车时刻（starts 非空则用已执行前缀）<br/>appendFleetOrders：车队全部订单入表（看得到别人的 kg/窗口）"]
+    D --> E["对每张跨簇单 o：摘单——从各车路线整段拿走（removeOrderFromRoute）<br/>finishSpecs 不可行 ⇒ skippedCount++，保持原分配"]
+    E --> F["① L1：本簇慢车 A → S_A<br/>buildRelayOnwardSpecs(取货, 卸站, preferEarliestAtTo=true)<br/>取优：penalty → S_A 卸入时刻 → 路线键"]
+    F --> G{"L1 接得下？"}
+    G -->|否| Y["三段腿未成立（reason）"]
+    G -->|是| H["t1 = transitStopArrival(L1 计划, S_A, unload=true)<br/>ctxs[快车].readyAt[o][S_A] = t1"]
+    H --> I["② L2：快车 S_A → S_B（取走 S_A + 卸入 S_B）<br/>每个候选位置都在 replay 里判「要等多久」"]
+    I --> J{"replay：need = ready − raw<br/>need &gt; kLookaheadWindowMin(60) 或 −need &gt; kTransferMaxDwellMin？"}
+    J -->|超窗| X2["该候选不可行<br/>L2 无候选 ⇒ reason「就绪差超出前瞻窗口 60min」"]
+    J -->|在窗内| K["wait = max(窗口等待, need)；arrival = raw + wait；elapsed = arrival<br/>等待只进 elapsed / Time 键，不进 penalty（penalty 只由送达窗口决定）"]
+    K --> L["t2 = transitStopArrival(L2 计划, S_B, unload=true)<br/>ctxs[对簇慢车].readyAt[o][S_B] = t2"]
+    L --> M["③ L3：对簇慢车 S_B → B（取走 S_B + 送达）<br/>候选车排除 L1 车（L1/L3 必须不同车）· 取优只比路线键"]
+    M --> N{"L3 接得下？"}
+    N -->|否| Y
+    N -->|是| O["对照方案：该单直接给快车（控制组）<br/>directLegal = legVehicleEligible(快车, 直达腿)"]
+    O --> P{"relay 可行 且 relay.penalty ≤ control.penalty<br/>且（直达对照不合法 或 relay.weight ≤ control.weight）"}
+    P -->|否| W["不更差兜底：直接给快车 / 职责降级直达（大声记日志）"]
+    P -->|是| Q{"relayChainConsistent 在最终计划上核：<br/>取货 ≤ S_A 卸入 ≤ S_A 取走 ≤ S_B 卸入 ≤ S_B 取走 ≤ 送达<br/>相邻两段不同车 · 两处等待 ≤ W"}
+    Q -->|不自洽| W
+    Q -->|通过| R["out.plans = relay.plans；订单改记到 L3 车<br/>relayedCount++；touched = {L1 车, 快车, L3 车}<br/>日志「[接力] <单> 三段腿成立：V02 取 Dxx -> 卸 T01 hh:mm；…」"]
+    R --> S(["buildTransitLedger(vehicles, plans)：<br/>从最终计划的 transitUnloads / transitPickups 反查<br/>逐单按时刻顺序配对 → 两端齐全的 TransitLeg（TRANSIT 行）"])
+    R --> T(["rescheduleFleet 收口 finalizeRescheduleLegs → buildLegs：<br/>腿结构读实际执行时刻（F7 的 readRelayExecution 分支）"])
+    X2 --> Y
+    Y --> W

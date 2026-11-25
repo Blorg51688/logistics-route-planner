@@ -1,6 +1,6 @@
 # docs/figures —— 报告与 PPT 用的流程图 / UML
 
-课程设计报告要用的全部图：**6 张函数流程图**（报告【详细设计】「主要函数的流程图」明文必需）
+课程设计报告要用的全部图：**9 张函数流程图**（报告【详细设计】「主要函数的流程图」明文必需）
 + **4 张 UML 图**（PPT 补充建议「用专业 UML 工具有加分」）。
 
 > **依据原则**：图的每个节点、字段、调用方向都指向具体的 `文件:符号名`。
@@ -10,7 +10,7 @@
 
 ---
 
-## 一、函数流程图（F1–F6）
+## 一、函数流程图（F1–F9）
 
 | 编号 | 文件 | 图名 | 依据（源码符号名） | 对应报告 |
 |---|---|---|---|---|
@@ -20,14 +20,17 @@
 | F4 | [F4-multitrip.png](F4-multitrip.png) | **单条连续路线构造**：`buildAll` 多起点（EDD / 按 A 聚簇 / 按 B 聚簇）→ 紧急段 FIFO → 普通段 pair-insertion → 两级兜底 → 降载 → 拒绝 | `src/core/RoutePlanner.cpp:buildAll`/`insertionStarts`/`buildWithOrder`/`appendUrgentAll`/`insertNormalAll`/`finalize` | 【详细设计】单条连续路线与载重约束 |
 | F5 | [F5-urgent-insert.png](F5-urgent-insert.png) | **通用插单**：`insertOrder` 按订单自己的 `urgent` 分流——紧急 FIFO 尾插 / 普通 pair-insertion；装不下先降载 | `src/core/RoutePlanner.cpp:insertOrder`/`replan`/`appendUrgentAll`/`insertNormalAll`/`shortestPath`（冲突判定） | 【详细设计】动态订单插入 |
 | F6 | [F6-traffic-replan.png](F6-traffic-replan.png) | 路况 → **顺序不变版重放**的增量重规划 → 不可行退回全量 | `src/gui/MainWindow.cpp:onSimulateTraffic`；`src/core/Traffic.cpp:simulateTrafficChange`/`needsReplan`；`src/core/RoutePlanner.cpp:sliceRemainder`/`replanIncremental`/`replay`/`finalize`/`replan` | 【详细设计】路况与增量重规划 |
+| F7 | [F7-legs-ready-chain.png](F7-legs-ready-chain.png) | **腿与就绪链**（规格三 §1/#45）：跨簇单展开 L1/L2/L3 → `readyTime` 链（L1=发车、L2=L1 完成、L3=L2 完成）→ `--dump-plan` 的 LEG 行；含退化/降级分支 | `src/core/RoutePlanner.cpp:buildLegs`/`stationOfCluster`/`chooseLegVehicle`/`readRelayExecution`；`src/core/RoutePlanner.h:Leg`/`LegKind`；`src/main.cpp` 的 LEG 行 | 【详细设计】腿模型 |
+| F8 | [F8-relay-wait-lookahead.png](F8-relay-wait-lookahead.png) | **三段接力与车等货**（规格三/#48）：`applyRelayLayer` → L1 慢车 → t1 → L2 快车（前瞻窗 W=60）→ t2 → L3 对簇慢车 → `replay` 的「车等货」等待 → 账本与腿结构；含不更差兜底/职责降级 | `src/core/RoutePlanner.cpp:applyRelayLayer`/`buildRelayChain`/`buildRelayOnwardSpecs`/`replay`/`relayChainConsistent`/`buildTransitLedger`；`src/core/RoutePlanner.h:kLookaheadWindowMin` | 【详细设计】三段接力与前瞻窗口 |
+| F9 | [F9-custody-repair.png](F9-custody-repair.png) | **custody 修复与审计**（规格三/#49）：封路/路况打断接力链 → `repairCustodyBreaks` 用新图重跑该单三段接力 → 自洽复核 → 拒绝兜底；另一条是只读口径 `auditCustody`（4 类缺口） | `src/core/RoutePlanner.cpp:repairCustodyBreaks`/`unpairedUnloadOrders`/`rescheduleFleet::accept`/`auditCustody`；`src/core/RoutePlanner.h:CustodyReport`/`CustodyGap` | 【详细设计】custody 守恒 |
 
 ## 二、UML 图（U1–U4）
 
 | 编号 | 文件 | 图名 | 依据 | 对应报告 |
 |---|---|---|---|---|
-| U1 | [U1-core-classes.png](U1-core-classes.png) | core 层类图：领域类型 / 图与堆 / 规划结果 / 路况事件 / 配置随机 / io | 各 `src/core/*.h` 与 `src/io/*.h`（`.mmd` 顶部注释逐条列出文件名:符号名） | 【数据结构设计】+【详细设计】 |
-| U2 | [U2-gui-io-classes.png](U2-gui-io-classes.png) | gui 层 + io 层类图：`MainWindow`/`VehicleState`/`GraphScene`/`NodeItem`/`EdgeItem` + 配置链 | `src/gui/*.h`、`src/io/*.h`、`src/core/Config.h`、`src/core/RoutePlanner.h` | 【数据结构设计】模块结构 |
-| U3 | [U3-seq-startup.png](U3-seq-startup.png) | 时序图：启动 → 加载配置 → 首次规划 → 画布高亮 | `src/main.cpp`、`src/io/ConfigLoader.cpp:ConfigLoader::load`、`src/io/IniFile.cpp:IniFile::loadFromFile`、`src/gui/MainWindow.cpp`（构造 / `replan` / `afterPlanReplaced` / `syncScene`）、`src/gui/GraphScene.cpp:build`/`highlightRoute` | 【详细设计】 |
+| U1 | [U1-core-classes.png](U1-core-classes.png) | core 层类图：领域类型 / 图与堆 / 规划结果 / **腿与转运账本（Leg/LegKind/TransitLeg/FleetPlan）/ custody（CustodyGap/CustodyReport）** / 路况事件 / 配置随机 / io | 各 `src/core/*.h` 与 `src/io/*.h`（`.mmd` 顶部注释逐条列出文件名:符号名；2026-11-26 #52 按规格三补 Leg/LegKind/TransitLeg/CustodyGap/CustodyReport/FleetPlan 与对应自由函数） | 【数据结构设计】+【详细设计】 |
+| U2 | [U2-gui-io-classes.png](U2-gui-io-classes.png) | gui 层 + io 层类图：`MainWindow`/`VehicleState`/`GraphScene`（**#50：`setFleetRoutes(fastFlags)` / `setVehicleMarks` / `roleColor`**）/`NodeItem`/`EdgeItem` + 配置链 | `src/gui/*.h`、`src/io/*.h`、`src/core/Config.h`、`src/core/RoutePlanner.h` | 【数据结构设计】模块结构 |
+| U3 | [U3-seq-startup.png](U3-seq-startup.png) | 时序图：启动 → 加载配置 → 首次规划 → 画布渲染（**#50：`syncScene` 调 `setFleetRoutes` + `setVehicleMarks` 角色两色 + 车辆环**） | `src/main.cpp`、`src/io/ConfigLoader.cpp:ConfigLoader::load`、`src/io/IniFile.cpp:IniFile::loadFromFile`、`src/gui/MainWindow.cpp`（构造 / `replan` / `afterPlanReplaced` / `syncScene` / `canvasTargetRoutes`）、`src/gui/GraphScene.cpp:build`/`setFleetRoutes`/`setVehicleMarks`、`src/core/RoutePlanner.h:fastVehicleFlags` | 【详细设计】 |
 | U4 | [U4-seq-traffic-replan.png](U4-seq-traffic-replan.png) | 时序图：路况触发 → 增量重规划 → 界面刷新 | 同 F6 的符号名 + `src/core/LogisticsGraph.cpp:updateEdgeTime` | 【详细设计】 |
 
 **U1/U2 两条读法（评审常问）**：
@@ -58,7 +61,7 @@
 ## 四、重新渲染
 
 ```bash
-bash docs/figures/src/render.sh          # 全量重渲 10 张 → docs/figures/*.png
+bash docs/figures/src/render.sh          # 全量重渲 13 张 → docs/figures/*.png
 ```
 
 依赖：`npx`（随 Node.js）+ `chrome-headless-shell`。本机首次使用前装一次：
@@ -71,7 +74,7 @@ npx -y puppeteer browsers install chrome-headless-shell
 渲染参数固定为 `-w 1600 -b white`，因此同一份 `.mmd` 在不同机器上应得到同一张 PNG
 （本机实测：重渲 U3 与仓库内 PNG 字节数一致）。
 
-## 五、文档与代码差异（**2026-11-24 重核：原四条已全部消解**）
+## 五、文档与代码差异（**2026-11-26 #52 重核：原四条已全部消解；规格三新图 F7/F8/F9 与 #50 画布形态已对齐源码，无新增差异**）
 
 本节原先列了 4 处「`docs/设计.md` 滞后于源码」的地方。规格一实施（#32–#37）+ 本轮文档同步（#38）后，**四处都已对齐**：
 
@@ -92,7 +95,7 @@ npx -y puppeteer browsers install chrome-headless-shell
 - 图里的数字（30 节点 / 106 有向边 / 25 订单 / **516kg 总需求** / 车 V01 200kg·08:00·1.00·1.00 /
   事件等级派生权重 **27:3:9:1** / 事件刻 15min）均来自 `config/default.ini` 与当前源码，
   属**已提交基线**口径（HEAD `cdc98e2`）。
-- **四个口径不许混**（2026-11-24 实测）：`ctest` **目标数 16**（`ctest -N` 为准）、9 个二进制**自报 2273 项**、`cli_plan_summary` **162 项**、`--self-check-actions` **79 条 OK**。
+- **四个口径不许混**（2026-11-25 实测，规格三 #44 收尾轮，HEAD `a028865` → #50 并入后 `fc4f98e` 行为不变）：`ctest` **目标数 17**（`ctest -N` 为准）、9 个二进制**自报合计 3955 项**、`cli_plan_summary` **773 项** + `cli_demo_transfer` **22 项**、`--self-check-actions` **112 条 OK**。
 - 图不是功能清单：每张图都落在「结构怎么支撑调度决策」上——堆支撑「取最小」、
   前驱数组支撑路径复原、`CostMatrix` 支撑 O(1) leg 查询、`stops` 动作集支撑状态转移与顺序不变版重放、
   `TrafficReport` 支撑「要不要重算」的判定。

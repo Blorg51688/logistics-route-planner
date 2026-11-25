@@ -9,9 +9,19 @@
 %%      src/core/MinHeap.h    class MinHeap（Entry 在类内 private）
 %%      src/core/Dijkstra.h   struct PathResult + 自由函数 shortestPath
 %%      src/core/RoutePlanner.h  struct Stop/StopDelivery/OffloadLeg/StashState/RoutePlan/OnboardItem/InsertResult
+%%                            + enum class LegKind / struct Leg（规格三 §1：腿与就绪链）
+%%                            + struct TransitLeg（转运账本的两端齐全记录）
+%%                            + struct CustodyGap / CustodyReport + 自由函数 auditCustody（custody 审计）
+%%                            + struct FleetPlan（legs / transitLegs / allocation*）/ VehicleStartState
+%%                            + struct FleetRescheduleInput / FleetRescheduleResult（level 1–5）
 %%                            + 自由函数 planRoute/replan/insertOrder/replanIncremental
 %%                            + sliceRemainder/replanIncremental/isEdgeOnRoute
 %%                            + nodeIndexAtTime
+%%                            + planFleet / buildLegs / legVehicleEligible / chooseLegVehicle / fastVehicleFlags
+%%                            + buildTransitLedger / applyTransitLayer
+%%                            + rescheduleFleet / localReplanTwoVersion / chooseVehicleForNewOrder
+%%                            + affectedVehiclesForTraffic / affectedVehiclesForClosure / aggregateFleet
+%%                            + 常量 kLookaheadWindowMin（60，车等货上限）
 %%      src/core/Traffic.h    struct TrafficChange/TrafficReport + 自由函数
 %%                            simulateTrafficChange/needsReplan
 %%      src/core/SimEvent.h   enum SimEventKind · struct EventWeights + 自由函数
@@ -116,6 +126,8 @@ classDiagram
             +vector~string~ pickups
             +vector~string~ offloads
             +vector~string~ reclaims
+            +vector~string~ transitUnloads（转运卸入：交给另一台车）
+            +vector~string~ transitPickups（转运取走：由另一台车卸入）
             +StopPhase phase
             +int rawArrivalMin
             +int waitMin
@@ -166,6 +178,7 @@ classDiagram
             +vector~bool~ nodeIsStop
             +vector~Stop~ stops
             +vector~OffloadLeg~ offloads
+            +map~string_double~ transitKg（账本渲染用的易手 kg）
             +RouteMetrics metrics
             +double totalDistanceKm
             +double totalTimeMin
@@ -182,6 +195,54 @@ classDiagram
             +RoutePlan plan
             +string warning
         }
+        class LegKind {
+            <<enumeration>>
+            +CustomerToCustomer（本地单：客户 → 客户）
+            +CustomerToStation（跨簇 L1：客户 → 本簇站）
+            +StationToStation（跨簇 L2：本簇站 → 对簇站，只能由快车执行）
+            +StationToCustomer（跨簇 L3：对簇站 → 客户）
+        }
+        class Leg {
+            +int seq（本地单恒 1；跨簇单 1 → 2 → 3）
+            +string from, to
+            +LegKind kind
+            +string orderId（跨簇单 3 条腿同单号）
+            +int readyTimeMin（L1=发车；L2=L1 完成；L3=L2 完成）
+            +int plannedArrivalMin
+            +string vehicleId（职责表定）
+            +bool temporaryAssignment（true=规划期估计）
+            +bool urgent
+            +int directPenaltyMin
+            +int relayPenaltyMin
+        }
+        class TransitLeg {
+            +string orderId, stationId
+            +double kg（= 订单需求）
+            +string inVehicleId（卸入车）
+            +int inTimeMin
+            +string outVehicleId（取走车）
+            +int outTimeMin
+        }
+        class CustodyGap {
+            +string orderId
+            +string stationId
+            +string kind（unload-no-pickup / pickup-no-unload / kg-mismatch / undelivered-not-rejected）
+            +string detail
+        }
+        class CustodyReport {
+            +bool ok
+            +vector~CustodyGap~ gaps
+        }
+        class FleetPlan {
+            +vector~RoutePlan~ vehicles
+            +vector~Leg~ legs（按订单 ID 升序、同单内腿序 1→3）
+            +vector~string~ legLog
+            +vector~TransitLeg~ transitLegs（buildTransitLedger 的结果）
+            +vector~string~ allocationOrderIds
+            +vector~int~ vehicleClusters
+            +double completionTimeMin
+            +double balanceSpread
+        }
     }
     namespace core 自由函数 {
         class Dijkstra {
@@ -197,6 +258,14 @@ classDiagram
             +replanIncremental(..., usedIncremental) RoutePlan$
             +isEdgeOnRoute(routeNodes, fromId, toId) bool$
             +nodeIndexAtTime(plan, timeMin) size_t$
+            +planFleet / planFleetSequentialBaseline / aggregateFleet(...)$
+            +buildLegs(graph, vehicles, orders, fleet, log) vector~Leg~$
+            +legVehicleEligible(...) / chooseLegVehicle(...) / fastVehicleFlags(vehicles)$
+            +buildTransitLedger(vehicles, plans) vector~TransitLeg~$
+            +applyTransitLayer(...) FleetTransitResult$
+            +rescheduleFleet(...) FleetRescheduleResult$
+            +auditCustody(vehicles, plans, orders, rejected) CustodyReport$
+            +localReplanTwoVersion / chooseVehicleForNewOrder / affectedVehiclesForTraffic / affectedVehiclesForClosure$
             +finalize(内部)：stops → 扁平视图 + 指标
         }
         class Traffic {
@@ -250,4 +319,13 @@ classDiagram
     StashState "1" o-- "*" OnboardItem : items（跨重规划透传）
     RoutePlan ..> RoutePlan : finalize()：扁平字段由 stops 展平而来，唯一生成点
     InsertResult *-- RoutePlan : plan
+    RoutePlan *-- TransitLeg : 经 buildTransitLedger 反查（transitUnloads/transitPickups 配对）
+    FleetPlan "1" *-- "*" RoutePlan : vehicles（下标与 [vehicles] 一一对应）
+    FleetPlan "1" *-- "*" Leg : legs（结构层真源，--dump-plan 的 LEG 行读它）
+    Leg ..> LegKind : kind
+    FleetPlan "1" *-- "*" TransitLeg : transitLegs
+    CustodyReport "1" *-- "*" CustodyGap : gaps
+    RoutePlanner ..> Leg : buildLegs 产出（readyTime 链）
+    RoutePlanner ..> CustodyReport : auditCustody 只读 stops 得出
+    RoutePlanner ..> FleetPlan : planFleet 产出
     Order ..> RoutePlanner : makeCtx 转成 Request（A/B/kg/逐单窗口）

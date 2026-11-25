@@ -8,7 +8,9 @@
 %%      src/gui/MainWindow.cpp     syncScene / replan / afterPlanReplaced
 %%      src/core/RoutePlanner.cpp  logistics::replan（首次规划入口）
 %%      src/core/RoutePlanner.cpp  makeCtx / buildAll / insertionStarts / finalize（内部）
-%%      src/gui/GraphScene.cpp     GraphScene::build / highlightRoute
+%%      src/gui/GraphScene.cpp     GraphScene::build / highlightRoute / setFleetRoutes / setVehicleMarks（#50）
+%%      src/gui/MainWindow.cpp     canvasTargetRoutes（每车只画到下一个目标）
+%%      src/core/RoutePlanner.h    fastVehicleFlags（角色两色：慢车青 / 快车洋红，与职责表同源）
 %% ----
 %% 注意：首次规划走 MainWindow::replan → logistics::replan（以当前位置/时刻为起点），
 %% 不是 planRoute —— planRoute 只被 CLI --plan-summary / 自检 / 测试直接调用
@@ -44,8 +46,9 @@ sequenceDiagram
     MW->>MW: afterPlanReplaced()
     Note right of MW: nodeIndex_ = 0, stopCursor_ = 0<br/>updateVehicleTabs()（页签数 == [vehicles] 行数）<br/>不装货：车空载发车，货只在取货点 A 上车
     MW->>MW: syncScene()
-    MW->>Scene: highlightRoute(plan_.nodes 从 nodeIndex_ 起)
-    Note right of Scene: 只高亮尚未走完的段<br/>setVehiclePosition(currentNodeId_)
+    MW->>Scene: setFleetRoutes(canvasTargetRoutes(), selectedVehicle, fastVehicleFlags)
+    MW->>Scene: setVehicleMarks(各车 atNodeId, fastFlags)
+    Note right of Scene: #50 画布简化：只画每车到下一个目标的箭头（慢车青 / 快车洋红）<br/>每车在自己所在节点外画一个环（同节点多车 slot 错开）
     MW->>MW: updatePanels()
     MW-->>main: 窗口就绪
 
