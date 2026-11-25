@@ -166,7 +166,7 @@ footer { margin-top: 44px; padding-top: 14px; border-top: 1px solid #e2e8f0;
 <rect x="400" y="436" width="420" height="104" rx="9" fill="#e9f2fd" stroke="#3a7bd5" stroke-width="1.8"/>
 <text x="412" y="463" font-size="14" font-weight="700" fill="#123f6e">config/default.ini</text>
 <text x="412" y="486" font-size="12.5" fill="#334155">30 节点 / 106 有向边 / 25 订单</text>
-<text x="412" y="505" font-size="12.5" fill="#334155">车 200kg，08:00 发车</text>
+<text x="412" y="505" font-size="12.5" fill="#334155">车 4 台：V01 400kg 快车 + V02/V03/V04 160kg 慢车，08:00 发车</text>
 <rect x="400" y="560" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
 <text x="412" y="587" font-size="14" font-weight="700" fill="#8a4500">IniFile::parse（手写解析）</text>
 <text x="412" y="610" font-size="12.5" fill="#334155"># 注释 / [section] / 空行；报错带行号</text>
@@ -273,7 +273,7 @@ footer { margin-top: 44px; padding-top: 14px; border-top: 1px solid #e2e8f0;
 <text x="42" y="1993" font-size="12.5" fill="#334155">起点 = 车当前位置，带上在途货</text>
 </svg></div>
 <details><summary>展开：同一张流通图的纯文本版（任何终端 / 编辑器可看，也是 <code>数据结构地图.md</code> 里的那一张）</summary>
-<pre>config/default.ini  （30 节点 / 106 有向边 / 25 订单 / 车 200kg·08:00·1.00·1.00）
+<pre>config/default.ini  （30 节点 / 106 有向边 / 25 订单 / 四车：V01 400kg·1.00·1.50 快车 + V02/V03/V04 160kg·1.25·0.80 慢车，全部 08:00）
    │ 文本
    ▼
 IniFile::parse ──────► IniSection / IniRecord（每条自带 lineNo，报错才能点行）
