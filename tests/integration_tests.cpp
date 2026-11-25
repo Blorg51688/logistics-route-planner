@@ -1683,6 +1683,82 @@ void checkDefaultLegsAreLocalSingleLegs(const Config& cfg, const FleetPlan* flee
 
 } // namespace
 
+// §4.8 登记项（US22/29 假绿）：封掉站间边后，第 ① 级局部重排会让「货无车承运即跨站」
+// ——V02 在 T01 卸入、V04 在 T03 取走送达、账本为空 ⇒「期末 0」空过。本票**不修**这个
+// 结构性缺口（要改逐易手账本/重排语义），但**必须点名**：res.log 里要有一行「账本空过」
+// 指名 O26（那是用户可见的运行日志，守卫读它）。
+// 反向验证：删掉 finalizeRescheduleLegs 里的「有卸入无同站取走」点名逻辑，本测试红。
+void checkClosureCustodyGapIsNamed(const Config& cfg) {
+    std::vector<logistics::Order> orders = cfg.orders;
+    logistics::Order o26;
+    o26.id = "O26";
+    o26.pickupNodeId = "D08";
+    o26.nodeId = "D18";
+    o26.demandKg = 8.0;
+    o26.windowStartMin = 480;
+    o26.windowEndMin = 780;
+    orders.push_back(o26);
+    const FleetPlan base = planFleet(cfg.graph, cfg.vehicles, orders, WeightType::Time);
+    check(base.transitLegs.size() == 1,
+          "封路夹具前置：默认+O26 时间策略走三段接力（账本 " + std::to_string(base.transitLegs.size())
+              + " 笔）");
+    if (base.transitLegs.size() != 1) {
+        return;
+    }
+    LogisticsGraph g2 = cfg.graph;
+    g2.removeEdge("T01", "T02");
+    g2.removeEdge("T02", "T01");
+    g2.removeEdge("T02", "T03");
+    g2.removeEdge("T03", "T02");
+    const std::size_t k = cfg.vehicles.size();
+    logistics::FleetRescheduleInput in;
+    in.starts.resize(k);
+    in.remainingPlans.resize(k);
+    for (std::size_t v = 0; v < k; ++v) {
+        in.starts[v].startNodeId = cfg.vehicles[v].startNodeId;
+        in.starts[v].startTimeMin = cfg.vehicles[v].departTimeMin;
+        in.remainingPlans[v] = base.vehicles[v];
+    }
+    in.vehicleOrders = logistics::vehicleOrdersFromPlans(base.vehicles, orders);
+    in.allRemainingOrders = orders;
+    logistics::RescheduleEvent ev;
+    ev.trigger = logistics::RescheduleTrigger::RoadClosure;
+    const char* edges[4][2] = {{"T01", "T02"}, {"T02", "T01"}, {"T02", "T03"}, {"T03", "T02"}};
+    for (int i = 0; i < 4; ++i) {
+        logistics::TrafficChange c;
+        c.fromId = edges[i][0];
+        c.toId = edges[i][1];
+        ev.changes.push_back(c);
+    }
+    const logistics::FleetRescheduleResult res =
+        logistics::rescheduleFleet(g2, cfg.vehicles, WeightType::Time, in, ev);
+    // 复现：账本为空（配对要求同站，卸入在 T01 / 取走在 T03 无法配对），但计划里确有 O26 卸入。
+    const std::vector<logistics::TransitLeg> ledger =
+        logistics::buildTransitLedger(cfg.vehicles, res.plans);
+    bool unpaired = false;
+    for (const RoutePlan& plan : res.plans) {
+        for (const logistics::Stop& st : plan.stops) {
+            for (const std::string& id : st.transitUnloads) {
+                if (id == "O26") {
+                    unpaired = true;
+                }
+            }
+        }
+    }
+    check(ledger.empty() && unpaired,
+          "封路复现：计划里有 O26 卸入、账本却为空（期末 0 会假绿；账本 "
+              + std::to_string(ledger.size()) + " 笔）");
+    bool named = false;
+    for (const std::string& line : res.log) {
+        if (line.find("账本空过") != std::string::npos
+            && line.find("O26") != std::string::npos) {
+            named = true;
+            std::printf("      %s\n", line.c_str());
+        }
+    }
+    check(named, "封路复现：『期末 0 空过』被点名（运行日志有「账本空过 … O26 …」行）");
+}
+
 int main() {
     Config cfg;
     std::string error;
@@ -1744,6 +1820,8 @@ int main() {
     checkSmallCapacityStaysSingleRoute(cfg);
     checkGraphRepresentationsOnRealData(cfg);
     checkTrafficAndUrgentOrderOnRealData(cfg);
+    // §4.8 登记项：封路后的「期末 0 空过」必须被点名（US22/29）。
+    checkClosureCustodyGapIsNamed(cfg);
 
     return testutil::summarize("integration_tests");
 }

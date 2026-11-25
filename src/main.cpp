@@ -403,12 +403,21 @@ int main(int argc, char** argv) {
         // 腿结构与就绪链（规格三 §1 / #45）：**只加行，不改既有行格式**（oracle 跳过未知行）。
         //   LEG <腿序> <from> <to> <orderId> <kind> <HH:MM readyTime> <vehicleId>
         // 行序固定：订单 ID 升序，同单内 L1 -> L2 -> L3（由 buildLegs 保证，这里不再排序）。
-        // 执行车是**临时指派**（本票职责封闭未启用）；没有执行车的单打 "-"，不代表没有这条腿。
+        // 执行车由职责表定（#46 已启用职责封闭）；接力真跑时是**实际执行车**，未跑时是
+        // 规划期估计（Leg::temporaryAssignment）。没有执行车的单打 "-"，不代表没有这条腿。
         for (const logistics::Leg& leg : fleet.legs) {
             std::printf("LEG %d %s %s %s %s %s %s\n", leg.seq, leg.from.c_str(), leg.to.c_str(),
                         leg.orderId.c_str(), logistics::toString(leg.kind),
                         minuteClock(leg.readyTimeMin).c_str(),
                         leg.vehicleId.empty() ? "-" : leg.vehicleId.c_str());
+        }
+        // 降级必须在 CLI seam 可见（规格三 Testing Decisions：唯一 seam = CLI 可见输出）：
+        //   跨簇单的三段腿没成立、被职责降级为直达执行时，buildLegs 会在 legLog 里写
+        //   LEGDEGRADE <orderId> <原因>；这里逐行打出，让「假报 3 条腿」无从藏身。
+        for (const std::string& line : fleet.legLog) {
+            if (line.rfind("LEGDEGRADE ", 0) == 0) {
+                std::printf("%s\n", line.c_str());
+            }
         }
         // 规格二 §4（#40）分配可核对：**只加行，不改既有行格式**（oracle 会跳过未知行）。
         //   ALLOC  <orderId>=<vehicleId>,…      按**订单 ID 升序**

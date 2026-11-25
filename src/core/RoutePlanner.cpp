@@ -3830,6 +3830,95 @@ std::vector<Leg> buildLegs(const LogisticsGraph& graph,
             continue;
         }
 
+        // ---- P2：实际执行形态优先于职责表估计 ----
+        // 跨簇单被「不更差兜底 / 职责降级」按直达执行时（同一台车取货、并在自己的路线上
+        // 送达，全程没有任何站内易手），LEG 必须如实登记 **1 条 customer->customer 直达腿**，
+        // 而不是照职责表报 3 条腿 —— 否则「每张跨簇单恰好 3 条腿」的结构断言在降级场景
+        // **假绿**（评审实测：ALLOC 是 O26=V01 直达，LEG 却报 V02/V01/V04 三条）。
+        {
+            std::string pickVehicle, delivVehicle;
+            int pickTime = -1, delivTime = -1;
+            bool anyTransit = false;
+            for (std::size_t v = 0; v < fleet.vehicles.size() && v < vehicles.size(); ++v) {
+                const RoutePlan& plan = fleet.vehicles[v];
+                if (plan.status != PlanStatus::Ok) {
+                    continue;
+                }
+                for (std::size_t s = 0; s < plan.stops.size(); ++s) {
+                    const Stop& st = plan.stops[s];
+                    if (idListHas(st.pickups, o.id)) {
+                        pickVehicle = vehicles[v].id;
+                        pickTime = st.arrivalMin;
+                    }
+                    for (std::size_t d = 0; d < st.deliveries.size(); ++d) {
+                        if (st.deliveries[d].orderId == o.id) {
+                            delivVehicle = vehicles[v].id;
+                            delivTime = st.arrivalMin;
+                        }
+                    }
+                    if (idListHas(st.transitUnloads, o.id) || idListHas(st.transitPickups, o.id)) {
+                        anyTransit = true;
+                    }
+                }
+            }
+            if (!anyTransit && !pickVehicle.empty() && pickVehicle == delivVehicle) {
+                Leg leg;
+                leg.seq = 1;
+                leg.from = o.pickupNodeId;
+                leg.to = o.nodeId;
+                leg.kind = LegKind::CustomerToCustomer;
+                leg.orderId = o.id;
+                leg.urgent = o.urgent;
+                const CrossPenaltyEstimate est2 = estimateCrossPenalties(
+                    graph, vehicles, o.pickupNodeId, o.nodeId, stationA, stationB, o.windowEndMin);
+                leg.directPenaltyMin = est2.ok ? est2.directMin : -1;
+                leg.relayPenaltyMin = est2.ok ? est2.relayMin : -1;
+                leg.vehicleId = pickVehicle;
+                leg.readyTimeMin = (pickTime >= 0) ? pickTime : fallbackDepartMin;
+                leg.plannedArrivalMin = (delivTime >= 0) ? delivTime : leg.readyTimeMin;
+                leg.temporaryAssignment = false;
+                std::size_t vIdx = vehicles.size();
+                for (std::size_t v = 0; v < vehicles.size(); ++v) {
+                    if (vehicles[v].id == pickVehicle) {
+                        vIdx = v;
+                    }
+                }
+                const bool legal =
+                    (vIdx < vehicles.size()) && legVehicleEligible(graph, vehicles, vIdx, leg);
+                if (legal) {
+                    log.push_back("[腿] 跨簇单 " + o.id + " 实际由 " + pickVehicle
+                                  + " 直达执行且合职责表（跨簇紧急单直达例外）⇒ 按实际形态登记"
+                                    " 1 条 customer->customer 腿");
+                } else {
+                    // 降级原因从分配/复调度日志里的 [职责降级] 行提取（两处口径同一句）。
+                    std::string why = "三段腿未成立，按直达执行（职责降级）";
+                    const std::string key = "[职责降级] 订单 " + o.id + " ";
+                    for (std::size_t i = 0; i < fleet.allocationLog.size(); ++i) {
+                        if (fleet.allocationLog[i].compare(0, key.size(), key) != 0) {
+                            continue;
+                        }
+                        const std::size_t lp = fleet.allocationLog[i].find("三段腿未成立（");
+                        if (lp != std::string::npos) {
+                            const std::string head = "三段腿未成立（";
+                            const std::size_t rp = fleet.allocationLog[i].find("）", lp);
+                            if (rp != std::string::npos) {
+                                why = fleet.allocationLog[i].substr(lp + head.size(),
+                                                                    rp - (lp + head.size()));
+                            }
+                        }
+                        break;
+                    }
+                    log.push_back("[腿] 跨簇单 " + o.id + " 实际由 " + pickVehicle
+                                  + " 直达执行（职责降级）⇒ 按实际形态登记 1 条 customer->customer"
+                                    " 腿，原因：" + why);
+                    // 降级必须在 CLI seam 可见（规格三 Testing Decisions：唯一 seam = CLI 可见输出）。
+                    log.push_back("LEGDEGRADE " + o.id + " " + why);
+                }
+                legs.push_back(leg);
+                continue;
+            }
+        }
+
         // L1：客户 -> 本簇站；L2：站 -> 站；L3：对簇站 -> 客户。
         // 先按结构把三条腿立起来（seq/from/to/kind），时刻与执行车**先按 #45 的规划期
         // 估计**填，再由 readRelayExecution 用**实际执行时刻**覆盖（#48 接力跑通后二者
@@ -5068,6 +5157,9 @@ struct RelayOutcome {
     int fallbackCount = 0;
     int skippedCount = 0;
     std::vector<std::string> log;
+    // 计划**真的被改过**的车（行下标）。事件路径只写回这些车，未参与接力的车路线逐字不变
+    // （不变量 5）。planFleet 路径不看它（整队计划一次性收口），事件路径靠它圈定写回范围。
+    std::vector<std::size_t> touched;
 };
 
 // 对一张跨簇单构造三段接力（①慢车 L1 -> ②快车 L2 -> ③对簇慢车 L3）。
@@ -5337,13 +5429,21 @@ bool relayChainConsistent(const std::vector<Vehicle>& vehicles,
 //   · 跨簇紧急单**不进来**：紧急语义保留快车直达通道（直达/接力的 penalty 判据归 #46）。
 //   · 「不更差」兜底：三段腿方案若劣于「把该单直接给快车」的对照方案，就按对照方案
 //     执行并记日志（防止形式僵化出荒谬解）。
+// starts（规格三 §2④ / US21）：可选「已执行前缀」。非空时按每车当前位置/时刻/在车货/暂存
+// 建 Ctx（事件路径），为空时退回「仓库 + 发车时刻」（planFleet 的静态规划，行为逐字不变）。
+// 事件刷出的跨簇单必须走同一条接力机件，才谈得上「动态场景与静态演示语义一致」。
 void applyRelayLayer(const LogisticsGraph& graph, const std::vector<Vehicle>& vehicles,
                      const std::vector<Order>& orders, WeightType weight,
                      const std::vector<std::vector<Order> >& vehicleOrders,
                      const std::vector<RoutePlan>& basePlans,
-                     const std::vector<Order>& relayOrders, RelayOutcome& out) {
+                     const std::vector<Order>& relayOrders, RelayOutcome& out,
+                     const std::vector<VehicleStartState>* starts = nullptr) {
     out.plans = basePlans;
     out.vehicleOrders = vehicleOrders;
+    // 起点表不完整 ⇒ 退回静态口径（防御：宁可当空车也不静默错位到别的车上）。
+    if (starts != nullptr && starts->size() < vehicles.size()) {
+        starts = nullptr;
+    }
     if (vehicles.size() < 2 || basePlans.size() != vehicles.size()
         || vehicleOrders.size() != vehicles.size()) {
         return;
@@ -5357,12 +5457,9 @@ void applyRelayLayer(const LogisticsGraph& graph, const std::vector<Vehicle>& ve
             relayIdx = v;
         }
     }
-    std::vector<std::size_t> slow;
-    for (std::size_t v = 0; v < vehicles.size(); ++v) {
-        if (v != relayIdx) {
-            slow.push_back(v);
-        }
-    }
+    // 慢车列表按**车辆 ID 升序**（P5 / 口径统一）：直接调 planFleet 用的同一个 helper，
+    // 避免这里自己按行序重算、两处口径悄悄漂开（职责表配对只认 ID 序）。
+    const std::vector<std::size_t> slow = slowVehiclesSortedById(vehicles, relayIdx);
     if (slow.empty()) {
         return;
     }
@@ -5390,9 +5487,16 @@ void applyRelayLayer(const LogisticsGraph& graph, const std::vector<Vehicle>& ve
     std::vector<Ctx> ctxs(vehicles.size());
     for (std::size_t v = 0; v < vehicles.size(); ++v) {
         std::string reason;
-        if (!makeCtx(graph, vehicles[v], vehicleOrders[v], vehicles[v].startNodeId,
-                     vehicles[v].departTimeMin, weight, std::vector<OnboardItem>(), StashState(),
-                     ctxs[v], reason)) {
+        // 有已执行前缀就从当前位置/时刻起算（readyTime 链因此锚在实际执行点，而不是 08:00）。
+        const std::string startPos = (starts != nullptr) ? (*starts)[v].startNodeId
+                                                         : vehicles[v].startNodeId;
+        const int startTime = (starts != nullptr) ? (*starts)[v].startTimeMin
+                                                  : vehicles[v].departTimeMin;
+        const std::vector<OnboardItem> onboard =
+            (starts != nullptr) ? (*starts)[v].onboard : std::vector<OnboardItem>();
+        const StashState stash = (starts != nullptr) ? (*starts)[v].stash : StashState();
+        if (!makeCtx(graph, vehicles[v], vehicleOrders[v], startPos, startTime, weight,
+                     onboard, stash, ctxs[v], reason)) {
             out.log.push_back("[接力] 跳过整层：车辆 " + vehicles[v].id + " 的上下文建不起来（"
                               + reason + "）");
             return;
@@ -5490,6 +5594,9 @@ void applyRelayLayer(const LogisticsGraph& graph, const std::vector<Vehicle>& ve
             }
             out.vehicleOrders[relay.destIdx].push_back(o);
             ++out.relayedCount;
+            out.touched.push_back(relay.srcIdx);
+            out.touched.push_back(relayIdx);
+            out.touched.push_back(relay.destIdx);
             std::ostringstream os;
             os << "[接力] " << o.id << " 三段腿成立：" << vehicles[relay.srcIdx].id << " 取 "
                << o.pickupNodeId << " -> 卸 " << relay.stationA << " "
@@ -5510,6 +5617,7 @@ void applyRelayLayer(const LogisticsGraph& graph, const std::vector<Vehicle>& ve
             }
             out.vehicleOrders[relayIdx].push_back(o);
             ++out.fallbackCount;
+            out.touched.push_back(relayIdx);
             out.log.push_back("[接力] 订单 " + o.id + " 不更差兜底："
                               + (!relay.ok ? std::string("三段腿不可行（" + relay.reason + "）")
                                  : !chainOk
@@ -5562,6 +5670,7 @@ void applyRelayLayer(const LogisticsGraph& graph, const std::vector<Vehicle>& ve
                 }
                 out.vehicleOrders[target].push_back(o);
                 ++out.fallbackCount;
+                out.touched.push_back(target);
                 out.log.push_back(
                     "[职责降级] 订单 " + o.id + " 三段腿未成立（"
                     + (!relay.ok ? std::string("不可行：" + relay.reason)
@@ -6796,6 +6905,94 @@ std::string vehicleListText(const std::vector<Vehicle>& vehicles,
     return out;
 }
 
+// ---- 事件路径的跨簇接力与腿重建（规格三 §2④ / US21 / P1）----
+
+// 跨簇单能否走三段接力（结构前提）：两端都在某个非 0 簇、两簇各有中转站且不同。
+// 不满足（缺站 / 子网 0 的异常数据）就不是「跨簇三段腿」能表达的单，交既有升级链兜底。
+bool relayChainPossible(const LogisticsGraph& graph, const Order& o) {
+    const int ca = clusterOfNode(graph, o.pickupNodeId);
+    const int cb = clusterOfNode(graph, o.nodeId);
+    if (ca <= 0 || cb <= 0 || ca == cb) {
+        return false;
+    }
+    const std::string sa = stationOfCluster(graph, ca);
+    const std::string sb = stationOfCluster(graph, cb);
+    return !sa.empty() && !sb.empty() && sa != sb;
+}
+
+// 事件后重建腿结构（P1-③）+ 把「期末 0 空过」点名（§4.8 登记项）。
+//
+// 为什么单独重建：rescheduleFleet 干的是逐车重规划，FleetPlan::legs 只在 planFleet 收口
+// 时 build 一次；事件不动它 ⇒ 呈现/守卫读到的腿仍是旧形态。这里用**同一套** buildLegs
+// 读事件后的真实计划，保证「LEG 说的形态」= 「STOP 里的实际执行」。
+//
+// readyTime 锚定「已执行前缀」：事件从中途发起时，腿的可接时刻是**该车当前时刻**，
+// 不是 08:00 发车时刻（规格三 Implementation Decisions §2④）。
+void finalizeRescheduleLegs(const LogisticsGraph& graph, const std::vector<Vehicle>& vehicles,
+                            const std::vector<Order>& legOrders,
+                            const std::vector<VehicleStartState>& starts,
+                            FleetRescheduleResult& res) {
+    FleetPlan shell = aggregateFleet(vehicles, res.plans);
+    // 让 buildLegs 提取「职责降级」原因时看得到接力层的点名行（与 planFleet 同口径）。
+    shell.allocationLog = res.log;
+    shell.legs = buildLegs(graph, vehicles, legOrders, shell, shell.legLog);
+    bool anchored = false;
+    for (std::size_t i = 0; i < shell.legs.size(); ++i) {
+        Leg& leg = shell.legs[i];
+        for (std::size_t v = 0; v < vehicles.size() && v < starts.size(); ++v) {
+            if (leg.vehicleId != vehicles[v].id) {
+                continue;
+            }
+            if (starts[v].startTimeMin > leg.readyTimeMin) {
+                leg.readyTimeMin = starts[v].startTimeMin;
+                anchored = true;
+            }
+            break;
+        }
+    }
+    if (anchored) {
+        shell.legLog.push_back("[腿] 事件路径的 readyTime 锚定已执行前缀（车辆当前位置/时刻），"
+                               "不再用发车时刻");
+    }
+    // 「期末 0」不能空过：有卸入必须有**同站、另一台车**的取走。三段接力有两个易手点，
+    // 封路/重排后可能出现「V02 在 T01 卸入、V04 在 T03 取走」——货物跨站却无车承运，
+    // 账本配对（要求同站）为空 ⇒ 期末 0 会**假绿**（评审实测）。这里逐笔点名，让空过
+    // 在 CLI/GUI 播报上可见（§4.8 登记项）。
+    for (std::size_t v = 0; v < res.plans.size(); ++v) {
+        for (std::size_t s = 0; s < res.plans[v].stops.size(); ++s) {
+            const Stop& st = res.plans[v].stops[s];
+            for (std::size_t i = 0; i < st.transitUnloads.size(); ++i) {
+                const std::string& id = st.transitUnloads[i];
+                bool matched = false;
+                for (std::size_t v2 = 0; v2 < res.plans.size() && !matched; ++v2) {
+                    if (v2 == v) {
+                        continue;
+                    }
+                    for (std::size_t s2 = 0; s2 < res.plans[v2].stops.size() && !matched; ++s2) {
+                        const Stop& st2 = res.plans[v2].stops[s2];
+                        if (st2.nodeId != st.nodeId) {
+                            continue;
+                        }
+                        for (std::size_t j = 0; j < st2.transitPickups.size(); ++j) {
+                            if (st2.transitPickups[j] == id) {
+                                matched = true;
+                            }
+                        }
+                    }
+                }
+                if (!matched) {
+                    res.log.push_back("[复调度] ⚠ 账本空过：订单 " + id + " 在 " + st.nodeId
+                                      + " 由 " + vehicles[v].id + " 卸入，但没有同站取走"
+                                        "（接力链断裂，货物跨站无承运）⇒ 期末 0 不能作数"
+                                        "（§4.8 登记项）");
+                }
+            }
+        }
+    }
+    res.legs = shell.legs;
+    res.legLog = shell.legLog;
+}
+
 }   // namespace
 
 FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
@@ -6822,6 +7019,17 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
     const Order pending = (event.trigger == RescheduleTrigger::NewOrder) ? event.newOrder : Order();
     const bool hasPending = (event.trigger == RescheduleTrigger::NewOrder) && !pending.id.empty();
 
+    // 事件后重建腿结构要用「未送达订单全集 + 新单」（buildLegs 按订单展开腿）。
+    std::vector<Order> legOrders;
+    for (std::size_t i = 0; i < input.allRemainingOrders.size(); ++i) {
+        if (!input.allRemainingOrders[i].served) {
+            legOrders.push_back(input.allRemainingOrders[i]);
+        }
+    }
+    if (hasPending && !containsOrderId(legOrders, pending.id)) {
+        legOrders.push_back(pending);
+    }
+
     // ---- 受影响车集合（§6.5）----
     // 第 ① 级失败的车：他们的上一版计划在当前图/当前订单集合下已经**不可实现**
     //（这正是 ① 失败的含义）。第 ② 级比较时把它们的"当前键"视为 +inf ——
@@ -6844,6 +7052,55 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
 
     // ---- ① 新订单的选车（§6.6，普通/紧急共用） / 局部重排（§6.3）----
     if (hasPending) {
+        // ---- ①-a 跨簇单：走与 planFleet **同一套**三段接力（P1 / US21）----
+        //
+        // 为什么放在第 ① 级之前分叉：跨簇单的**合法执行形态只有三段腿**（职责表：
+        // 慢车不接跨簇客户腿、快车不接非紧急客户腿），「单台车插入」必然越界
+        // （评审实测：事件后 V04 把 O26 直达取送、账本 0 笔）。所以它一进升级链就
+        // 走接力机件，不与「单台车插入」竞争；分流判据与 planFleet 同一句
+        // （紧急且直达估计严格更优才允许快车直达，其余一律接力 —— 由 applyRelayLayer
+        // 内部按职责表判定，不在本层重写一遍）。
+        if (isCrossCluster(graph, pending) && relayChainPossible(graph, pending)) {
+            std::vector<Order> fleetOrders = legOrders;   // 未送达全集（已含 pending）
+            std::vector<Order> relayOrders;
+            relayOrders.push_back(pending);
+            RelayOutcome relayOutcome;
+            applyRelayLayer(graph, vehicles, fleetOrders, weight, work, plans, relayOrders,
+                            relayOutcome, &input.starts);
+            for (std::size_t i = 0; i < relayOutcome.log.size(); ++i) {
+                res.log.push_back("[复调度] " + relayOutcome.log[i]);
+            }
+            const bool placed = (relayOutcome.relayedCount > 0 || relayOutcome.fallbackCount > 0);
+            if (placed) {
+                for (std::size_t i = 0; i < relayOutcome.touched.size(); ++i) {
+                    const std::size_t t = relayOutcome.touched[i];
+                    if (t < plans.size() && t < relayOutcome.plans.size()) {
+                        plans[t] = relayOutcome.plans[t];
+                        res.replanned.push_back(t);
+                    }
+                }
+                work = relayOutcome.vehicleOrders;
+                res.level = 1;
+                res.log.push_back("[复调度] 跨簇单 " + pending.id
+                                  + " 走三段接力（与静态 planFleet 同机件，readyTime 锚已执行前缀）");
+                std::string why;
+                if (!inheritExecutedInStation(graph, vehicles, weight, input, work, plans,
+                                              res.replanned, res.log, why)) {
+                    res.level = 5;
+                    res.rejected = true;
+                    res.reason = why;
+                    res.log.push_back("[复调度] 拒绝：" + why);
+                    return res;
+                }
+                res.plans = plans;
+                res.vehicleOrders = work;
+                finalizeRescheduleLegs(graph, vehicles, legOrders, input.starts, res);
+                return res;
+            }
+            res.log.push_back("[复调度] 跨簇单 " + pending.id
+                              + " 三段接力未成立（各腿不可行 / 不更差兜底与职责降级均未落位）"
+                                " → 退回既有升级链（降级结果由腿结构的 LEGDEGRADE 点名）");
+        }
         const NewOrderAssignment a =
             chooseVehicleForNewOrder(graph, vehicles, work, plans, input.starts, weight, pending);
         if (a.feasible) {
@@ -6866,6 +7123,7 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
             }
             res.plans = plans;
             res.vehicleOrders = work;
+            finalizeRescheduleLegs(graph, vehicles, legOrders, input.starts, res);
             return res;
         }
         res.log.push_back("[复调度] 新单 " + pending.id
@@ -6910,6 +7168,7 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
             }
             res.plans = plans;
             res.vehicleOrders = work;
+            finalizeRescheduleLegs(graph, vehicles, legOrders, input.starts, res);
             return res;
         }
         // 部分车成功：保留它们的 ① 结果；失败车进第 ② 级。
@@ -7040,6 +7299,7 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
         }
         res.plans = plans;
         res.vehicleOrders = work;
+        finalizeRescheduleLegs(graph, vehicles, legOrders, input.starts, res);
         return res;
     }
 
@@ -7114,6 +7374,7 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
             }
             res.plans = plans;
             res.vehicleOrders = work;
+            finalizeRescheduleLegs(graph, vehicles, legOrders, input.starts, res);
             return res;
         }
         res.log.push_back("[复调度] 全车队重调度失败 → 升级链第 ④ 级");
@@ -7227,6 +7488,7 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
             }
             res.plans = plans;
             res.vehicleOrders = work;
+            finalizeRescheduleLegs(graph, vehicles, legOrders, input.starts, res);
             return res;
         }
         res.log.push_back("[复调度] 降载 / 转运均不可行 → 升级链第 ⑤ 级");

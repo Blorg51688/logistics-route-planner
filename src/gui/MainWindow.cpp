@@ -926,6 +926,18 @@ void MainWindow::applyRescheduleResult(const logistics::FleetRescheduleResult& r
         plans.push_back(veh(v).plan);
     }
     fleetPlan_ = logistics::aggregateFleet(config_.vehicles, plans);
+    // 事件后重建的腿结构（P1-③ / US21）：aggregateFleet 不建腿，这里接上 rescheduleFleet
+    // 带回的 buildLegs 结果，让 GUI 与守卫读到同一份「实际执行形态」；降级行写进运行日志
+    // （用户可见），"假报 3 条腿"在界面上同样藏不住。
+    if (!res.legs.empty()) {
+        fleetPlan_.legs = res.legs;
+        fleetPlan_.legLog = res.legLog;
+        for (std::size_t i = 0; i < res.legLog.size(); ++i) {
+            if (res.legLog[i].rfind("LEGDEGRADE ", 0) == 0) {
+                appendLog(QString::fromStdString(res.legLog[i]));
+            }
+        }
+    }
     syncScene();
     updatePanels();
 }

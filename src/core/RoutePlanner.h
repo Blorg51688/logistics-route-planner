@@ -651,6 +651,11 @@ struct FleetRescheduleResult {
     std::string reason;
     std::vector<std::size_t> replanned;               // 被重算的车（不变量 5 用它判「未受影响车不变」）
     std::vector<std::string> log;                     // 分级播报行（每行都以「[复调度] 」开头）
+    // 事件**之后**重建的腿结构（规格三 §2④ / US21：事件刷出的跨簇单也走三段腿）。
+    // rescheduleFleet 只在逐车重规划上工作，腿/账本要单独重建 —— 这里用**与 planFleet 同一套**
+    // buildLegs 读事件后的真实计划，让「LEG 说的形态」= 「STOP 里的实际执行」。
+    std::vector<Leg>         legs;
+    std::vector<std::string> legLog;                  // 腿登记日志（含 LEGDEGRADE 降级行）
 };
 
 // §6.4 五级升级链：① 局部重排 → ② 跨车再分配 → ③ 全车队重调度 → ④ 降载/转运并列 → ⑤ 拒绝。

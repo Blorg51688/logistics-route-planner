@@ -453,6 +453,7 @@ void checkDumpPlanLegLines(const std::string& appPath) {
              "\n[vehicles]\n"
              "V01, W01, 400, 08:00, 1.00, 1.50\n"
              "V02, W01, 160, 08:00, 1.25, 0.80\n"
+             "V03, W01, 160, 08:00, 1.25, 0.80\n"
              "\n[orders]\n"
              "O1, D08, D01, 10, 00:00, 23:59, 0\n"
              "M1, D08, D18, 8, 00:00, 23:59, 0\n";
@@ -571,11 +572,12 @@ void checkDumpPlanLegLines(const std::string& appPath) {
     // 执行车字段必须是车队里的车（本票是临时指派，但**不能**是空/占位符）。
     bool vehiclesOk = true;
     for (std::size_t i = 0; i < vehiclesOfLeg.size(); ++i) {
-        if (vehiclesOfLeg[i] != "V01" && vehiclesOfLeg[i] != "V02") {
+        if (vehiclesOfLeg[i] != "V01" && vehiclesOfLeg[i] != "V02"
+            && vehiclesOfLeg[i] != "V03") {
             vehiclesOk = false;
         }
     }
-    check(vehiclesOk, "LEG：执行车字段取自车队（V01/V02），没有伪装成 '-'");
+    check(vehiclesOk, "LEG：执行车字段取自车队（V01/V02/V03），没有伪装成 '-'");
 }
 
 } // namespace
@@ -1219,6 +1221,70 @@ void checkCrossClusterRelayOnDefaultData(const std::string& appPath) {
     std::remove(tmpPath);
 }
 
+// P2：降级场景下 LEG 必须**如实反映实际执行形态**。
+// 默认数据 + 紧窗 O26（08:00-09:00）⇒ 三段腿劣于直达对照、职责降级为 V01 直达。
+// 守卫：O26 只应有 1 条 customer->customer 直达腿（执行车 == ALLOC 里的车），且打出
+// LEGDEGRADE 行（降级在唯一 seam = CLI 可见输出上可见）。
+// 反向验证：把 buildLegs 的「按实际形态登记」改回「照职责表报 3 条腿」，这里 legCount==3 即红。
+void checkLegDegradationVisibleInDump(const std::string& appPath) {
+    char tmpPath[256];
+    std::snprintf(tmpPath, sizeof(tmpPath), "/tmp/cli_leg_degrade_%d.ini",
+                  static_cast<int>(getpid()));
+    {
+        std::ifstream in(DEFAULT_CONFIG_PATH);
+        check(in.good(), "降级夹具：能读到默认配置");
+        std::ofstream outFile(tmpPath);
+        std::string line;
+        while (std::getline(in, line)) {
+            outFile << line << "\n";
+        }
+        outFile << "O26, D08, D18, 8, 08:00, 09:00, 0\n";   // 紧窗 ⇒ 三段腿劣于直达对照
+    }
+    const char* strategies[3] = {"distance", "cost", "time"};
+    for (int si = 0; si < 3; ++si) {
+        const std::string tag = std::string("降级·") + strategies[si];
+        const std::string out = runCapture("'" + appPath + "' --config '" + tmpPath
+                                           + "' --dump-plan " + strategies[si] + " 2>/dev/null");
+        const std::vector<std::string> lines = splitLines(out);
+        std::vector<std::string> legs;
+        std::string allocV;
+        for (const std::string& line : lines) {
+            if (line.rfind("LEG ", 0) == 0 && line.find(" O26 ") != std::string::npos) {
+                legs.push_back(line);
+            }
+            if (line.rfind("ALLOC ", 0) == 0) {
+                const std::size_t p = line.find("O26=");
+                if (p != std::string::npos) {
+                    const std::size_t e = line.find(',', p);
+                    allocV = line.substr(p + 4,
+                                         e == std::string::npos ? std::string::npos : e - (p + 4));
+                }
+            }
+        }
+        check(legs.size() == 1,
+              tag + "：降级后 O26 只登记 1 条直达腿（照职责表假报 3 条会红；实际 "
+                  + std::to_string(legs.size()) + "）");
+        if (legs.size() == 1) {
+            check(legs[0].find("customer->customer") != std::string::npos,
+                  tag + "：降级腿 = customer->customer 直达");
+            const std::size_t sp = legs[0].rfind(' ');
+            const std::string legV = (sp == std::string::npos) ? std::string()
+                                                               : legs[0].substr(sp + 1);
+            check(!allocV.empty() && legV == allocV,
+                  tag + "：LEG 执行车 == ALLOC 里的车（" + legV + " vs " + allocV + "）");
+        }
+        bool degLine = false;
+        for (const std::string& line : lines) {
+            if (line.rfind("LEGDEGRADE O26 ", 0) == 0) {
+                degLine = true;
+                std::printf("      %s %s\n", tag.c_str(), line.c_str());
+            }
+        }
+        check(degLine, tag + "：CLI 打出 LEGDEGRADE O26 行（降级在唯一 seam 可见）");
+    }
+    std::remove(tmpPath);
+}
+
 }   // namespace
 
 int main(int argc, char** argv) {
@@ -1247,6 +1313,8 @@ int main(int argc, char** argv) {
     // 职责封闭（规格三 §1 / #46）：用户可见输出上的两条守卫。
     checkDutyClosureDefault(appPath);
     checkCrossClusterRelayOnDefaultData(appPath);
+    // P2：降级场景下 LEG 如实反映实际执行形态（LEGDEGRADE 在 CLI seam 可见）。
+    checkLegDegradationVisibleInDump(appPath);
 
     std::vector<std::string> strategies;
     if (strategy == "all") {

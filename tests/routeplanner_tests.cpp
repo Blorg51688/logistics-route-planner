@@ -4380,9 +4380,12 @@ std::vector<Vehicle> makeLegsTwoClusterVehicles() {
     Vehicle a = makeVehicleWithFactors("W01", 400.0, 480, 1.00, 1.50);
     a.id = "V01";
     Vehicle b = makeVehicleWithFactors("W01", 160.0, 480, 1.25, 0.80);
-    b.id = "V02";
+    b.id = "V02";   // 簇1 慢车
+    Vehicle c = makeVehicleWithFactors("W01", 160.0, 480, 1.25, 0.80);
+    c.id = "V03";   // 簇3 慢车（三段接力需要「对簇慢车」与「本簇慢车」两台不同车）
     vs.push_back(a);
     vs.push_back(b);
+    vs.push_back(c);
     return vs;
 }
 
@@ -4553,10 +4556,10 @@ void testLegsReadyTimeChainAndTemporaryAssignment() {
     check(vehicles[0].capacityKg == maxCap && vehicles[0].costFactor == maxCost,
           "夹具口径：V01 就是容量最大 + 成本因子最高的快车");
 
-    // 接力没跑起来时，三条腿仍是**规划期估计** ⇒ temporaryAssignment 保持 true
-    //（本夹具的三段腿由职责表指派：L1 本簇慢车 / L2 快车 / L3 对簇慢车）。
-    check(l1->temporaryAssignment && l2->temporaryAssignment && l3->temporaryAssignment,
-          "三条腿的执行车都是**规划期估计**（temporaryAssignment == true，接力未跑）");
+    // 三车各自守簇 ⇒ 接力真的跑了 ⇒ 三条腿是**实际执行**（temporaryAssignment == false）。
+    // 反向验证：把接力退回直达（旧态 temporaryAssignment 保持 true）会让本行变红。
+    check(!l1->temporaryAssignment && !l2->temporaryAssignment && !l3->temporaryAssignment,
+          "三条腿的执行车都是**实际执行**（temporaryAssignment == false，接力已跑）");
     check(!fleet.legLog.empty(), "腿结构的登记日志非空");
     bool logged = false;
     bool carLogged = false;
@@ -4766,6 +4769,97 @@ void testDutyBoundaryOnFourVehicleFleet() {
     }
 }
 
+// ---- 事件路径的跨簇单：必须走与 planFleet **同一套**三段接力（规格三 §2④ / US21 / P1）----
+//
+// 反向验证：把事件路径退回「单台车 Δkey 插入」（即 chooseVehicleForNewOrder 直达），
+// 账本会变 0、腿会变成「1 条直达 + 职责越界」，下面账本/腿/职责的断言随即变红。
+void testRescheduleNewOrderCrossClusterRelay() {
+    const LogisticsGraph g = makeRelayCorridorGraph(3.0, 1.0);
+    const std::vector<Vehicle> vehicles = makeRelayVehicles();   // V01 快 + V02/V03 慢
+    const Order o1 = makeOrder("O1", "D08", "D01", 10.0, 0, 1440);   // 簇1 本地
+    const Order o2 = makeOrder("O2", "D20", "D18", 10.0, 0, 1440);   // 簇3 本地
+    const std::vector<Order> baseOrders{o1, o2};
+    const FleetPlan base = planFleet(g, vehicles, baseOrders, WeightType::Time);
+    check(base.allOk, "事件接力夹具前置：base 计划可行");
+    if (!base.allOk) {
+        return;
+    }
+
+    const Order m1 = makeOrder("M1", "D08", "D18", 8.0, 0, 1440);   // 跨簇 簇1 -> 簇3
+    FleetRescheduleInput in;
+    in.starts.resize(vehicles.size());
+    for (std::size_t v = 0; v < vehicles.size(); ++v) {
+        in.starts[v].startNodeId = vehicles[v].startNodeId;
+        in.starts[v].startTimeMin = vehicles[v].departTimeMin;
+    }
+    in.remainingPlans = base.vehicles;
+    in.vehicleOrders = vehicleOrdersFromPlans(base.vehicles, baseOrders);
+    in.allRemainingOrders = baseOrders;
+    in.allRemainingOrders.push_back(m1);
+    RescheduleEvent ev;
+    ev.trigger = RescheduleTrigger::NewOrder;
+    ev.newOrder = m1;
+    const FleetRescheduleResult res = rescheduleFleet(g, vehicles, WeightType::Time, in, ev);
+    check(res.level == 1 && !res.rejected,
+          "事件刷出的跨簇单 M1 在第 ① 级被接力重排（实际第 " + std::to_string(res.level) + " 级）");
+
+    // 账本：恰 1 笔、两端不同车、dwell 0（与 planFleet 静态路径同语义）。
+    const std::vector<TransitLeg> ledger = buildTransitLedger(vehicles, res.plans);
+    check(ledger.size() == 1,
+          "事件路径：M1 恰 1 笔 TRANSIT（实际 " + std::to_string(ledger.size()) + "）");
+    if (ledger.size() == 1) {
+        check(ledger[0].orderId == "M1" && ledger[0].stationId == "T3"
+                  && ledger[0].inVehicleId != ledger[0].outVehicleId,
+              "事件路径：账本两端 = M1/T3/" + ledger[0].inVehicleId + "->"
+                  + ledger[0].outVehicleId);
+        check(ledger[0].outTimeMin - ledger[0].inTimeMin == 0,
+              "事件路径：车等货 ⇒ 取走 == 卸入（dwell 0）");
+    }
+    // 交付：M1 由账本取走车送达（期末无在站）。
+    std::string deliveryVehicle;
+    for (std::size_t v = 0; v < res.plans.size() && v < vehicles.size(); ++v) {
+        if (planDelivers(res.plans[v], "M1")) {
+            deliveryVehicle = vehicles[v].id;
+        }
+    }
+    check(!deliveryVehicle.empty() && !ledger.empty()
+              && ledger[0].outVehicleId == deliveryVehicle,
+          "事件路径：M1 由账本取走车 " + deliveryVehicle + " 在 D18 送达（期末无在站）");
+
+    // 腿结构重建：res.legs 里有 M1 的 3 条腿，L2 由快车 V01 执行，相邻执行车不同，readyTime 单调。
+    std::vector<Leg> m1Legs;
+    for (const Leg& leg : res.legs) {
+        if (leg.orderId == "M1") {
+            m1Legs.push_back(leg);
+        }
+    }
+    check(m1Legs.size() == 3,
+          "事件路径：res.legs 重建出 M1 恰 3 条腿（实际 " + std::to_string(m1Legs.size()) + "）");
+    if (m1Legs.size() == 3) {
+        check(m1Legs[0].kind == LegKind::CustomerToStation
+                  && m1Legs[1].kind == LegKind::StationToStation
+                  && m1Legs[2].kind == LegKind::StationToCustomer,
+              "事件路径：腿序 = customer->station / station->station / station->customer");
+        check(m1Legs[1].vehicleId == "V01", "事件路径：L2 站间腿由快车 V01 执行");
+        check(m1Legs[0].vehicleId != m1Legs[1].vehicleId
+                  && m1Legs[1].vehicleId != m1Legs[2].vehicleId,
+              "事件路径：相邻两段执行车不同（职责表）");
+        check(m1Legs[0].readyTimeMin <= m1Legs[1].readyTimeMin
+                  && m1Legs[1].readyTimeMin <= m1Legs[2].readyTimeMin,
+              "事件路径：readyTime 沿接力链单调不减（" + std::to_string(m1Legs[0].readyTimeMin)
+                  + " / " + std::to_string(m1Legs[1].readyTimeMin) + " / "
+                  + std::to_string(m1Legs[2].readyTimeMin) + "）");
+    }
+    // 接力成立时不应出现职责降级行（降级只在接力失败兜底时才写）。
+    bool degraded = false;
+    for (const std::string& line : res.legLog) {
+        if (line.rfind("LEGDEGRADE ", 0) == 0) {
+            degraded = true;
+        }
+    }
+    check(!degraded, "事件路径：接力成立时不出现 LEGDEGRADE（降级只发生在接力失败兜底）");
+}
+
 } // namespace
 
 int main() {
@@ -4838,6 +4932,7 @@ int main() {
     RUN(testRescheduleUrgentPerVehicleFifo);
     RUN(testRescheduleInheritsExecutedInStation);
     RUN(testRescheduleLedgerAndDeterminism);
+    RUN(testRescheduleNewOrderCrossClusterRelay);
 
     // 规格三 §1 / #45：腿与就绪链（结构层）
     RUN(testLegsCrossClusterExpandsToThreeInFixedOrder);
