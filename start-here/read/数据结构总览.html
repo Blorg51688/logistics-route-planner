@@ -36,11 +36,11 @@ footer { margin-top: 44px; padding-top: 14px; border-top: 1px solid #e2e8f0;
   font-size: 12.5px; color: #64748b; }
 </style></head><body>
 <h1>数据结构总览</h1>
-<p class="lead">系统的每一种结构画成一个方块，箭头写「传的是<strong>什么</strong>」。橙色 = 手写算法，蓝色 = 容器／结构本体，绿色 = 被算法承载的记录（Stop / OffloadLeg / StashState / RoutePlan / 各类记账），紫色 = Qt 视图层。虚线 = 非顺序的控制流（改图、回写计划）。</p>
+<p class="lead">系统的每一种结构画成一个方块，箭头写「传的是<strong>什么</strong>」。橙色 = 手写算法，蓝色 = 容器／结构本体，绿色 = 被算法承载的记录（Stop / OffloadLeg / StashState / RoutePlan / 各类记账），<strong>青色（teal，虚线框）= 规格三新增（腿 / 接力 / custody 审计）</strong>，紫色 = Qt 视图层。虚线 = 非顺序的控制流（改图、回写计划）。</p>
 <p class="lead">读法：从左上 <code>config/default.ini</code> 顺着箭头往下，第三条带（事件与重规划）末尾会沿虚线回到 <code>RoutePlan</code> —— 这就是「重规划后计划换了一版」。表在下面，逐格与 <a href="../../docs/数据结构地图.md">docs/数据结构地图.md</a> 一致。</p>
-<p class="meta">数字口径：n = 节点数 30、m = 有向边数 106、k = 订单数（25）、s = 堆内条目数；config = 2 仓库 + 3 中转站 + 25 配送点、25 订单（全部 A→B 取送，总需求 516kg）、三车 V01 400kg·1.00·1.50 / V02·V03 160kg·1.25·0.80（全部 W01 08:00）。规格二新增 <code>FleetPlan</code> / <code>TransitLeg</code> / 三阶段分配器 / 复调度输入，表与流图见 <a href="../../docs/数据结构地图.md">docs/数据结构地图.md</a>（事实取自 <code>src/</code>；口径 = #43 工作区实测，2026-11-24）。</p>
-<div class="legend"><span><i class="sw" style="background:#fff4e5;border:1.8px solid #e08a1e"></i>手写算法</span><span><i class="sw" style="background:#e9f2fd;border:1.8px solid #3a7bd5"></i>容器 / 结构本体</span><span><i class="sw" style="background:#eafaf0;border:1.8px solid #2f9e6b"></i>记录（被承载的数据）</span><span><i class="sw" style="background:#f3ecfd;border:1.8px solid #8a5cd6"></i>Qt 视图层</span><span><i class="dashline"></i>虚线 = 改图 / 回写计划</span></div>
-<div class="box"><svg viewBox="0 0 1200 1742" width="100%" xmlns="http://www.w3.org/2000/svg" font-family="Noto Sans CJK SC, Source Han Sans SC, Microsoft YaHei, sans-serif">
+<p class="meta">数字口径：n = 节点数 30、m = 有向边数 106、k = 订单数（25）、s = 堆内条目数；config = 2 仓库 + 3 中转站 + 25 配送点、25 订单（全部 A→B 取送，总需求 516kg）、<strong>四车</strong> V01 400kg·1.00·1.50（快车）/ V02·V03·V04 160kg·1.25·0.80（慢车，全部 W01 08:00 发车）。规格二新增 <code>FleetPlan</code> / <code>TransitLeg</code> / 分配器 / 复调度输入；<strong>规格三新增</strong> <code>Leg</code> / <code>LegKind</code> / <code>CustodyReport</code> / <code>CustodyGap</code> 与四段流程（<code>buildLegs</code> / <code>applyRelayLayer</code>·<code>buildRelayChain</code> / <code>repairCustodyBreaks</code> / <code>auditCustody</code>），图里第 ③ 带「订单 → 腿（L1/L2/L3）→ 三段接力 → 转运账本 → custody 审计」就是它。表与流图见 <a href="../../docs/数据结构地图.md">docs/数据结构地图.md</a>（事实取自 <code>src/</code>；口径 = <strong>已提交基线</strong> <code>main</code> @ <code>359ad44</code>，2026-11-26 复核）。</p>
+<div class="legend"><span><i class="sw" style="background:#fff4e5;border:1.8px solid #e08a1e"></i>手写算法</span><span><i class="sw" style="background:#e9f2fd;border:1.8px solid #3a7bd5"></i>容器 / 结构本体</span><span><i class="sw" style="background:#eafaf0;border:1.8px solid #2f9e6b"></i>记录（被承载的数据）</span><span><i class="sw" style="background:#e6f7f5;border:1.8px dashed #00897b"></i>规格三新增（腿 / 接力 / custody 审计）</span><span><i class="sw" style="background:#f3ecfd;border:1.8px solid #8a5cd6"></i>Qt 视图层</span><span><i class="dashline"></i>虚线 = 改图 / 回写计划</span></div>
+<div class="box"><svg viewBox="0 0 1200 2010" width="100%" xmlns="http://www.w3.org/2000/svg" font-family="Noto Sans CJK SC, Source Han Sans SC, Microsoft YaHei, sans-serif">
 <defs>
 <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/></marker>
 <marker id="ahd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#c2410c"/></marker>
@@ -51,179 +51,229 @@ footer { margin-top: 44px; padding-top: 14px; border-top: 1px solid #e2e8f0;
 <rect x="0" y="556" width="1200" height="620" fill="#fdfbf7"/>
 <line x1="0" y1="556" x2="1200" y2="556" stroke="#e2e8f0" stroke-width="1.5"/>
 <text x="18" y="548" font-size="13" font-weight="700" fill="#94a3b8">② 最短路 → 调度状态（core · 橙色 = 手写算法，绿色 = 被承载的记录）</text>
-<rect x="0" y="1176" width="1200" height="532" fill="#fbfaff"/>
+<rect x="0" y="1176" width="1200" height="356" fill="#f2fbfa"/>
 <line x1="0" y1="1176" x2="1200" y2="1176" stroke="#e2e8f0" stroke-width="1.5"/>
-<text x="18" y="1168" font-size="13" font-weight="700" fill="#94a3b8">③ 运行 · 事件 · 重规划 → 视图（紫色 = Qt 视图层，只读消费）</text>
-<line x1="0" y1="1708" x2="1200" y2="1708" stroke="#e2e8f0" stroke-width="1.5"/>
-<path d="M 610.0 184.0 L 610.0 204.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 400.0 256.0 L 320.0 256.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 610.0 308.0 L 610.0 328.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 610.0 432.0 L 610.0 452.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 400.0 380.0 L 330.0 380.0 L 330.0 628.0 L 320.0 628.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 610.0 556.0 L 610.0 576.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 820.0 504.0 L 890.0 504.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 820.0 628.0 L 890.0 628.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 610.0 680.0 L 610.0 700.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 30.0 628.0 L 360.0 628.0 L 360.0 752.0 L 820.0 752.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 820.0 752.0 L 890.0 752.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 610.0 804.0 L 610.0 824.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 320.0 876.0 L 400.0 876.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 610.0 928.0 L 610.0 948.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 820.0 1000.0 L 890.0 1000.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 610.0 1052.0 L 610.0 1072.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 820.0 1124.0 L 890.0 1124.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 610.0 1176.0 L 610.0 1196.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<text x="18" y="1168" font-size="13" font-weight="700" fill="#00897b">③ 规格三 · 订单 → 腿（L1/L2/L3）→ 三段接力 → 转运账本 → custody 审计（青色虚线框 = 规格三新增）</text>
+<path d="M 610.0 1148.0 L 610.0 1196.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 820.0 1124.0 L 890.0 1150.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
 <path d="M 820.0 1248.0 L 890.0 1248.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 610.0 1300.0 L 610.0 1320.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 400.0 1372.0 L 348.0 1372.0 L 348.0 1496.0 L 320.0 1496.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 610.0 1424.0 L 610.0 1444.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 820.0 1372.0 L 872.0 1372.0 L 872.0 1496.0 L 890.0 1496.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 610.0 1548.0 L 610.0 1568.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 400.0 1620.0 L 320.0 1620.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
-<path d="M 400.0 1496.0 L 384.0 1496.0 L 384.0 504.0 L 400.0 504.0" fill="none" stroke="#c2410c" stroke-width="1.4" stroke-dasharray="6 4" marker-end="url(#ahd)"/>
-<path d="M 1170.0 1496.0 L 1195.0 1496.0 L 1195.0 44.0 L 880.0 44.0 L 880.0 530.0 L 820.0 530.0" fill="none" stroke="#c2410c" stroke-width="1.4" stroke-dasharray="6 4" marker-end="url(#ahd)"/>
-<path d="M 400.0 1620.0 L 396.0 1620.0 L 396.0 1000.0 L 400.0 1000.0" fill="none" stroke="#c2410c" stroke-width="1.4" stroke-dasharray="6 4" marker-end="url(#ahd)"/>
-<path d="M 30.0 1620.0 L 336.0 1620.0 L 336.0 1000.0 L 400.0 1000.0" fill="none" stroke="#c2410c" stroke-width="1.4" stroke-dasharray="6 4" marker-end="url(#ahd)"/>
-<text x="619" y="198" font-size="11.5" fill="#475569" text-anchor="start">文本</text>
-<text x="360" y="248" font-size="11.5" fill="#475569" text-anchor="middle">记录</text>
-<text x="619" y="322" font-size="11.5" fill="#475569" text-anchor="start">解析结果</text>
-<text x="619" y="446" font-size="11.5" fill="#475569" text-anchor="start">Config.graph</text>
-<text x="336" y="446" font-size="11.5" fill="#475569" text-anchor="start">Config.orders</text>
-<text x="619" y="570" font-size="11.5" fill="#475569" text-anchor="start">adjacency() 只读</text>
-<text x="855" y="496" font-size="11.5" fill="#475569" text-anchor="middle">node/edge</text>
-<text x="855" y="620" font-size="11.5" fill="#475569" text-anchor="middle">push/popMin</text>
-<text x="619" y="694" font-size="11.5" fill="#475569" text-anchor="start">PathResult{nodes, totalWeight}</text>
-<text x="366" y="694" font-size="11.5" fill="#475569" text-anchor="start">Request[]（取送对）</text>
-<text x="855" y="744" font-size="11.5" fill="#475569" text-anchor="middle">Stop</text>
-<text x="619" y="818" font-size="11.5" fill="#475569" text-anchor="start">stops[]（动作集为真源）</text>
-<text x="360" y="868" font-size="11.5" fill="#475569" text-anchor="middle">在途货</text>
-<text x="619" y="942" font-size="11.5" fill="#475569" text-anchor="start">offloads 记账</text>
-<text x="855" y="992" font-size="11.5" fill="#475569" text-anchor="middle">custody</text>
-<text x="619" y="1066" font-size="11.5" fill="#475569" text-anchor="start">stops（真源）</text>
-<text x="855" y="1116" font-size="11.5" fill="#475569" text-anchor="middle">展平字段</text>
-<text x="619" y="1190" font-size="11.5" fill="#475569" text-anchor="start">扁平视图</text>
-<text x="855" y="1240" font-size="11.5" fill="#475569" text-anchor="middle">syncScene()</text>
-<text x="619" y="1314" font-size="11.5" fill="#475569" text-anchor="start">settleEventsUpTo(now)</text>
-<text x="354" y="1438" font-size="11.5" fill="#475569" text-anchor="start">抽到紧急单 3/40</text>
-<text x="619" y="1438" font-size="11.5" fill="#475569" text-anchor="start">抽到路况 27/40</text>
-<text x="878" y="1438" font-size="11.5" fill="#475569" text-anchor="start">抽到普通单/封路 10/40</text>
-<text x="619" y="1562" font-size="11.5" fill="#475569" text-anchor="start">needsReplan：增幅 ≥ 20% 且恰在相邻两站</text>
-<text x="360" y="1612" font-size="11.5" fill="#475569" text-anchor="middle">重放不可行</text>
-<text x="390" y="942" font-size="11.5" fill="#475569" text-anchor="start">就地改 Edge::timeMin（baseTimeMin 不动）</text>
-<text x="1040" y="34" font-size="11.5" fill="#475569" text-anchor="middle">增删节点 / 边（GraphEdit）</text>
-<text x="402" y="1190" font-size="11.5" fill="#475569" text-anchor="start">回写 stops（新一版 RoutePlan）</text>
-<text x="342" y="1438" font-size="11.5" fill="#475569" text-anchor="start">回写（全量版）</text>
-<rect x="400" y="80" width="420" height="104" rx="9" fill="#e9f2fd" stroke="#3a7bd5" stroke-width="1.8"/>
-<text x="412" y="107" font-size="14" font-weight="700" fill="#123f6e">config/default.ini</text>
-<text x="412" y="130" font-size="12.5" fill="#334155">30 节点 / 106 有向边 / 25 订单</text>
-<text x="412" y="149" font-size="12.5" fill="#334155">车 200kg，08:00 发车</text>
-<rect x="400" y="204" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
-<text x="412" y="231" font-size="14" font-weight="700" fill="#8a4500">IniFile::parse（手写解析）</text>
-<text x="412" y="254" font-size="12.5" fill="#334155"># 注释 / [section] / 空行；报错带行号</text>
-<text x="412" y="273" font-size="12.5" fill="#334155">记录自带 lineNo ⇒ 报错能指到具体行</text>
-<rect x="30" y="204" width="290" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
-<text x="42" y="231" font-size="13" font-weight="700" fill="#12563c">IniRecord / IniSection</text>
-<text x="42" y="254" font-size="12.5" fill="#334155">键值行或逗号记录行 + lineNo</text>
-<text x="42" y="273" font-size="12.5" fill="#334155">findValue 返回记录本体</text>
-<rect x="400" y="328" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
-<text x="412" y="355" font-size="14" font-weight="700" fill="#8a4500">ConfigLoader::load → Config</text>
-<text x="412" y="378" font-size="12.5" fill="#334155">组装 + 校验：缺节 / 字段数 / 类型 / 端点 / 重复 ID</text>
-<text x="412" y="397" font-size="12.5" fill="#334155">输出 Config{graph, vehicles, orders, general}</text>
-<rect x="400" y="452" width="420" height="104" rx="9" fill="#e9f2fd" stroke="#3a7bd5" stroke-width="1.8"/>
-<text x="412" y="479" font-size="14" font-weight="700" fill="#123f6e">LogisticsGraph（邻接表）</text>
-<text x="412" y="502" font-size="12.5" fill="#334155">nodes_ 顺序表 + out_ 邻接表，下标对齐</text>
-<text x="412" y="521" font-size="12.5" fill="#334155">稀疏图：不用邻接矩阵（900 格几乎全空）</text>
-<text x="412" y="540" font-size="12.5" fill="#334155">indexOf O(n) / removeNode O(n+m)</text>
-<rect x="890" y="452" width="280" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
-<text x="902" y="479" font-size="13" font-weight="700" fill="#12563c">Node / Edge</text>
-<text x="902" y="502" font-size="12.5" fill="#334155">Edge 三权重 + baseTimeMin</text>
-<text x="902" y="521" font-size="12.5" fill="#334155">congested；baseTimeMin 永不改写</text>
-<rect x="400" y="576" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
-<text x="412" y="603" font-size="14" font-weight="700" fill="#8a4500">Dijkstra::shortestPath</text>
-<text x="412" y="626" font-size="12.5" fill="#334155">dist[] + previous[] + 惰性删除</text>
-<text x="412" y="645" font-size="12.5" fill="#334155">三策略共用一份，只在 pickWeight 换维度</text>
-<text x="412" y="664" font-size="12.5" fill="#334155">时间 O(m·n + m·log m)，n 点 / m 边</text>
-<rect x="890" y="576" width="280" height="104" rx="9" fill="#e9f2fd" stroke="#3a7bd5" stroke-width="1.8"/>
-<text x="902" y="603" font-size="13" font-weight="700" fill="#123f6e">MinHeap（无 decrease-key）</text>
-<text x="902" y="626" font-size="12.5" fill="#334155">Entry{key, value}，底层 vector</text>
-<text x="902" y="645" font-size="12.5" fill="#334155">siftUp / siftDown / swapEntries</text>
-<text x="902" y="664" font-size="12.5" fill="#334155">push / popMin 各 O(log s)，自写</text>
-<rect x="30" y="576" width="290" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
-<text x="42" y="603" font-size="13" font-weight="700" fill="#12563c">Request / StopSpec</text>
-<text x="42" y="626" font-size="12.5" fill="#334155">一张订单一个取送对（A/B/kg/窗口）</text>
-<text x="42" y="645" font-size="12.5" fill="#334155">StopSpec：构造期的动作集中间态</text>
-<rect x="400" y="700" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
-<text x="412" y="727" font-size="14" font-weight="700" fill="#8a4500">pair-insertion + replay</text>
-<text x="412" y="750" font-size="12.5" fill="#334155">枚举 (A,B) 的全部位置对，逐个重放评价</text>
-<text x="412" y="769" font-size="12.5" fill="#334155">键 = (Σpenalty, 策略权重, tieKey)；停靠零耗时</text>
-<text x="412" y="788" font-size="12.5" fill="#334155">单请求 O(n²) 位置对 × O(n) 重放 = O(n³)</text>
-<rect x="890" y="700" width="280" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
-<text x="902" y="727" font-size="13" font-weight="700" fill="#12563c">Stop（动作集 = 真源）</text>
-<text x="902" y="750" font-size="12.5" fill="#334155">deliveries/pickups/offloads/reclaims</text>
-<text x="902" y="769" font-size="12.5" fill="#334155">逐单 penalty：max(0, arr − 该单 we)</text>
-<text x="902" y="788" font-size="12.5" fill="#334155">remainingLoadKg = 离开该站时在车量</text>
-<rect x="400" y="824" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
-<text x="412" y="851" font-size="14" font-weight="700" fill="#8a4500">buildAll（多起点 + 兜底 + 降载）</text>
-<text x="412" y="874" font-size="12.5" fill="#334155">三版插入序（EDD / 按 A 聚簇 / 按 B 聚簇）</text>
-<text x="412" y="893" font-size="12.5" fill="#334155">失败 → repair R≤3 → 全量兜底 → 降载 → 拒绝</text>
-<rect x="30" y="824" width="290" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
-<text x="42" y="851" font-size="13" font-weight="700" fill="#12563c">OnboardItem</text>
-<text x="42" y="874" font-size="12.5" fill="#334155">车此刻在车上的货（订单 + 目的 B + kg）</text>
-<text x="42" y="893" font-size="12.5" fill="#334155">少了它，重规划会先跑回基地</text>
-<rect x="400" y="948" width="420" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
-<text x="412" y="975" font-size="14" font-weight="700" fill="#12563c">RoutePlan（stops 是真源）</text>
-<text x="412" y="998" font-size="12.5" fill="#334155">stops[] + offloads[] + metrics + 展平视图</text>
-<text x="412" y="1017" font-size="12.5" fill="#334155">扁平字段只在一处生成 ⇒ 不会各自走样</text>
-<rect x="890" y="948" width="280" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
-<text x="902" y="975" font-size="13" font-weight="700" fill="#12563c">OffloadLeg / StashState</text>
-<text x="902" y="998" font-size="12.5" fill="#334155">降载 custody：站/单/kg/卸下/取回</text>
-<text x="902" y="1017" font-size="12.5" fill="#334155">Σ卸入 − Σ取回 = 0（期末）；跨重规划透传</text>
-<rect x="400" y="1072" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
-<text x="412" y="1099" font-size="14" font-weight="700" fill="#8a4500">finalize（唯一展平点）</text>
-<text x="412" y="1122" font-size="12.5" fill="#334155">stops → 扁平视图 + 指标汇总（一处生成）</text>
-<text x="412" y="1141" font-size="12.5" fill="#334155">所有规划出口各调一次</text>
-<rect x="890" y="1072" width="280" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
-<text x="902" y="1099" font-size="13" font-weight="700" fill="#12563c">扁平视图（界面消费）</text>
-<text x="902" y="1122" font-size="12.5" fill="#334155">nodes / nodeArrivalMin / nodeIsStop</text>
-<text x="902" y="1141" font-size="12.5" fill="#334155">nodeIsStop 标记哪次出现是停靠</text>
-<rect x="400" y="1196" width="420" height="104" rx="9" fill="#f3ecfd" stroke="#8a5cd6" stroke-width="1.8"/>
-<text x="412" y="1223" font-size="14" font-weight="700" fill="#42257c">MainWindow 推进与结算</text>
-<text x="412" y="1246" font-size="12.5" fill="#334155">onAdvanceStop / onAdvanceMoment → settleEventsUpTo</text>
-<text x="412" y="1265" font-size="12.5" fill="#334155">nodeIndexAtTime：半路显示所在段的起点</text>
-<rect x="890" y="1196" width="280" height="104" rx="9" fill="#f3ecfd" stroke="#8a5cd6" stroke-width="1.8"/>
-<text x="902" y="1223" font-size="13" font-weight="700" fill="#42257c">GraphScene / NodeItem / EdgeItem</text>
-<text x="902" y="1246" font-size="12.5" fill="#334155">syncScene：高亮 isEdgeOnRoute</text>
-<text x="902" y="1265" font-size="12.5" fill="#334155">拥堵标记 / 车辆位置重绘</text>
-<text x="902" y="1284" font-size="12.5" fill="#334155">build O(m·n)，highlight O(m)</text>
-<rect x="400" y="1320" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
-<text x="412" y="1347" font-size="14" font-weight="700" fill="#8a4500">SimEvent::nextEventTimeMin + pickEvent</text>
-<text x="412" y="1370" font-size="12.5" fill="#334155">每 15min 一个事件刻，严格前进</text>
-<text x="412" y="1389" font-size="12.5" fill="#334155">权重由 event_level_* 派生：默认 27:3:9:1</text>
-<text x="412" y="1408" font-size="12.5" fill="#334155">Rng 手写 xorshift32：为可复现，不是被禁 STL</text>
-<rect x="30" y="1444" width="290" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
-<text x="42" y="1471" font-size="13" font-weight="700" fill="#8a4500">insertOrder（通用插单）</text>
-<text x="42" y="1494" font-size="12.5" fill="#334155">紧急 → FIFO 尾插；普通 → pair-insertion</text>
-<text x="42" y="1513" font-size="12.5" fill="#334155">装不下先降载；以当前位置/时刻重算</text>
-<rect x="400" y="1444" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
-<text x="412" y="1471" font-size="14" font-weight="700" fill="#8a4500">Traffic::simulateTrafficChange → TrafficReport</text>
-<text x="412" y="1494" font-size="12.5" fill="#334155">部分 Fisher-Yates 选 round(0.1×106)=11 条边</text>
-<text x="412" y="1513" font-size="12.5" fill="#334155">改 Edge::timeMin；baseTimeMin 永不动</text>
-<rect x="890" y="1444" width="280" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
-<text x="902" y="1471" font-size="13" font-weight="700" fill="#8a4500">GraphEdit</text>
-<text x="902" y="1494" font-size="12.5" fill="#334155">addRandomCustomer / closeRandomRoad</text>
-<text x="902" y="1513" font-size="12.5" fill="#334155">封路先 BFS 防封桥（不切孤岛）</text>
-<rect x="400" y="1568" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
-<text x="412" y="1595" font-size="14" font-weight="700" fill="#8a4500">needsReplan → replanIncremental</text>
-<text x="412" y="1618" font-size="12.5" fill="#334155">增幅 ≥ 20% 且恰在路线相邻两站才触发</text>
-<text x="412" y="1637" font-size="12.5" fill="#334155">顺序不变版重放：停靠不变，按新权重重算</text>
-<text x="412" y="1656" font-size="12.5" fill="#334155">任一段不可达 ⇒ 退回全量 replan</text>
-<rect x="30" y="1568" width="290" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
-<text x="42" y="1595" font-size="13" font-weight="700" fill="#8a4500">replan（全量兜底）</text>
-<text x="42" y="1618" font-size="12.5" fill="#334155">重放不可行时兜底：重跑构造（含多起点）</text>
-<text x="42" y="1637" font-size="12.5" fill="#334155">起点 = 车当前位置，带上在途货</text>
+<path d="M 610.0 1300.0 L 610.0 1348.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 820.0 1372.0 L 890.0 1348.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 1452.0 L 610.0 1500.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 820.0 1552.0 L 890.0 1552.0" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<text x="619" y="1188" font-size="11.5" fill="#00574e" text-anchor="start">订单 → 腿：本地单 1 条 / 跨簇单 3 条</text>
+<text x="855" y="1116" font-size="11.5" fill="#475569" text-anchor="middle">逐车计划</text>
+<text x="855" y="1240" font-size="11.5" fill="#475569" text-anchor="middle">职责表定车</text>
+<text x="619" y="1336" font-size="11.5" fill="#475569" text-anchor="start">L1.ready = 发车时刻 · L2.ready = L1 完成 · L3.ready = L2 完成</text>
+<text x="855" y="1336" font-size="11.5" fill="#475569" text-anchor="middle">易手事件</text>
+<text x="619" y="1488" font-size="11.5" fill="#475569" text-anchor="start">卸入 / 取走事件 → 逐单核对</text>
+<text x="855" y="1544" font-size="11.5" fill="#475569" text-anchor="middle">缺口清单</text>
+<text x="619" y="1580" font-size="11.5" fill="#475569" text-anchor="start">计划产物（STOP / TRANSIT 行）</text>
+<rect x="400" y="1196" width="420" height="104" rx="9" fill="#e6f7f5" stroke="#00897b" stroke-width="1.8" stroke-dasharray="7 4"/>
+<text x="412" y="1223" font-size="14" font-weight="700" fill="#00574e">buildLegs（订单 → 腿 L1/L2/L3）</text>
+<text x="412" y="1246" font-size="12.5" fill="#334155">本地单 1 条 customer-&gt;customer</text>
+<text x="412" y="1265" font-size="12.5" fill="#334155">跨簇单恰 3 条：客户→站 / 站→站 / 站→客户</text>
+<text x="412" y="1284" font-size="12.5" fill="#334155">执行车 = 职责表 legVehicleEligible（不硬编码车号）</text>
+<rect x="890" y="1196" width="280" height="104" rx="9" fill="#e6f7f5" stroke="#00897b" stroke-width="1.8" stroke-dasharray="7 4"/>
+<text x="902" y="1223" font-size="13" font-weight="700" fill="#00574e">Leg / LegKind / legs[]</text>
+<text x="902" y="1246" font-size="12.5" fill="#334155">readyTime 由前驱腿反推（构造性单调）</text>
+<text x="902" y="1265" font-size="12.5" fill="#334155">temporaryAssignment：估计 vs 实际</text>
+<text x="902" y="1284" font-size="12.5" fill="#334155">--dump-plan 的 LEG 行</text>
+<rect x="400" y="1348" width="420" height="104" rx="9" fill="#e6f7f5" stroke="#00897b" stroke-width="1.8" stroke-dasharray="7 4"/>
+<text x="412" y="1375" font-size="14" font-weight="700" fill="#00574e">applyRelayLayer → buildRelayChain</text>
+<text x="412" y="1398" font-size="12.5" fill="#334155">L1 本簇慢车 → L2 快车（站间）→ L3 对簇慢车</text>
+<text x="412" y="1417" font-size="12.5" fill="#334155">车等货：wait = max(窗口等待, ready − 到达)</text>
+<text x="412" y="1436" font-size="12.5" fill="#334155">前瞻 W = 60min / 站内停留 ≤ 60min 都是可行性判据</text>
+<rect x="890" y="1348" width="280" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
+<text x="902" y="1375" font-size="13" font-weight="700" fill="#12563c">TransitLeg 转运账本</text>
+<text x="902" y="1398" font-size="12.5" fill="#334155">buildTransitLedger（逐单全量易手）</text>
+<text x="902" y="1417" font-size="12.5" fill="#334155">inVehicle ≠ outVehicle；dwell ≤ 60</text>
+<text x="902" y="1436" font-size="12.5" fill="#334155">--dump-plan 的 TRANSIT 行 / GUI 7 列</text>
+<rect x="400" y="1500" width="420" height="104" rx="9" fill="#e6f7f5" stroke="#00897b" stroke-width="1.8" stroke-dasharray="7 4"/>
+<text x="412" y="1527" font-size="14" font-weight="700" fill="#00574e">CustodyReport / CustodyGap</text>
+<text x="412" y="1550" font-size="12.5" fill="#334155">只读 stops 的 transitUnloads/transitPickups/deliveries</text>
+<text x="412" y="1569" font-size="12.5" fill="#334155">不重算公式：Σ卸入 == Σ取走、送达或显式拒绝</text>
+<rect x="890" y="1500" width="280" height="104" rx="9" fill="#e6f7f5" stroke="#00897b" stroke-width="1.8" stroke-dasharray="7 4"/>
+<text x="902" y="1527" font-size="13" font-weight="700" fill="#00574e">auditCustody（期末 0 真断言）</text>
+<text x="902" y="1550" font-size="12.5" fill="#334155">四种缺口：unload-no-pickup / pickup-no-unload</text>
+<text x="902" y="1569" font-size="12.5" fill="#334155">/ kg-mismatch / undelivered-not-rejected</text>
+<text x="902" y="1588" font-size="12.5" fill="#334155">checkClosureCustodyContinuous 守着它</text>
+<line x1="0" y1="1532" x2="1200" y2="1532" stroke="#e2e8f0" stroke-width="1.5"/>
+<text x="18" y="1524" font-size="13" font-weight="700" fill="#94a3b8">④ 运行 · 事件 · 重规划 → 视图（紫色 = Qt 视图层，只读消费）</text>
+<line x1="0" y1="2064" x2="1200" y2="2064" stroke="#e2e8f0" stroke-width="1.5"/>
+<path d="M 610.0 540 L 610.0 560" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 400.0 612 L 320.0 612" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 400.0 612 L 40.0 612 L 40.0 744 L 400.0 744" fill="none" stroke="#64748b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#ah)"/>
+<text x="168" y="602" font-size="11.5" fill="#475569" text-anchor="middle">行号 / 记录</text>
+<text x="170" y="736" font-size="11.5" fill="#475569" text-anchor="middle">parser</text>
+<path d="M 610.0 664 L 610.0 684" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 788 L 610.0 808" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 400.0 736 L 330.0 736 L 330.0 984 L 320.0 984" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 912 L 610.0 932" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 820.0 860 L 890.0 860" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 820.0 984 L 890.0 984" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 1036 L 610.0 1056" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 30.0 984 L 360.0 984 L 360.0 1108 L 820.0 1108" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 820.0 1108 L 890.0 1108" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 1160 L 610.0 1180" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 320.0 1232 L 400.0 1232" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 1284 L 610.0 1304" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 820.0 1356 L 890.0 1356" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 1408 L 610.0 1428" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 820.0 1480 L 890.0 1480" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 820.0 1480 L 890.0 1480" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 1532 L 610.0 1596" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 820.0 1604 L 890.0 1604" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 1656 L 610.0 1676" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 400.0 1728 L 348.0 1728 L 348.0 1852 L 320.0 1852" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 1780 L 610.0 1800" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 820.0 1728 L 872.0 1728 L 872.0 1852 L 890.0 1852" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 610.0 1904 L 610.0 1924" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 400.0 1976 L 320.0 1976" fill="none" stroke="#64748b" stroke-width="1.4" marker-end="url(#ah)"/>
+<path d="M 400.0 1852 L 384.0 1852 L 384.0 860 L 400.0 860" fill="none" stroke="#c2410c" stroke-width="1.4" stroke-dasharray="6 4" marker-end="url(#ahd)"/>
+<path d="M 1170.0 1852 L 1195.0 1852 L 1195.0 400 L 880.0 400 L 880.0 886 L 820.0 886" fill="none" stroke="#c2410c" stroke-width="1.4" stroke-dasharray="6 4" marker-end="url(#ahd)"/>
+<path d="M 400.0 1976 L 396.0 1976 L 396.0 1356 L 400.0 1356" fill="none" stroke="#c2410c" stroke-width="1.4" stroke-dasharray="6 4" marker-end="url(#ahd)"/>
+<path d="M 30.0 1976 L 336.0 1976 L 336.0 1356 L 400.0 1356" fill="none" stroke="#c2410c" stroke-width="1.4" stroke-dasharray="6 4" marker-end="url(#ahd)"/>
+<text x="619" y="554" font-size="11.5" fill="#475569" text-anchor="start">文本</text>
+<text x="360" y="604" font-size="11.5" fill="#475569" text-anchor="middle">记录</text>
+<text x="619" y="678" font-size="11.5" fill="#475569" text-anchor="start">解析结果</text>
+<text x="619" y="802" font-size="11.5" fill="#475569" text-anchor="start">Config.graph</text>
+<text x="336" y="802" font-size="11.5" fill="#475569" text-anchor="start">Config.orders</text>
+<text x="619" y="926" font-size="11.5" fill="#475569" text-anchor="start">adjacency() 只读</text>
+<text x="855" y="852" font-size="11.5" fill="#475569" text-anchor="middle">node/edge</text>
+<text x="855" y="976" font-size="11.5" fill="#475569" text-anchor="middle">push/popMin</text>
+<text x="619" y="1050" font-size="11.5" fill="#475569" text-anchor="start">PathResult{nodes, totalWeight}</text>
+<text x="366" y="1050" font-size="11.5" fill="#475569" text-anchor="start">Request[]（取送对）</text>
+<text x="855" y="1100" font-size="11.5" fill="#475569" text-anchor="middle">Stop</text>
+<text x="619" y="1174" font-size="11.5" fill="#475569" text-anchor="start">stops[]（动作集为真源）</text>
+<text x="360" y="1224" font-size="11.5" fill="#475569" text-anchor="middle">在途货</text>
+<text x="619" y="1298" font-size="11.5" fill="#475569" text-anchor="start">offloads 记账</text>
+<text x="855" y="1348" font-size="11.5" fill="#475569" text-anchor="middle">custody</text>
+<text x="619" y="1422" font-size="11.5" fill="#475569" text-anchor="start">stops（真源）</text>
+<text x="855" y="1472" font-size="11.5" fill="#475569" text-anchor="middle">展平字段</text>
+<text x="619" y="1546" font-size="11.5" fill="#475569" text-anchor="start">扁平视图</text>
+<text x="855" y="1596" font-size="11.5" fill="#475569" text-anchor="middle">syncScene()</text>
+<text x="619" y="1670" font-size="11.5" fill="#475569" text-anchor="start">settleEventsUpTo(now)</text>
+<text x="354" y="1794" font-size="11.5" fill="#475569" text-anchor="start">抽到紧急单 3/40</text>
+<text x="619" y="1794" font-size="11.5" fill="#475569" text-anchor="start">抽到路况 27/40</text>
+<text x="878" y="1794" font-size="11.5" fill="#475569" text-anchor="start">抽到普通单/封路 10/40</text>
+<text x="619" y="1918" font-size="11.5" fill="#475569" text-anchor="start">needsReplan：增幅 ≥ 20% 且恰在相邻两站</text>
+<text x="360" y="1968" font-size="11.5" fill="#475569" text-anchor="middle">重放不可行</text>
+<text x="390" y="1298" font-size="11.5" fill="#475569" text-anchor="start">就地改 Edge::timeMin（baseTimeMin 不动）</text>
+<text x="1040" y="390" font-size="11.5" fill="#475569" text-anchor="middle">增删节点 / 边（GraphEdit）</text>
+<text x="402" y="1546" font-size="11.5" fill="#475569" text-anchor="start">回写 stops（新一版 RoutePlan）</text>
+<text x="342" y="1794" font-size="11.5" fill="#475569" text-anchor="start">回写（全量版）</text>
+<rect x="400" y="436" width="420" height="104" rx="9" fill="#e9f2fd" stroke="#3a7bd5" stroke-width="1.8"/>
+<text x="412" y="463" font-size="14" font-weight="700" fill="#123f6e">config/default.ini</text>
+<text x="412" y="486" font-size="12.5" fill="#334155">30 节点 / 106 有向边 / 25 订单</text>
+<text x="412" y="505" font-size="12.5" fill="#334155">车 4 台：V01 400kg 快车 + V02/V03/V04 160kg 慢车，08:00 发车</text>
+<rect x="400" y="560" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="412" y="587" font-size="14" font-weight="700" fill="#8a4500">IniFile::parse（手写解析）</text>
+<text x="412" y="610" font-size="12.5" fill="#334155"># 注释 / [section] / 空行；报错带行号</text>
+<text x="412" y="629" font-size="12.5" fill="#334155">记录自带 lineNo ⇒ 报错能指到具体行</text>
+<rect x="30" y="560" width="290" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
+<text x="42" y="587" font-size="13" font-weight="700" fill="#12563c">IniRecord / IniSection</text>
+<text x="42" y="610" font-size="12.5" fill="#334155">键值行或逗号记录行 + lineNo</text>
+<text x="42" y="629" font-size="12.5" fill="#334155">findValue 返回记录本体</text>
+<rect x="400" y="684" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="412" y="711" font-size="14" font-weight="700" fill="#8a4500">ConfigLoader::load → Config</text>
+<text x="412" y="734" font-size="12.5" fill="#334155">组装 + 校验：缺节 / 字段数 / 类型 / 端点 / 重复 ID</text>
+<text x="412" y="753" font-size="12.5" fill="#334155">输出 Config{graph, vehicles, orders, general}</text>
+<rect x="400" y="808" width="420" height="104" rx="9" fill="#e9f2fd" stroke="#3a7bd5" stroke-width="1.8"/>
+<text x="412" y="835" font-size="14" font-weight="700" fill="#123f6e">LogisticsGraph（邻接表）</text>
+<text x="412" y="858" font-size="12.5" fill="#334155">nodes_ 顺序表 + out_ 邻接表，下标对齐</text>
+<text x="412" y="877" font-size="12.5" fill="#334155">稀疏图：不用邻接矩阵（900 格几乎全空）</text>
+<text x="412" y="896" font-size="12.5" fill="#334155">indexOf O(n) / removeNode O(n+m)</text>
+<rect x="890" y="808" width="280" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
+<text x="902" y="835" font-size="13" font-weight="700" fill="#12563c">Node / Edge</text>
+<text x="902" y="858" font-size="12.5" fill="#334155">Edge 三权重 + baseTimeMin</text>
+<text x="902" y="877" font-size="12.5" fill="#334155">congested；baseTimeMin 永不改写</text>
+<rect x="400" y="932" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="412" y="959" font-size="14" font-weight="700" fill="#8a4500">Dijkstra::shortestPath</text>
+<text x="412" y="982" font-size="12.5" fill="#334155">dist[] + previous[] + 惰性删除</text>
+<text x="412" y="1001" font-size="12.5" fill="#334155">三策略共用一份，只在 pickWeight 换维度</text>
+<text x="412" y="1020" font-size="12.5" fill="#334155">时间 O(m·n + m·log m)，n 点 / m 边</text>
+<rect x="890" y="932" width="280" height="104" rx="9" fill="#e9f2fd" stroke="#3a7bd5" stroke-width="1.8"/>
+<text x="902" y="959" font-size="13" font-weight="700" fill="#123f6e">MinHeap（无 decrease-key）</text>
+<text x="902" y="982" font-size="12.5" fill="#334155">Entry{key, value}，底层 vector</text>
+<text x="902" y="1001" font-size="12.5" fill="#334155">siftUp / siftDown / swapEntries</text>
+<text x="902" y="1020" font-size="12.5" fill="#334155">push / popMin 各 O(log s)，自写</text>
+<rect x="30" y="932" width="290" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
+<text x="42" y="959" font-size="13" font-weight="700" fill="#12563c">Request / StopSpec</text>
+<text x="42" y="982" font-size="12.5" fill="#334155">一张订单一个取送对（A/B/kg/窗口）</text>
+<text x="42" y="1001" font-size="12.5" fill="#334155">StopSpec：构造期的动作集中间态</text>
+<rect x="400" y="1056" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="412" y="1083" font-size="14" font-weight="700" fill="#8a4500">pair-insertion + replay</text>
+<text x="412" y="1106" font-size="12.5" fill="#334155">枚举 (A,B) 的全部位置对，逐个重放评价</text>
+<text x="412" y="1125" font-size="12.5" fill="#334155">键 = (Σpenalty, 策略权重, tieKey)；停靠零耗时</text>
+<text x="412" y="1144" font-size="12.5" fill="#334155">单请求 O(n²) 位置对 × O(n) 重放 = O(n³)</text>
+<rect x="890" y="1056" width="280" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
+<text x="902" y="1083" font-size="13" font-weight="700" fill="#12563c">Stop（动作集 = 真源）</text>
+<text x="902" y="1106" font-size="12.5" fill="#334155">deliveries/pickups/offloads/reclaims</text>
+<text x="902" y="1125" font-size="12.5" fill="#334155">逐单 penalty：max(0, arr − 该单 we)</text>
+<text x="902" y="1144" font-size="12.5" fill="#334155">remainingLoadKg = 离开该站时在车量</text>
+<rect x="400" y="1180" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="412" y="1207" font-size="14" font-weight="700" fill="#8a4500">buildAll（多起点 + 兜底 + 降载）</text>
+<text x="412" y="1230" font-size="12.5" fill="#334155">三版插入序（EDD / 按 A 聚簇 / 按 B 聚簇）</text>
+<text x="412" y="1249" font-size="12.5" fill="#334155">失败 → repair R≤3 → 全量兜底 → 降载 → 拒绝</text>
+<rect x="30" y="1180" width="290" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
+<text x="42" y="1207" font-size="13" font-weight="700" fill="#12563c">OnboardItem</text>
+<text x="42" y="1230" font-size="12.5" fill="#334155">车此刻在车上的货（订单 + 目的 B + kg）</text>
+<text x="42" y="1249" font-size="12.5" fill="#334155">少了它，重规划会先跑回基地</text>
+<rect x="400" y="1304" width="420" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
+<text x="412" y="1331" font-size="14" font-weight="700" fill="#12563c">RoutePlan（stops 是真源）</text>
+<text x="412" y="1354" font-size="12.5" fill="#334155">stops[] + offloads[] + metrics + 展平视图</text>
+<text x="412" y="1373" font-size="12.5" fill="#334155">扁平字段只在一处生成 ⇒ 不会各自走样</text>
+<rect x="890" y="1304" width="280" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
+<text x="902" y="1331" font-size="13" font-weight="700" fill="#12563c">OffloadLeg / StashState</text>
+<text x="902" y="1354" font-size="12.5" fill="#334155">降载 custody：站/单/kg/卸下/取回</text>
+<text x="902" y="1373" font-size="12.5" fill="#334155">Σ卸入 − Σ取回 = 0（期末）；跨重规划透传</text>
+<rect x="400" y="1428" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="412" y="1455" font-size="14" font-weight="700" fill="#8a4500">finalize（唯一展平点）</text>
+<text x="412" y="1478" font-size="12.5" fill="#334155">stops → 扁平视图 + 指标汇总（一处生成）</text>
+<text x="412" y="1497" font-size="12.5" fill="#334155">所有规划出口各调一次</text>
+<rect x="890" y="1428" width="280" height="104" rx="9" fill="#eafaf0" stroke="#2f9e6b" stroke-width="1.8"/>
+<text x="902" y="1455" font-size="13" font-weight="700" fill="#12563c">聚合 → FleetPlan</text>
+<text x="902" y="1478" font-size="12.5" fill="#334155">aggregateFleet：车队汇总 + 分配表</text>
+<text x="902" y="1497" font-size="12.5" fill="#334155">vehicles[] / transitLegs[] / relocations[]</text>
+<rect x="400" y="1552" width="420" height="104" rx="9" fill="#f3ecfd" stroke="#8a5cd6" stroke-width="1.8"/>
+<text x="412" y="1579" font-size="14" font-weight="700" fill="#42257c">MainWindow 推进与结算</text>
+<text x="412" y="1602" font-size="12.5" fill="#334155">onAdvanceStop / onAdvanceMoment → settleEventsUpTo</text>
+<text x="412" y="1621" font-size="12.5" fill="#334155">nodeIndexAtTime：半路显示所在段的起点</text>
+<rect x="890" y="1552" width="280" height="104" rx="9" fill="#f3ecfd" stroke="#8a5cd6" stroke-width="1.8"/>
+<text x="902" y="1579" font-size="13" font-weight="700" fill="#42257c">GraphScene / NodeItem / EdgeItem</text>
+<text x="902" y="1602" font-size="12.5" fill="#334155">syncScene：高亮 isEdgeOnRoute</text>
+<text x="902" y="1621" font-size="12.5" fill="#334155">拥堵标记 / 车辆位置重绘</text>
+<text x="902" y="1640" font-size="12.5" fill="#334155">build O(m·n)，highlight O(m)</text>
+<rect x="400" y="1676" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="412" y="1703" font-size="14" font-weight="700" fill="#8a4500">SimEvent::nextEventTimeMin + pickEvent</text>
+<text x="412" y="1726" font-size="12.5" fill="#334155">每 15min 一个事件刻，严格前进</text>
+<text x="412" y="1745" font-size="12.5" fill="#334155">权重由 event_level_* 派生：默认 27:3:9:1</text>
+<text x="412" y="1764" font-size="12.5" fill="#334155">Rng 手写 xorshift32：为可复现，不是被禁 STL</text>
+<rect x="30" y="1800" width="290" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="42" y="1827" font-size="13" font-weight="700" fill="#8a4500">insertOrder（通用插单）</text>
+<text x="42" y="1850" font-size="12.5" fill="#334155">紧急 → FIFO 尾插；普通 → pair-insertion</text>
+<text x="42" y="1869" font-size="12.5" fill="#334155">装不下先降载；以当前位置/时刻重算</text>
+<rect x="400" y="1800" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="412" y="1827" font-size="14" font-weight="700" fill="#8a4500">Traffic::simulateTrafficChange → TrafficReport</text>
+<text x="412" y="1850" font-size="12.5" fill="#334155">部分 Fisher-Yates 选 round(0.1×106)=11 条边</text>
+<text x="412" y="1869" font-size="12.5" fill="#334155">改 Edge::timeMin；baseTimeMin 永不动</text>
+<rect x="890" y="1800" width="280" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="902" y="1827" font-size="13" font-weight="700" fill="#8a4500">GraphEdit</text>
+<text x="902" y="1850" font-size="12.5" fill="#334155">addRandomCustomer / closeRandomRoad</text>
+<text x="902" y="1869" font-size="12.5" fill="#334155">封路先 BFS 防封桥（不切孤岛）</text>
+<rect x="400" y="1924" width="420" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="412" y="1951" font-size="14" font-weight="700" fill="#8a4500">needsReplan → replanIncremental</text>
+<text x="412" y="1974" font-size="12.5" fill="#334155">增幅 ≥ 20% 且恰在路线相邻两站才触发</text>
+<text x="412" y="1993" font-size="12.5" fill="#334155">顺序不变版重放：停靠不变，按新权重重算</text>
+<text x="412" y="2012" font-size="12.5" fill="#334155">任一段不可达 ⇒ 退回全量 replan</text>
+<rect x="30" y="1924" width="290" height="104" rx="9" fill="#fff4e5" stroke="#e08a1e" stroke-width="1.8"/>
+<text x="42" y="1951" font-size="13" font-weight="700" fill="#8a4500">replan（全量兜底）</text>
+<text x="42" y="1974" font-size="12.5" fill="#334155">重放不可行时兜底：重跑构造（含多起点）</text>
+<text x="42" y="1993" font-size="12.5" fill="#334155">起点 = 车当前位置，带上在途货</text>
 </svg></div>
 <details><summary>展开：同一张流通图的纯文本版（任何终端 / 编辑器可看，也是 <code>数据结构地图.md</code> 里的那一张）</summary>
-<pre>config/default.ini  （30 节点 / 106 有向边 / 25 订单 / 车 200kg·08:00·1.00·1.00）
+<pre>config/default.ini  （30 节点 / 106 有向边 / 25 订单 / 四车：V01 400kg·1.00·1.50 快车 + V02/V03/V04 160kg·1.25·0.80 慢车，全部 08:00）
    │ 文本
    ▼
 IniFile::parse ──────► IniSection / IniRecord（每条自带 lineNo，报错才能点行）
