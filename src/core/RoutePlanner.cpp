@@ -4116,6 +4116,178 @@ std::vector<TransitLeg> buildTransitLedger(const std::vector<Vehicle>& vehicles,
     return legs;
 }
 
+// ---- 规格三 #49：custody 守恒审计（读计划产物，不重算公式）----
+//
+// 「期末 0」过去是**空过**的：账本配对要求同站，封路把 T01->T03 的快车腿吃掉后，
+// V02 在 T01 卸入、V04 在 T03 取走，两端不同站 => 账本 0 笔 => 看着「期末 0」其实是
+// 货物跨站无承运（假绿）。本函数不看账本，直接读**计划里的每一次易手**逐单核：
+//   · 卸入必须有同站、另一台车、时刻不早于它的取走（否则 unload-no-pickup）；
+//   · 取走必须有同站、另一台车、时刻不晚于它的卸入（否则 pickup-no-unload）；
+//   · 整单不可拆（C1）：每次易手都是该单全部需求 => Σ卸入 kg == Σ取走 kg；
+//   · 期末：每单要么送达、要么被显式拒绝。
+CustodyReport auditCustody(const std::vector<Vehicle>& vehicles,
+                           const std::vector<RoutePlan>& plans,
+                           const std::vector<Order>& orders,
+                           const std::vector<std::string>& rejectedOrderIds) {
+    CustodyReport report;
+    struct Ev {
+        std::string station;
+        std::string vehicleId;
+        int         timeMin = 0;
+        double      kg = 0.0;
+    };
+    std::map<std::string, std::vector<Ev> > unloads;   // 订单 -> 卸入事件
+    std::map<std::string, std::vector<Ev> > pickups;   // 订单 -> 取走事件
+    std::map<std::string, bool> delivered;             // 订单 -> 计划里是否送达
+    for (std::size_t v = 0; v < plans.size() && v < vehicles.size(); ++v) {
+        if (plans[v].status != PlanStatus::Ok) {
+            continue;
+        }
+        for (std::size_t s = 0; s < plans[v].stops.size(); ++s) {
+            const Stop& st = plans[v].stops[s];
+            for (std::size_t i = 0; i < st.transitUnloads.size(); ++i) {
+                Ev e;
+                e.station = st.nodeId;
+                e.vehicleId = vehicles[v].id;
+                e.timeMin = st.arrivalMin;
+                const std::map<std::string, double>::const_iterator kg =
+                    plans[v].transitKg.find(st.transitUnloads[i]);
+                e.kg = (kg != plans[v].transitKg.end()) ? kg->second : 0.0;
+                unloads[st.transitUnloads[i]].push_back(e);
+            }
+            for (std::size_t i = 0; i < st.transitPickups.size(); ++i) {
+                Ev e;
+                e.station = st.nodeId;
+                e.vehicleId = vehicles[v].id;
+                e.timeMin = st.arrivalMin;
+                pickups[st.transitPickups[i]].push_back(e);
+            }
+            for (std::size_t d = 0; d < st.deliveries.size(); ++d) {
+                delivered[st.deliveries[d].orderId] = true;
+            }
+        }
+    }
+    const std::vector<Ev> emptyEvents;
+    for (std::size_t oi = 0; oi < orders.size(); ++oi) {
+        const Order& o = orders[oi];
+        const double demand = o.demandKg;
+        const std::vector<Ev>& ins = (unloads.count(o.id) > 0) ? unloads[o.id] : emptyEvents;
+        const std::vector<Ev>& outs = (pickups.count(o.id) > 0) ? pickups[o.id] : emptyEvents;
+        const bool del = delivered.count(o.id) > 0;
+        bool rejected = false;
+        for (std::size_t i = 0; i < rejectedOrderIds.size(); ++i) {
+            if (rejectedOrderIds[i] == o.id) {
+                rejected = true;
+            }
+        }
+        if (ins.empty() && outs.empty()) {
+            if (!del && !rejected) {
+                CustodyGap g;
+                g.orderId = o.id;
+                g.kind = "undelivered-not-rejected";
+                g.detail = "订单 " + o.id + " 计划里没有送达，也不在显式拒绝名单里";
+                report.gaps.push_back(g);
+                report.ok = false;
+            }
+            continue;
+        }
+        // kg：整单不可拆 => 每次易手 = 该单全部需求；Σ卸入 必须 == Σ取走。
+        double sumIn = 0.0;
+        double sumOut = 0.0;
+        for (std::size_t i = 0; i < ins.size(); ++i) {
+            sumIn += ins[i].kg;
+            if (std::fabs(ins[i].kg - demand) > 1e-6) {
+                CustodyGap g;
+                g.orderId = o.id;
+                g.stationId = ins[i].station;
+                g.kind = "kg-mismatch";
+                g.detail = "订单 " + o.id + " 在 " + ins[i].station + " 卸入 "
+                           + std::to_string(ins[i].kg) + "kg != 需求 " + std::to_string(demand)
+                           + "kg";
+                report.gaps.push_back(g);
+                report.ok = false;
+            }
+        }
+        for (std::size_t i = 0; i < outs.size(); ++i) {
+            sumOut += demand;
+        }
+        if (std::fabs(sumIn - sumOut) > 1e-6) {
+            CustodyGap g;
+            g.orderId = o.id;
+            g.kind = "kg-mismatch";
+            g.detail = "订单 " + o.id + " Σ卸入 " + std::to_string(sumIn) + "kg != Σ取走 "
+                       + std::to_string(sumOut) + "kg";
+            report.gaps.push_back(g);
+            report.ok = false;
+        }
+        // 卸入 -> 同站、不同车、时刻不早于它的取走（每一笔取走最多吃一笔卸入）。
+        std::vector<char> outUsed(outs.size(), 0);
+        for (std::size_t i = 0; i < ins.size(); ++i) {
+            long long pick = -1;
+            for (std::size_t j = 0; j < outs.size(); ++j) {
+                if (outUsed[j]) {
+                    continue;
+                }
+                if (outs[j].station != ins[i].station) {
+                    continue;
+                }
+                if (outs[j].vehicleId == ins[i].vehicleId) {
+                    continue;
+                }
+                if (outs[j].timeMin < ins[i].timeMin) {
+                    continue;
+                }
+                if (pick < 0
+                    || outs[j].timeMin < outs[static_cast<std::size_t>(pick)].timeMin) {
+                    pick = static_cast<long long>(j);
+                }
+            }
+            if (pick < 0) {
+                CustodyGap g;
+                g.orderId = o.id;
+                g.stationId = ins[i].station;
+                g.kind = "unload-no-pickup";
+                g.detail = "订单 " + o.id + " 在 " + ins[i].station + " 由 " + ins[i].vehicleId
+                           + " 卸入，但无同站、另一台车的取走（货物跨站无承运）";
+                report.gaps.push_back(g);
+                report.ok = false;
+            } else {
+                outUsed[static_cast<std::size_t>(pick)] = 1;
+            }
+        }
+        // 取走 -> 同站、不同车、时刻不晚于它的卸入（不允许凭空的「只取不卸」）。
+        for (std::size_t j = 0; j < outs.size(); ++j) {
+            bool matched = false;
+            for (std::size_t i = 0; i < ins.size(); ++i) {
+                if (ins[i].station == outs[j].station && ins[i].vehicleId != outs[j].vehicleId
+                    && ins[i].timeMin <= outs[j].timeMin) {
+                    matched = true;
+                }
+            }
+            if (!matched) {
+                CustodyGap g;
+                g.orderId = o.id;
+                g.stationId = outs[j].station;
+                g.kind = "pickup-no-unload";
+                g.detail = "订单 " + o.id + " 在 " + outs[j].station + " 由 " + outs[j].vehicleId
+                           + " 取走，但无同站、另一台车的卸入（货物凭空出现在站上）";
+                report.gaps.push_back(g);
+                report.ok = false;
+            }
+        }
+        // 期末：有易手的单也必须最终送达或被显式拒绝。
+        if (!del && !rejected) {
+            CustodyGap g;
+            g.orderId = o.id;
+            g.kind = "undelivered-not-rejected";
+            g.detail = "订单 " + o.id + " 有站内易手，但计划里没有送达，也不在显式拒绝名单里";
+            report.gaps.push_back(g);
+            report.ok = false;
+        }
+    }
+    return report;
+}
+
 namespace {
 
 // 站点时钟文本（HH:MM，软件内分钟数）。只用于日志 / 账本，不参与任何算术。
@@ -6954,10 +7126,10 @@ void finalizeRescheduleLegs(const LogisticsGraph& graph, const std::vector<Vehic
         shell.legLog.push_back("[腿] 事件路径的 readyTime 锚定已执行前缀（车辆当前位置/时刻），"
                                "不再用发车时刻");
     }
-    // 「期末 0」不能空过：有卸入必须有**同站、另一台车**的取走。三段接力有两个易手点，
-    // 封路/重排后可能出现「V02 在 T01 卸入、V04 在 T03 取走」——货物跨站却无车承运，
-    // 账本配对（要求同站）为空 ⇒ 期末 0 会**假绿**（评审实测）。这里逐笔点名，让空过
-    // 在 CLI/GUI 播报上可见（§4.8 登记项）。
+    // 兜底告警（#49 起正常情况下**不会**触发）：有卸入必须有**同站、另一台车**的取走。
+    // 「封路/重排后 V02 在 T01 卸入、V04 在 T03 取走」的断链已由 repairCustodyBreaks 在
+    // 收口前修好（重跑接力或显式拒绝），所以走到这里时不应再有未配对卸入。保留此逐笔点名
+    // 作为最后的防线：万一将来某个新路径绕过了修复，仍能在 CLI/GUI 播报上看见，不静默。
     for (std::size_t v = 0; v < res.plans.size(); ++v) {
         for (std::size_t s = 0; s < res.plans[v].stops.size(); ++s) {
             const Stop& st = res.plans[v].stops[s];
@@ -6991,6 +7163,146 @@ void finalizeRescheduleLegs(const LogisticsGraph& graph, const std::vector<Vehic
     }
     res.legs = shell.legs;
     res.legLog = shell.legLog;
+}
+
+// ---- 规格三 #49：封路/路况打断接力链后的 custody 断链修复 ----
+//
+// 判据只读**计划产物**：某笔 transitUnload 找不到「**同站、另一台车**」的 transitPickup
+// ⇒ 货物在站里没有承接人（跨站无承运，正是封路把 T01->T03 快车腿吃掉后的病灶）。
+// 返回这些订单 ID（去重、按出现序）。
+//
+// 为什么这里**不**把「取走时刻 >= 卸入时刻」也放进判据：时刻倒挂（取走比卸入早几分钟）
+// 是既有「逐易手账本 + 局部重排」的另一类保真问题（US19，已登记为不修），任何一次与本单
+// 无关的逐车重排都可能把它挪动几分钟；把它当断链会误伤**没有跨站**的正常接力、并触发没
+// 必要的重跑。跨站无承运才是本票要修的封路病灶；时刻单调由 repairCustodyBreaks 末尾的
+// relayChainConsistent 在**重跑后**严格复核（那里要求取走 >= 卸入且等待 <= W）。
+std::vector<std::string> unpairedUnloadOrders(const std::vector<Vehicle>& vehicles,
+                                              const std::vector<RoutePlan>& plans) {
+    std::vector<std::string> broken;
+    for (std::size_t v = 0; v < plans.size() && v < vehicles.size(); ++v) {
+        if (plans[v].status != PlanStatus::Ok) {
+            continue;
+        }
+        for (std::size_t s = 0; s < plans[v].stops.size(); ++s) {
+            const Stop& st = plans[v].stops[s];
+            for (std::size_t i = 0; i < st.transitUnloads.size(); ++i) {
+                const std::string& id = st.transitUnloads[i];
+                bool matched = false;
+                for (std::size_t v2 = 0; v2 < plans.size() && !matched; ++v2) {
+                    if (v2 == v) {
+                        continue;
+                    }
+                    for (std::size_t s2 = 0; s2 < plans[v2].stops.size() && !matched; ++s2) {
+                        const Stop& st2 = plans[v2].stops[s2];
+                        if (st2.nodeId != st.nodeId) {
+                            continue;
+                        }
+                        for (std::size_t j = 0; j < st2.transitPickups.size(); ++j) {
+                            if (st2.transitPickups[j] == id) {
+                                matched = true;
+                            }
+                        }
+                    }
+                }
+                bool known = false;
+                for (std::size_t b = 0; b < broken.size(); ++b) {
+                    if (broken[b] == id) {
+                        known = true;
+                    }
+                }
+                if (!matched && !known) {
+                    broken.push_back(id);
+                }
+            }
+        }
+    }
+    return broken;
+}
+
+// 收口前的 custody 断链修复（US22 / US29）。
+//
+// 为什么首选「用新图重跑该单的三段接力」而不是直接拒绝：封路只堵 T01->T03 的**直达**，
+// 经 W01 的绕行（T01->W01->T03）仍在，接力往往仍可行 —— 一刀切拒绝会把能走通的单也
+// 丢掉。只有新图下确实接不上（或该单根本不是可接力的跨簇单）时才显式拒绝并记原因，
+// 这就是五级链第 ⑤ 级的落点；绝不允许「无车承运即跨站」通过。
+//
+// starts = 已执行前缀：事件从中途发起时，接力的可接时刻锚在该车当前位置/时刻。
+bool repairCustodyBreaks(const LogisticsGraph& graph, const std::vector<Vehicle>& vehicles,
+                         WeightType weight, const FleetRescheduleInput& input,
+                         const std::vector<Order>& legOrders,
+                         std::vector<std::vector<Order> >& work, std::vector<RoutePlan>& plans,
+                         std::vector<std::size_t>& replanned, std::vector<std::string>& log,
+                         std::string& why, bool repairEnabled) {
+    // 只在**封路/路况**这类「把某条腿打断」的事件上修 custody：跨簇新单另有 ①-a 的接力
+    // 分流（新单本来就重新构造三段接力，不存在旧链被打断的问题），而 Manual/NewOrder 在
+    // 已执行前缀上的保真属 US19（逐易手账本，已登记不修），把它们一并「重跑接力」会把
+    // 中途已执行的卸入当未执行重排，反而丢单 —— 那不是本票范围，也不该由这里兜。
+    if (!repairEnabled) {
+        return true;
+    }
+    const std::vector<std::string> broken = unpairedUnloadOrders(vehicles, plans);
+    if (broken.empty()) {
+        return true;   // 没有断链：原样通过（默认数据/无跨簇事件逐字不变）
+    }
+    std::vector<Order> targets;
+    for (std::size_t i = 0; i < broken.size(); ++i) {
+        Order found;
+        bool have = false;
+        for (std::size_t j = 0; j < legOrders.size(); ++j) {
+            if (legOrders[j].id == broken[i]) {
+                found = legOrders[j];
+                have = true;
+            }
+        }
+        if (!have) {
+            why = "订单 " + broken[i] + " 有卸入、无同站取走，但订单表里找不到它（无法重跑接力）";
+            return false;
+        }
+        if (!(isCrossCluster(graph, found) && relayChainPossible(graph, found))) {
+            why = "订单 " + found.id + " 有卸入、无同站取走，且不是可接力的跨簇单 "
+                  "（无法用三段接力修复）";
+            return false;
+        }
+        targets.push_back(found);
+    }
+    // 用**新图**重跑这些单的三段接力（starts = 已执行前缀）。
+    const std::vector<Order> fleetOrders = legOrders;
+    RelayOutcome ro;
+    applyRelayLayer(graph, vehicles, fleetOrders, weight, work, plans, targets, ro, &input.starts);
+    for (std::size_t i = 0; i < ro.log.size(); ++i) {
+        log.push_back("[复调度] " + ro.log[i]);
+    }
+    for (std::size_t i = 0; i < ro.touched.size(); ++i) {
+        const std::size_t t = ro.touched[i];
+        if (t < ro.plans.size() && t < plans.size()) {
+            plans[t] = ro.plans[t];
+            replanned.push_back(t);
+        }
+    }
+    work = ro.vehicleOrders;
+    // 复核：每张目标单都必须真的走完**合法接力**（6 个 custody 锚点齐全、相邻不同车、
+    // 等待落在 W 内）。relayChainConsistent 读的是最终计划的停靠，不是重算公式。
+    for (std::size_t i = 0; i < targets.size(); ++i) {
+        const Order& o = targets[i];
+        const std::string sa = stationOfCluster(graph, clusterOfNode(graph, o.pickupNodeId));
+        const std::string sb = stationOfCluster(graph, clusterOfNode(graph, o.nodeId));
+        if (!relayChainConsistent(vehicles, plans, o.id, sa, sb)) {
+            why = "封路后订单 " + o.id + " 无法重跑成合法三段接力（"
+                  + (ro.relayedCount > 0 ? std::string("新图下接力链仍不自洽")
+                                         : std::string("新图下接力不可行"))
+                  + "）";
+            return false;
+        }
+    }
+    // 再核：不能留下别的未配对卸入。
+    const std::vector<std::string> still = unpairedUnloadOrders(vehicles, plans);
+    if (!still.empty()) {
+        why = "重跑接力后仍有「有卸入、无同站取走」的订单 " + still[0];
+        return false;
+    }
+    log.push_back("[复调度] custody 断链已修复：用新图重跑 " + std::to_string(targets.size())
+                  + " 张跨簇单的三段接力（绕行 / 账本两端齐全 / 期末 0）");
+    return true;
 }
 
 }   // namespace
@@ -7029,6 +7341,29 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
     if (hasPending && !containsOrderId(legOrders, pending.id)) {
         legOrders.push_back(pending);
     }
+
+    // 收口（每条被接受的升级级都走这里）：先修「封路/路况打断接力链」造成的 custody
+    // 断链（#49 / US22 / US29），再重建腿结构。修不好就按五级链第 ⑤ 级拒绝并点名，
+    // 绝不留下「无车承运即跨站」。
+    auto accept = [&]() -> FleetRescheduleResult {
+        std::string custodyWhy;
+        const bool repairEnabled = (event.trigger == RescheduleTrigger::RoadClosure
+                                    || event.trigger == RescheduleTrigger::Traffic);
+        if (!repairCustodyBreaks(graph, vehicles, weight, input, legOrders, work, plans,
+                                 res.replanned, res.log, custodyWhy, repairEnabled)) {
+            res.level = 5;
+            res.rejected = true;
+            res.reason = custodyWhy;
+            res.log.push_back("[复调度] 拒绝：" + custodyWhy);
+            res.plans = input.remainingPlans;
+            res.vehicleOrders = input.vehicleOrders;
+            return res;
+        }
+        res.plans = plans;
+        res.vehicleOrders = work;
+        finalizeRescheduleLegs(graph, vehicles, legOrders, input.starts, res);
+        return res;
+    };
 
     // ---- 受影响车集合（§6.5）----
     // 第 ① 级失败的车：他们的上一版计划在当前图/当前订单集合下已经**不可实现**
@@ -7092,10 +7427,7 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
                     res.log.push_back("[复调度] 拒绝：" + why);
                     return res;
                 }
-                res.plans = plans;
-                res.vehicleOrders = work;
-                finalizeRescheduleLegs(graph, vehicles, legOrders, input.starts, res);
-                return res;
+                return accept();
             }
             res.log.push_back("[复调度] 跨簇单 " + pending.id
                               + " 三段接力未成立（各腿不可行 / 不更差兜底与职责降级均未落位）"
@@ -7121,10 +7453,7 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
                 res.log.push_back("[复调度] 拒绝：" + why);
                 return res;
             }
-            res.plans = plans;
-            res.vehicleOrders = work;
-            finalizeRescheduleLegs(graph, vehicles, legOrders, input.starts, res);
-            return res;
+            return accept();
         }
         res.log.push_back("[复调度] 新单 " + pending.id
                           + " 在全部车上都无法可行插入 → 进入升级链");
@@ -7166,10 +7495,7 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
                 res.log.push_back("[复调度] 拒绝：" + why);
                 return res;
             }
-            res.plans = plans;
-            res.vehicleOrders = work;
-            finalizeRescheduleLegs(graph, vehicles, legOrders, input.starts, res);
-            return res;
+            return accept();
         }
         // 部分车成功：保留它们的 ① 结果；失败车进第 ② 级。
         for (std::size_t i = 0; i < affected.size(); ++i) {
@@ -7297,10 +7623,7 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
             res.log.push_back("[复调度] 拒绝：" + why);
             return res;
         }
-        res.plans = plans;
-        res.vehicleOrders = work;
-        finalizeRescheduleLegs(graph, vehicles, legOrders, input.starts, res);
-        return res;
+        return accept();
     }
 
     // ---- ③ 全车队重调度：#40 的三阶段全跑 ----
@@ -7372,10 +7695,7 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
                 res.log.push_back("[复调度] 拒绝：" + why);
                 return res;
             }
-            res.plans = plans;
-            res.vehicleOrders = work;
-            finalizeRescheduleLegs(graph, vehicles, legOrders, input.starts, res);
-            return res;
+            return accept();
         }
         res.log.push_back("[复调度] 全车队重调度失败 → 升级链第 ④ 级");
     }
@@ -7486,10 +7806,7 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
                 res.log.push_back("[复调度] 拒绝：" + why);
                 return res;
             }
-            res.plans = plans;
-            res.vehicleOrders = work;
-            finalizeRescheduleLegs(graph, vehicles, legOrders, input.starts, res);
-            return res;
+            return accept();
         }
         res.log.push_back("[复调度] 降载 / 转运均不可行 → 升级链第 ⑤ 级");
     }
