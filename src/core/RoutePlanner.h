@@ -588,6 +588,33 @@ struct FleetRescheduleInput {
     std::vector<ExecutedTransitEntry> executedInStation;
 };
 
+// ---- 规格三 #49：custody（货物保管）守恒的「读计划产物」审计 ----
+//
+// 这是 US22/US29「期末 0」的**真断言**：只读 RoutePlan::stops 里的
+// transitUnloads / transitPickups / deliveries（即 --dump-plan 的 STOP/TRANSIT 行给
+// 用户看到的东西），**不重算任何公式**。它回答三个问题：
+//   · 逐单：每一笔「卸入」(进站) 是否都有一笔「同站、另一台车、时刻不早于它」的取走？
+//           （「有卸入、无同站取走」= 货物跨站却无车承运 —— 封路打断接力链的病灶）
+//   · kg：整单不可拆（C1）⇒ 每次易手都是该单全部需求，Σ卸入 kg 必须 == Σ取走 kg。
+//   · 期末：每单要么在计划里送达、要么在 rejected 名单里被**显式拒绝**（有原因）。
+struct CustodyGap {
+    std::string orderId;    // 涉事订单
+    std::string stationId;  // 涉事中转站（undelivered-not-rejected 时为空）
+    std::string kind;       // unload-no-pickup / pickup-no-unload / kg-mismatch / undelivered-not-rejected
+    std::string detail;     // 可读说明（点名订单 / 站 / 车），供日志与守卫摘录
+};
+struct CustodyReport {
+    bool ok = true;                 // 无任何缺口
+    std::vector<CustodyGap> gaps;   // 逐条缺口（按订单表顺序 + 事件顺序，确定性）
+};
+
+// 读计划产物逐单核 custody 守恒。rejectedOrderIds = 被显式拒绝的订单（有原因）；
+// 计划里出现、但既未送达也不在拒绝名单里的单，记为 undelivered-not-rejected。
+CustodyReport auditCustody(const std::vector<Vehicle>& vehicles,
+                           const std::vector<RoutePlan>& plans,
+                           const std::vector<Order>& orders,
+                           const std::vector<std::string>& rejectedOrderIds);
+
 // 局部重规划的两版结果（§6.3）。
 struct LocalReplanOutcome {
     RoutePlan chosen;            // 最终采用的那一版（都不可行时 status != Ok）

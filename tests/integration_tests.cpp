@@ -1683,12 +1683,17 @@ void checkDefaultLegsAreLocalSingleLegs(const Config& cfg, const FleetPlan* flee
 
 } // namespace
 
-// §4.8 登记项（US22/29 假绿）：封掉站间边后，第 ① 级局部重排会让「货无车承运即跨站」
-// ——V02 在 T01 卸入、V04 在 T03 取走送达、账本为空 ⇒「期末 0」空过。本票**不修**这个
-// 结构性缺口（要改逐易手账本/重排语义），但**必须点名**：res.log 里要有一行「账本空过」
-// 指名 O26（那是用户可见的运行日志，守卫读它）。
-// 反向验证：删掉 finalizeRescheduleLegs 里的「有卸入无同站取走」点名逻辑，本测试红。
-void checkClosureCustodyGapIsNamed(const Config& cfg) {
+// 规格三 #49（US22/US29）：封路打断接力链时 custody 必须保持连续 ——「期末 0」是**真断言**，
+// 不是空过。旧守卫（本函数的前身 checkClosureCustodyGapIsNamed）断言「缺口存在并被点名」；
+// 修完后**翻转**为断言「缺口不存在」：封路夹具上 O26 要么走完合法三段接力（账本两端齐全、
+// 期末 0），要么被显式拒绝并点名原因。两种结果都**不允许**「T01 卸入、T03 取走」的跨站无承运。
+//
+// 守卫读的是**计划产物**（STOP 行的 transitUnloads/transitPickups/deliveries 与账本），
+// 不是把公式重算一遍：auditCustody 就是「逐单 Σ卸入==Σ取走、已送达或显式拒绝、全队无
+// 『有卸入无同站取走』」的那条守恒检查。
+// 反向验证：把 rescheduleFleet 收口里的 repairCustodyBreaks 关掉（恢复成「原样保留悬空卸入」），
+// 本守卫的 custody 守恒检查即红（见 docs/测试用例表.md §6.6）。
+void checkClosureCustodyContinuous(const Config& cfg) {
     std::vector<logistics::Order> orders = cfg.orders;
     logistics::Order o26;
     o26.id = "O26";
@@ -1732,31 +1737,101 @@ void checkClosureCustodyGapIsNamed(const Config& cfg) {
     }
     const logistics::FleetRescheduleResult res =
         logistics::rescheduleFleet(g2, cfg.vehicles, WeightType::Time, in, ev);
-    // 复现：账本为空（配对要求同站，卸入在 T01 / 取走在 T03 无法配对），但计划里确有 O26 卸入。
+
+    // (0) 显式拒绝分支：封路后确实走不通时，必须点名 O26（第 ⑤ 级「拒绝」）。
+    if (res.rejected) {
+        const bool named = res.reason.find("O26") != std::string::npos;
+        std::printf("      封路拒绝原因（%d 级）：%s\n", res.level, res.reason.c_str());
+        check(named, "封路：O26 接力被中断时被显式拒绝并点名原因（不静默丢单）");
+        return;
+    }
+
+    // 打印 O26 的三处易手（用户可见的计划产物），便于人工核对。
+    for (std::size_t v = 0; v < res.plans.size() && v < cfg.vehicles.size(); ++v) {
+        for (const logistics::Stop& st : res.plans[v].stops) {
+            bool isO26 = false;
+            for (const std::string& id : st.transitUnloads) {
+                if (id == "O26") isO26 = true;
+            }
+            for (const std::string& id : st.transitPickups) {
+                if (id == "O26") isO26 = true;
+            }
+            for (const logistics::StopDelivery& d : st.deliveries) {
+                if (d.orderId == "O26") isO26 = true;
+            }
+            if (isO26) {
+                std::printf("      O26@%s 车=%s arr=%d 卸=%zu 取=%zu 送=%zu\n", st.nodeId.c_str(),
+                            cfg.vehicles[v].id.c_str(), st.arrivalMin, st.transitUnloads.size(),
+                            st.transitPickups.size(), st.deliveries.size());
+            }
+        }
+    }
+
+    // (1) 逐单 custody 守恒（读计划产物，不重算公式）：全队不存在「有卸入、无同站取走」。
+    const logistics::CustodyReport rep =
+        logistics::auditCustody(cfg.vehicles, res.plans, orders, std::vector<std::string>());
+    for (const logistics::CustodyGap& g : rep.gaps) {
+        std::printf("      custody 缺口 [%s] %s@%s：%s\n", g.kind.c_str(), g.orderId.c_str(),
+                    g.stationId.c_str(), g.detail.c_str());
+    }
+    check(rep.ok,
+          "封路：custody 守恒检查通过（Σ卸入==Σ取走、已送达或显式拒绝、全队无「有卸入无同站取走」）");
+
+    // (2) 账本两端齐全 / in≠out / dwell ≤ 60（期末 0 的必要条件）。
     const std::vector<logistics::TransitLeg> ledger =
         logistics::buildTransitLedger(cfg.vehicles, res.plans);
-    bool unpaired = false;
+    bool ledgerOk = !ledger.empty();
+    for (const logistics::TransitLeg& leg : ledger) {
+        std::printf("      账本 %s@%s %.1fkg 卸入=%s@%d 取走=%s@%d dwell=%d\n", leg.orderId.c_str(),
+                    leg.stationId.c_str(), leg.kg, leg.inVehicleId.c_str(), leg.inTimeMin,
+                    leg.outVehicleId.c_str(), leg.outTimeMin, leg.outTimeMin - leg.inTimeMin);
+        if (leg.inVehicleId.empty() || leg.outVehicleId.empty()
+            || leg.inVehicleId == leg.outVehicleId || leg.outTimeMin < leg.inTimeMin
+            || leg.outTimeMin - leg.inTimeMin > logistics::kTransferMaxDwellMin) {
+            ledgerOk = false;
+        }
+    }
+    check(ledgerOk, "封路：O26 走完合法接力，账本两端齐全 / in≠out / dwell≤60（账本 "
+                        + std::to_string(ledger.size()) + " 笔）");
+
+    // (3) 期末 0：O26 必须在计划里被送达（不存在留站库存）。
+    bool delivered = false;
     for (const RoutePlan& plan : res.plans) {
         for (const logistics::Stop& st : plan.stops) {
-            for (const std::string& id : st.transitUnloads) {
-                if (id == "O26") {
-                    unpaired = true;
+            for (const logistics::StopDelivery& d : st.deliveries) {
+                if (d.orderId == "O26") {
+                    delivered = true;
                 }
             }
         }
     }
-    check(ledger.empty() && unpaired,
-          "封路复现：计划里有 O26 卸入、账本却为空（期末 0 会假绿；账本 "
-              + std::to_string(ledger.size()) + " 笔）");
-    bool named = false;
+    check(delivered, "封路：O26 期末已送达（无在站库存）");
+
+    // (4) 旧「账本空过」告警必须消失（缺口已修，不再空过）。
+    bool warned = false;
     for (const std::string& line : res.log) {
-        if (line.find("账本空过") != std::string::npos
-            && line.find("O26") != std::string::npos) {
-            named = true;
+        if (line.find("账本空过") != std::string::npos) {
+            warned = true;
             std::printf("      %s\n", line.c_str());
         }
     }
-    check(named, "封路复现：『期末 0 空过』被点名（运行日志有「账本空过 … O26 …」行）");
+    check(!warned, "封路：不再出现『账本空过』告警（缺口已修复，非空过）");
+
+    // (5) 反向直判：不存在「T01 卸入、T03 取走」的跨站无承运（点名叫得出来）。
+    bool t01Unload = false;
+    bool t01Pickup = false;
+    for (const RoutePlan& plan : res.plans) {
+        for (const logistics::Stop& st : plan.stops) {
+            for (const std::string& id : st.transitUnloads) {
+                if (id == "O26" && st.nodeId == "T01") t01Unload = true;
+            }
+            for (const std::string& id : st.transitPickups) {
+                if (id == "O26" && st.nodeId == "T01") t01Pickup = true;
+            }
+        }
+    }
+    check(!t01Unload || t01Pickup,
+          "封路：O26 若在 T01 卸入则必须在 T01 有同站取走（杜绝「T01 卸、T03 取」的跨站无承运）");
 }
 
 int main() {
@@ -1820,8 +1895,9 @@ int main() {
     checkSmallCapacityStaysSingleRoute(cfg);
     checkGraphRepresentationsOnRealData(cfg);
     checkTrafficAndUrgentOrderOnRealData(cfg);
-    // §4.8 登记项：封路后的「期末 0 空过」必须被点名（US22/29）。
-    checkClosureCustodyGapIsNamed(cfg);
+    // 规格三 #49：封路打断接力链后 custody 必须连续、「期末 0」是真断言（US22/29）。
+    // 旧守卫 checkClosureCustodyGapIsNamed（断言缺口存在）已翻转为断言缺口不存在。
+    checkClosureCustodyContinuous(cfg);
 
     return testutil::summarize("integration_tests");
 }
