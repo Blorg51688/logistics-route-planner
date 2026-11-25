@@ -58,14 +58,17 @@ EVENT_LEVELS = [
     ("event_level_closure", "extra_low"),
 ]
 
-# 默认车队（规格二 §3.2 数据集事实，**权威**）：
-#   快车 V01 400kg / 1.00 / 1.50；慢车 V02、V03 160kg / 1.25 / 0.80；全部 W01、08:00 同刻发车。
-# 三车 / 三枢纽批次（160 / 144 / 152kg）天然一一对应；"慢车 160kg 零余量"是例外非常态
-# （规格二 §3.8），只有分配把两批压到同一台慢车时才会走降载/兜底。
+# 默认车队（规格三 §4 数据集事实，**权威**）：
+#   快车 V01 400kg / 1.00 / 1.50（只跑站间腿）；慢车 V02、V03、V04 160kg / 1.25 / 0.80
+#   （各守一簇，簇 ID 升序 × 慢车 ID 升序固定配对）；全部 W01、08:00 同刻发车。
+# 为什么是 3 台慢车而不是 2 台（规格二曾是 3 车）：职责封闭要求「每个子配送网有专属运力」，
+# 3 簇 / 3 慢车 ⇒ 簇→慢车是**排列数 1 的固定指派**，无需枚举（#46 退役整簇全排列的根因）。
+# 订单表一个字不改：25 单 516kg 全部簇内，每簇一批（160/144/152kg）仍与一台慢车对应。
 VEHICLES = [
     ("V01", "W01", 400, "08:00", 1.00, 1.50),
     ("V02", "W01", 160, "08:00", 1.25, 0.80),
     ("V03", "W01", 160, "08:00", 1.25, 0.80),
+    ("V04", "W01", 160, "08:00", 1.25, 0.80),
 ]
 
 # 初始数据集（规格一 #23「四、订单表（权威版，25 行）」**逐字照抄**）。
@@ -460,6 +463,34 @@ def self_check(text):
         if not any(v[5] < 1.0 for v in vehicles):
             problems.append("[vehicles] 不存在 cost_factor < 1 的车")
 
+    # 职责封闭的三条数据前提（规格三 §4 / #46）。判据全部由**车队与簇**推出来，
+    # 不硬编码车号或簇号：换数据时只要三条仍成立，职责封闭就仍然可执行。
+    #   · 慢车数 == 簇数：每簇恰有一台慢车 ⇒ 「簇 -> 慢车」是排列数 1 的固定指派；
+    #   · 快车容量 >= 2 × 每台慢车容量：站间腿（整单搬运）必须一台装得下，
+    #     否则跨簇单会被迫拆成多趟，三段接力在容量上就不成立；
+    #   · 两型因子分化：快车 time_factor 严格小于每台慢车、cost_factor 严格大于每台慢车。
+    #     若不分化，「快车只跑站间腿」就没有经济含义（跑得一样快、一样贵，不如合并车型）。
+    if vehicles:
+        max_cap = max(caps)
+        fast = [v for v in vehicles if abs(v[2] - max_cap) < 1e-9]
+        slow = [v for v in vehicles if abs(v[2] - max_cap) >= 1e-9]
+        if len(fast) != 1:
+            problems.append("[vehicles] 快车（容量最大者）应恰有 1 台，实际 %d 台" % len(fast))
+        cluster_ids = sorted(sub for sub in subs
+                             if sub != "0" and any(m[1] == "delivery" for m in subs[sub]))
+        if len(slow) != len(cluster_ids):
+            problems.append("[vehicles] 慢车 %d 台 != 簇 %d 个（每簇恰有一台慢车不成立）"
+                            % (len(slow), len(cluster_ids)))
+        for fv in fast:
+            for sv in slow:
+                if fv[2] < 2.0 * sv[2] - 1e-9:
+                    problems.append("[vehicles] 快车 %s 容量 %.0f < 2 × 慢车 %s 容量 %.0f"
+                                    % (fv[0], fv[2], sv[0], sv[2]))
+                if not (fv[4] < sv[4] and fv[5] > sv[5]):
+                    problems.append("[vehicles] 两型因子未分化：快车 %s (%.2f/%.2f) 应"
+                                    " time_factor 更小、cost_factor 更大（对照慢车 %s %.2f/%.2f）"
+                                    % (fv[0], fv[4], fv[5], sv[0], sv[4], sv[5]))
+
     # ---- [orders]：七列 + 规格一 §3.5/§3.8 的全部结构事实 ----
     delivery_ids = {nid for nid, t in nodes.items() if t == "delivery"}
     parsed_orders = []
@@ -571,7 +602,8 @@ def main():
             print("  - " + p)
         return 1
     print("[generate_dataset] 自检通过（七列订单 / 六列车辆 / 等级键 / 双口径规模 / 单向边 / "
-          "中转站归属 / A-B 同子网络 / 总重与窗口分布 / 往返可达 / 双策略可分化）")
+          "中转站归属 / A-B 同子网络 / 总重与窗口分布 / 往返可达 / 双策略可分化 / "
+          "每簇一台慢车 / 快车容量≥2×慢车 / 两型因子分化）")
 
     if args.write:
         os.makedirs(os.path.dirname(DEFAULT_INI), exist_ok=True)

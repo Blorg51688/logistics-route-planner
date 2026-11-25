@@ -2590,6 +2590,29 @@ void MainWindow::updatePanels() {
                 vehicleTabs_->setTabText(static_cast<int>(vi), tabTitle);
             }
         }
+        // 默认落点：选中的页签应当**有路线可看**。
+        // 职责封闭（#46）之后行序 0 的快车在默认数据上恒为空车 —— 若把选中停在它身上，
+        // 画布上既没有加粗边、也没有可核对的信息（--ui-probe 的「选中车加粗」会落空）。
+        // 因此只在「当前选中的是空车、而别的车有活」这一种情形下改选第一台有路线的车；
+        // 用户自己切到哪一页就留在哪一页（有路线时一律不覆盖）。
+        if (vehicleTabs_ != nullptr && !config_.vehicles.empty()) {
+            const int cur = vehicleTabs_->currentIndex();
+            bool curHasRoute = false;
+            if (cur >= 0 && static_cast<std::size_t>(cur) < fleet_.size()) {
+                curHasRoute = fleet_[static_cast<std::size_t>(cur)].plan.status
+                                  == logistics::PlanStatus::Ok
+                              && !fleet_[static_cast<std::size_t>(cur)].plan.stops.empty();
+            }
+            if (!curHasRoute) {
+                for (std::size_t vi = 0; vi < fleet_.size(); ++vi) {
+                    if (fleet_[vi].plan.status == logistics::PlanStatus::Ok
+                        && !fleet_[vi].plan.stops.empty()) {
+                        vehicleTabs_->setCurrentIndex(static_cast<int>(vi));
+                        break;
+                    }
+                }
+            }
+        }
         // **逐车**填两块（不按当前页签填：切页状态会影响断言结果）。
         for (std::size_t vi = 0; vi < config_.vehicles.size(); ++vi) {
             QWidget* page = vehicleTabs_->widget(static_cast<int>(vi));
@@ -3530,12 +3553,17 @@ int MainWindow::runActionSelfCheck() {
                        .arg(QString::fromStdString(customerOrder->id)));
         }
 
-        // X 必须真的进路线（只看"新增节点"太弱：节点加了但没被配送等于没有需求）
+        // X 必须真的进路线（只看"新增节点"太弱：节点加了但没被配送等于没有需求）。
+        // 读**全队**路线而不是当前页签那一台车：职责封闭（#46）之后新客户按它的子网归属
+        // 落到**该簇的慢车**上，未必是界面当前选中的那台（默认选中的是「第一台有路线的车」）。
+        // 只看 active() 会把它判成"没进路线"，那是口径错、不是缺陷。
         bool inPlan = false;
-        for (const std::string& n : active().plan.nodes) {
-            if (n == node) {
-                inPlan = true;
-                break;
+        for (std::size_t v = 0; v < fleet_.size() && !inPlan; ++v) {
+            for (const std::string& n : fleet_[v].plan.nodes) {
+                if (n == node) {
+                    inPlan = true;
+                    break;
+                }
             }
         }
         expect(inPlan, QStringLiteral("新客户节点 X 必须出现在路线里（B=X 的结果）"));
@@ -4147,6 +4175,9 @@ int MainWindow::runActionSelfCheck() {
         two("H", "C", 15.0);
         two("C", "D", 15.0);
         two("D", "W", 15.0);
+        // #46：职责封闭要求「一台快车 + 若干慢车」。夹具要的是**两台对称的慢车**，
+        // 所以再加一台 200kg 的快车 V03 当「簇间车」——它在纯本地单的镜像夹具上没有活
+        // （空车不参与并列断言），V01/V02 才是要比较的那两台慢车。
         mirror.vehicles.clear();
         for (const char* id : {"V01", "V02"}) {
             logistics::Vehicle v;
@@ -4155,6 +4186,14 @@ int MainWindow::runActionSelfCheck() {
             v.capacityKg = 100.0;
             v.departTimeMin = 480;
             mirror.vehicles.push_back(v);
+        }
+        {
+            logistics::Vehicle fast;
+            fast.id = "V03";
+            fast.startNodeId = "W";
+            fast.capacityKg = 200.0;   // 容量最大 ⇒ 快车（簇间搬运），不接本地簇
+            fast.departTimeMin = 480;
+            mirror.vehicles.push_back(fast);
         }
         mirror.orders.clear();
         const auto order = [&mirror](const std::string& id, const std::string& a,
@@ -4175,7 +4214,7 @@ int MainWindow::runActionSelfCheck() {
         MainWindow tieA(mirror, configPath_);
         MainWindow tieB(mirror, configPath_);
         // （前置）两台车每一步都并列：到达时刻数组逐位相同
-        bool tiePremise = tieA.fleet().size() == 2
+        bool tiePremise = tieA.fleet().size() == 3
                           && tieA.fleet()[0].plan.nodeArrivalMin
                                  == tieA.fleet()[1].plan.nodeArrivalMin
                           && tieA.fleet()[0].plan.nodeArrivalMin.size() >= 4;
@@ -4235,14 +4274,14 @@ int MainWindow::runActionSelfCheck() {
         tieOne.onAdvanceStop();   // 全队下一到达时刻 = 两台车并列的那个时刻
         const int t1 = tieOne.fleet().size() > 0 ? tieOne.fleet()[0].state.atTimeMin : -1;
         const int t2 = tieOne.fleet().size() > 1 ? tieOne.fleet()[1].state.atTimeMin : -1;
-        expect(tieOne.fleet().size() == 2 && t1 == expectedArrival && t2 == expectedArrival,
+        expect(tieOne.fleet().size() == 3 && t1 == expectedArrival && t2 == expectedArrival,
                QStringLiteral("X7 并列到达：一次「推进一站」把**两台车**都推到同一时刻 %1"
                               "（实际 V01 %2 / V02 %3）")
                    .arg(expectedArrival)
                    .arg(t1)
                    .arg(t2));
         // 夹具里两台车的第一站都是共用的 H（同刻并列）——断言"两台车都真的前进了一站"。
-        expect(tieOne.fleet().size() == 2 && tieOne.fleet()[0].nodeIndex == 1
+        expect(tieOne.fleet().size() == 3 && tieOne.fleet()[0].nodeIndex == 1
                    && tieOne.fleet()[1].nodeIndex == 1
                    && tieOne.fleet()[0].state.atNodeId == tieOne.fleet()[1].state.atNodeId,
                QStringLiteral("X7 并列到达：两台车都真的前进了一站（实际下标 %1 / %2）")

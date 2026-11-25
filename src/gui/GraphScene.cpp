@@ -70,12 +70,19 @@ void GraphScene::clearHighlight() {
     highlightRoute({});
 }
 
-// 车队三色（规格二 §7.5⑤）：按 [vehicles] 行序取色，超出 3 台循环。
+// 车队四色（规格二 §7.5⑤ + 规格三 §7 的「第 4 色需定值」）：
+// 按 [vehicles] 行序取色，**超出 4 台循环**。
+//
+// 为什么必须补 case 3：原实现是 case 0/1 + default 绿，3 车时恰好覆盖；车队扩到 4 台后
+// 第 4 台（行序 3）会落进 default 与第 3 台**同色**，画布上两台车的路线分不出来 ——
+// 「谁跑哪条边」这件用户可见的事就断了。四色都取**定值**（不是按比例算），
+// 这样报告、探针与截图里的颜色恒定，不随车辆数漂。
 QColor GraphScene::vehicleColor(int vehicleIndex) {
-    switch (((vehicleIndex % 3) + 3) % 3) {
-        case 0:  return QColor(0xC0, 0x39, 0x2B);   // V01 红
-        case 1:  return QColor(0x1F, 0x6F, 0xEB);   // V02 蓝
-        default: return QColor(0x1A, 0x7F, 0x37);   // V03 绿
+    switch (((vehicleIndex % 4) + 4) % 4) {
+        case 0:  return QColor(0xC0, 0x39, 0x2B);   // 行序 0 红
+        case 1:  return QColor(0x1F, 0x6F, 0xEB);   // 行序 1 蓝
+        case 2:  return QColor(0x1A, 0x7F, 0x37);   // 行序 2 绿
+        default: return QColor(0x7B, 0x2E, 0xA6);   // 行序 3 紫（与红/蓝/绿都易分辨）
     }
 }
 

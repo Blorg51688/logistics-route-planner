@@ -234,19 +234,23 @@ void testLoadDefaultConfig() {
     check(countType(cfg, NodeType::Transit) >= 3, "中转站 ≥ 3");
     check(cfg.graph.edgeCount() >= 50, "路径总数 ≥ 50");
 
-    // 车辆：规格二 §3.2 的**默认三车异构车队**（六列，含两因子），行序即车辆序。
-    check(cfg.vehicles.size() == 3, "默认车队恰有 3 辆车（V01/V02/V03）");
-    if (cfg.vehicles.size() == 3) {
+    // 车辆：规格三 §4 的**默认四车车队**（六列，含两因子），行序即车辆序。
+    //   一台快车（400kg / 成本因子 1.50：簇间搬运贵而快）+ 三台慢车（160kg / 0.80：
+    //   每台守一个簇）。**这是职责封闭的前提**：三簇三慢车 ⇒「簇 -> 慢车」排列数 = 1。
+    //   订单表一个字没动（见 #44/#46：车队形状变了，需求数据不变）。
+    check(cfg.vehicles.size() == 4, "默认车队恰有 4 辆车（V01 快车 + V02/V03/V04 慢车）");
+    if (cfg.vehicles.size() == 4) {
         struct ExpectVehicle {
             const char* id;
             double      capacityKg;
             double      timeFactor;
             double      costFactor;
         };
-        const ExpectVehicle expect[3] = {{"V01", 400.0, 1.00, 1.50},
+        const ExpectVehicle expect[4] = {{"V01", 400.0, 1.00, 1.50},
                                          {"V02", 160.0, 1.25, 0.80},
-                                         {"V03", 160.0, 1.25, 0.80}};
-        for (int i = 0; i < 3; ++i) {
+                                         {"V03", 160.0, 1.25, 0.80},
+                                         {"V04", 160.0, 1.25, 0.80}};
+        for (int i = 0; i < 4; ++i) {
             const logistics::Vehicle& v = cfg.vehicles[static_cast<std::size_t>(i)];
             const std::string tag = std::string("默认车辆 ") + expect[i].id + "：";
             check(v.id == expect[i].id, tag + "行序与 ID 一致");
