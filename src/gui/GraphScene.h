@@ -34,10 +34,22 @@ public:
     // 第 4 色是 #46 补的：原实现只有 3 个 case + default，第 4 台会与第 3 台同色。
     // **共享边**归行序最前那台车、不重复绘制；
     // 加粗判定 = 该边是否属于 selectedVehicle（与颜色归属解耦）。
+    // fastFlags[i] = 第 i 台车是否快车（长度可与 routes 不同：缺省视为慢车）。
+    // 颜色按**角色**取（慢车统一一色、快车另一色），不再按行序四色。
     void setFleetRoutes(const std::vector<std::vector<std::string> >& routes,
-                        int selectedVehicle);
-    // 每车路线颜色（代码常量，按行序循环；报告/探针共用同一份）
+                        int selectedVehicle,
+                        const std::vector<bool>& fastFlags = std::vector<bool>());
+    // 每车路线颜色（代码常量，按行序循环；报告/探针共用同一份）。
+    // 说明：画布上路线颜色已改为按**角色**（roleColor），vehicleColor 保留给
+    // 「按行序区分」的离屏图/历史探针，不再用于 GUI 主画布。
     static QColor vehicleColor(int vehicleIndex);
+    // 角色两色：慢车（false）青、快车（true）洋红 —— 与节点类型色、路径高亮红都可分辨。
+    static QColor roleColor(bool fast);
+
+    // 每台车在自己所在节点外的**环**（规格三 GUI §7）。
+    // atNodeIds[i] = 第 i 台车当前所在节点（空串=不画）；同节点多车按行序 slot 错开。
+    void setVehicleMarks(const std::vector<std::string>& atNodeIds,
+                         const std::vector<bool>& fastFlags);
 
     // 标记车辆当前所在节点（空串表示不标记任何节点）
     void setVehiclePosition(const std::string& nodeId);
@@ -56,6 +68,7 @@ private:
     bool allLabelsVisible_ = false;
     std::string vehicleNodeId_;
     std::vector<std::vector<std::string> > fleetRoutes_;
+    std::vector<bool> fleetFastFlags_;   // 与 fleetRoutes_ 对应的角色标记（快车=true）
     int selectedVehicle_ = 0;
 
     void refreshLabelVisibility();

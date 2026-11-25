@@ -413,6 +413,13 @@ bool legVehicleEligible(const LogisticsGraph& graph, const std::vector<Vehicle>&
 std::string chooseLegVehicle(const LogisticsGraph& graph, const std::vector<Vehicle>& vehicles,
                              const Leg& leg);
 
+// 「哪台是快车」的**公开只读**判定（GUI 按角色取色/画环用，规格三 GUI §7）：
+// 返回与 vehicles 同长的 bool 向量，true = 快车（站↔站 + 跨簇紧急单直达）。
+// 判据与 legVehicleEligible / 接力层**同一份**（relayVehicleIndex → betterForStationLeg）：
+// 容量最大 ⇒ 成本因子更高 ⇒ 车辆 ID 小；只有一台车时它就是快车。
+// 为什么公开：GUI 不能自己再推一遍角色 —— 口径一漂，画布颜色与 LEG 行就会互相矛盾。
+std::vector<bool> fastVehicleFlags(const std::vector<Vehicle>& vehicles);
+
 // 顺序轮转基线（规格二 §4.5，**对照组不是候选方案**）：
 // 订单 ID 升序、第 i 单 -> 第 (i mod k) 台车、车辆序 = [vehicles] 行序；
 // 不跳车、不重分配、不做可行性预判；分完后各车独立跑 planRoute。

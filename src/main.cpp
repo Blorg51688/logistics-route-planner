@@ -522,7 +522,15 @@ int main(int argc, char** argv) {
                                      ? plan.nodes
                                      : std::vector<std::string>());
             }
-            scene.setFleetRoutes(routes, 0);
+            // 角色两色 + 车辆环（规格三 GUI §7）：离屏图与界面同一份配色口径。
+            const std::vector<bool> fastFlags = logistics::fastVehicleFlags(config.vehicles);
+            scene.setFleetRoutes(routes, 0, fastFlags);
+            std::vector<std::string> atNodes;
+            for (std::size_t v = 0; v < fleet.vehicles.size() && v < config.vehicles.size(); ++v) {
+                atNodes.push_back(fleet.vehicles[v].nodes.empty() ? config.vehicles[v].startNodeId
+                                                                 : fleet.vehicles[v].nodes.front());
+            }
+            scene.setVehicleMarks(atNodes, fastFlags);
             if (fleet.allOk) {
                 std::printf("规划（%s）：距离 %.1fkm  完工耗时 %.1fmin（车时合计 %.1fmin）  "
                             "成本 %.1f元  penalty %dmin  停靠 %d 站  车 %zu 台\n",
@@ -1113,6 +1121,40 @@ int main(int argc, char** argv) {
                 }
                 return -1;
             };
+            // ---- 规格三 #50：每车只画到「下一个停靠点」，任何边都不得越过它 ----
+            // 用同一份规划（planFleet）取每台车的节点序列与停靠标记，算出「目标停靠点下标」；
+            // 画布上凡属于某台车的边，其终点下标必须 ≤ 该车的目标下标。回退成整条剩余路线即红。
+            const logistics::FleetPlan fleet =
+                logistics::planFleet(config.graph, config.vehicles, config.orders,
+                                     logistics::WeightType::Distance);
+            std::vector<std::vector<std::string> > planNodes(config.vehicles.size());
+            std::vector<std::vector<bool> > planIsStop(config.vehicles.size());
+            for (std::size_t v = 0; v < fleet.vehicles.size(); ++v) {
+                planNodes[v] = fleet.vehicles[v].nodes;
+                planIsStop[v] = fleet.vehicles[v].nodeIsStop;
+            }
+            const auto vehicleIndexOf = [&config](const QString& id) -> int {
+                for (std::size_t v = 0; v < config.vehicles.size(); ++v) {
+                    if (QString::fromStdString(config.vehicles[v].id) == id) {
+                        return static_cast<int>(v);
+                    }
+                }
+                return -1;
+            };
+            // 该车「下一个停靠点」在 nodes 里的下标（发车时刻：从下标 1 起找第一个 nodeIsStop）。
+            const auto targetIndexOf = [&planNodes, &planIsStop](int v) -> int {
+                if (v < 0) {
+                    return -1;
+                }
+                const std::vector<std::string>& ns = planNodes[static_cast<std::size_t>(v)];
+                for (std::size_t j = 1; j < ns.size(); ++j) {
+                    if (j < planIsStop[static_cast<std::size_t>(v)].size()
+                        && planIsStop[static_cast<std::size_t>(v)][j]) {
+                        return static_cast<int>(j);
+                    }
+                }
+                return static_cast<int>(ns.size()) - 1;   // 没有停靠点（空车/直达回库）
+            };
             int selectedRows = 0;
             for (const QString& line : rows) {
                 const QRegularExpressionMatch m = rowRe.match(line);
@@ -1125,6 +1167,27 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "[ui-probe] 画布归属车不是配置里的车辆：%s\n",
                                  line.toUtf8().constData());
                     return 1;
+                }
+                // 画布上的边不得越过**任何一台经过它的车**的下一个停靠点（规格三 #50）。
+                for (const QString& oid : m.captured(5).split(QLatin1Char(','), Qt::SkipEmptyParts)) {
+                    const int v = vehicleIndexOf(oid);
+                    const int target = targetIndexOf(v);
+                    const std::vector<std::string>& ns = planNodes[static_cast<std::size_t>(v)];
+                    int toIdx = -1;
+                    for (std::size_t j = 0; j < ns.size(); ++j) {
+                        if (QString::fromStdString(ns[j]) == m.captured(2)) {
+                            toIdx = static_cast<int>(j);
+                            break;
+                        }
+                    }
+                    if (toIdx < 0 || toIdx > target) {
+                        std::fprintf(stderr,
+                                     "[ui-probe] 画布边 %s 越过了车 %s 的下一个停靠点"
+                                     "（终点下标 %d > 目标下标 %d）：%s\n",
+                                     m.captured(1).toUtf8().constData(), oid.toUtf8().constData(),
+                                     toIdx, target, line.toUtf8().constData());
+                        return 1;
+                    }
                 }
                 if (m.captured(4) == QStringLiteral("1")) {
                     ++selectedRows;
