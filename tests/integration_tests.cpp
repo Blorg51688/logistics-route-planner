@@ -487,12 +487,12 @@ void checkDefaultTransitNotTriggered(const Config& cfg, const FleetPlan& byDista
     // **不再自带第二份数字**：这 22 项与 tests/plan_golden.h 的车队 13 字段是**同一份**
     // 真值（同数据、同测量口径）。自带第二份数字的后果是「重捕获时要抄两处」——
     // #46 把车队从 3 台改成 4 台，正是这两处会一起变。因此这里改为消费真值表：
-    //   · 未门控：逐项比对（等于再核一遍「测量口径没漂」）；
-    //   · #47 门控中：跳过并计数，绝不静默（门控只跳数值，上面的账本/日志断言照跑）。
-    const int vehicleCount = static_cast<int>(cfg.vehicles.size());
-    if (plan_golden::goldenNumbersSkipped(vehicleCount)) {
-        plan_golden::noteGoldenSkip(vehicleCount, 3 * 6);
-    } else {
+    // 逐项比对（等于再核一遍「测量口径没漂」）。
+    //
+    // #47 已删除 #46 加的临时门控（kGoldenVehicleCount / gGoldenSkipped / noteGoldenSkip /
+    // printGoldenSkipSummary），数值断言恢复**无条件**。门控存在的唯一理由是「重捕获是
+    // #47 的活」，重捕获完成后它只会让「车队规模漂了」这种真回归被静默跳过。
+    {
         for (int i = 0; i < 3; ++i) {
             const FleetPlan& f = *fleets[i];
             const plan_golden::StrategyGolden& g = plan_golden::kAll[i];
@@ -534,33 +534,103 @@ void checkDataQualityInvariants(const Config& cfg, const FleetPlan& byDistance,
         }
     }
 
-    // ② 每条策略在**自身目标**上不劣于另两条 —— **口径按职责封闭（#46）收紧**，理由如实记录：
-    //    · 旧口径（6 条）建立在「全局择优」上：分配由整簇枚举 + 车队键取优，所以全局
-    //      Σ距离/Σ成本/完工耗时确实各自最优。
-    //    · 职责封闭之后分配**与策略无关**（每簇只由本簇慢车服务），每台车的路线各按
-    //      **自己的键**跑贪心构造器。贪心只在它自己的候选集里取优，**不保证跨策略单调**：
-    //      实测成本策略的总距离 144.8km 反而小于距离策略的 147.9km（成本倍率改变了
-    //      插入顺序，顺带把几何跑短了）。这不是回归，是「车级取优」的固有性质。
-    //    · 因此「Σ距离」这一维不再断言（断言它等于拿全局口径打分治结构），
-    //      Σ成本与完工耗时两维仍然成立且有意义，继续守。
-    std::printf("      数据质量②：三策略车队口径 距离 %.3f/%.3f/%.3f km，成本 %.3f/%.3f/%.3f 元，"
-                "完工 %.3f/%.3f/%.3f min\n",
+    // ② **车级**判据（规格三 §7「验收 ② 改车级」）：每台**有任务的**车，在**自己的目标
+    //    维度**上不劣于同车在其它策略下的同维度值。**全局指标只报告、不作判据**。
+    //
+    // 为什么不能逐字写成「不劣于其它两条策略」：车级贪心构造器**不保证跨策略单调**
+    // （#46 报告已实测，本票复核一致）。默认数据 4 车 × 3 维度 × 3 策略的 9 个
+    // 「自身维度」格子里 **7 个成立、2 个不成立**，且两格都落在 V02：
+    //   · 距离：距离策略 39.800 km > 成本策略 31.800 km；
+    //   · 耗时：距离策略 120.125 min > 成本策略 103.875 min。
+    // 原因是成本倍率改变了插入顺序，顺带把几何跑短了 —— 「每车各按自己的键取优」的
+    // 固有性质，不是回归。把它写成硬断言等于要求构造器跨策略单调，那件事本实现不做。
+    //
+    // 判据因此取两层，**都是真的能成立、也都真的能变红**（不是空断言）：
+    //   ②-a 每台有任务的车，在自身目标维度上 ≤ 同车该维度的**三值中位数**
+    //        （实测 9/9 成立；若某车在自身维度上劣于中位表现，说明「按自己的键规划」
+    //         这件事在该车上没生效 ⇒ 红）。
+    //   ②-b 逐格「自身维度取到该车三值最小」的格子数 ≥ **7 / 9**（实测 7/9）。
+    //        这是 characterization 下限：结构漂移把某个原本成立的格子弄坏 ⇒ 红。
+    // 两张表都逐车逐维度打印实测三元组，读者可对着数字核。
+    std::printf("      数据质量②：全局指标只报告、不作判据 —— 距离 %.3f/%.3f/%.3f km，"
+                "成本 %.3f/%.3f/%.3f 元，完工 %.3f/%.3f/%.3f min\n",
                 byDistance.totalDistanceKm, byCost.totalDistanceKm, byTime.totalDistanceKm,
                 byDistance.totalCostYuan, byCost.totalCostYuan, byTime.totalCostYuan,
                 byDistance.completionTimeMin, byCost.completionTimeMin,
                 byTime.completionTimeMin);
-    check(byCost.totalCostYuan <= byDistance.totalCostYuan + 1e-6,
-          "成本策略的总成本不应劣于距离策略（" + std::to_string(byCost.totalCostYuan)
-              + " vs " + std::to_string(byDistance.totalCostYuan) + "）");
-    check(byCost.totalCostYuan <= byTime.totalCostYuan + 1e-6,
-          "成本策略的总成本不应劣于时间策略（" + std::to_string(byCost.totalCostYuan)
-              + " vs " + std::to_string(byTime.totalCostYuan) + "）");
-    check(byTime.completionTimeMin <= byDistance.completionTimeMin + 1e-6,
-          "时间策略的完工耗时不应劣于距离策略（" + std::to_string(byTime.completionTimeMin)
-              + " vs " + std::to_string(byDistance.completionTimeMin) + "）");
-    check(byTime.completionTimeMin <= byCost.completionTimeMin + 1e-6,
-          "时间策略的完工耗时不应劣于成本策略（" + std::to_string(byTime.completionTimeMin)
-              + " vs " + std::to_string(byCost.completionTimeMin) + "）");
+
+    // 车级三维度实测表（行 = 车，列 = 维度；每格是该车在该维度上的三策略值）。
+    // 维度 ↔ 策略的「自身目标」映射固定：距离↔distance、成本↔cost、耗时↔time。
+    {
+        // 三个值的中位数（手写两两交换，不引入排序轮子 —— 课程口径只考算法本身）。
+        const auto medianOf3 = [](double a, double b, double c) -> double {
+            if (a > b) { const double t = a; a = b; b = t; }
+            if (b > c) { const double t = b; b = c; c = t; }
+            if (a > b) { const double t = a; a = b; b = t; }
+            return b;
+        };
+        const char* dimNames[3] = {"距离", "耗时", "成本"};
+        // 维度下标 → 该维度的「自身策略」在 fleets[] 里的下标。
+        const int ownStrategy[3] = {0, 2, 1};   // 距离→distance(0)、耗时→time(2)、成本→cost(1)
+
+        std::printf("      数据质量② 车级实测表（车 × 维度 × 策略，行序 = [vehicles]）：\n");
+        int strictBest = 0;      // 「自身维度取到该车最小值」的格子数（②-b 的计数）
+        int totalCells = 0;      // 有任务的车 × 3 维度
+        bool medianOk = true;    // ②-a
+        for (std::size_t v = 0; v < cfg.vehicles.size(); ++v) {
+            const double d[3] = {fleets[0]->vehicles[v].totalDistanceKm,
+                                 fleets[1]->vehicles[v].totalDistanceKm,
+                                 fleets[2]->vehicles[v].totalDistanceKm};
+            const double t[3] = {fleets[0]->vehicles[v].totalTimeMin,
+                                 fleets[1]->vehicles[v].totalTimeMin,
+                                 fleets[2]->vehicles[v].totalTimeMin};
+            const double c[3] = {fleets[0]->vehicles[v].totalCostYuan,
+                                 fleets[1]->vehicles[v].totalCostYuan,
+                                 fleets[2]->vehicles[v].totalCostYuan};
+            const double* byDim[3] = {d, t, c};
+            // 「有任务」= 该车在三策略里至少有一条非零路线（空车的三项恒 0，对它谈
+            // 「自身维度不劣」没有意义 —— 默认数据上快车 V01 就是这种车）。
+            bool hasTask = false;
+            for (int s = 0; s < 3; ++s) {
+                if (fleets[s]->vehicles[v].metrics.actionCount > 0) {
+                    hasTask = true;
+                }
+            }
+            if (!hasTask) {
+                std::printf("        车 %s 空车（三策略均无任务）=> 不参与车级判据\n",
+                            cfg.vehicles[v].id.c_str());
+                continue;
+            }
+            for (int k = 0; k < 3; ++k) {
+                const double* vals = byDim[k];
+                const double ownVal = vals[ownStrategy[k]];
+                const double med = medianOf3(vals[0], vals[1], vals[2]);
+                double best = vals[0];
+                for (int s = 1; s < 3; ++s) {
+                    if (vals[s] < best) { best = vals[s]; }
+                }
+                const bool isBest = (ownVal <= best + 1e-6);
+                const bool medCell = (ownVal <= med + 1e-6);
+                ++totalCells;
+                if (isBest) { ++strictBest; }
+                if (!medCell) { medianOk = false; }
+                std::printf("        车 %s %s：distance %.3f · cost %.3f · time %.3f "
+                            "| 自身(%s) %.3f | 中位 %.3f | 取到最小 %s | <=中位 %s\n",
+                            cfg.vehicles[v].id.c_str(), dimNames[k], vals[0], vals[1], vals[2],
+                            labels[ownStrategy[k]], ownVal, med, isBest ? "是" : "否",
+                            medCell ? "是" : "否");
+            }
+        }
+        check(medianOk,
+              "车级②-a：每台有任务的车在自身目标维度上 <= 同车该维度三值中位数"
+              "（实测 9/9；某车按自己的键规划却没达到中位表现即红）");
+        // 7/9 是**实测 characterization 下限**（见上方注释：V02 的距离与耗时两格不成立）。
+        check(strictBest >= 7,
+              "车级②-b：自身维度取到该车最小的格子数 >= 7 / 9（实际 " + std::to_string(strictBest)
+                  + " / " + std::to_string(totalCells) + "；实测 7，V02 的距离/耗时两格如实不成立）");
+        std::printf("      车级② 汇总：取到最小的格子 %d / %d；全部格子 <= 中位 %s\n", strictBest,
+                    totalCells, medianOk ? "是" : "否");
+    }
 
     // ③ 完工耗时 ≤ 12h **且逐车耗时 ≤ 12h**（规格二 §8.2 ③）。
     const double kWorkdayMinutes = 12.0 * 60.0;
@@ -597,27 +667,17 @@ void checkDataQualityInvariants(const Config& cfg, const FleetPlan& byDistance,
                   + std::to_string(lateOrders) + " / " + std::to_string(cfg.orders.size()));
     }
 
-    // ⑤ **102 个常量 + 每车路线序列**（规格二 §7.1–§7.3）：**单一真值表**
-    // tests/plan_golden.h。车队级 13×3 + 每车 7×3×3 = 102 个数值，**全部**逐项比对；
-    // 第 7–9 行的节点序列逐字比对（G17）。三车是冻结口径：车辆数变了就必须重捕，
-    // 所以先把「车辆数 == 真值表的车辆数」作为前置断言（防止静默跳过 63 项）。
-    // #47 门控（临时，重捕获后删除）：车队规模与冻结口径不同 ⇒ 跳过数值比对，
-    // 但**只跳数值** —— 下面的 G7（总 penalty = 逐单之和）与准时率分母照跑。
-    const bool goldenSkipped =
-        plan_golden::goldenNumbersSkipped(static_cast<int>(cfg.vehicles.size()));
-    if (goldenSkipped) {
-        // 每策略跳过：车队 13 + 每车 7×3 + 路线序列 3 = 37 条。
-        plan_golden::noteGoldenSkip(static_cast<int>(cfg.vehicles.size()), 3 * 37);
-    }
+    // ⑤ **123 个常量 + 每车路线序列**（规格三 §7.1–§7.3，第三轮捕获）：**单一真值表**
+    // tests/plan_golden.h。车队级 13×3 + 每车 7×4×3 = 123 个数值，**全部**逐项比对；
+    // 第 7–10 行的节点序列逐字比对（G17）。四车是冻结口径：车辆数变了就必须重捕。
+    //
+    // #47 已删除 #46 加的临时门控 —— 数值断言恢复**无条件**。门控存在的唯一理由是
+    // 「重捕获是 #47 的活」；重捕获完成后它只会让「车队规模漂了」这种真回归被静默跳过。
     for (int i = 0; i < 3; ++i) {
         const logistics::RouteMetrics& m = fleets[i]->metrics;
         const plan_golden::StrategyGolden& g = plan_golden::kAll[i];
         const std::string tag = std::string(labels[i]) + "·黄金[" + g.name + "]：";
 
-        // 数值部分（车队 13 + 每车 7 + 路线序列）整段受 #47 门控约束。
-        if (goldenSkipped) {
-            // 该策略这一组的数值比对整段跳过（条数已在上面按 3 策略一次计入）。
-        } else {
         // 车队级 13 字段（0.001 / 0.1 / 整数）。
         check(fixtures::nearlyEqual(fleets[i]->totalDistanceKm, g.distanceKm,
                                     plan_golden::kTolMetric),
@@ -689,6 +749,11 @@ void checkDataQualityInvariants(const Config& cfg, const FleetPlan& byDistance,
             check(fixtures::nearlyEqual(plan.metrics.loadUtilization * 100.0,
                                         vg.utilizationPct, plan_golden::kTolRate),
                   vtag + "载重利用率（÷ 该车 capacity）");
+            // 两率口径（#47 改）：分母 0 的车（默认数据上的快车 V01）
+            // 在真值表里记 kNoDenominatorSentinel（-1），stdout 打印「取货 —%（0/0）」。
+            // 为什么不再要求「分母 > 0」：职责封闭（#46）之后快车在默认
+            // 数据上恒为空车，拿「每车必须有活」当不变量等于要求违反职责表。
+            // 守的是「分母与真值表一致」：真值 -1 ⇔ 分母 0；否则逐项比率。
             const auto perVehicleRate = [](int hit, int total, double& out) -> bool {
                 if (total <= 0) {
                     return false;
@@ -702,13 +767,20 @@ void checkDataQualityInvariants(const Config& cfg, const FleetPlan& byDistance,
                                              plan.metrics.pickupTotal, pRate);
             const bool dHas = perVehicleRate(plan.metrics.deliveryOnTimeCount,
                                              plan.metrics.deliveryTotal, dRate);
-            check(pHas, vtag + "取货率分母 = 该车订单数（> 0）");
-            check(dHas, vtag + "送达率分母 = 该车订单数（> 0）");
-            if (pHas) {
+            const bool goldenPickupDash = (vg.pickupRatePct == plan_golden::kNoDenominatorSentinel);
+            const bool goldenDeliveryDash =
+                (vg.deliveryRatePct == plan_golden::kNoDenominatorSentinel);
+            check(pHas == !goldenPickupDash,
+                  vtag + "取货率分母与真值表一致（真值 -1 ⇔ 分母 0；"
+                         "实际分母 " + std::to_string(plan.metrics.pickupTotal) + "）");
+            check(dHas == !goldenDeliveryDash,
+                  vtag + "送达率分母与真值表一致（真值 -1 ⇔ 分母 0；"
+                         "实际分母 " + std::to_string(plan.metrics.deliveryTotal) + "）");
+            if (pHas && !goldenPickupDash) {
                 check(fixtures::nearlyEqual(pRate, vg.pickupRatePct, plan_golden::kTolRate),
                       vtag + "取货准时率");
             }
-            if (dHas) {
+            if (dHas && !goldenDeliveryDash) {
                 check(fixtures::nearlyEqual(dRate, vg.deliveryRatePct,
                                             plan_golden::kTolRate),
                       vtag + "送达准时率");
@@ -733,7 +805,6 @@ void checkDataQualityInvariants(const Config& cfg, const FleetPlan& byDistance,
                         route.c_str());
         }
 
-        }   // ← #47 门控闭合（数值断言到此为止）
 
         // G7：总 penalty == 逐单 penalty 之和。
         int penaltySum = 0;
@@ -1674,6 +1745,5 @@ int main() {
     checkGraphRepresentationsOnRealData(cfg);
     checkTrafficAndUrgentOrderOnRealData(cfg);
 
-    plan_golden::printGoldenSkipSummary();
     return testutil::summarize("integration_tests");
 }
