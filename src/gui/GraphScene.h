@@ -28,9 +28,11 @@ public:
     void highlightRoute(const std::vector<std::string>& routeNodes);
     void clearHighlight();
 
-    // ---- 车队三色 + 选中加粗（规格二 §7.5⑤）----
+    // ---- 车队四色 + 选中加粗（规格二 §7.5⑤ / 规格三 §7 的第 4 色）----
     // routes[i] = 第 i 台车（= [vehicles] 行序）**剩余**路线的节点序列；空车传空序列。
-    // 颜色按行序取（超出 3 台循环）；**共享边**归行序最前那台车、不重复绘制；
+    // 颜色按行序取（**超出 4 台循环**）：行序 0 红 / 1 蓝 / 2 绿 / 3 紫，四色都是定值。
+    // 第 4 色是 #46 补的：原实现只有 3 个 case + default，第 4 台会与第 3 台同色。
+    // **共享边**归行序最前那台车、不重复绘制；
     // 加粗判定 = 该边是否属于 selectedVehicle（与颜色归属解耦）。
     void setFleetRoutes(const std::vector<std::vector<std::string> >& routes,
                         int selectedVehicle);

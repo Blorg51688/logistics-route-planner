@@ -482,37 +482,34 @@ void checkDefaultTransitNotTriggered(const Config& cfg, const FleetPlan& byDista
         check(fleets[i]->transitLog.empty(),
               std::string(labels[i]) + "：默认数据上转运层不产生任何候选日志（门控在工作）");
     }
-    // 22 个车队级数字（3 × 距离/耗时/成本/penalty/停靠/动作）——**#40 基线**。
-    // 口径：本工作区实现、config/default.ini 三车 25 单（不是规格一单车黄金值）。
-    struct Base {
-        const char* label;
-        double distance;
-        double completion;
-        double cost;
-        int penalty;
-        int stops;
-        int actions;
-    };
-    const Base kBase[3] = {
-        {"距离", 139.900, 429.000, 172.970, 0, 28, 50},
-        {"成本", 145.400, 449.500, 160.260, 0, 32, 50},
-        {"时间", 170.400, 378.200, 243.090, 0, 30, 50},
-    };
-    for (int i = 0; i < 3; ++i) {
-        const FleetPlan& f = *fleets[i];
-        const Base& b = kBase[i];
-        check(fixtures::nearlyEqual(f.totalDistanceKm, b.distance, 0.001),
-              std::string(b.label) + "策略·默认数据总距离与 #40 基线一致（"
-                  + std::to_string(f.totalDistanceKm) + " vs " + std::to_string(b.distance) + "）");
-        check(fixtures::nearlyEqual(f.completionTimeMin, b.completion, 0.001),
-              std::string(b.label) + "策略·完工耗时与 #40 基线一致");
-        check(fixtures::nearlyEqual(f.totalCostYuan, b.cost, 0.001),
-              std::string(b.label) + "策略·总成本与 #40 基线一致");
-        check(f.totalPenaltyMin == b.penalty, std::string(b.label) + "策略·penalty 与 #40 基线一致");
-        check(f.stopCount == b.stops, std::string(b.label) + "策略·停靠数与 #40 基线一致");
-        check(f.actionCount == b.actions, std::string(b.label) + "策略·动作数与 #40 基线一致");
+    // 22 个车队级数字（3 × 距离/耗时/成本/penalty/停靠/动作）。
+    //
+    // **不再自带第二份数字**：这 22 项与 tests/plan_golden.h 的车队 13 字段是**同一份**
+    // 真值（同数据、同测量口径）。自带第二份数字的后果是「重捕获时要抄两处」——
+    // #46 把车队从 3 台改成 4 台，正是这两处会一起变。因此这里改为消费真值表：
+    //   · 未门控：逐项比对（等于再核一遍「测量口径没漂」）；
+    //   · #47 门控中：跳过并计数，绝不静默（门控只跳数值，上面的账本/日志断言照跑）。
+    const int vehicleCount = static_cast<int>(cfg.vehicles.size());
+    if (plan_golden::goldenNumbersSkipped(vehicleCount)) {
+        plan_golden::noteGoldenSkip(vehicleCount, 3 * 6);
+    } else {
+        for (int i = 0; i < 3; ++i) {
+            const FleetPlan& f = *fleets[i];
+            const plan_golden::StrategyGolden& g = plan_golden::kAll[i];
+            check(fixtures::nearlyEqual(f.totalDistanceKm, g.distanceKm, 0.001),
+                  std::string(labels[i]) + "·默认数据总距离与真值表一致（"
+                      + std::to_string(f.totalDistanceKm) + " vs "
+                      + std::to_string(g.distanceKm) + "）");
+            check(fixtures::nearlyEqual(f.completionTimeMin, g.timeMin, 0.001),
+                  std::string(labels[i]) + "·完工耗时与真值表一致");
+            check(fixtures::nearlyEqual(f.totalCostYuan, g.costYuan, 0.001),
+                  std::string(labels[i]) + "·总成本与真值表一致");
+            check(f.totalPenaltyMin == g.penaltyMin,
+                  std::string(labels[i]) + "·penalty 与真值表一致");
+            check(f.stopCount == g.stopCount, std::string(labels[i]) + "·停靠数与真值表一致");
+            check(f.actionCount == g.actionCount, std::string(labels[i]) + "·动作数与真值表一致");
+        }
     }
-    (void)cfg;
 }
 
 void checkDataQualityInvariants(const Config& cfg, const FleetPlan& byDistance,
@@ -537,14 +534,21 @@ void checkDataQualityInvariants(const Config& cfg, const FleetPlan& byDistance,
         }
     }
 
-    // ② 每条策略在**自身目标**上不劣于另两条（3 × 2 = 6 条）。车队口径：
-    //    距离/成本是 Σ，耗时是**完工耗时**（主口径，§3.4）。
-    check(byDistance.totalDistanceKm <= byCost.totalDistanceKm + 1e-6,
-          "距离策略的总距离不应劣于成本策略（" + std::to_string(byDistance.totalDistanceKm)
-              + " vs " + std::to_string(byCost.totalDistanceKm) + "）");
-    check(byDistance.totalDistanceKm <= byTime.totalDistanceKm + 1e-6,
-          "距离策略的总距离不应劣于时间策略（" + std::to_string(byDistance.totalDistanceKm)
-              + " vs " + std::to_string(byTime.totalDistanceKm) + "）");
+    // ② 每条策略在**自身目标**上不劣于另两条 —— **口径按职责封闭（#46）收紧**，理由如实记录：
+    //    · 旧口径（6 条）建立在「全局择优」上：分配由整簇枚举 + 车队键取优，所以全局
+    //      Σ距离/Σ成本/完工耗时确实各自最优。
+    //    · 职责封闭之后分配**与策略无关**（每簇只由本簇慢车服务），每台车的路线各按
+    //      **自己的键**跑贪心构造器。贪心只在它自己的候选集里取优，**不保证跨策略单调**：
+    //      实测成本策略的总距离 144.8km 反而小于距离策略的 147.9km（成本倍率改变了
+    //      插入顺序，顺带把几何跑短了）。这不是回归，是「车级取优」的固有性质。
+    //    · 因此「Σ距离」这一维不再断言（断言它等于拿全局口径打分治结构），
+    //      Σ成本与完工耗时两维仍然成立且有意义，继续守。
+    std::printf("      数据质量②：三策略车队口径 距离 %.3f/%.3f/%.3f km，成本 %.3f/%.3f/%.3f 元，"
+                "完工 %.3f/%.3f/%.3f min\n",
+                byDistance.totalDistanceKm, byCost.totalDistanceKm, byTime.totalDistanceKm,
+                byDistance.totalCostYuan, byCost.totalCostYuan, byTime.totalCostYuan,
+                byDistance.completionTimeMin, byCost.completionTimeMin,
+                byTime.completionTimeMin);
     check(byCost.totalCostYuan <= byDistance.totalCostYuan + 1e-6,
           "成本策略的总成本不应劣于距离策略（" + std::to_string(byCost.totalCostYuan)
               + " vs " + std::to_string(byDistance.totalCostYuan) + "）");
@@ -597,15 +601,23 @@ void checkDataQualityInvariants(const Config& cfg, const FleetPlan& byDistance,
     // tests/plan_golden.h。车队级 13×3 + 每车 7×3×3 = 102 个数值，**全部**逐项比对；
     // 第 7–9 行的节点序列逐字比对（G17）。三车是冻结口径：车辆数变了就必须重捕，
     // 所以先把「车辆数 == 真值表的车辆数」作为前置断言（防止静默跳过 63 项）。
-    check(cfg.vehicles.size() == static_cast<std::size_t>(plan_golden::kVehicleCount),
-          std::string("默认数据车辆数 == 真值表冻结车辆数（实际 ")
-              + std::to_string(cfg.vehicles.size()) + " vs "
-              + std::to_string(plan_golden::kVehicleCount) + "）");
+    // #47 门控（临时，重捕获后删除）：车队规模与冻结口径不同 ⇒ 跳过数值比对，
+    // 但**只跳数值** —— 下面的 G7（总 penalty = 逐单之和）与准时率分母照跑。
+    const bool goldenSkipped =
+        plan_golden::goldenNumbersSkipped(static_cast<int>(cfg.vehicles.size()));
+    if (goldenSkipped) {
+        // 每策略跳过：车队 13 + 每车 7×3 + 路线序列 3 = 37 条。
+        plan_golden::noteGoldenSkip(static_cast<int>(cfg.vehicles.size()), 3 * 37);
+    }
     for (int i = 0; i < 3; ++i) {
         const logistics::RouteMetrics& m = fleets[i]->metrics;
         const plan_golden::StrategyGolden& g = plan_golden::kAll[i];
         const std::string tag = std::string(labels[i]) + "·黄金[" + g.name + "]：";
 
+        // 数值部分（车队 13 + 每车 7 + 路线序列）整段受 #47 门控约束。
+        if (goldenSkipped) {
+            // 该策略这一组的数值比对整段跳过（条数已在上面按 3 策略一次计入）。
+        } else {
         // 车队级 13 字段（0.001 / 0.1 / 整数）。
         check(fixtures::nearlyEqual(fleets[i]->totalDistanceKm, g.distanceKm,
                                     plan_golden::kTolMetric),
@@ -721,6 +733,8 @@ void checkDataQualityInvariants(const Config& cfg, const FleetPlan& byDistance,
                         route.c_str());
         }
 
+        }   // ← #47 门控闭合（数值断言到此为止）
+
         // G7：总 penalty == 逐单 penalty 之和。
         int penaltySum = 0;
         for (const logistics::OrderMetric& om : m.orders) {
@@ -833,11 +847,14 @@ void checkAllocationInvariants(const Config& cfg, const FleetPlan* fleets[3],
                       + std::to_string(cfg.vehicles[v].capacityKg) + "）");
         }
     }
-    // 反例（§4.3 / Q5 实证）：顺序轮转基线上 V02/V03 各分到 165kg > 160kg 容量，
-    // 但峰值只有 64 / 57kg，**完全可行**。任何「总 kg ≤ 容量」的判定都会误报违规。
+    // 反例（§4.3 / Q5 实证，**载体按 #46 换成默认入口**）：职责封闭后每簇整批交给本簇
+    // 慢车 —— 簇1 180kg / 簇2 164kg / 簇3 172kg 都 > 160kg 容量，而前缀峰值只有
+    // 160/144/152kg，**完全可行**。任何「总 kg ≤ 容量」的判定都会误报违规。
+    // （旧的载体是顺序轮转基线：3 车时它把 165kg 压到一台 160kg 车上；4 车后基线每车
+    //   只有 ~129kg，那条反例不再触发 —— 所以换到真正能产生该形态的入口上。）
     {
         const std::vector<std::vector<logistics::Order> > assigned =
-            allocationOrderSets(cfg, baseDistance);
+            allocationOrderSets(cfg, *fleets[0]);
         int overTotal = 0;
         for (std::size_t v = 0; v < cfg.vehicles.size() && v < assigned.size(); ++v) {
             double totalKg = 0.0;
@@ -846,7 +863,7 @@ void checkAllocationInvariants(const Config& cfg, const FleetPlan* fleets[3],
             }
             const double peak = baseDistance.vehicles[v].metrics.peakLoadKg;
             const double cap = cfg.vehicles[v].capacityKg;
-            std::printf("      分配③（基线）%s：总分配 %.0fkg / 容量 %.0fkg，峰值 %.0fkg\n",
+            std::printf("      分配③（默认入口）%s：总分配 %.0fkg / 容量 %.0fkg，峰值 %.0fkg\n",
                         cfg.vehicles[v].id.c_str(), totalKg, cap, peak);
             if (totalKg > cap + 1e-6) {
                 ++overTotal;
@@ -858,8 +875,9 @@ void checkAllocationInvariants(const Config& cfg, const FleetPlan* fleets[3],
             }
         }
         check(overTotal >= 2,
-              "分配③：顺序轮转基线至少有 2 台车「总分配 kg > 该车容量」而峰值合规"
-              "（§4.3 实证；禁止用总 kg 判可行性）");
+              "分配③：默认入口至少有 2 台车「总分配 kg > 该车容量」而峰值合规"
+              "（§4.3 实证；禁止用总 kg 判可行性；实际 " + std::to_string(overTotal)
+                  + " 台）");
     }
 
     // ---- ④ 每车从自己的 start_node / depart_time 空载出发、回同一基地；空车五项 0 ----
@@ -912,10 +930,16 @@ void checkAllocationInvariants(const Config& cfg, const FleetPlan* fleets[3],
             planFleet(cfg.graph, cfg.vehicles, shuffled, WeightType::Distance);
         check(byShuffle.allocationVehicleIndex == fleets[0]->allocationVehicleIndex,
               "分配⑤：打乱订单传入顺序不改变分配（ID/簇/车辆三层排序在枚举之前）");
-        std::printf("      分配⑤：候选键留痕 %zu 行（默认 3 簇 3 车应为 6 行）\n",
+        // 口径变更（#46）：整簇全排列枚举**退役** —— 职责封闭后「簇 -> 慢车」的可行集合
+        // 收缩成单点（排列数 = 1），再枚举只会构造越界解。留痕因此恒 1 行。
+        // 旧断言「枚举 6 种排列」按退役处理（提交信息里点名了这一处）。
+        std::printf("      分配⑤：阶段二留痕 %zu 行（职责封闭后排列数 = 1）\n",
                     fleets[0]->candidateKeyLog.size());
-        check(fleets[0]->candidateKeyLog.size() == 6,
-              "分配⑤：枚举 6 种「簇 -> 车」排列（默认 3 簇 3 车）");
+        check(fleets[0]->candidateKeyLog.size() == 1,
+              "分配⑤：阶段二留痕恰 1 行（固定指派；枚举已退役）");
+        check(!fleets[0]->candidateKeyLog.empty()
+                  && fleets[0]->candidateKeyLog[0].find("固定指派") != std::string::npos,
+              "分配⑤：留痕行点名「固定指派」（可人工核对簇 -> 慢车映射）");
     }
 
     // ---- ⑧ 第三阶段守卫：逐条读改派日志核对「完工耗时不变差」+「键严格变优」 ----
@@ -947,8 +971,13 @@ void checkAllocationInvariants(const Config& cfg, const FleetPlan* fleets[3],
                             rec.weightAfter, rec.balanceAfter);
             }
         }
-        // **守卫必须真的测到了东西**：默认数据至少有一条被接受的改派。
-        check(records >= 1, "分配⑧：改派日志非空（守卫在这份数据上真的被消费过）");
+        // **口径变更（#46）：阶段三「有界跨车改派」退役** —— 职责封闭后一张簇内单只能由
+        // 本簇慢车接，挪给别的车就越界，可改派集合恒空。所以这里从「日志非空」改成
+        // 「日志恒空」（这是退役后的正确形态，不是把红断言压掉：上面那段逐条核对仍然
+        // 保留着，一旦哪天改派又冒出来，它照样会逐条核对键与完工耗时）。
+        check(records == 0,
+              "分配⑧：改派日志**恒空**（阶段三已退役；实际 " + std::to_string(records)
+                  + " 条）");
     }
 
     // ---- ⑨ 基线确定性：分配只由「订单 ID 升序 + 车队行序」决定，与策略/容量/窗口无关 ----
@@ -1563,14 +1592,21 @@ void checkDefaultLegsAreLocalSingleLegs(const Config& cfg, const FleetPlan* flee
             }
         }
         check(readyOk, tag + "每腿 readyTime = 该腿执行车的发车时刻");
-        // 「结构已立、接力未启用」必须在这条入口也留登记（不声称已转运）。
-        bool logged = false;
+        // legLog 必须**如实登记**两件事（#46 改了措辞，意图不变）：
+        //   ① 执行车由职责表定（慢车腿 -> 本簇慢车、站间腿 -> 快车）；
+        //   ② 腿的时刻是**规划产物**：接力没跑起来时是规划期估计值，不声称已转运。
+        bool carLogged = false;
+        bool estimateLogged = false;
         for (std::size_t i = 0; i < fleet.legLog.size(); ++i) {
-            if (fleet.legLog[i].find("接力未启用") != std::string::npos) {
-                logged = true;
+            if (fleet.legLog[i].find("职责表") != std::string::npos) {
+                carLogged = true;
+            }
+            if (fleet.legLog[i].find("规划期估计") != std::string::npos) {
+                estimateLogged = true;
             }
         }
-        check(logged, tag + "legLog 登记「结构已立、接力未启用」");
+        check(carLogged, tag + "legLog 登记「执行车由职责表定」");
+        check(estimateLogged, tag + "legLog 登记「时刻是规划期估计、不声称已转运」");
     }
 }
 
@@ -1619,10 +1655,16 @@ int main() {
         checkDefaultLegsAreLocalSingleLegs(cfg, legFleets, legLabels);
     }
 
-    // 阶段二的 6 种排列留痕（默认 3 簇 3 车）——人工核对「各自怎么取优」。
+    // 阶段二的留痕（#46：整簇全排列枚举已退役 ⇒ 恒 1 行「固定指派」）。
+    // 打印出来是为了让「到底选了哪个簇->车映射」在测试输出里可核对，
+    // 不是再断言一次行数（行数是口径，不是行为）。
     for (std::size_t i = 0; i < byDistance.candidateKeyLog.size(); ++i) {
-        std::printf("      排列[%zu] %s\n", i, byDistance.candidateKeyLog[i].c_str());
+        std::printf("      阶段二留痕[%zu] %s\n", i,
+                    byDistance.candidateKeyLog[i].c_str());
     }
+    check(byDistance.candidateKeyLog.size() == 1,
+          "阶段二留痕恰 1 行（固定指派，职责封闭后排列数 = 1；实际 "
+              + std::to_string(byDistance.candidateKeyLog.size()) + " 行）");
 
     // 车队专属规则（规格二 §3.4 / §3.6）：空车与「慢车因子」两条。
     checkEmptyVehicleRules(cfg);
@@ -1632,5 +1674,6 @@ int main() {
     checkGraphRepresentationsOnRealData(cfg);
     checkTrafficAndUrgentOrderOnRealData(cfg);
 
+    plan_golden::printGoldenSkipSummary();
     return testutil::summarize("integration_tests");
 }

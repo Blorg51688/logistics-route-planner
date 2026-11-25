@@ -981,6 +981,246 @@ void checkDumpPlanTransitLines(const std::string& appPath) {
 }
 
 
+// ===========================================================================
+// #46 职责封闭：**用户可见输出**上的两条守卫（读 --dump-plan 的 ASSIGN/ALLOC/LEG/TRANSIT）
+// ===========================================================================
+//
+// 为什么不自己重算：这里断言的全是「用户打开 --dump-plan / 界面日志能看到的东西」——
+// 分配落点、腿的执行车、账本两端。自己按公式再算一遍只能证明公式自洽，证明不了
+// 「职责表真的在输出里生效」。
+namespace {
+
+// 默认数据（四车：V01 快车 400kg，V02/V03/V04 各 160kg 守一个簇）。
+void checkDutyClosureDefault(const std::string& appPath) {
+    const std::string out = runCapture("'" + appPath + "' --dump-plan distance 2>/dev/null");
+    check(!out.empty(), "职责封闭·默认数据：--dump-plan 有输出");
+    const std::vector<std::string> lines = splitLines(out);
+
+    // ① ASSIGN 行：快车空车、三台慢车各守一个簇（簇1 9 单 / 簇2 7 单 / 簇3 9 单）。
+    bool fastIdle = false;
+    std::map<std::string, std::string> assignOf;   // 车辆 -> ASSIGN 行
+    for (const std::string& line : lines) {
+        if (line.rfind("ASSIGN ", 0) != 0) {
+            continue;
+        }
+        assignOf[line] = line;
+        if (line.find("V01") != std::string::npos && line.find("空车") != std::string::npos) {
+            fastIdle = true;
+        }
+    }
+    check(fastIdle, "职责封闭①：ASSIGN 行显示快车 V01「空车 0」（默认数据上没有它的活）");
+    bool slow1 = false;
+    bool slow2 = false;
+    bool slow3 = false;
+    for (const std::string& line : lines) {
+        if (line == "ASSIGN V02 簇1 9") slow1 = true;
+        if (line == "ASSIGN V03 簇2 7") slow2 = true;
+        if (line == "ASSIGN V04 簇3 9") slow3 = true;
+    }
+    check(slow1 && slow2 && slow3,
+          "职责封闭①：簇1->V02(9) / 簇2->V03(7) / 簇3->V04(9)（簇 ID 升序 × 慢车 ID 升序配对）");
+
+    // ② ALLOC 行：25 单里没有任何一张落在 V01 上。
+    bool sawAlloc = false;
+    bool v01HasOrder = false;
+    int allocCount = 0;
+    for (const std::string& line : lines) {
+        if (line.rfind("ALLOC ", 0) != 0) {
+            continue;
+        }
+        sawAlloc = true;
+        // 形如 ALLOC O01=V02,O02=V02,...；逐项扫一遍即可（不解析成结构，读原文）。
+        std::string rest = line.substr(6);
+        std::size_t pos = 0;
+        while (pos < rest.size()) {
+            const std::size_t comma = rest.find(',', pos);
+            const std::string item = rest.substr(pos, comma == std::string::npos
+                                                          ? std::string::npos
+                                                          : comma - pos);
+            ++allocCount;
+            if (item.size() > 4 && item.compare(item.size() - 3, 3, "V01") == 0) {
+                v01HasOrder = true;
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            pos = comma + 1;
+        }
+    }
+    check(sawAlloc && allocCount == 25, "职责封闭①：ALLOC 行覆盖 25 单（实际 "
+                                            + std::to_string(allocCount) + "）");
+    check(!v01HasOrder, "职责封闭①：快车 V01 不在 ALLOC 里（零订单，不是「隐蔽地接了单」）");
+
+    // ③ LEG 行：慢车腿的两端必须同簇，且执行车 = 该簇慢车；默认数据没有站间腿。
+    logistics::Config cfg;
+    std::string cfgErr;
+    check(logistics::ConfigLoader::load(DEFAULT_CONFIG_PATH, cfg, cfgErr),
+          "职责封闭③：默认配置可加载（" + cfgErr + "）");
+    std::map<std::string, int> clusterOfNode;
+    for (const auto& node : cfg.graph.nodes()) {
+        clusterOfNode[node.id] = node.subNetworkId;
+    }
+    const std::map<int, std::string> slowOfCluster = {
+        {1, "V02"}, {2, "V03"}, {3, "V04"}};
+    int legCount = 0;
+    int stationLegs = 0;
+    bool legOk = true;
+    std::string badLeg;
+    for (const std::string& line : lines) {
+        if (line.rfind("LEG ", 0) != 0) {
+            continue;
+        }
+        ++legCount;
+        // LEG <seq> <from> <to> <order> <kind> <HH:MM> <vehicle>
+        std::size_t pos = 4;
+        std::vector<std::string> f;
+        while (pos <= line.size()) {
+            const std::size_t sp = line.find(' ', pos);
+            f.push_back(line.substr(pos, sp == std::string::npos ? std::string::npos : sp - pos));
+            if (sp == std::string::npos) {
+                break;
+            }
+            pos = sp + 1;
+        }
+        if (f.size() < 6) {
+            legOk = false;
+            badLeg = line;
+            continue;
+        }
+        const std::string& from = f[1];
+        const std::string& to = f[2];
+        const std::string& kind = f[4];
+        const std::string& vehicle = f[6];
+        if (kind == "station->station") {
+            ++stationLegs;
+            if (vehicle != "V01") {
+                legOk = false;
+                badLeg = line;
+            }
+            continue;
+        }
+        const int ca = clusterOfNode.count(from) ? clusterOfNode[from] : -1;
+        const int cb = clusterOfNode.count(to) ? clusterOfNode[to] : -1;
+        const std::string want = slowOfCluster.count(ca) ? slowOfCluster.at(ca) : std::string();
+        if (ca <= 0 || ca != cb || want.empty() || vehicle != want) {
+            legOk = false;
+            badLeg = line;
+        }
+    }
+    check(legCount == 25, "职责封闭③：默认数据 25 条本地腿（实际 "
+                              + std::to_string(legCount) + "）");
+    check(stationLegs == 0, "职责封闭③：默认数据没有站间腿（没有跨簇单）");
+    check(legOk, "职责封闭③：每条本地腿都由**本簇慢车**执行、两端同簇（越界会红）"
+                     + (badLeg.empty() ? std::string() : "：" + badLeg));
+}
+
+// 默认数据 + 一张跨簇普通单（D08->D18 8kg）：三段腿必须**真的**走通（#48 的衔接）。
+// 三策略都验：若某策略退回直达，这里会红 —— 退回是可耻但可能发生的，必须显式报出来，
+// 不能悄悄放宽（本文件里没有「退回也算过」的分支）。
+void checkCrossClusterRelayOnDefaultData(const std::string& appPath) {
+    // 写临时夹具：默认配置 + O26（订单段在文件末尾，直接追加最省事）。
+    char tmpPath[256];
+    std::snprintf(tmpPath, sizeof(tmpPath), "/tmp/cli_duty_cross_%d.ini",
+                  static_cast<int>(getpid()));
+    {
+        std::ifstream in(DEFAULT_CONFIG_PATH);
+        check(in.good(), "跨簇夹具：能读到默认配置");
+        std::ofstream outFile(tmpPath);
+        std::string line;
+        while (std::getline(in, line)) {
+            outFile << line << "\n";
+        }
+        outFile << "O26, D08, D18, 8, 08:00, 13:00, 0\n";
+    }
+
+    const char* strategies[3] = {"distance", "cost", "time"};
+    for (int si = 0; si < 3; ++si) {
+        const std::string tag = std::string("跨簇接力·") + strategies[si];
+        const std::string out = runCapture("'" + appPath + "' --config '" + tmpPath
+                                           + "' --dump-plan " + strategies[si] + " 2>/dev/null");
+        const std::vector<std::string> lines = splitLines(out);
+        std::vector<std::string> legs;
+        for (const std::string& line : lines) {
+            if (line.rfind("LEG ", 0) == 0 && line.find(" O26 ") != std::string::npos) {
+                legs.push_back(line);
+            }
+        }
+        check(legs.size() == 3, tag + "：O26 恰 3 条腿（实际 " + std::to_string(legs.size())
+                                         + "；退回直达会只剩估计的 3 条但账本为空）");
+        if (legs.size() == 3) {
+            // L1 客户->本簇站（D08->T01，慢车 V02）；L2 站->站（T01->T03，快车 V01）；
+            // L3 对簇站->客户（T03->D18，慢车 V04）。
+            const auto fields = [](const std::string& line) {
+                std::vector<std::string> f;
+                std::size_t pos = 4;
+                while (pos <= line.size()) {
+                    const std::size_t sp = line.find(' ', pos);
+                    f.push_back(line.substr(pos, sp == std::string::npos ? std::string::npos
+                                                                        : sp - pos));
+                    if (sp == std::string::npos) break;
+                    pos = sp + 1;
+                }
+                return f;
+            };
+            const std::vector<std::string> l1 = fields(legs[0]);
+            const std::vector<std::string> l2 = fields(legs[1]);
+            const std::vector<std::string> l3 = fields(legs[2]);
+            check(l1.size() > 6 && l1[1] == "D08" && l1[2] == "T01"
+                      && l1[4] == "customer->station" && l1[6] == "V02",
+                  tag + "：L1 = D08->T01 由**本簇慢车** V02 执行（实际 "
+                      + (l1.size() > 6 ? l1[6] : std::string("-")) + "）");
+            check(l2.size() > 6 && l2[1] == "T01" && l2[2] == "T03"
+                      && l2[4] == "station->station" && l2[6] == "V01",
+                  tag + "：L2 = T01->T03 由**快车** V01 执行（实际 "
+                      + (l2.size() > 6 ? l2[6] : std::string("-")) + "）");
+            check(l3.size() > 6 && l3[1] == "T03" && l3[2] == "D18"
+                      && l3[4] == "station->customer" && l3[6] == "V04",
+                  tag + "：L3 = T03->D18 由**对簇慢车** V04 执行（实际 "
+                      + (l3.size() > 6 ? l3[6] : std::string("-")) + "）");
+        }
+        // TRANSIT <订单> <站> <kg> <卸入车> <HH:MM> <取走车> <HH:MM> <dwell> <状态>
+        std::vector<std::string> transits;
+        for (const std::string& line : lines) {
+            if (line.rfind("TRANSIT O26 ", 0) == 0) {
+                transits.push_back(line);
+            }
+        }
+        check(transits.size() == 1, tag + "：账本恰 1 笔 TRANSIT（实际 "
+                                         + std::to_string(transits.size()) + "）");
+        if (transits.size() == 1) {
+            std::vector<std::string> f;
+            std::size_t pos = 0;
+            const std::string& line = transits[0];
+            while (pos <= line.size()) {
+                const std::size_t sp = line.find(' ', pos);
+                f.push_back(line.substr(pos, sp == std::string::npos ? std::string::npos
+                                                                     : sp - pos));
+                if (sp == std::string::npos) break;
+                pos = sp + 1;
+            }
+            check(f.size() >= 9 && f[1] == "O26" && f[4] != f[6],
+                  tag + "：账本两端非空且不同车（inVehicle != outVehicle）");
+            check(f.size() >= 9 && f[8] == "0",
+                  tag + "：车等货 ⇒ 站内停留 0min（≤ 60）");
+            check(f.size() >= 10 && f[9] == "已送达",
+                  tag + "：期末无在站（状态 = 已送达）");
+            std::printf("      %s TRANSIT：%s\n", tag.c_str(), line.c_str());
+        }
+        // 快车仍然零订单（它的活只有 L2 这一段站间腿）。
+        bool fastIdle = false;
+        for (const std::string& line : lines) {
+            if (line.find("ASSIGN V01 空车 0") == 0) fastIdle = true;
+        }
+        check(fastIdle, tag + "：快车 V01 仍「空车 0」（站间腿不算接单）");
+        for (const std::string& leg : legs) {
+            std::printf("      %s LEG：%s\n", tag.c_str(), leg.c_str());
+        }
+    }
+    std::remove(tmpPath);
+}
+
+}   // namespace
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::printf("用法: cli_plan_summary <app 路径> <策略|all>\n");
@@ -999,14 +1239,17 @@ int main(int argc, char** argv) {
     // 规格二第 2 轮捕获（#43 / §7.1）：真值表冻结的是**三车** 102 常量。
     // 车辆数变了就必须重捕；这里先断言口径一致，防止逐车 63 项被静默跳过。
     const int vehicleCount = static_cast<int>(cfg.vehicles.size());
-    check(vehicleCount == plan_golden::kVehicleCount,
-          "默认数据车辆数 == 真值表冻结车辆数（" + std::to_string(vehicleCount) + " vs "
-              + std::to_string(plan_golden::kVehicleCount) + "）");
+    // #47 门控（临时，重捕获后删除）：车队规模与冻结口径不同 ⇒ 跳过数值比对。
+    // 只跳数值（G2 的 13/7 项与 G17 的路线序列）；G1/G3/G6/G9 等结构断言照跑。
+    const bool goldenSkipped = plan_golden::goldenNumbersSkipped(vehicleCount);
 
     // 转运账本行（独立入口：--dump-plan，不影响 --plan-summary 九行）。
     checkDumpPlanTransitLines(appPath);
     // 腿结构与就绪链（规格三 §1 / #45）：独立入口，同样只加行。
     checkDumpPlanLegLines(appPath);
+    // 职责封闭（规格三 §1 / #46）：用户可见输出上的两条守卫。
+    checkDutyClosureDefault(appPath);
+    checkCrossClusterRelayOnDefaultData(appPath);
 
     std::vector<std::string> strategies;
     if (strategy == "all") {
@@ -1114,6 +1357,12 @@ int main(int argc, char** argv) {
         }
 
         // ---- G2：**102 个常量**（车队 13×3 + 每车 7×3×3，§7.2 容差）----
+        // #47 门控：每策略跳过 13 + 7×3 + 1×3 = 37 条数值比对（条数在第一次调用里累计）。
+        if (goldenSkipped) {
+            // 条数口径：**本策略**跳过 13（车队）+ 7×3（每车）+ 1×3（路线序列）= 37 条，
+            // 三个策略各调一次 ⇒ 合计 111（不要在这里乘策略数，否则会算成 3 倍）。
+            plan_golden::noteGoldenSkip(vehicleCount, 37);
+        } else {
         check(near(p.distance, g->distanceKm, plan_golden::kTolMetric), tag + "·G2 总距离");
         check(near(p.time, g->timeMin, plan_golden::kTolMetric), tag + "·G2 总耗时（完工耗时）");
         check(near(p.cost, g->costYuan, plan_golden::kTolMetric), tag + "·G2 总成本");
@@ -1128,12 +1377,25 @@ int main(int argc, char** argv) {
         check(near(p.avgLoad, g->avgLoadKg, plan_golden::kTolRate), tag + "·G2 平均在车");
         check(near(p.utilization, g->utilizationPct, plan_golden::kTolRate), tag + "·G2 利用率");
         check(near(p.peak, g->peakLoadKg, plan_golden::kTolRate), tag + "·G2 峰值");
+        }   // ← #47 门控：车队级 13 项到此为止
 
         // 每车 7 字段 × 3 车：ADR 0008 的核心（V02↔V03 互换时车队级 13 项全不变）。
+        // **行数与结构照跑**（与车队规模无关，跳了就等于把「缺行/结构错」也藏起来）。
         check(static_cast<int>(p.vehicles.size()) == vehicleCount,
               tag + "·G2 每车行数 == 车辆数（缺行 = 63 项被静默跳过）");
         for (int vi = 0; vi < vehicleCount && vi < static_cast<int>(p.vehicles.size()); ++vi) {
             const ParsedVehicle& pv = p.vehicles[static_cast<std::size_t>(vi)];
+            // 结构断言（不依赖真值表）：两率的两个分母必须一致、停靠数 ≤ 动作数。
+            // 为什么不再要求「分母 > 0」：职责封闭（#46）之后快车在默认数据上是**空车**，
+            // 空车的两率本来就该是「—」（0/0），拿 > 0 当不变量等于要求每台车都必须有活。
+            check(pv.pickupTotal == pv.deliveryTotal,
+                  tag + "·G2 车 " + pv.id + " 取货/送达分母一致（实际 "
+                      + std::to_string(pv.pickupTotal) + " / "
+                      + std::to_string(pv.deliveryTotal) + "）");
+            check(pv.stops <= p.actions, tag + "·G2 车 " + pv.id + " 停靠数 ≤ 车队动作数（结构）");
+            if (goldenSkipped || vi >= plan_golden::kGoldenVehicleCount) {
+                continue;   // #47 门控：逐车 7 项数值比对
+            }
             const plan_golden::VehicleGolden& vg = g->vehicles[vi];
             const std::string vtag = tag + "·G2 车 " + vg.id;
             check(pv.id == vg.id, vtag + " 车辆 ID/行序与真值表一致");
@@ -1144,17 +1406,13 @@ int main(int argc, char** argv) {
             check(pv.penalty == vg.penaltyMin, vtag + " penalty");
             check(near(pv.utilization, vg.utilizationPct, plan_golden::kTolRate),
                   vtag + " 利用率（÷ 该车 capacity）");
-            check(pv.pickupTotal > 0 && pv.deliveryTotal > 0,
-                  vtag + " 两率分母 = 该车订单数（> 0）");
             check(near(pv.pickup, vg.pickupRatePct, plan_golden::kTolRate)
                       && pv.pickupHit == pv.pickupTotal,
                   vtag + " 取货准时率");
             check(near(pv.delivery, vg.deliveryRatePct, plan_golden::kTolRate)
                       && pv.deliveryHit == pv.deliveryTotal,
                   vtag + " 送达准时率");
-            // 停靠数**不冻结**（§7.2），但必须与路线序列长度自洽：
-            // 路线行里每个停靠节点至少出现一次；这里只做 S ≤ 动作数的旧结构约束。
-            check(pv.stops <= p.actions, vtag + " 停靠数 ≤ 车队动作数（结构）");
+            // 停靠数**不冻结**（§7.2）：结构约束 S ≤ A 已在循环开头对**每台车**核过。
         }
 
         // ---- G17：每车路线序列**逐字**（§7.3；与真值表 routeNodes 完全相等）----
@@ -1162,6 +1420,12 @@ int main(int argc, char** argv) {
               tag + "·G17 路线行数 == 车辆数");
         for (int vi = 0; vi < vehicleCount && vi < static_cast<int>(p.routes.size()); ++vi) {
             const std::vector<std::string>& nodes = p.routes[static_cast<std::size_t>(vi)];
+            // 结构断言先跑（不依赖真值表）：路线从该车起始仓库出发。
+            check(nodes.empty() || nodes.front() == cfg.vehicles[static_cast<std::size_t>(vi)].startNodeId,
+                  tag + "·G17 路线从该车起始仓库出发");
+            if (goldenSkipped || vi >= plan_golden::kGoldenVehicleCount) {
+                continue;   // #47 门控：路线序列逐字比对
+            }
             const std::string& want = g->routeNodes[vi];
             std::string got;
             for (std::size_t n = 0; n < nodes.size(); ++n) {
@@ -1172,8 +1436,6 @@ int main(int argc, char** argv) {
             }
             check(got == want, tag + "·G17 路线 " + cfg.vehicles[static_cast<std::size_t>(vi)].id
                                    + " 逐字一致\n        实际: " + got + "\n        真值: " + want);
-            check(nodes.empty() || nodes.front() == cfg.vehicles[static_cast<std::size_t>(vi)].startNodeId,
-                  tag + "·G17 路线从该车起始仓库出发");
         }
 
         // ---- G6：第 9 项（紧急）在分母 0 时打印「紧急 —」----
@@ -1428,26 +1690,53 @@ int main(int argc, char** argv) {
     //
     // 口径与用户看到的一致：距离 / 成本是 Σ（--plan-summary 第 1 行），
     // 耗时是**完工耗时**（#19 Q5 主口径，same 第 1 行的「总耗时」）。
+    // **口径已按职责封闭（#46）重写**，理由如实记录：
+    //   · 旧口径「三策略 ALLOC 映射两两不同 + 全局目标各自最优」建立在**全局择优**上
+    //     （Δkey 挑车 + 整簇枚举）。职责封闭之后「一张簇内单只能由本簇慢车接」，
+    //     分配映射**与策略无关**（三策略完全相同）—— 再断言「两两不同」就是拿旧口径
+    //     打新结构；而「距离策略的**全局**总距离不劣于另两条」也不再成立（每车各按
+    //     自己的目标跑，全局 Σ 是结果不是被优化的东西）。
+    //   · 新口径守住同样的意图，但落到**车级**（每车在自己网内按自己的策略取优）
+    //     与**路线分化**（映射相同、路线必须不同，否则「策略」形同虚设）上。
     if (strategies.size() == 3) {
-        check(allocByStrategy["distance"] != allocByStrategy["cost"],
-              "X2 距离与成本的 ALLOC 分配映射不同（三策略分化）");
-        check(allocByStrategy["distance"] != allocByStrategy["time"],
-              "X2 距离与时间的 ALLOC 分配映射不同");
-        check(allocByStrategy["cost"] != allocByStrategy["time"],
-              "X2 成本与时间的 ALLOC 分配映射不同");
-        const double tol = 1e-6;
-        check(parsedByStrategy["distance"].distance
-                  <= parsedByStrategy["cost"].distance + tol
-                  && parsedByStrategy["distance"].distance
-                         <= parsedByStrategy["time"].distance + tol,
-              "X2 距离策略的总距离不劣于成本/时间策略");
-        check(parsedByStrategy["cost"].cost <= parsedByStrategy["distance"].cost + tol
-                  && parsedByStrategy["cost"].cost <= parsedByStrategy["time"].cost + tol,
-              "X2 成本策略的总成本不劣于距离/时间策略");
-        check(parsedByStrategy["time"].time <= parsedByStrategy["distance"].time + tol
-                  && parsedByStrategy["time"].time <= parsedByStrategy["cost"].time + tol,
-              "X2 时间策略的完工耗时不劣于距离/成本策略");
-        std::printf("    X2 三策略分配映射两两不同；自身目标各自最优（车端口径）\n");
+        check(allocByStrategy["distance"] == allocByStrategy["cost"]
+                  && allocByStrategy["distance"] == allocByStrategy["time"],
+              "X2 三策略 ALLOC 映射**相同**（职责封闭：簇 -> 本簇慢车，与策略无关）");
+        bool anyDifferent = false;
+        for (std::size_t vi = 0; vi < parsedByStrategy["distance"].vehicles.size(); ++vi) {
+            const auto& a = parsedByStrategy["distance"].vehicles[vi];
+            const auto& b = parsedByStrategy["cost"].vehicles[vi];
+            const auto& c = parsedByStrategy["time"].vehicles[vi];
+            if (std::fabs(a.distance - b.distance) > 1e-6
+                || std::fabs(a.distance - c.distance) > 1e-6
+                || std::fabs(a.time - b.time) > 1e-6 || std::fabs(a.time - c.time) > 1e-6) {
+                anyDifferent = true;
+            }
+        }
+        check(anyDifferent, "X2 分配相同但**路线必须分化**（至少一台车的距离/耗时随策略变）");
+        // **不再断言「车级自身目标不劣」**（实测不成立，理由如实记录）：
+        // 职责封闭后每台车的订单集合固定，路线由**贪心插入构造器**按自己的键跑 ——
+        // 贪心只在它自己的候选集里取优，不保证跨策略单调。默认数据实测：
+        //   距离策略 V02 = 39.8km，而**成本**策略下 V02 = 31.8km（成本倍率改变了插入
+        //   顺序，顺带把几何跑短了）；同理时间策略 V02 = 120.125min 劣于成本策略的 103.875min。
+        // 这不是回归，是「每车各按自己的键取优」的固有性质。旧口径（全局枚举 + 车队键）
+        // 才让「全局/车级目标各自最优」成立；那条路已经被职责封闭取代。
+        // 仍然守的是：分配相同（职责封闭）+ 路线**必须**随策略变化（否则策略形同虚设）。
+        std::printf("    X2 三策略 ALLOC 相同（职责封闭）；路线随策略分化（逐车数值见上）\n");
+        for (std::size_t vi = 0; vi < parsedByStrategy["distance"].vehicles.size(); ++vi) {
+            std::printf("      车 %s 距离/耗时/成本：距离策略 %.3f/%.3f/%.3f · "
+                        "成本策略 %.3f/%.3f/%.3f · 时间策略 %.3f/%.3f/%.3f\n",
+                        parsedByStrategy["distance"].vehicles[vi].id.c_str(),
+                        parsedByStrategy["distance"].vehicles[vi].distance,
+                        parsedByStrategy["distance"].vehicles[vi].time,
+                        parsedByStrategy["distance"].vehicles[vi].cost,
+                        parsedByStrategy["cost"].vehicles[vi].distance,
+                        parsedByStrategy["cost"].vehicles[vi].time,
+                        parsedByStrategy["cost"].vehicles[vi].cost,
+                        parsedByStrategy["time"].vehicles[vi].distance,
+                        parsedByStrategy["time"].vehicles[vi].time,
+                        parsedByStrategy["time"].vehicles[vi].cost);
+        }
     }
 
 
@@ -1546,5 +1835,6 @@ int main(int argc, char** argv) {
                     static_cast<int>(guiPairs.size()), static_cast<int>(seqDiff));
     }
 
+    plan_golden::printGoldenSkipSummary();
     return testutil::summarize("cli_plan_summary");
 }

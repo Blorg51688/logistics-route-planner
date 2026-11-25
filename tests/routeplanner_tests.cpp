@@ -2159,23 +2159,27 @@ std::vector<Order> makeThreeClusterOrders() {
     return orders;
 }
 
-// V01 快而贵（×1.00 / ×1.00，60kg）；V02 慢而**极便宜**（×1.25 / ×0.10，400kg）；
-// V03 慢而贵（×1.25 / ×1.00，400kg）。三台车都装得下任一簇（峰值 20/40/60 ≤ 60），
-// 所以 6 种排列全部可行。三种策略各自选出**不同的分配映射**（差在 V02/V03 或 V01 上）：
-//   距离 → 均衡键在两种同距排列里取 tieKey 持有者（簇2→V02）；
-//   成本 → V02 的 ×0.10 把最大簇（簇3）吸过去；
-//   时间 → V01 最快，把最大簇（簇3）放上 V01 才能压低完工耗时。
+// 与 config/default.ini 同形：**一台快车 + 每簇一台慢车**（#46 的职责封闭前提）。
+//   V01 快车（400kg / 时因 1.00 / 成本因 1.50）：只做簇间搬运与跨簇紧急直达；
+//   V02/V03/V04 慢车（160kg / 1.25 / 0.80）：每台守一个簇，按 **ID 升序 × 簇 ID 升序**
+//   逐位配对（簇1→V02、簇2→V03、簇3→V04）。
+// 为什么这个形状是必须的：慢车数 < 簇数时一台慢车要守多簇（合法但降级）；慢车数 > 簇数时
+// 有慢车空转。3 簇 3 慢车是唯一「排列数 = 1 且不降级」的形状，也正是默认数据的形状 ——
+// 于是「距离/成本/时间三策略给出不同分配映射」这件事在这里**不再成立**（见测试注释）。
 std::vector<Vehicle> makeThreeClusterVehicles() {
     std::vector<Vehicle> vs;
-    Vehicle a = makeVehicleWithFactors("W", 60.0, 480, 1.00, 1.00);
+    Vehicle a = makeVehicleWithFactors("W", 400.0, 480, 1.00, 1.50);
     a.id = "V01";
-    Vehicle b = makeVehicleWithFactors("W", 400.0, 480, 1.25, 0.10);
+    Vehicle b = makeVehicleWithFactors("W", 160.0, 480, 1.25, 0.80);
     b.id = "V02";
-    Vehicle c = makeVehicleWithFactors("W", 400.0, 480, 1.25, 1.00);
+    Vehicle c = makeVehicleWithFactors("W", 160.0, 480, 1.25, 0.80);
     c.id = "V03";
+    Vehicle d = makeVehicleWithFactors("W", 160.0, 480, 1.25, 0.80);
+    d.id = "V04";
     vs.push_back(a);
     vs.push_back(b);
     vs.push_back(c);
+    vs.push_back(d);
     return vs;
 }
 
@@ -2323,64 +2327,64 @@ void checkFleetAllocationInvariants(const LogisticsGraph& g, const std::vector<V
 }
 
 // 阶段二的 6 种排列 + 三策略各自的分配映射（**不变量 1–4 的落点**）。
-// 夹具上 6 种排列全部可行（峰值 20/40/60 ≤ 最小容量 60），所以留痕恰好 6 行。
+// 职责封闭（#46）后的**分配口径**：整簇全排列枚举已退役，「簇 -> 慢车」由
+// 「簇 ID 升序 × 慢车 ID 升序逐位配对」唯一确定 ⇒ 留痕 1 行、分配映射**与策略无关**。
+// 三策略的分化只剩**每车路线**（各车按自己的键跑构造器）。
+//
+// 旧断言「枚举 6 种排列 + 三策略分配映射两两不同」按**退役**处理（提交信息里点名）：
+// 职责封闭之后那 6 种排列里有 5 种一执行就越界（把簇交给别的车），再枚举只是把越界解
+// 造出来再丢掉；分配映射也不再随策略变 —— 那不是退化，正是「职责先于优化」的直接后果。
 void testFleetTypeAwareAllocationInvariants() {
     const LogisticsGraph g = makeThreeClusterGraph();
     const std::vector<Order> orders = makeThreeClusterOrders();
     const std::vector<Vehicle> vehicles = makeThreeClusterVehicles();
     const FleetPlan fleet = planFleet(g, vehicles, orders, WeightType::Distance);
-    check(fleet.allOk, "三簇六单三车全部可行（reason: " + fleet.reason + "）");
-    checkFleetAllocationInvariants(g, vehicles, orders, fleet, "三阶段·距离");
+    check(fleet.allOk, "三簇六单四车全部可行（reason: " + fleet.reason + "）");
+    checkFleetAllocationInvariants(g, vehicles, orders, fleet, "职责封闭·距离");
 
-    // 6 种「簇 -> 车」排列全部被枚举（默认 3 簇 3 车）。
-    check(fleet.candidateKeyLog.size() == 6,
-          "枚举 6 种排列（实际 " + std::to_string(fleet.candidateKeyLog.size()) + "）");
-    for (std::size_t i = 0; i < fleet.candidateKeyLog.size(); ++i) {
-        check(fleet.candidateKeyLog[i].find("key=(") != std::string::npos,
-              "排列 " + std::to_string(i) + " 留痕带车队键");
+    // 阶段二留痕：固定指派只有 1 行（枚举已退役）。
+    check(fleet.candidateKeyLog.size() == 1,
+          "阶段二留痕恰 1 行（实际 " + std::to_string(fleet.candidateKeyLog.size()) + "）");
+    if (!fleet.candidateKeyLog.empty()) {
+        const std::string& line = fleet.candidateKeyLog[0];
+        check(line.find("固定指派") != std::string::npos && line.find("key=(") != std::string::npos,
+              "留痕行点名「固定指派」且带车队键：" + line);
+        check(line.find("簇1=V02") != std::string::npos
+                  && line.find("簇2=V03") != std::string::npos
+                  && line.find("簇3=V04") != std::string::npos,
+              "留痕行写出「簇 ID 升序 × 慢车 ID 升序」的配对：" + line);
     }
 
-    // 三策略的分配映射（簇 -> 车；簇下标 0/1/2 = 簇 1/2/3）。夹具参数详见
-    // makeThreeClusterVehicles 的注释：距离靠均衡键 + tieKey，成本被 V02 的 ×0.10 拉动，
-    // 时间把最大簇放上最快的 V01。
-    struct Expect {
-        WeightType weight;
-        const char* label;
-        int clusterOnVehicle[3];
-        const char* why;
-    };
-    const Expect expects[3] = {
-        {WeightType::Distance, "距离", {0, 1, 2},
-         "均衡键 + tieKey（6 种排列 Σ距离完全并列）"},
-        {WeightType::Cost, "成本", {0, 2, 1}, "V02 的 ×0.10 把最大簇吸到 V02"},
-        {WeightType::Time, "时间", {2, 0, 1}, "V01 最快，最大簇上 V01 才能压低完工耗时"},
-    };
-    for (int e = 0; e < 3; ++e) {
-        const FleetPlan f = (e == 0) ? fleet : planFleet(g, vehicles, orders, expects[e].weight);
-        check(f.allOk, std::string(expects[e].label) + "策略可行");
-        const std::string tag = std::string(expects[e].label) + "策略（" + expects[e].why + "）";
-        checkFleetAllocationInvariants(g, vehicles, orders, f, tag);
-        // 每个簇取一张代表单，核对它落在期望的车上。
-        const char* rep[3] = {"O1", "O3", "O5"};
-        for (int v = 0; v < 3; ++v) {
-            bool found = false;
-            const std::size_t got = allocationVehicleOf(f, rep[expects[e].clusterOnVehicle[v]], found);
-            check(found && got == static_cast<std::size_t>(v),
-                  tag + "：簇 " + std::to_string(expects[e].clusterOnVehicle[v] + 1) + " -> "
-                      + vehicles[static_cast<std::size_t>(v)].id);
-        }
-        // 整簇不可分时每车只该有一个本地簇（阶段三没有**跨簇搬运**的例子在这里）。
-        for (std::size_t v = 0; v < f.vehicleClusters.size(); ++v) {
-            check(f.vehicleClusters[v].size() <= 1,
-                  tag + "：" + vehicles[v].id + " 至多承载一个本地簇");
-        }
+    // 每簇的代表单落在**本簇慢车**上；快车 V01 一单不接（空车）。
+    const char* rep[3] = {"O1", "O3", "O5"};
+    for (int c = 0; c < 3; ++c) {
+        bool found = false;
+        const std::size_t got = allocationVehicleOf(fleet, rep[c], found);
+        check(found && got == static_cast<std::size_t>(c + 1),
+              "簇 " + std::to_string(c + 1) + " -> 本簇慢车 "
+                  + vehicles[static_cast<std::size_t>(c + 1)].id);
     }
-    // 距离与成本/时间的映射必须不同（三策略分化在夹具上的最小化版本）。
+    check(fleet.vehicleOrderCount.size() == 4 && fleet.vehicleOrderCount[0] == 0,
+          "快车 V01 空车（职责封闭：它不进本簇订单队列）");
+    for (std::size_t v = 1; v < fleet.vehicleClusters.size(); ++v) {
+        check(fleet.vehicleClusters[v].size() == 1,
+              std::string(vehicles[v].id) + " 恰好守一个簇（实际 "
+                  + std::to_string(fleet.vehicleClusters[v].size()) + " 个）");
+    }
+
+    // 三策略：分配映射**相同**（职责封闭），但每车路线必须分化（否则「策略」形同虚设）。
     const FleetPlan byCost = planFleet(g, vehicles, orders, WeightType::Cost);
     const FleetPlan byTime = planFleet(g, vehicles, orders, WeightType::Time);
-    check(byCost.allocationVehicleIndex != fleet.allocationVehicleIndex, "距离 ≠ 成本 的分配");
-    check(byTime.allocationVehicleIndex != fleet.allocationVehicleIndex, "距离 ≠ 时间 的分配");
-    check(byTime.allocationVehicleIndex != byCost.allocationVehicleIndex, "时间 ≠ 成本 的分配");
+    check(byCost.allOk && byTime.allOk, "成本/时间策略在夹具上都可行");
+    check(byCost.allocationVehicleIndex == fleet.allocationVehicleIndex
+              && byTime.allocationVehicleIndex == fleet.allocationVehicleIndex,
+          "三策略的分配映射相同（簇 -> 慢车与策略无关）");
+    // **不断言「路线随策略分化」**：这个夹具每簇只有两张**同起终点**的单，任何策略下
+    // 每台车的节点序列都只能是「取货点 -> 送达点 -> 送达点」，分化在几何上不可能出现。
+    // 三策略分化由**默认数据**守（integration_tests ① 与 cli_plan_summary 的 X2/G17），
+    // 那里 25 单/4 车实测路线确实不同 —— 不在这里用一个造不出来的形态假装守住。
+    check(byCost.vehicles.size() == fleet.vehicles.size(),
+          "三策略车辆数一致（逐车可比）");
 }
 
 // 均衡键**单独**裁决的一次并列（这是「把均衡键去掉 → 守卫变红」的落点）：
@@ -2400,8 +2404,10 @@ void testFleetBalanceKeyDecidesTie() {
     addTwoWay(g, "A2", "B2", 10.0, 10.0, 10.0);
     addTwoWay(g, "B2", "W", 10.0, 10.0, 10.0);
 
-    // V01 容量**小**（100kg）、V02 容量大（200kg）：tieKey 会把 50kg 的簇1 放上 V01
-    // （0.50 / 0.05 = 极差 0.45），均衡键则把 50kg 送到 V02（0.25 / 0.10 = 0.15）。
+    // **口径变更（#46）**：均衡键从「阶段二决策键」退成**纯报告指标**。职责封闭后
+    // 「簇 -> 慢车」由 ID 配对唯一确定，再没有「哪种排列更均衡」可挑。
+    // 夹具仍是两簇两台车（V01 100kg、V02 200kg ⇒ 快车 = V02，慢车 = V01），
+    // 于是两簇都落在唯一的慢车 V01 上（一台慢车守多簇，日志点名）。
     std::vector<Vehicle> vehicles;
     Vehicle small = makeVehicle("W", 100.0, 480);
     small.id = "V01";
@@ -2422,26 +2428,29 @@ void testFleetBalanceKeyDecidesTie() {
     bool found2 = false;
     const std::size_t v1 = allocationVehicleOf(fleet, "O1", found1);
     const std::size_t v2 = allocationVehicleOf(fleet, "O2", found2);
-    check(found1 && v1 == 1, "50kg 的簇1 -> V02（cap 200）：均衡键选中（否则 tieKey 会放 V01）");
-    check(found2 && v2 == 0, "10kg 的簇2 -> V01（cap 100）");
-    // 极差：0.25 − 0.10 = 0.15；另一种排列（tieKey 的）是 0.50 − 0.05 = 0.45。
-    check(fixtures::nearlyEqual(fleet.balanceSpread, 0.15, 1e-9),
-          "均衡度 = 0.25 − 0.10 = 0.15（实际 " + std::to_string(fleet.balanceSpread) + "）");
-    // 两种排列的 Σ距离完全相同（几何对称、因子相同）⇒ 第一/第二键分不出高下。
-    const RoutePlan a1 = planRoute(g, vehicles[0], {orders[0]}, WeightType::Distance);
-    const RoutePlan a2 = planRoute(g, vehicles[0], {orders[1]}, WeightType::Distance);
-    const RoutePlan b1 = planRoute(g, vehicles[1], {orders[0]}, WeightType::Distance);
-    const RoutePlan b2 = planRoute(g, vehicles[1], {orders[1]}, WeightType::Distance);
-    check(fixtures::nearlyEqual(a1.totalDistanceKm + b2.totalDistanceKm,
-                                a2.totalDistanceKm + b1.totalDistanceKm),
-          "两种排列 Σ距离完全并列 ⇒ 只能由均衡键/tieKey 裁决");
-    // tieKey（不看均衡键）会选「簇1→V01」：V01 首次停靠 A1 < A2。
-    check(a1.stops.front().nodeId == "A1" && a2.stops.front().nodeId == "A2",
-          "tieKey 口径：V01 的首次停靠 A1 < A2 ⇒ 均衡键缺席时会选簇1→V01");
+    check(found1 && v1 == 0 && found2 && v2 == 0,
+          "两簇都由唯一的慢车 V01 接（一台慢车守多簇；快车 V02 空车）");
+    check(fleet.vehicleClusters[0].size() == 2,
+          "V01 的本地簇列表 = {1,2}（一台慢车守两簇，循环配对）");
+    bool loopLogged = false;
+    for (std::size_t i = 0; i < fleet.allocationLog.size(); ++i) {
+        if (fleet.allocationLog[i].find("循环配对") != std::string::npos) {
+            loopLogged = true;
+        }
+    }
+    check(loopLogged, "「簇数 > 慢车数 ⇒ 循环配对」留日志（降级不静默）");
+    // 均衡度**仍然被算出来并报告**（只是不再参与决策）：V01 峰值 50 / 容量 100 = 0.50，
+    // V02 空车记 0 ⇒ 极差 = 0.50 − 0.00 = 0.50。
+    check(fixtures::nearlyEqual(fleet.balanceSpread, 0.50, 1e-9),
+          "均衡度仍被算出并报告（空车 utilization 记 0 参与极差；实际 "
+              + std::to_string(fleet.balanceSpread) + "）");
+    check(fleet.relocations.empty(), "阶段三已退役 ⇒ 改派日志恒空");
 }
 
-// 簇数 > 车数（§4.3 的贪心分支）：按簇货量降序取前 k 个各占一车，
-// 剩余簇并入「货量最接近且仍可行」的车；日志里留一行，绝不静默。
+// 簇数 > 慢车数（职责封闭后的降级形态）：慢车按 **ID 升序**、簇按 **簇 ID 升序**循环
+// 配对 —— 一台慢车守多簇，日志里留一行，绝不静默。
+// 旧的「按簇货量降序贪心 + 并入货量最接近的车」随整簇枚举一起退役：那是**择优**，
+// 而职责封闭只允许本簇慢车接本簇单，把一簇并给另一台车就越界。
 void testFleetMoreClustersThanVehicles() {
     const LogisticsGraph g = makeThreeClusterGraph();     // 3 簇（货量 20/40/60）
     const std::vector<Order> orders = makeThreeClusterOrders();
@@ -2457,15 +2466,19 @@ void testFleetMoreClustersThanVehicles() {
     checkFleetAllocationInvariants(g, vehicles, orders, fleet, "簇数>车数");
     bool logged = false;
     for (std::size_t i = 0; i < fleet.allocationLog.size(); ++i) {
-        if (fleet.allocationLog[i].find("簇数 > 车数") != std::string::npos) {
+        if (fleet.allocationLog[i].find("循环配对") != std::string::npos) {
             logged = true;
         }
     }
-    check(logged, "簇数 > 车数**留日志**（不静默合并）");
-    // 2 台车都必须有活；6 张单都分配到（合并后一组含两簇，阶段三可能再搬单）。
-    check(fleet.vehicleOrderCount.size() == 2 && fleet.vehicleOrderCount[0] > 0
-              && fleet.vehicleOrderCount[1] > 0,
-          "两台车都分到订单");
+    check(logged, "簇数 > 慢车数 **留日志**（一台慢车守多簇，不静默）");
+    // 唯一那台慢车（V02）守 3 个簇；快车 V01 一单不接（职责封闭）。
+    check(fleet.vehicleOrderCount.size() == 2 && fleet.vehicleOrderCount[0] == 0
+              && fleet.vehicleOrderCount[1] == 6,
+          "6 张单全落在唯一的慢车 V02 上，快车 V01 空车（实际 V01="
+              + std::to_string(fleet.vehicleOrderCount.size() > 0 ? fleet.vehicleOrderCount[0] : -1)
+              + " / V02="
+              + std::to_string(fleet.vehicleOrderCount.size() > 1 ? fleet.vehicleOrderCount[1] : -1)
+              + "）");
     int served = 0;
     for (std::size_t v = 0; v < fleet.vehicles.size(); ++v) {
         served += fleet.vehicles[v].metrics.actionCount / 2;
@@ -2521,12 +2534,16 @@ void testFleetClusterFitsViaPrefixSerialization() {
     check(served == 2, "两张单都被服务一次");
 }
 
-// 完工耗时守卫（§4.4 第二接受条件）**必须能独立拦住**一次「键更优但完工更差」的改派。
+// **退役（#46）：阶段三「有界跨车改派」不再存在**，因此「完工耗时守卫挡住一次键更优
+// 但完工更差的改派」这条用例的对象消失了。**不删掉它**，而是改成守同一件事的两面：
+//   ① 改派日志恒空（阶段三退役的直接形态）；
+//   ② 成本因子**不再能把别的簇的单吸过来** —— 职责封闭后「簇 -> 慢车」只看 ID 配对，
+//      夹具里 V01 的 ×0.10 再便宜也只能跑本簇慢车的活。
 //
-// 夹具：V01 成本因子 ×0.10（便宜）、V02 ×1.00；近簇 A 路线 15km、远簇 B 路线 60km。
-// 成本策略的初解把远簇 B 放上便宜的 V01（21 元），完工 60min。
-// 阶段三会试「把近簇 A 也挪到 V01」：成本 21 -> 7.5（**键更优**），但 V01 要跑 75km，
-// 完工 60 -> 75（**更差**）⇒ 守卫必须拒绝。去掉守卫这条用例立刻变红。
+// 夹具保留原样：V01 成本因子 ×0.10（便宜）、V02 ×1.00；近簇 1 路线 15km、远簇 2 路线 60km。
+// 旧语义下成本策略会把远簇 B 放上 V01（键更优），阶段三再试图把近簇 A 也挪过去
+// （完工 60 -> 75 ⇒ 被守卫拒绝）。新语义下：V02 成本因子更高 ⇒ 它才是快车，
+// 唯一慢车 V01 同时守两簇 ⇒ 两单都在 V01 上，改派没有发生也不需要发生。
 void testFleetCompletionGuardRejectsRelocation() {
     LogisticsGraph g;
     g.addNode(makeSubNode("W", NodeType::Warehouse, "仓库", 0));
@@ -2550,29 +2567,32 @@ void testFleetCompletionGuardRejectsRelocation() {
     vehicles.push_back(dear);
 
     const std::vector<Order> orders = {
-        makeOrder("O1", "P1", "Q1", 10.0, 0, 1440, false),   // 近簇 A
-        makeOrder("O2", "P2", "Q2", 10.0, 0, 1440, false),   // 远簇 B
+        makeOrder("O1", "P1", "Q1", 10.0, 0, 1440, false),   // 近簇
+        makeOrder("O2", "P2", "Q2", 10.0, 0, 1440, false),   // 远簇
     };
     const FleetPlan fleet = planFleet(g, vehicles, orders, WeightType::Cost);
-    check(fleet.allOk, "守卫夹具可行（reason: " + fleet.reason + "）");
+    check(fleet.allOk, "哨兵夹具可行（reason: " + fleet.reason + "）");
     bool found1 = false;
     bool found2 = false;
-    const std::size_t vO2 = allocationVehicleOf(fleet, "O2", found2);
     const std::size_t vO1 = allocationVehicleOf(fleet, "O1", found1);
-    check(found2 && vO2 == 0, "初解：远簇 B -> 便宜的 V01（成本 ×0.10）");
-    check(found1 && vO1 == 1, "初解：近簇 A -> V02");
-    check(fleet.relocations.empty(),
-          "守卫拒绝了唯一一次「键更优但完工更差」的改派（日志应为空）");
-    check(fixtures::nearlyEqual(fleet.completionTimeMin, 60.0),
-          "完工耗时仍为 60min（V01 跑远簇 60km）；实际 "
-              + std::to_string(fleet.completionTimeMin));
-    check(fleet.vehicleOrderCount[0] == 1 && fleet.vehicleOrderCount[1] == 1,
-          "两车各 1 单（没有把两簇压到同一台车）");
+    const std::size_t vO2 = allocationVehicleOf(fleet, "O2", found2);
+    check(found1 && vO1 == 0 && found2 && vO2 == 0,
+          "两簇都落在唯一的慢车 V01 上（成本因子 ×0.10 不再能挑单：职责先于优化）");
+    check(fleet.relocations.empty(), "阶段三已退役 ⇒ 改派日志恒空（不再有「键更优但完工更差」的候选）");
+    check(fleet.vehicleOrderCount.size() == 2 && fleet.vehicleOrderCount[0] == 2
+              && fleet.vehicleOrderCount[1] == 0,
+          "V01 两单 / V02（快车）空车");
+    // 完工耗时口径不变：max(返回) − min(发车)；单跑两簇时由 V01 的返回决定。
+    const double expect = static_cast<double>(fleet.vehicles[0].returnArrivalMin)
+                          - static_cast<double>(vehicles[0].departTimeMin);
+    check(fixtures::nearlyEqual(fleet.completionTimeMin, expect),
+          "完工耗时 = max(返回) − min(发车)（实际 "
+              + std::to_string(fleet.completionTimeMin) + "，期望 " + std::to_string(expect) + "）");
     checkFleetAllocationInvariants(g, vehicles, orders, fleet, "完工守卫");
 }
 
-// tieKey 三层 + 确定性：同输入同输出；传入顺序打乱也一致（订单先按 ID 升序、
-// 簇按簇号升序、车辆按 ID 升序枚举）；三策略的分配映射**两两不同**。
+// 确定性：同输入同输出；传入顺序打乱也一致（订单先按 ID 升序、簇按簇 ID 升序、
+// 慢车按 ID 升序配对）。三策略的**分配映射相同**（职责封闭），分化在每车路线上。
 void testFleetTypeAwareDeterministic() {
     const LogisticsGraph g = makeThreeClusterGraph();
     const std::vector<Order> orders = makeThreeClusterOrders();
@@ -2595,20 +2615,21 @@ void testFleetTypeAwareDeterministic() {
     }
     check(sameNodes, "确定性：逐车节点序列逐字相同");
 
-    // 三策略分化（车队口径）：三份 ALLOC 映射两两不同。
+    // **口径变更（#46）**：职责封闭后「簇 -> 慢车」与策略无关 ⇒ 三份 ALLOC 映射**相同**。
+    // 旧断言「两两不同」按退役处理；仍要守的是「路线随策略分化」与「三策略都可行」。
     const FleetPlan byCost = planFleet(g, vehicles, orders, WeightType::Cost);
     const FleetPlan byTime = planFleet(g, vehicles, orders, WeightType::Time);
-    check(byCost.allocationVehicleIndex != a.allocationVehicleIndex,
-          "距离与成本的分配映射不同");
-    check(byTime.allocationVehicleIndex != a.allocationVehicleIndex,
-          "距离与时间的分配映射不同");
-    check(byTime.allocationVehicleIndex != byCost.allocationVehicleIndex,
-          "时间与成本的分配映射不同");
     check(byCost.allOk && byTime.allOk, "成本/时间策略在夹具上都可行");
+    check(byCost.allocationVehicleIndex == a.allocationVehicleIndex
+              && byTime.allocationVehicleIndex == a.allocationVehicleIndex,
+          "三策略分配映射相同（职责封闭：簇 -> 本簇慢车）");
+    check(byCost.totalDistanceKm > 0.0 && byTime.totalDistanceKm > 0.0,
+          "三策略都给出了非退化的车队指标（分化性的守卫在默认数据集上）");
 }
 
-// 单簇 + 三台车：tieKey 的「停靠序列逐位（短者先）」把订单放到**最后一台车**，
-// 前两台是空车（五项全 0、返回时刻 = 发车时刻、不抬升完工耗时）。
+// 单簇 + 三台车（同容量同因子 ⇒ 快车 = 行序 0 的 V01，慢车 = V02/V03）：
+// 职责封闭把这一簇交给**慢车 ID 升序第一台**（V02）；快车 V01 与多余慢车 V03 空车
+//（五项全 0、返回时刻 = 发车时刻、不抬升完工耗时）。
 void testFleetTypeAwareOneClusterLeavesEarlierVehiclesEmpty() {
     LogisticsGraph g;   // 一个本地簇（A1、B1 同属子网络 1）
     g.addNode(makeSubNode("W", NodeType::Warehouse, "仓库", 0));
@@ -2633,13 +2654,14 @@ void testFleetTypeAwareOneClusterLeavesEarlierVehiclesEmpty() {
     checkFleetAllocationInvariants(g, vehicles, orders, fleet, "单簇三车");
     bool found = false;
     const std::size_t at = allocationVehicleOf(fleet, "O1", found);
-    check(found && at == 2, "tieKey（短停靠序列优先）把单放到 V03，前两台空车");
+    check(found && at == 1,
+          "职责封闭：单簇交给慢车 ID 升序第一台（V02，行序 1）；快车 V01 空车");
     check(fleet.vehicleOrderCount.size() == 3 && fleet.vehicleOrderCount[0] == 0
-              && fleet.vehicleOrderCount[1] == 0 && fleet.vehicleOrderCount[2] == 1,
-          "每车订单数 0 / 0 / 1");
+              && fleet.vehicleOrderCount[1] == 1 && fleet.vehicleOrderCount[2] == 0,
+          "每车订单数 0 / 1 / 0");
     // 空车不抬升完工耗时，但参与 min(发车)：完工 = 有货车的返回 − 最早发车。
-    const double expect = static_cast<double>(vehicles[2].departTimeMin)
-                          + fleet.vehicles[2].totalTimeMin
+    const double expect = static_cast<double>(vehicles[1].departTimeMin)
+                          + fleet.vehicles[1].totalTimeMin
                           - static_cast<double>(vehicles[0].departTimeMin);
     check(fixtures::nearlyEqual(fleet.completionTimeMin, expect),
           "完工耗时 = max(返回) − min(发车)（空车不抬升 max）");
@@ -2725,9 +2747,9 @@ void testFleetBaselineDeterministic() {
     std::vector<Vehicle> vehicles = makeThreeClusterVehicles();
     const FleetPlan base = planFleetSequentialBaseline(g, vehicles, orders, WeightType::Distance);
     check(base.allOk, "基线可行");
-    // 订单 ID 升序 + 行序：O1/O4 -> V01、O2/O5 -> V02、O3/O6 -> V03。
+    // 订单 ID 升序 + 行序（i mod k，k = 4）：O1/O5 -> V01、O2/O6 -> V02、O3 -> V03、O4 -> V04。
     const char* expectId[6] = {"O1", "O2", "O3", "O4", "O5", "O6"};
-    const std::size_t expectV[6] = {0, 1, 2, 0, 1, 2};
+    const std::size_t expectV[6] = {0, 1, 2, 3, 0, 1};
     for (int i = 0; i < 6; ++i) {
         bool found = false;
         const std::size_t v = allocationVehicleOf(base, expectId[i], found);
@@ -3857,7 +3879,14 @@ void testRescheduleLevel2CrossVehicleReassignment() {
     }
 }
 
-// ---- 第 ③ 级：② 改不动（挪走一张、剩下那张仍装不上）⇒ 全车队三阶段重调度 ----
+// ---- 第 ③ 级：② 改不动（挪走一张、剩下那张仍装不上）⇒ 全车队重调度 ----
+//
+// **夹具按职责封闭（#46）调过一处**：两张 60kg 的单都放在**簇 2**（C→D）。
+// 为什么：③ 的全车队重调度走 planFleet，而职责封闭把簇 1 固定交给慢车 ID 升序第一台
+//（这台 50kg 的 V01）—— 若簇 1 里还有 60kg 的单，那台车永远装不下，③ 只能继续升级到
+// 第 ⑤ 级（实测如此）。把两张单都放进簇 2（由 100kg 的 V03 守）之后，③ 能合法地
+// 把两张单都交给 V03，"全车队重调度"这一级才测得到；而 ② 仍然救不了（挪走一张后，
+// 剩下那张 60kg 还在 50kg 的 V01 上）。
 void testRescheduleLevel3FullFleet() {
     LogisticsGraph g = makeRescheduleGraph();
     Vehicle v1 = makeVehicle("W", 50.0, 480);   // 装不下 60kg 的单
@@ -3867,7 +3896,7 @@ void testRescheduleLevel3FullFleet() {
     Vehicle v3 = makeVehicle("W", 100.0, 480);
     v3.id = "V03";
     const std::vector<Vehicle> vehicles{v1, v2, v3};
-    const Order o1 = makeOrder("O1", "A", "B", 60.0, 0, 1440);
+    const Order o1 = makeOrder("O1", "C", "D", 60.0, 0, 1440);   // 两单同簇（簇 2）
     const Order o2 = makeOrder("O2", "C", "D", 60.0, 0, 1440);
     const RoutePlan p1 = planRoute(g, v1, {o1, o2}, WeightType::Time);   // 不可行
     const RoutePlan p2 = planRoute(g, v2, {}, WeightType::Time);
@@ -4524,17 +4553,23 @@ void testLegsReadyTimeChainAndTemporaryAssignment() {
     check(vehicles[0].capacityKg == maxCap && vehicles[0].costFactor == maxCost,
           "夹具口径：V01 就是容量最大 + 成本因子最高的快车");
 
-    // 临时性可断言：三条腿都标着「临时指派」，职责封闭（#46）尚未启用。
+    // 接力没跑起来时，三条腿仍是**规划期估计** ⇒ temporaryAssignment 保持 true
+    //（本夹具的三段腿由职责表指派：L1 本簇慢车 / L2 快车 / L3 对簇慢车）。
     check(l1->temporaryAssignment && l2->temporaryAssignment && l3->temporaryAssignment,
-          "三条腿的执行车都是**临时指派**（temporaryAssignment == true）");
-    check(fleet.legLog.size() > 0, "腿结构的登记日志非空（「结构已立、接力未启用」）");
+          "三条腿的执行车都是**规划期估计**（temporaryAssignment == true，接力未跑）");
+    check(!fleet.legLog.empty(), "腿结构的登记日志非空");
     bool logged = false;
+    bool carLogged = false;
     for (std::size_t i = 0; i < fleet.legLog.size(); ++i) {
-        if (fleet.legLog[i].find("接力未启用") != std::string::npos) {
+        if (fleet.legLog[i].find("规划期估计") != std::string::npos) {
             logged = true;
         }
+        if (fleet.legLog[i].find("职责表") != std::string::npos) {
+            carLogged = true;
+        }
     }
-    check(logged, "legLog 里如实登记了「接力未启用」（不声称已转运）");
+    check(logged, "legLog 如实登记「时刻为规划期估计」（不声称已转运）");
+    check(carLogged, "legLog 如实登记「执行车由职责表定」（#46）");
 
     // 本地单的腿：ready = 发车时刻，完成时刻 = 该单在既有计划里的**实际送达时刻**
     // （本票不执行 relay，本地腿的到达时刻本来就是真实规划值）。
@@ -4547,6 +4582,190 @@ void testLegsReadyTimeChainAndTemporaryAssignment() {
         check(false, "本地单 O1 有腿");
     }
 }
+} // namespace
+
+
+// ===========================================================================
+// 职责表（规格三 §1 / #46）：**唯一决定点** legVehicleEligible 的真值表
+// ===========================================================================
+//
+// 为什么用真值表而不是「读计划再总结」：职责表是**规则**，它的反例（慢车接跨簇客户腿、
+// 快车接客户↔客户腿）在正常数据上根本不会出现 —— 等计划上出现就已经是 bug 了。
+// 所以这里逐格枚举 (车辆类 × 腿类 × 跨簇/紧急) 的真值，把规则钉死。
+// 反向验证 C/D 打的就是这张表（见提交信息）：
+//   C =「允许慢车接跨簇客户腿」⇒ 下表 slow×跨簇客户 那一格从 false 变 true ⇒ 红；
+//   D =「允许快车接客户↔客户腿」⇒ fast×本地客户 / fast×非紧急跨簇 两格变 true ⇒ 红。
+namespace {
+
+LogisticsGraph makeDutyGraph() {
+    LogisticsGraph g;
+    g.addNode(makeSubNode("W", NodeType::Warehouse, "仓库", 0));
+    for (int c = 1; c <= 3; ++c) {
+        g.addNode(makeSubNode("T" + std::to_string(c), NodeType::Transit,
+                              "中转站" + std::to_string(c), c));
+        g.addNode(makeSubNode("A" + std::to_string(c), NodeType::Delivery,
+                              "取货点" + std::to_string(c), c));
+        g.addNode(makeSubNode("B" + std::to_string(c), NodeType::Delivery,
+                              "送达点" + std::to_string(c), c));
+        addTwoWay(g, "W", "T" + std::to_string(c), 5.0, 5.0, 5.0);
+        addTwoWay(g, "T" + std::to_string(c), "A" + std::to_string(c), 5.0, 5.0, 5.0);
+        addTwoWay(g, "A" + std::to_string(c), "B" + std::to_string(c), 5.0, 5.0, 5.0);
+        addTwoWay(g, "B" + std::to_string(c), "W", 10.0, 10.0, 10.0);
+        if (c < 3) {
+            addTwoWay(g, "T" + std::to_string(c), "T" + std::to_string(c + 1), 20.0, 20.0, 20.0);
+        }
+    }
+    return g;
+}
+
+std::vector<Vehicle> makeDutyVehicles() {
+    std::vector<Vehicle> vs;
+    Vehicle fast = makeVehicleWithFactors("W", 400.0, 480, 1.00, 1.50);
+    fast.id = "V01";
+    vs.push_back(fast);
+    for (const char* id : {"V02", "V03", "V04"}) {
+        Vehicle slow = makeVehicleWithFactors("W", 160.0, 480, 1.25, 0.80);
+        slow.id = id;
+        vs.push_back(slow);
+    }
+    return vs;
+}
+
+Leg makeDutyLeg(LegKind kind, const std::string& from, const std::string& to) {
+    Leg leg;
+    leg.seq = 1;
+    leg.kind = kind;
+    leg.from = from;
+    leg.to = to;
+    leg.orderId = "X";
+    leg.urgent = false;
+    leg.directPenaltyMin = -1;
+    leg.relayPenaltyMin = -1;
+    return leg;
+}
+
+// 期望值表：[车][腿] = expected。车 0 = 快车 V01，1..3 = 慢车 V02/V03/V04。
+// 腿：0 = 簇1 本地客户腿；1 = 簇2 本地客户腿；2 = 簇1->簇1 站腿（客户->站）；
+//     3 = 站->站；4 = 跨簇客户腿（非紧急）；5 = 跨簇客户腿（紧急，直达更优）；
+//     6 = 跨簇客户腿（紧急，直达不更优）。
+void testDutyTableTruthTable() {
+    const LogisticsGraph g = makeDutyGraph();
+    const std::vector<Vehicle> vehicles = makeDutyVehicles();
+    check(vehicles.size() == 4, "职责表夹具：一台快车 + 三台慢车");
+
+    Leg local1 = makeDutyLeg(LegKind::CustomerToCustomer, "A1", "B1");
+    Leg local2 = makeDutyLeg(LegKind::CustomerToCustomer, "A2", "B2");
+    Leg l1 = makeDutyLeg(LegKind::CustomerToStation, "A1", "T1");
+    Leg l2 = makeDutyLeg(LegKind::StationToStation, "T1", "T3");
+    Leg crossNormal = makeDutyLeg(LegKind::CustomerToCustomer, "A1", "B3");
+    Leg crossUrgentWin = makeDutyLeg(LegKind::CustomerToCustomer, "A1", "B3");
+    crossUrgentWin.urgent = true;
+    crossUrgentWin.directPenaltyMin = 0;
+    crossUrgentWin.relayPenaltyMin = 30;
+    Leg crossUrgentLose = makeDutyLeg(LegKind::CustomerToCustomer, "A1", "B3");
+    crossUrgentLose.urgent = true;
+    crossUrgentLose.directPenaltyMin = 30;
+    crossUrgentLose.relayPenaltyMin = 0;
+
+    // 逐格真值：行 = 车（0 快车 / 1..3 慢车 V02..V04），列 = 腿。
+    const bool expect[4][7] = {
+        // 快车：站间腿 + 跨簇紧急直达（直达**严格**更优）
+        {false, false, false, true, false, true, false},
+        // 慢车 V02（守簇 1）
+        {true, false, true, false, false, false, false},
+        // 慢车 V03（守簇 2）
+        {false, true, false, false, false, false, false},
+        // 慢车 V04（守簇 3）
+        {false, false, false, false, false, false, false},
+    };
+    const Leg* legs[7] = {&local1, &local2, &l1, &l2, &crossNormal, &crossUrgentWin,
+                          &crossUrgentLose};
+    const char* legNames[7] = {"簇1本地客户腿", "簇2本地客户腿", "簇1客户->站",
+                               "站->站",        "跨簇客户腿(非紧急)",
+                               "跨簇紧急(直达更优)", "跨簇紧急(直达不更优)"};
+    for (std::size_t v = 0; v < vehicles.size(); ++v) {
+        for (int l = 0; l < 7; ++l) {
+            const bool got = legVehicleEligible(g, vehicles, v, *legs[l]);
+            check(got == expect[v][l],
+                  std::string("职责表：") + vehicles[v].id + " × " + legNames[l] + " = "
+                      + (expect[v][l] ? "合资格" : "不合资格")
+                      + (got == expect[v][l] ? "" : "（实际相反）"));
+        }
+    }
+
+    // 快车/慢车的分类是**从数据推出来的**（不硬编码车号）：把容量调换之后角色必须跟着换。
+    std::vector<Vehicle> swapped = vehicles;
+    swapped[0].capacityKg = 100.0;
+    swapped[1].capacityKg = 400.0;   // 现在 V02 才是快车
+    check(legVehicleEligible(g, swapped, 1, l2), "换数据后 V02 变成快车：站间腿合资格");
+    check(!legVehicleEligible(g, swapped, 0, l2), "换数据后 V01 不再合资格站间腿");
+    check(legVehicleEligible(g, swapped, 0, local1), "换数据后 V01 变成慢车：簇1 本地腿合资格");
+}
+
+// 职责边界在**真实计划输出**上成立（四车默认形状 + 一张跨簇普通单）：
+// L1 = 本簇慢车、L2 = 快车、L3 = 对簇慢车；账本 1 笔且两端不同车。
+void testDutyBoundaryOnFourVehicleFleet() {
+    const LogisticsGraph g = makeDutyGraph();
+    const std::vector<Vehicle> vehicles = makeDutyVehicles();
+    std::vector<Order> orders;
+    orders.push_back(makeOrder("O1", "A1", "B1", 10.0, 0, 1440, false));
+    orders.push_back(makeOrder("O2", "A2", "B2", 10.0, 0, 1440, false));
+    orders.push_back(makeOrder("O3", "A3", "B3", 10.0, 0, 1440, false));
+    orders.push_back(makeOrder("M1", "A1", "B3", 5.0, 0, 1440, false));   // 跨簇普通单
+    struct WeightLabel {
+        WeightType weight;
+        const char* label;
+    };
+    const WeightLabel weights[3] = {{WeightType::Distance, "distance"},
+                                     {WeightType::Cost, "cost"},
+                                     {WeightType::Time, "time"}};
+    for (int wi = 0; wi < 3; ++wi) {
+        const std::string tag = std::string("职责边界·") + weights[wi].label;
+        const FleetPlan fp = planFleet(g, vehicles, orders, weights[wi].weight);
+        check(fp.allOk, tag + "：整队可行");
+        // 本地单：只落在本簇慢车（簇1->V02、簇2->V03、簇3->V04）。
+        bool found1 = false;
+        bool found2 = false;
+        bool found3 = false;
+        check(allocationVehicleOf(fp, "O1", found1) == 1 && found1,
+              tag + "：O1（簇1）由本簇慢车 V02 执行");
+        check(allocationVehicleOf(fp, "O2", found2) == 2 && found2,
+              tag + "：O2（簇2）由本簇慢车 V03 执行");
+        check(allocationVehicleOf(fp, "O3", found3) == 3 && found3,
+              tag + "：O3（簇3）由本簇慢车 V04 执行");
+        // 跨簇单的三段腿：L1 本簇慢车 / L2 快车 / L3 对簇慢车。
+        std::vector<Leg> m1;
+        for (const Leg& leg : fp.legs) {
+            if (leg.orderId == "M1") {
+                m1.push_back(leg);
+            }
+        }
+        check(m1.size() == 3, tag + "：M1 恰 3 条腿（实际 " + std::to_string(m1.size()) + "）");
+        if (m1.size() == 3) {
+            check(m1[0].kind == LegKind::CustomerToStation && m1[0].vehicleId == "V02",
+                  tag + "：L1 = 本簇慢车 V02（实际 " + m1[0].vehicleId + "）");
+            check(m1[1].kind == LegKind::StationToStation && m1[1].vehicleId == "V01",
+                  tag + "：L2 = 快车 V01（实际 " + m1[1].vehicleId + "）");
+            check(m1[2].kind == LegKind::StationToCustomer && m1[2].vehicleId == "V04",
+                  tag + "：L3 = 对簇慢车 V04（实际 " + m1[2].vehicleId + "）");
+        }
+        check(fp.transitLegs.size() == 1,
+              tag + "：整单恰 1 笔 TRANSIT（实际 " + std::to_string(fp.transitLegs.size()) + "）");
+        if (fp.transitLegs.size() == 1) {
+            const TransitLeg& leg = fp.transitLegs[0];
+            check(leg.orderId == "M1" && leg.inVehicleId != leg.outVehicleId,
+                  tag + "：账本两端不同车（" + leg.inVehicleId + " -> " + leg.outVehicleId + "）");
+            check(leg.outTimeMin - leg.inTimeMin == 0,
+                  tag + "：车等货 ⇒ 站内停留 0（≤ 60）");
+            check(leg.inVehicleId == "V01" && leg.outVehicleId == "V04",
+                  tag + "：易手 = V01 卸入 T3 -> V04 取走");
+        }
+        // 快车不接任何**订单**（它的活只有站间腿）。
+        check(fp.vehicleOrderCount.size() == 4 && fp.vehicleOrderCount[0] == 0,
+              tag + "：快车 V01 零订单（职责封闭：站间腿不算接单）");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -4623,6 +4842,10 @@ int main() {
     // 规格三 §1 / #45：腿与就绪链（结构层）
     RUN(testLegsCrossClusterExpandsToThreeInFixedOrder);
     RUN(testLegsReadyTimeChainAndTemporaryAssignment);
+
+    // 规格三 §1 / #46：职责表（**唯一决定点**）与职责边界
+    RUN(testDutyTableTruthTable);
+    RUN(testDutyBoundaryOnFourVehicleFleet);
 
     return testutil::summarize("routeplanner_tests");
 }
