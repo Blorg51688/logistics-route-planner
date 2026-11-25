@@ -416,6 +416,168 @@ AllocDump parseAllocDump(const std::string& text) {
     return d;
 }
 
+// --dump-plan 的 LEG 行（规格三 §1 / #45）：**只加行、不改既有行**。
+// 读的是 stdout 文本，不是内部公式：把「腿结构」当成用户可见的契约来钉。
+void checkDumpPlanLegLines(const std::string& appPath) {
+    const std::string tmp = "/tmp/cli_plan_summary_legs_"
+                            + std::to_string(static_cast<long long>(getpid())) + ".ini";
+    {
+        std::ofstream f(tmp.c_str());
+        f << "[general]\n"
+             "event_interval_min = 1440\n"
+             "event_level_traffic = high\n"
+             "event_level_customer = medium\n"
+             "event_level_urgent = low\n"
+             "event_level_closure = extra_low\n"
+             "\n[nodes]\n"
+             "W01, warehouse, 80, 160, 中央仓库, 0\n"
+             "T01, transit, 380, 200, 中转站甲, 1\n"
+             "T03, transit, 700, 330, 中转站丙, 3\n"
+             "D08, delivery, 300, 220, 客户08, 1\n"
+             "D01, delivery, 180, 90, 客户01, 1\n"
+             "D18, delivery, 620, 120, 客户18, 3\n"
+             "D20, delivery, 600, 300, 客户20, 3\n"
+             "\n[edges]\n"
+             "W01, T01, 4.7, 4.7, 7.5\n"
+             "T01, W01, 4.7, 4.7, 7.5\n"
+             "T01, T03, 18.2, 18.2, 29.0\n"
+             "T03, T01, 18.2, 18.2, 29.0\n"
+             "T01, D08, 1.3, 3.1, 1.6\n"
+             "D08, T01, 1.3, 3.1, 1.6\n"
+             "T01, D01, 3.6, 8.6, 4.3\n"
+             "D01, T01, 3.6, 8.6, 4.3\n"
+             "T03, D18, 3.5, 8.4, 4.2\n"
+             "D18, T03, 3.5, 8.4, 4.2\n"
+             "T03, D20, 1.6, 3.8, 1.9\n"
+             "D20, T03, 1.6, 3.8, 1.9\n"
+             "\n[vehicles]\n"
+             "V01, W01, 400, 08:00, 1.00, 1.50\n"
+             "V02, W01, 160, 08:00, 1.25, 0.80\n"
+             "\n[orders]\n"
+             "O1, D08, D01, 10, 00:00, 23:59, 0\n"
+             "M1, D08, D18, 8, 00:00, 23:59, 0\n";
+    }
+    const std::string out =
+        runCapture("'" + appPath + "' --config '" + tmp + "' --dump-plan distance 2>/dev/null");
+    std::remove(tmp.c_str());
+
+    // LEG <腿序> <from> <to> <orderId> <kind> <HH:MM readyTime> <vehicleId>
+    std::vector<std::string> orderIds;
+    std::vector<int> seqs;
+    std::vector<std::string> kinds;
+    std::vector<std::string> froms;
+    std::vector<std::string> tos;
+    std::vector<int> readyMin;
+    std::vector<std::string> vehiclesOfLeg;
+    bool shapeOk = true;
+    for (const std::string& line : splitLines(out)) {
+        if (line.rfind("LEG ", 0) != 0) {
+            continue;
+        }
+        const std::vector<std::string> tok = splitSpaces(line);
+        if (tok.size() != 8 || tok[0] != "LEG") {
+            shapeOk = false;
+            continue;
+        }
+        // HH:MM -> 分钟；解析失败（或不是两位数格式）就判形状错。
+        const std::size_t colon = tok[6].find(':');
+        if (colon != 2 || tok[6].size() != 5) {
+            shapeOk = false;
+            continue;
+        }
+        const int hh = std::atoi(tok[6].substr(0, 2).c_str());
+        const int mm = std::atoi(tok[6].substr(3, 2).c_str());
+        if (mm < 0 || mm > 59) {
+            shapeOk = false;
+        }
+        orderIds.push_back(tok[4]);
+        seqs.push_back(std::atoi(tok[1].c_str()));
+        froms.push_back(tok[2]);
+        tos.push_back(tok[3]);
+        kinds.push_back(tok[5]);
+        readyMin.push_back(hh * 60 + mm);
+        vehiclesOfLeg.push_back(tok[7]);
+    }
+
+    check(shapeOk, "LEG：字段形状 = 腿序 / from / to / 订单 / kind / HH:MM / 执行车（8 段）");
+    check(orderIds.size() == 4,
+          "LEG：本地单 1 条 + 跨簇单 3 条 = 4 行（实际 " + std::to_string(orderIds.size()) + "）");
+
+    // 腿的所属订单与订单表**双向一致**：LEG 行里的订单号恰好是夹具的两张单，且各出现对次。
+    int m1 = 0;
+    int o1 = 0;
+    bool onlyKnown = true;
+    for (std::size_t i = 0; i < orderIds.size(); ++i) {
+        if (orderIds[i] == "M1") {
+            ++m1;
+        } else if (orderIds[i] == "O1") {
+            ++o1;
+        } else {
+            onlyKnown = false;
+        }
+    }
+    check(onlyKnown, "LEG：腿的订单号都能在订单表里查到（不多）");
+    check(m1 == 3, "LEG：跨簇单 M1 恰好 3 条腿（实际 " + std::to_string(m1) + "）");
+    check(o1 == 1, "LEG：本地单 O1 恰好 1 条腿（实际 " + std::to_string(o1) + "）");
+
+    // 行序固定：订单 ID 升序（M1 < O1），同单内 1 -> 2 -> 3。
+    bool orderOk = true;
+    for (std::size_t i = 1; i < orderIds.size(); ++i) {
+        if (orderIds[i - 1] > orderIds[i]) {
+            orderOk = false;
+        }
+        if (orderIds[i - 1] == orderIds[i] && seqs[i - 1] >= seqs[i]) {
+            orderOk = false;
+        }
+    }
+    check(orderOk, "LEG：行序 = 订单 ID 升序、同单内腿序 1 -> 2 -> 3");
+
+    // 跨簇单的三条腿：顺序固定、首尾相连、L2 由快车执行。
+    std::vector<std::size_t> idxOfM1;
+    for (std::size_t i = 0; i < orderIds.size(); ++i) {
+        if (orderIds[i] == "M1") {
+            idxOfM1.push_back(i);
+        }
+    }
+    bool crossOk = idxOfM1.size() == 3;
+    if (crossOk) {
+        const std::size_t a = idxOfM1[0], b = idxOfM1[1], c = idxOfM1[2];
+        crossOk = seqs[a] == 1 && seqs[b] == 2 && seqs[c] == 3
+                  && kinds[a] == "customer->station" && kinds[b] == "station->station"
+                  && kinds[c] == "station->customer" && froms[a] == "D08" && tos[a] == "T01"
+                  && froms[b] == "T01" && tos[b] == "T03" && froms[c] == "T03"
+                  && tos[c] == "D18";
+    }
+    check(crossOk,
+          "LEG：跨簇单 L1 D08->T01 / L2 T01->T03 / L3 T03->D18，kind 依次 customer->station / "
+          "station->station / station->customer");
+
+    // readyTime 单调（L1 <= L2 <= L3）且站间腿让 L2 严格晚于 L1 —— 常量 0 或
+    // 「L2.ready = L1.ready」这两种退化都会在这两条上变红。
+    if (idxOfM1.size() == 3) {
+        const int r1 = readyMin[idxOfM1[0]];
+        const int r2 = readyMin[idxOfM1[1]];
+        const int r3 = readyMin[idxOfM1[2]];
+        check(r1 <= r2 && r2 <= r3, "LEG：readyTime 单调 L1 <= L2 <= L3（" + std::to_string(r1)
+                                        + " / " + std::to_string(r2) + " / "
+                                        + std::to_string(r3) + "）");
+        check(r1 < r2 && r2 < r3,
+              "LEG：readyTime 严格递增（站间腿耗时 > 0 ⇒ 就绪链真的在往前走，不是常量）");
+        check(r1 == 480, "LEG：L1.ready = 发车时刻 08:00（480min）");
+        check(vehiclesOfLeg[idxOfM1[1]] == "V01",
+              "LEG：站间腿 L2 由快车 V01 执行（实际「" + vehiclesOfLeg[idxOfM1[1]] + "」）");
+    }
+
+    // 执行车字段必须是车队里的车（本票是临时指派，但**不能**是空/占位符）。
+    bool vehiclesOk = true;
+    for (std::size_t i = 0; i < vehiclesOfLeg.size(); ++i) {
+        if (vehiclesOfLeg[i] != "V01" && vehiclesOfLeg[i] != "V02") {
+            vehiclesOk = false;
+        }
+    }
+    check(vehiclesOk, "LEG：执行车字段取自车队（V01/V02），没有伪装成 '-'");
+}
+
 } // namespace
 
 
@@ -523,6 +685,8 @@ int main(int argc, char** argv) {
 
     // 转运账本行（独立入口：--dump-plan，不影响 --plan-summary 九行）。
     checkDumpPlanTransitLines(appPath);
+    // 腿结构与就绪链（规格三 §1 / #45）：独立入口，同样只加行。
+    checkDumpPlanLegLines(appPath);
 
     std::vector<std::string> strategies;
     if (strategy == "all") {

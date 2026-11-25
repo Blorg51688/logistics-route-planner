@@ -62,6 +62,9 @@ using logistics::TransitLeg;
 using logistics::applyTransitLayer;
 using logistics::buildTransitLedger;
 using logistics::OrderMetric;
+using logistics::Leg;
+using logistics::LegKind;
+using logistics::buildLegs;
 using logistics::replan;
 using logistics::replanIncremental;
 using logistics::insertOrder;
@@ -4142,6 +4145,240 @@ void testRescheduleLedgerAndDeterminism() {
         }
     }
 }
+// ---------------------------------------------------------------------------
+// 腿与就绪链（规格三 §1 / #45：结构层）
+//
+// 守卫读的是 `planFleet` 的**公开产物**（FleetPlan::legs），不是把公式重算一遍：
+//   · 跨簇单恰 3 条腿、顺序固定 L1 客户->本簇站 / L2 站->站 / L3 对簇站->客户；
+//   · 本地单恰 1 条 customer->customer 腿；
+//   · 腿的所属订单与订单表**双向一致**（不多不少）；
+//   · readyTime 链：L1 = 执行车发车时刻，L2 = L1 的计划完成时刻，L3 = L2 的计划完成时刻，
+//     且严格递增（站间腿耗时 > 0 ⇒ 常量 0 或「L2.ready = L1.ready」必红）。
+// ---------------------------------------------------------------------------
+
+// 两簇各有自己的中转站：簇 1 = T01、簇 3 = T03。
+// 站间腿给 18.2min，让 readyTime 链的递增**肉眼可辨**（不是 1~2 分的舍入噪声）。
+LogisticsGraph makeLegsTwoClusterGraph() {
+    LogisticsGraph g;
+    g.addNode(makeSubNode("W01", NodeType::Warehouse, "仓库", 0));
+    g.addNode(makeSubNode("T01", NodeType::Transit, "中转站甲", 1));
+    g.addNode(makeSubNode("T03", NodeType::Transit, "中转站丙", 3));
+    g.addNode(makeSubNode("D08", NodeType::Delivery, "客户08", 1));
+    g.addNode(makeSubNode("D01", NodeType::Delivery, "客户01", 1));
+    g.addNode(makeSubNode("D18", NodeType::Delivery, "客户18", 3));
+    g.addNode(makeSubNode("D20", NodeType::Delivery, "客户20", 3));
+    addTwoWay(g, "W01", "T01", 4.7, 4.7, 7.5);
+    addTwoWay(g, "T01", "T03", 18.2, 18.2, 29.0);
+    addTwoWay(g, "T01", "D08", 1.3, 3.1, 1.6);
+    addTwoWay(g, "T01", "D01", 3.6, 8.6, 4.3);
+    addTwoWay(g, "T03", "D18", 3.5, 8.4, 4.2);
+    addTwoWay(g, "T03", "D20", 1.6, 3.8, 1.9);
+    return g;
+}
+
+// V01 快车（400kg、×1.00 时间、×1.50 成本）；V02 慢车（160kg、×1.25、×0.80）。
+// 「快车」的判据就是**容量最大 + 成本因子最高**，与默认数据一致。
+std::vector<Vehicle> makeLegsTwoClusterVehicles() {
+    std::vector<Vehicle> vs;
+    Vehicle a = makeVehicleWithFactors("W01", 400.0, 480, 1.00, 1.50);
+    a.id = "V01";
+    Vehicle b = makeVehicleWithFactors("W01", 160.0, 480, 1.25, 0.80);
+    b.id = "V02";
+    vs.push_back(a);
+    vs.push_back(b);
+    return vs;
+}
+
+// O1 本地（D08->D01，同簇 1）；M1 跨簇（D08 簇 1 -> D18 簇 3，8kg）。
+std::vector<Order> makeLegsTwoClusterOrders() {
+    std::vector<Order> orders;
+    orders.push_back(makeOrder("O1", "D08", "D01", 10.0, 0, 1440, false));
+    orders.push_back(makeOrder("M1", "D08", "D18", 8.0, 0, 1440, false));
+    return orders;
+}
+
+const Leg* findLeg(const FleetPlan& fleet, const std::string& orderId, int seq) {
+    for (std::size_t i = 0; i < fleet.legs.size(); ++i) {
+        if (fleet.legs[i].orderId == orderId && fleet.legs[i].seq == seq) {
+            return &fleet.legs[i];
+        }
+    }
+    return nullptr;
+}
+
+int legsOfOrder(const FleetPlan& fleet, const std::string& orderId) {
+    int n = 0;
+    for (std::size_t i = 0; i < fleet.legs.size(); ++i) {
+        if (fleet.legs[i].orderId == orderId) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+// 结构：3 腿/1 腿、顺序固定、所属订单双向一致、行序（订单 ID 升序 -> 腿序）。
+void testLegsCrossClusterExpandsToThreeInFixedOrder() {
+    const LogisticsGraph g = makeLegsTwoClusterGraph();
+    const std::vector<Order> orders = makeLegsTwoClusterOrders();
+    const std::vector<Vehicle> vehicles = makeLegsTwoClusterVehicles();
+    const FleetPlan fleet = planFleet(g, vehicles, orders, WeightType::Distance);
+    check(fleet.allOk, "腿结构夹具全部可行（reason: " + fleet.reason + "）");
+
+    // 1 条本地 + 3 条跨簇 = 4 条腿。空清单（未展开）会立刻在这一行变红。
+    check(fleet.legs.size() == 4, "腿清单：本地单 1 条 + 跨簇单 3 条 = 4 条（实际 "
+                                      + std::to_string(fleet.legs.size()) + "）");
+    check(legsOfOrder(fleet, "M1") == 3,
+          "跨簇单 M1 恰好 3 条腿（实际 " + std::to_string(legsOfOrder(fleet, "M1")) + "）");
+    check(legsOfOrder(fleet, "O1") == 1,
+          "本地单 O1 恰好 1 条腿（实际 " + std::to_string(legsOfOrder(fleet, "O1")) + "）");
+
+    // 顺序固定：L1 = A->S(c1)、L2 = S(c1)->S(c2)、L3 = S(c2)->B。
+    const Leg* l1 = findLeg(fleet, "M1", 1);
+    const Leg* l2 = findLeg(fleet, "M1", 2);
+    const Leg* l3 = findLeg(fleet, "M1", 3);
+    check(l1 != nullptr && l2 != nullptr && l3 != nullptr,
+          "跨簇单 M1 的腿序是 1 / 2 / 3（不是别的编号）");
+    if (l1 != nullptr && l2 != nullptr && l3 != nullptr) {
+        check(l1->kind == LegKind::CustomerToStation && l1->from == "D08" && l1->to == "T01",
+              "L1 = 客户->本簇站（D08 -> T01），实际 " + l1->from + " -> " + l1->to + " "
+                  + logistics::toString(l1->kind));
+        check(l2->kind == LegKind::StationToStation && l2->from == "T01" && l2->to == "T03",
+              "L2 = 站->站（T01 -> T03），实际 " + l2->from + " -> " + l2->to + " "
+                  + logistics::toString(l2->kind));
+        check(l3->kind == LegKind::StationToCustomer && l3->from == "T03" && l3->to == "D18",
+              "L3 = 对簇站->客户（T03 -> D18），实际 " + l3->from + " -> " + l3->to + " "
+                  + logistics::toString(l3->kind));
+        check(l1->to == l2->from && l2->to == l3->from,
+              "腿首尾相连：L1.to == L2.from 且 L2.to == L3.from");
+        check(l1->plannedArrivalMin >= l1->readyTimeMin
+                  && l2->plannedArrivalMin >= l2->readyTimeMin
+                  && l3->plannedArrivalMin >= l3->readyTimeMin,
+              "每条腿的计划完成时刻不早于它的 readyTime");
+    }
+
+    // 本地单：1 条 customer->customer 腿，端点就是订单的 A / B。
+    const Leg* local = findLeg(fleet, "O1", 1);
+    check(local != nullptr, "本地单 O1 有腿序 1 的腿");
+    if (local != nullptr) {
+        check(local->kind == LegKind::CustomerToCustomer && local->from == "D08"
+                  && local->to == "D01",
+              "本地单是 1 条客户->客户腿（D08 -> D01），实际 " + local->from + " -> "
+                  + local->to);
+    }
+
+    // 所属订单**双向一致**：订单表里每张单都有腿，每条腿的订单号都在订单表里。
+    for (std::size_t i = 0; i < orders.size(); ++i) {
+        check(legsOfOrder(fleet, orders[i].id) >= 1,
+              "订单表里的 " + orders[i].id + " 至少产生 1 条腿");
+    }
+    bool everyLegKnown = true;
+    for (std::size_t i = 0; i < fleet.legs.size(); ++i) {
+        bool known = false;
+        for (std::size_t k = 0; k < orders.size(); ++k) {
+            if (orders[k].id == fleet.legs[i].orderId) {
+                known = true;
+            }
+        }
+        if (!known) {
+            everyLegKnown = false;
+        }
+    }
+    check(everyLegKnown, "每条腿的 orderId 都能在订单表里查到（不多）");
+
+    // 行序固定：订单 ID 升序（M1 < O1），同单内 1 -> 2 -> 3。
+    bool orderOk = true;
+    for (std::size_t i = 1; i < fleet.legs.size(); ++i) {
+        const Leg& prev = fleet.legs[i - 1];
+        const Leg& cur = fleet.legs[i];
+        if (prev.orderId > cur.orderId) {
+            orderOk = false;
+        }
+        if (prev.orderId == cur.orderId && prev.seq >= cur.seq) {
+            orderOk = false;
+        }
+    }
+    check(orderOk, "腿清单按「订单 ID 升序、同单内腿序 1 -> 2 -> 3」排列");
+    check(!fleet.legs.empty() && fleet.legs.front().orderId == "M1",
+          "行序首位是订单 ID 最小的 M1（M1 < O1）");
+}
+
+// 就绪链 + 临时指派：readyTime 必须由**前驱腿的计划完成时刻**反推，
+// 执行车在结构层是临时指派（临时性要能被断言到）。
+void testLegsReadyTimeChainAndTemporaryAssignment() {
+    const LogisticsGraph g = makeLegsTwoClusterGraph();
+    const std::vector<Order> orders = makeLegsTwoClusterOrders();
+    const std::vector<Vehicle> vehicles = makeLegsTwoClusterVehicles();
+    const FleetPlan fleet = planFleet(g, vehicles, orders, WeightType::Distance);
+    check(fleet.allOk, "就绪链夹具全部可行（reason: " + fleet.reason + "）");
+
+    const Leg* l1 = findLeg(fleet, "M1", 1);
+    const Leg* l2 = findLeg(fleet, "M1", 2);
+    const Leg* l3 = findLeg(fleet, "M1", 3);
+    if (l1 == nullptr || l2 == nullptr || l3 == nullptr) {
+        check(false, "就绪链：M1 的 3 条腿存在（缺腿时本用例其余断言无意义）");
+        return;
+    }
+
+    // L1.ready = 执行车发车时刻（这里两台车都是 08:00 = 480）。
+    check(l1->readyTimeMin == 480,
+          "L1.readyTimeMin = 执行车发车时刻 480（实际 " + std::to_string(l1->readyTimeMin) + "）");
+    check(l1->vehicleId == "V01" || l1->vehicleId == "V02",
+          "L1 的执行车来自车队（实际「" + l1->vehicleId + "」）");
+
+    // 链式恒等式：后继的 ready 就是前驱的计划完成时刻（不是常量、不是估计）。
+    check(l2->readyTimeMin == l1->plannedArrivalMin,
+          "L2.ready == L1 的计划完成时刻（" + std::to_string(l2->readyTimeMin) + " vs "
+              + std::to_string(l1->plannedArrivalMin) + "）");
+    check(l3->readyTimeMin == l2->plannedArrivalMin,
+          "L3.ready == L2 的计划完成时刻（" + std::to_string(l3->readyTimeMin) + " vs "
+              + std::to_string(l2->plannedArrivalMin) + "）");
+
+    // 单调且**严格递增**：站间腿耗时 18.2min > 0，所以 L2/L3 的 ready 必须比前一级晚。
+    // 把 readyTime 改成常量 0、或让 L2.ready = L1.ready，这一行必红（反向验证见测试记录）。
+    check(l1->readyTimeMin < l2->readyTimeMin && l2->readyTimeMin < l3->readyTimeMin,
+          "readyTime 严格递增 L1 < L2 < L3（" + std::to_string(l1->readyTimeMin) + " / "
+              + std::to_string(l2->readyTimeMin) + " / " + std::to_string(l3->readyTimeMin) + "）");
+    check(l3->plannedArrivalMin > l3->readyTimeMin, "L3 的计划完成时刻晚于它的 ready");
+
+    // 站间腿临时交给**快车**（容量最大、成本因子最高）——本票的临时指派规则。
+    check(l2->vehicleId == "V01",
+          "L2（站->站）由快车 V01 执行（实际「" + l2->vehicleId + "」）");
+    double maxCap = 0.0;
+    double maxCost = 0.0;
+    for (std::size_t v = 0; v < vehicles.size(); ++v) {
+        if (vehicles[v].capacityKg > maxCap) {
+            maxCap = vehicles[v].capacityKg;
+        }
+        if (vehicles[v].costFactor > maxCost) {
+            maxCost = vehicles[v].costFactor;
+        }
+    }
+    check(vehicles[0].capacityKg == maxCap && vehicles[0].costFactor == maxCost,
+          "夹具口径：V01 就是容量最大 + 成本因子最高的快车");
+
+    // 临时性可断言：三条腿都标着「临时指派」，职责封闭（#46）尚未启用。
+    check(l1->temporaryAssignment && l2->temporaryAssignment && l3->temporaryAssignment,
+          "三条腿的执行车都是**临时指派**（temporaryAssignment == true）");
+    check(fleet.legLog.size() > 0, "腿结构的登记日志非空（「结构已立、接力未启用」）");
+    bool logged = false;
+    for (std::size_t i = 0; i < fleet.legLog.size(); ++i) {
+        if (fleet.legLog[i].find("接力未启用") != std::string::npos) {
+            logged = true;
+        }
+    }
+    check(logged, "legLog 里如实登记了「接力未启用」（不声称已转运）");
+
+    // 本地单的腿：ready = 发车时刻，完成时刻 = 该单在既有计划里的**实际送达时刻**
+    // （本票不执行 relay，本地腿的到达时刻本来就是真实规划值）。
+    const Leg* local = findLeg(fleet, "O1", 1);
+    if (local != nullptr) {
+        check(local->readyTimeMin == 480, "本地腿 ready = 发车时刻 480");
+        check(local->plannedArrivalMin > local->readyTimeMin,
+              "本地腿的计划完成时刻晚于发车（有行驶耗时）");
+    } else {
+        check(false, "本地单 O1 有腿");
+    }
+}
 } // namespace
 
 int main() {
@@ -4214,6 +4451,10 @@ int main() {
     RUN(testRescheduleUrgentPerVehicleFifo);
     RUN(testRescheduleInheritsExecutedInStation);
     RUN(testRescheduleLedgerAndDeterminism);
+
+    // 规格三 §1 / #45：腿与就绪链（结构层）
+    RUN(testLegsCrossClusterExpandsToThreeInFixedOrder);
+    RUN(testLegsReadyTimeChainAndTemporaryAssignment);
 
     return testutil::summarize("routeplanner_tests");
 }

@@ -1492,6 +1492,88 @@ void checkSlowVehicleFactorReplay(const Config& cfg) {
     }
 }
 
+// 腿结构（规格三 §1 / #45）+ 默认数据「全簇内」的事实：
+// 默认 25 单没有一张跨簇 ⇒ 每条订单恰好 1 条 customer->customer 腿、没有站间腿；
+// 就绪时刻 = 该单执行车的发车时刻（08:00）。这条守卫同时钉住「本票不改默认路线」：
+// 腿只是登记结构，plan.summary 的黄金值与它无关，二者互不影响。
+void checkDefaultLegsAreLocalSingleLegs(const Config& cfg, const FleetPlan* fleets[3],
+                                       const char* labels[3]) {
+    for (int s = 0; s < 3; ++s) {
+        const FleetPlan& fleet = *fleets[s];
+        const std::string tag = std::string("[腿·") + labels[s] + "] ";
+        check(fleet.legs.size() == cfg.orders.size(),
+              tag + "腿条数 == 订单数（默认 25 单全簇内 => 25 条腿），实际 "
+                  + std::to_string(fleet.legs.size()));
+        int stationLegs = 0;
+        int multiLegOrders = 0;
+        for (std::size_t i = 0; i < fleet.legs.size(); ++i) {
+            const logistics::Leg& leg = fleet.legs[i];
+            if (leg.kind == logistics::LegKind::StationToStation
+                || leg.kind == logistics::LegKind::CustomerToStation
+                || leg.kind == logistics::LegKind::StationToCustomer) {
+                ++stationLegs;
+            }
+            if (leg.seq != 1) {
+                ++multiLegOrders;
+            }
+        }
+        check(stationLegs == 0, tag + "默认数据没有站间/中转腿（全簇内 => 0 条），实际 "
+                                    + std::to_string(stationLegs));
+        check(multiLegOrders == 0, tag + "默认数据每单只有 L1（没有 L2/L3）");
+        // 逐单双向核对：订单表里每张单都能在腿清单里查到**它自己的** A->B 腿。
+        for (std::size_t oi = 0; oi < cfg.orders.size(); ++oi) {
+            const logistics::Order& o = cfg.orders[oi];
+            bool found = false;
+            int count = 0;
+            for (std::size_t i = 0; i < fleet.legs.size(); ++i) {
+                if (fleet.legs[i].orderId != o.id) {
+                    continue;
+                }
+                ++count;
+                if (fleet.legs[i].seq == 1
+                    && fleet.legs[i].kind == logistics::LegKind::CustomerToCustomer
+                    && fleet.legs[i].from == o.pickupNodeId && fleet.legs[i].to == o.nodeId) {
+                    found = true;
+                }
+            }
+            check(count == 1, tag + "订单 " + o.id + " 恰好 1 条腿（实际有 "
+                                    + std::to_string(count) + " 条）");
+            check(found, tag + "订单 " + o.id + " 的腿就是它自己的 A -> B");
+        }
+        // 行序：订单 ID 升序（同单内只有 L1，无需再比腿序）。
+        bool ordered = true;
+        for (std::size_t i = 1; i < fleet.legs.size(); ++i) {
+            if (fleet.legs[i - 1].orderId > fleet.legs[i].orderId) {
+                ordered = false;
+            }
+        }
+        check(ordered, tag + "腿清单按订单 ID 升序");
+        // 就绪时刻 = 该单执行车的发车时刻（默认三车都 08:00）。
+        bool readyOk = true;
+        for (std::size_t i = 0; i < fleet.legs.size(); ++i) {
+            const logistics::Leg& leg = fleet.legs[i];
+            int depart = -1;
+            for (std::size_t v = 0; v < cfg.vehicles.size(); ++v) {
+                if (cfg.vehicles[v].id == leg.vehicleId) {
+                    depart = cfg.vehicles[v].departTimeMin;
+                }
+            }
+            if (depart < 0 || leg.readyTimeMin != depart) {
+                readyOk = false;
+            }
+        }
+        check(readyOk, tag + "每腿 readyTime = 该腿执行车的发车时刻");
+        // 「结构已立、接力未启用」必须在这条入口也留登记（不声称已转运）。
+        bool logged = false;
+        for (std::size_t i = 0; i < fleet.legLog.size(); ++i) {
+            if (fleet.legLog[i].find("接力未启用") != std::string::npos) {
+                logged = true;
+            }
+        }
+        check(logged, tag + "legLog 登记「结构已立、接力未启用」");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1529,6 +1611,13 @@ int main() {
     const FleetPlan* threeFleets[3] = {&byDistance, &byCost, &byTime};
     const char* threeLabels[3] = {"最短距离策略", "最低成本策略", "最短耗时策略"};
     checkAllocationInvariants(cfg, threeFleets, threeLabels, baseDistance, baseCost, baseTime);
+
+    // 腿与就绪链（规格三 §1 / #45）：默认数据全簇内 => 每单 1 条本地腿，无站间腿。
+    {
+        const FleetPlan* legFleets[3] = {&byDistance, &byCost, &byTime};
+        const char* legLabels[3] = {"最短距离策略", "最低成本策略", "最短耗时策略"};
+        checkDefaultLegsAreLocalSingleLegs(cfg, legFleets, legLabels);
+    }
 
     // 阶段二的 6 种排列留痕（默认 3 簇 3 车）——人工核对「各自怎么取优」。
     for (std::size_t i = 0; i < byDistance.candidateKeyLog.size(); ++i) {
