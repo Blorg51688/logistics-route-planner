@@ -44,7 +44,7 @@ QVariant NodeItem::itemChange(GraphicsItemChange change, const QVariant& value) 
 
 QRectF NodeItem::boundingRect() const {
     // 下方留出名称文字的空间；四周留出车辆标记环的余量
-    const qreal pad = kRadius + 10;
+    const qreal pad = kRadius + 10 + 24;   // 留出多车环按 slot 外扩的余量
     return QRectF(-pad, -pad, 2 * pad, 2 * pad + 18);
 }
 
@@ -53,6 +53,20 @@ void NodeItem::setVehicleHere(bool on) {
         return;
     }
     vehicleHere_ = on;
+    update();
+}
+
+// 设置本节点上的车辆环（可能 0..n 台）。与旧 setVehicleHere 并存：旧接口只画单环，
+// 新接口按 slot 错开、按角色取色 —— GUI 用新接口，老的离屏/自检代码不必改。
+void NodeItem::setVehicleMarks(const std::vector<VehicleMark>& marks) {
+    bool same = marks.size() == vehicleMarks_.size();
+    for (std::size_t i = 0; same && i < marks.size(); ++i) {
+        same = marks[i].fast == vehicleMarks_[i].fast && marks[i].slot == vehicleMarks_[i].slot;
+    }
+    if (same) {
+        return;
+    }
+    vehicleMarks_ = marks;
     update();
 }
 
@@ -77,8 +91,22 @@ void NodeItem::paint(QPainter* painter, const QStyleOptionGraphicsItem*, QWidget
     painter->drawText(QRectF(-kRadius, -kRadius, 2 * kRadius, 2 * kRadius),
                       Qt::AlignCenter, QString::fromStdString(node_.id));
 
-    // 车辆当前位置：品红环，与红色路径高亮、与节点类型色都能区分开
-    if (vehicleHere_) {
+    // 车辆环（规格三 GUI §7）：慢车一种颜色、快车另一种；同节点多车按 slot 往外错开，
+    // 否则环完全重合看起来像只有一台车。快车环更粗，一眼能分出「簇间搬运」那台。
+    // 颜色刻意避开节点类型色（蓝/绿/橙）与路径高亮的红：慢车=青、快车=洋红。
+    for (std::size_t m = 0; m < vehicleMarks_.size(); ++m) {
+        const VehicleMark& mark = vehicleMarks_[m];
+        QColor ringColor = mark.fast ? QColor(0xD6, 0x00, 0x9A) : QColor(0x00, 0x96, 0x88);
+        QPen ring(ringColor);
+        ring.setWidthF(mark.fast ? 4.0 : 2.6);
+        painter->setPen(ring);
+        painter->setBrush(Qt::NoBrush);
+        const qreal rad = kRadius + 6.0 + mark.slot * 6.0;
+        painter->drawEllipse(QPointF(0, 0), rad, rad);
+    }
+
+    // 兼容旧接口：单环、品红（离屏/自检里可能仍用 setVehicleHere）
+    if (vehicleHere_ && vehicleMarks_.empty()) {
         QPen ring(QColor(214, 0, 154));
         ring.setWidthF(3.5);
         painter->setPen(ring);

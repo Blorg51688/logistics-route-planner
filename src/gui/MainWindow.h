@@ -160,6 +160,9 @@ public:
     // 画布归属快照（G15）：每条车路线边 -> 归属车（行序最前）+ 是否属于选中车。
     // 格式：`<from>-><to> owner=<VID> selected=<0|1>`，逐行。
     QString canvasOwnershipSnapshot() const;
+    // 画布与快照共用的**唯一**路线数据源（规格三 GUI §7）：每台车只给「当前位置 → 下一目标」
+    // 那一段节点序列（含目标节点）；空车/已回库给空序列。两处都调它 ⇒ 画出来的与探针读到的一致。
+    std::vector<std::vector<std::string> > canvasTargetRoutes() const;
     // 当前页签（= 画布选中车）
     int selectedVehicleIndex() const;
 

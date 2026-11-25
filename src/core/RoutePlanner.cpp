@@ -3539,6 +3539,17 @@ CrossPenaltyEstimate estimateCrossPenalties(const LogisticsGraph& graph,
 // 快车这一侧为什么留「紧急直达」这条缝：紧急单的语义是「越快越好」，三段接力要等
 // 两次货（L1 卸站、L2 卸站），可能反而更晚。判据用**严格小于**（不是 ≤）：
 // 打平时走 relay 才是「转运成为跨簇单的唯一路径」的本意，只有直达**真的更优**才直达。
+// 公开的「哪台是快车」判定：唯一来源是 relayVehicleIndex（与职责表/接力层同判据），
+// GUI 按角色取色与画环都读它，避免第三个地方各推一遍「谁是快车」。
+std::vector<bool> fastVehicleFlags(const std::vector<Vehicle>& vehicles) {
+    std::vector<bool> fast(vehicles.size(), false);
+    if (vehicles.empty()) {
+        return fast;
+    }
+    fast[relayVehicleIndex(vehicles)] = true;
+    return fast;
+}
+
 bool legVehicleEligible(const LogisticsGraph& graph, const std::vector<Vehicle>& vehicles,
                         std::size_t vehicleIndex, const Leg& leg) {
     if (vehicleIndex >= vehicles.size()) {

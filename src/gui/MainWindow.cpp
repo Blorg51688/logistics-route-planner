@@ -480,8 +480,38 @@ int MainWindow::selectedVehicleIndex() const {
     return vehicleTabs_->currentIndex() >= 0 ? vehicleTabs_->currentIndex() : 0;
 }
 
+// 画布与 G15 快照共用的**唯一**路线数据源（规格三 GUI §7「只画到自己的目标」）。
+// 每台车：从当前位置（nodeIndex）到**下一个停靠点**（nodeIsStop 为 true 的下一节点）那一段，
+// 含起点与目标节点；没有下一个停靠点（已回库/空车）给空序列。
+// 为什么用 nodeIsStop 而不是 stops：nodeIsStop 是 finalize 展平视图里「这一站要停」的标记，
+// 与画布用同一份节点序列，stops 的下标与 nodes 的下标不同源，混用会错位。
+std::vector<std::vector<std::string> > MainWindow::canvasTargetRoutes() const {
+    std::vector<std::vector<std::string> > routes;
+    routes.reserve(fleet_.size());
+    for (std::size_t v = 0; v < fleet_.size(); ++v) {
+        const VehicleRuntime& rt = fleet_[v];
+        std::vector<std::string> seg;
+        if (rt.plan.status == logistics::PlanStatus::Ok && rt.plan.nodes.size() >= 2) {
+            const std::size_t from = (rt.nodeIndex < rt.plan.nodes.size()) ? rt.nodeIndex : 0;
+            std::size_t target = rt.plan.nodes.size();
+            for (std::size_t j = from + 1; j < rt.plan.nodes.size(); ++j) {
+                if (j < rt.plan.nodeIsStop.size() && rt.plan.nodeIsStop[j]) {
+                    target = j;
+                    break;
+                }
+            }
+            if (target < rt.plan.nodes.size()) {
+                seg.assign(rt.plan.nodes.begin() + static_cast<std::ptrdiff_t>(from),
+                           rt.plan.nodes.begin() + static_cast<std::ptrdiff_t>(target) + 1);
+            }
+        }
+        routes.push_back(seg);
+    }
+    return routes;
+}
+
 // 画布归属快照（G15）：逐条车路线边给出归属车（行序最前）与「是否属于选中车」。
-// 读的是与画布同一份数据（各车剩余路线 + 页签选中），不重算任何公式。
+// 读的是与画布同一份数据（canvasTargetRoutes + 页签选中），不重算任何公式。
 QString MainWindow::canvasOwnershipSnapshot() const {
     // 收集全部车路线边（有向），并记录**经过它的全部车**（行序）：
     // owner = 其中行序最前的那台车（共享边不重复绘制）。
@@ -490,28 +520,26 @@ QString MainWindow::canvasOwnershipSnapshot() const {
         std::string to;
         std::vector<std::size_t> owners;   // 按行序
     };
+    // 与画布**同一份**数据：每车只到自己的下一个目标（canvasTargetRoutes）。
+    const std::vector<std::vector<std::string> > routes = canvasTargetRoutes();
     std::vector<EdgeOwners> edges;
-    for (std::size_t v = 0; v < fleet_.size(); ++v) {
-        const VehicleRuntime& rt = fleet_[v];
-        if (rt.plan.status != logistics::PlanStatus::Ok || rt.plan.nodes.size() < 2) {
-            continue;   // 空车/不可行不参与绘制
-        }
-        const std::size_t from = (rt.nodeIndex < rt.plan.nodes.size()) ? rt.nodeIndex : 0;
-        for (std::size_t i = from + 1; i < rt.plan.nodes.size(); ++i) {
-            if (rt.plan.nodes[i] == rt.plan.nodes[i - 1]) {
+    for (std::size_t v = 0; v < routes.size(); ++v) {
+        const std::vector<std::string>& seg = routes[v];
+        for (std::size_t i = 1; i < seg.size(); ++i) {
+            if (seg[i] == seg[i - 1]) {
                 continue;   // 零位移（同节点连续两次停靠）不是边
             }
             std::size_t at = edges.size();
             for (std::size_t e = 0; e < edges.size(); ++e) {
-                if (edges[e].from == rt.plan.nodes[i - 1] && edges[e].to == rt.plan.nodes[i]) {
+                if (edges[e].from == seg[i - 1] && edges[e].to == seg[i]) {
                     at = e;
                     break;
                 }
             }
             if (at == edges.size()) {
                 EdgeOwners e;
-                e.from = rt.plan.nodes[i - 1];
-                e.to = rt.plan.nodes[i];
+                e.from = seg[i - 1];
+                e.to = seg[i];
                 edges.push_back(e);
             }
             edges[at].owners.push_back(v);   // 行序扫描 ⇒ 天然升序
@@ -645,24 +673,20 @@ std::vector<Order> MainWindow::remainingOrders() const {
 void MainWindow::syncScene() {
     scene_->build(config_.graph, scene_->weightType());
     scene_->setAllLabelsVisible(false);
-    std::vector<std::vector<std::string> > routes;
-    routes.reserve(fleet_.size());
+    // 规格三 GUI §7：**每车只画到自己的下一个目标**，不再把整条剩余路线铺满画布。
+    // 路线数据与 G15 快照共用 canvasTargetRoutes（画什么 = 探针读到什么）。
+    // 颜色按**角色**（慢车一色 / 快车另一色），不再按行序四色。
+    const std::vector<std::vector<std::string> > routes = canvasTargetRoutes();
+    const std::vector<bool> fastFlags = logistics::fastVehicleFlags(config_.vehicles);
+    scene_->setFleetRoutes(routes, selectedVehicleIndex(), fastFlags);
+
+    // 车辆环：每台车在自己所在节点外一个环；同节点多车按行序 slot 错开。
+    std::vector<std::string> atNodes;
+    atNodes.reserve(fleet_.size());
     for (std::size_t v = 0; v < fleet_.size(); ++v) {
-        const VehicleRuntime& rt = fleet_[v];
-        if (rt.plan.status != logistics::PlanStatus::Ok || rt.plan.nodes.empty()) {
-            routes.push_back(std::vector<std::string>());
-            continue;
-        }
-        // 只画**尚未走完**的那一段：已走过的路段继续着色会让人误以为还没送到。
-        const std::size_t from = (rt.nodeIndex < rt.plan.nodes.size()) ? rt.nodeIndex : 0;
-        routes.push_back(std::vector<std::string>(rt.plan.nodes.begin()
-                                                  + static_cast<std::ptrdiff_t>(from),
-                                                  rt.plan.nodes.end()));
+        atNodes.push_back(fleet_[v].state.atNodeId);
     }
-    scene_->setFleetRoutes(routes, selectedVehicleIndex());
-    if (!fleet_.empty()) {
-        scene_->setVehiclePosition(active().state.atNodeId);
-    }
+    scene_->setVehicleMarks(atNodes, fastFlags);
 }
 
 // 换计划之后必须做的三件事，只此一处。三处重规划路径（replan /

@@ -3,6 +3,8 @@
 #include <QPen>
 #include <QRectF>
 
+#include <map>
+
 #include "core/RoutePlanner.h"
 #include "gui/EdgeItem.h"
 #include "gui/NodeItem.h"
@@ -86,10 +88,17 @@ QColor GraphScene::vehicleColor(int vehicleIndex) {
     }
 }
 
+QColor GraphScene::roleColor(bool fast) {
+    // 慢车青 / 快车洋红：都不是节点类型色（蓝/绿/橙），也不是路径高亮的红。
+    return fast ? QColor(0xD6, 0x00, 0x9A) : QColor(0x00, 0x96, 0x88);
+}
+
 void GraphScene::setFleetRoutes(const std::vector<std::vector<std::string> >& routes,
-                                int selectedVehicle) {
+                                int selectedVehicle,
+                                const std::vector<bool>& fastFlags) {
     fleetRoutes_ = routes;
     selectedVehicle_ = selectedVehicle;
+    fleetFastFlags_ = fastFlags;
     for (EdgeItem* edge : edges_) {
         // 共享边归**行序最前**那台车：按 routes 顺序扫，首个命中者即 owner。
         int owner = -1;
@@ -100,7 +109,12 @@ void GraphScene::setFleetRoutes(const std::vector<std::vector<std::string> >& ro
             }
         }
         const bool owned = owner >= 0;
-        const QColor color = owned ? vehicleColor(owner) : QColor(130, 130, 130);
+        // 颜色按**角色**取（慢车一色、快车一色）；快慢由 fastFlags 给出（缺省当慢车）。
+        bool ownerFast = false;
+        if (owned && static_cast<std::size_t>(owner) < fleetFastFlags_.size()) {
+            ownerFast = fleetFastFlags_[static_cast<std::size_t>(owner)];
+        }
+        const QColor color = owned ? roleColor(ownerFast) : QColor(130, 130, 130);
         // 加粗 = 该边属于**选中车**（与颜色归属解耦）。
         bool selected = false;
         if (owned && selectedVehicle >= 0
@@ -119,6 +133,33 @@ void GraphScene::setVehiclePosition(const std::string& nodeId) {
     for (NodeItem* node : nodes_) {
         node->setVehicleHere(node->nodeId() == nodeId);
     }
+}
+
+// 每台车在自己所在节点外画环：先按节点分组（同一节点上的车按行序拿 slot），
+// 再一次性把「谁在这里」交给该节点图元 —— 环的错开与配色都在 NodeItem 里完成。
+void GraphScene::setVehicleMarks(const std::vector<std::string>& atNodeIds,
+                                 const std::vector<bool>& fastFlags) {
+    // 每个节点上已分配了几个环（slot 计数）
+    std::map<std::string, int> used;
+    std::map<std::string, std::vector<NodeItem::VehicleMark> > byNode;
+    for (std::size_t v = 0; v < atNodeIds.size(); ++v) {
+        const std::string& id = atNodeIds[v];
+        if (id.empty()) {
+            continue;
+        }
+        NodeItem::VehicleMark mark;
+        mark.fast = (v < fastFlags.size()) ? fastFlags[v] : false;
+        mark.slot = used[id];
+        ++used[id];
+        byNode[id].push_back(mark);
+    }
+    for (NodeItem* node : nodes_) {
+        const std::map<std::string, std::vector<NodeItem::VehicleMark> >::const_iterator it =
+            byNode.find(node->nodeId());
+        node->setVehicleMarks(it == byNode.end() ? std::vector<NodeItem::VehicleMark>()
+                                                : it->second);
+    }
+    update();
 }
 
 void GraphScene::setAllLabelsVisible(bool on) {
