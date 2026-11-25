@@ -1,0 +1,44 @@
+%%{init: {'theme':'base', 'flowchart': {'curve':'basis'}}}%%
+%% F7 腿与就绪链（跨簇单展开成 L1/L2/L3 → readyTime 链 → --dump-plan 的 LEG 行）
+%% 依据 src/core/RoutePlanner.h   enum class LegKind（CustomerToCustomer / CustomerToStation /
+%%                               StationToStation / StationToCustomer）+ toString(LegKind)
+%%      src/core/RoutePlanner.h   struct Leg（seq / from / to / kind / orderId / readyTimeMin /
+%%                               plannedArrivalMin / vehicleId / temporaryAssignment /
+%%                               urgent / directPenaltyMin / relayPenaltyMin）
+%%      src/core/RoutePlanner.h   FleetPlan::legs · FleetPlan::legLog · buildLegs / chooseLegVehicle
+%%      src/core/RoutePlanner.cpp buildLegs（订单展开；本地单 1 腿 / 跨簇单 3 腿 / 退化单腿）
+%%      src/core/RoutePlanner.cpp stationOfCluster（簇 -> 中转站，不硬编码站 ID）
+%%      src/core/RoutePlanner.cpp chooseLegVehicle + legVehicleEligible（职责表唯一决定点）
+%%      src/core/RoutePlanner.cpp estimateCrossPenalties（直达 vs 接力的规划期估计）
+%%      src/core/RoutePlanner.cpp readRelayExecution / plannedArrivalOf / departTimeOf（匿名命名空间）
+%%      src/core/RoutePlanner.cpp transitStopArrival / relayChainConsistent（实际执行时刻复核）
+%%      src/main.cpp              --dump-plan 的 LEG 行：
+%%                                LEG <腿序> <from> <to> <orderId> <kind> <HH:MM readyTime> <vehicleId>
+%%      设计.md §5.11（腿与就绪）/ §5.8（腿模型与三段接力）
+%% 落点只写符号名不写行号：行号会漂，符号名不会。
+flowchart TD
+    A(["buildLegs(graph, vehicles, orders, fleet, log)"]) --> B["取订单 o：A = pickupNodeId，B = nodeId<br/>簇 = node.subNetworkId（查图，不硬编码）"]
+    B --> C{"A 或 B 不在图上？"}
+    C -->|是| D["只登记 1 条腿：seq=1 / CustomerToCustomer<br/>执行车留空、readyTime = 车队最早发车<br/>日志点名，不伪造可行的腿"]
+    C -->|否| E{"簇(A) == 簇(B)？"}
+    E -->|是（本地单）| F["Leg{seq=1, A -> B, CustomerToCustomer}<br/>执行车 = chooseLegVehicle（过职责表，不直接抄分配表）<br/>readyTime = departTimeOf(执行车)"]
+    F --> G["plannedArrivalMin = actualDeliveryMin(fleet, o)<br/>读不到 → plannedArrivalOf（规划期估计）"]
+    E -->|否 跨簇单| H["stationA = stationOfCluster(c1)<br/>stationB = stationOfCluster(c2)"]
+    H --> I{"两侧都有中转站？"}
+    I -->|否| J["退化为 1 条直达腿（CustomerToCustomer）并点名<br/>+ estimateCrossPenalties 填 direct/relayPenaltyMin"]
+    I -->|是| K{"实际执行形态：同一台车取货并送达，<br/>全程没有 transitUnloads/transitPickups？"}
+    K -->|是| L["按「实际形态」登记 1 条 CustomerToCustomer 腿<br/>temporaryAssignment = false<br/>不合职责表 → 日志 + LEGDEGRADE <order> <原因>"]
+    K -->|否| M0["三段腿的展开：三条腿各自 seq / from / to / kind，<br/>readyTime 链式定义（前驱完成时刻 → 后继可接时刻），<br/>时刻与执行车先按规划期估计填"]
+    M0 --> M1["L1：A -> S(c1)，CustomerToStation<br/>vehicleId = chooseLegVehicle（本簇慢车）<br/>readyTime = departTimeOf(L1 车)"]
+    M1 --> M2["L2：S(c1) -> S(c2)，StationToStation<br/>vehicleId = chooseLegVehicle（快车）<br/>readyTime = L1.plannedArrivalMin"]
+    M2 --> M3["L3：S(c2) -> B，StationToCustomer<br/>vehicleId = chooseLegVehicle（对簇慢车）<br/>readyTime = L2.plannedArrivalMin"]
+    M3 --> N{"readRelayExecution 成功？<br/>（接力真的跑了）"}
+    N -->|是| O["readRelayExecution：用实际卸入/送达时刻与实际执行车覆盖 L1/L2/L3<br/>temporaryAssignment = false（readyTime 链锚在真实易手点）"]
+    N -->|否| P["保留规划期估计，temporaryAssignment = true<br/>日志：「未跑三段接力 ⇒ 时刻为估计值」"]
+    O --> Q["行序：订单 ID 升序、同单内腿序 1 -> 2 -> 3（手写插入排序）"]
+    P --> Q
+    Q --> R(["FleetPlan.legs → --dump-plan 的 LEG 行<br/>LEG <seq> <from> <to> <orderId> <kind> <HH:MM readyTime> <vehicleId>"])
+    D --> Q
+    G --> Q
+    J --> Q
+    L --> Q

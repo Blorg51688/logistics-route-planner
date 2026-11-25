@@ -1,0 +1,56 @@
+%%{init: {'theme':'base', 'flowchart': {'curve':'basis'}}}%%
+%% F9 custody 修复与审计（封路/路况打断接力链 → 重跑该单三段接力 → 自洽复核 → 拒绝兜底；
+%%    另一条是只读的审计口径 auditCustody）
+%% 依据 src/core/RoutePlanner.cpp rescheduleFleet 的 accept()（每级收口都走这里）
+%%      src/core/RoutePlanner.cpp repairCustodyBreaks（匿名命名空间；repairEnabled = 封路/路况）
+%%      src/core/RoutePlanner.cpp unpairedUnloadOrders（断链判据：有卸入、无同站另一台车的取走）
+%%      src/core/RoutePlanner.cpp applyRelayLayer（用**新图**重跑这些单的三段接力，starts = 已执行前缀）
+%%      src/core/RoutePlanner.cpp relayChainConsistent（6 锚点 / 相邻不同车 / 等待 ≤ W 的严格复核）
+%%      src/core/RoutePlanner.cpp isCrossCluster / relayChainPossible（能不能用接力修）
+%%      src/core/RoutePlanner.cpp finalizeRescheduleLegs（修好后再重建腿结构）
+%%      src/core/RoutePlanner.h   CustodyReport / CustodyGap + auditCustody
+%%                                （kind = unload-no-pickup / pickup-no-unload / kg-mismatch /
+%%                                 undelivered-not-rejected；只读 RoutePlan::stops，不重算公式）
+%%      src/core/RoutePlanner.h   FleetRescheduleResult（level = 5 / rejected / reason）
+%%      设计.md §5.9（复调度升级链）/ §5.10（custody 守恒）
+%% 落点只写符号名不写行号：行号会漂，符号名不会。
+flowchart TD
+    subgraph 收口修复["rescheduleFleet 收口 accept() → repairCustodyBreaks"]
+        A(["某级产出可行解 plans"]) --> B{"事件是封路 / 路况？<br/>repairEnabled"}
+        B -->|否| C["直接收口（Manual / NewOrder 不在本范围）"]
+        B -->|是| D["broken = unpairedUnloadOrders(vehicles, plans)<br/>某笔 transitUnload 找不到同站、另一台车的 transitPickup"]
+        D --> E{"broken 为空？"}
+        E -->|是| F["原样通过（默认数据 / 无跨簇事件逐字不变）"]
+        E -->|否| G["逐单查订单表 + isCrossCluster + relayChainPossible"]
+        G --> H{"全部是可接力的跨簇单？"}
+        H -->|否| I["返回 false：有卸入、无同站取走，且不是可接力的跨簇单"]
+        H -->|是| J["applyRelayLayer（**新图** + starts = 已执行前缀）<br/>重跑这些单的三段接力；touched 车写回 plans / replanned"]
+        J --> K{"逐单 relayChainConsistent（最终计划）通过？"}
+        K -->|否| L["返回 false：新图下接力链仍不自洽 / 接力不可行"]
+        K -->|是| M{"还有别的未配对卸入？"}
+        M -->|是| N["返回 false：仍有「有卸入、无同站取走」"]
+        M -->|否| O["返回 true：日志「custody 断链已修复（绕行 / 账本两端齐全 / 期末 0）」"]
+        I --> P["level = 5 · rejected = true · res.reason = why<br/>plans / vehicleOrders 回滚为输入（第 ⑤ 级：拒绝并点名）"]
+        L --> P
+        N --> P
+        O --> Q(["finalizeRescheduleLegs → buildLegs：<br/>腿结构按修好后的真实计划重建（F7）"])
+        F --> Q
+        C --> Q
+    end
+    subgraph 只读审计["auditCustody（读计划产物，不重算任何公式）"]
+        S(["auditCustody(vehicles, plans, orders, rejectedOrderIds)"]) --> T["扫每个 Stop：transitUnloads / transitPickups / deliveries<br/>（transitKg 读出易手 kg；失败计划跳过）"]
+        T --> U{"逐单：无任何易手？"}
+        U -->|是| V{"已送达 或 在 rejectedOrderIds 里？"}
+        V -->|否| V1["CustodyGap{kind=undelivered-not-rejected}"]
+        V -->|是| V2["无缺口"]
+        U -->|否| W["kg：整单不可拆 ⇒ 每次易手都等于需求<br/>Σ卸入 ≠ Σ取走 ⇒ kg-mismatch；单笔 kg ≠ 需求 ⇒ kg-mismatch"]
+        W --> X["卸入 → 配对同站、不同车、时刻不早于它的取走（每笔取走只吃一笔卸入）<br/>配不上 ⇒ unload-no-pickup"]
+        X --> Y["取走 → 必须有同站、不同车、时刻不晚于它的卸入<br/>没有 ⇒ pickup-no-unload"]
+        Y --> Z{"有易手但未送达、也不在拒绝名单？"}
+        Z -->|是| Z1["CustodyGap{kind=undelivered-not-rejected}"]
+        Z -->|否| Z2["无缺口"]
+    end
+    V1 --> R2(["return CustodyReport{ok=false, gaps}"])
+    Z1 --> R2
+    V2 --> R2
+    Z2 --> R2

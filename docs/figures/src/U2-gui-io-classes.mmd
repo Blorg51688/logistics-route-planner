@@ -1,7 +1,9 @@
 %%{init: {'theme':'base'}}%%
 %% U2 类图：gui 层（Qt6）+ io 层（零 Qt）
 %% 依据 src/gui/MainWindow.h   class MainWindow（含 struct VehicleState：物理事实唯一权威来源）
-%%      src/gui/GraphScene.h   class GraphScene
+%%      src/gui/GraphScene.h   class GraphScene（#50 画布简化：setFleetRoutes/fastFlags 角色两色、
+%%                               setVehicleMarks 车辆环、roleColor / vehicleColor）
+%%      src/gui/MainWindow.cpp  syncScene（canvasTargetRoutes / fastVehicleFlags / setFleetRoutes / setVehicleMarks）
 %%      src/gui/NodeItem.h     class NodeItem
 %%      src/gui/EdgeItem.h     class EdgeItem
 %%      src/io/ConfigLoader.h  class ConfigLoader
@@ -88,9 +90,13 @@ classDiagram
             +setWeightType(weight)
             +highlightRoute(routeNodes)
             +clearHighlight()
+            +setFleetRoutes(routes, selectedVehicle, fastFlags)（#50：只画每车到下一个目标，颜色按角色）
+            +setVehicleMarks(atNodeIds, fastFlags)（#50：每车节点外一个环，同节点多车 slot 错开）
             +setVehiclePosition(nodeId)
             +setAllLabelsVisible(on)
             +vehiclePosition() string
+            +roleColor(fast) QColor$（#50：慢车青 / 快车洋红）
+            +vehicleColor(vehicleIndex) QColor$（离屏图/历史探针用，按行序四色）
             -refreshLabelVisibility()
         }
 
