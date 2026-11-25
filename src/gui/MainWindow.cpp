@@ -712,6 +712,11 @@ void MainWindow::replanFleet() {
             appendLog(QStringLiteral("[分配] %1")
                           .arg(QString::fromStdString(fp.allocationLog[i])));
         }
+        // 腿结构的登记（规格三 §1 / #45）：「结构已立、接力未启用」必须在运行日志里
+        // 看得见 —— 否则用户会以为 LEG 行意味着已经转运。日志行已自带「[腿] 」前缀。
+        for (std::size_t i = 0; i < fp.legLog.size(); ++i) {
+            appendLog(QString::fromStdString(fp.legLog[i]));
+        }
         allocationSnapshot_ = allocationTextOf(fp);
         appendLog(QStringLiteral("[分配] 三阶段分配（%1 台车）：%2")
                       .arg(k)
@@ -921,6 +926,18 @@ void MainWindow::applyRescheduleResult(const logistics::FleetRescheduleResult& r
         plans.push_back(veh(v).plan);
     }
     fleetPlan_ = logistics::aggregateFleet(config_.vehicles, plans);
+    // 事件后重建的腿结构（P1-③ / US21）：aggregateFleet 不建腿，这里接上 rescheduleFleet
+    // 带回的 buildLegs 结果，让 GUI 与守卫读到同一份「实际执行形态」；降级行写进运行日志
+    // （用户可见），"假报 3 条腿"在界面上同样藏不住。
+    if (!res.legs.empty()) {
+        fleetPlan_.legs = res.legs;
+        fleetPlan_.legLog = res.legLog;
+        for (std::size_t i = 0; i < res.legLog.size(); ++i) {
+            if (res.legLog[i].rfind("LEGDEGRADE ", 0) == 0) {
+                appendLog(QString::fromStdString(res.legLog[i]));
+            }
+        }
+    }
     syncScene();
     updatePanels();
 }
@@ -2585,6 +2602,29 @@ void MainWindow::updatePanels() {
                 vehicleTabs_->setTabText(static_cast<int>(vi), tabTitle);
             }
         }
+        // 默认落点：选中的页签应当**有路线可看**。
+        // 职责封闭（#46）之后行序 0 的快车在默认数据上恒为空车 —— 若把选中停在它身上，
+        // 画布上既没有加粗边、也没有可核对的信息（--ui-probe 的「选中车加粗」会落空）。
+        // 因此只在「当前选中的是空车、而别的车有活」这一种情形下改选第一台有路线的车；
+        // 用户自己切到哪一页就留在哪一页（有路线时一律不覆盖）。
+        if (vehicleTabs_ != nullptr && !config_.vehicles.empty()) {
+            const int cur = vehicleTabs_->currentIndex();
+            bool curHasRoute = false;
+            if (cur >= 0 && static_cast<std::size_t>(cur) < fleet_.size()) {
+                curHasRoute = fleet_[static_cast<std::size_t>(cur)].plan.status
+                                  == logistics::PlanStatus::Ok
+                              && !fleet_[static_cast<std::size_t>(cur)].plan.stops.empty();
+            }
+            if (!curHasRoute) {
+                for (std::size_t vi = 0; vi < fleet_.size(); ++vi) {
+                    if (fleet_[vi].plan.status == logistics::PlanStatus::Ok
+                        && !fleet_[vi].plan.stops.empty()) {
+                        vehicleTabs_->setCurrentIndex(static_cast<int>(vi));
+                        break;
+                    }
+                }
+            }
+        }
         // **逐车**填两块（不按当前页签填：切页状态会影响断言结果）。
         for (std::size_t vi = 0; vi < config_.vehicles.size(); ++vi) {
             QWidget* page = vehicleTabs_->widget(static_cast<int>(vi));
@@ -3525,12 +3565,17 @@ int MainWindow::runActionSelfCheck() {
                        .arg(QString::fromStdString(customerOrder->id)));
         }
 
-        // X 必须真的进路线（只看"新增节点"太弱：节点加了但没被配送等于没有需求）
+        // X 必须真的进路线（只看"新增节点"太弱：节点加了但没被配送等于没有需求）。
+        // 读**全队**路线而不是当前页签那一台车：职责封闭（#46）之后新客户按它的子网归属
+        // 落到**该簇的慢车**上，未必是界面当前选中的那台（默认选中的是「第一台有路线的车」）。
+        // 只看 active() 会把它判成"没进路线"，那是口径错、不是缺陷。
         bool inPlan = false;
-        for (const std::string& n : active().plan.nodes) {
-            if (n == node) {
-                inPlan = true;
-                break;
+        for (std::size_t v = 0; v < fleet_.size() && !inPlan; ++v) {
+            for (const std::string& n : fleet_[v].plan.nodes) {
+                if (n == node) {
+                    inPlan = true;
+                    break;
+                }
             }
         }
         expect(inPlan, QStringLiteral("新客户节点 X 必须出现在路线里（B=X 的结果）"));
@@ -4142,6 +4187,9 @@ int MainWindow::runActionSelfCheck() {
         two("H", "C", 15.0);
         two("C", "D", 15.0);
         two("D", "W", 15.0);
+        // #46：职责封闭要求「一台快车 + 若干慢车」。夹具要的是**两台对称的慢车**，
+        // 所以再加一台 200kg 的快车 V03 当「簇间车」——它在纯本地单的镜像夹具上没有活
+        // （空车不参与并列断言），V01/V02 才是要比较的那两台慢车。
         mirror.vehicles.clear();
         for (const char* id : {"V01", "V02"}) {
             logistics::Vehicle v;
@@ -4150,6 +4198,14 @@ int MainWindow::runActionSelfCheck() {
             v.capacityKg = 100.0;
             v.departTimeMin = 480;
             mirror.vehicles.push_back(v);
+        }
+        {
+            logistics::Vehicle fast;
+            fast.id = "V03";
+            fast.startNodeId = "W";
+            fast.capacityKg = 200.0;   // 容量最大 ⇒ 快车（簇间搬运），不接本地簇
+            fast.departTimeMin = 480;
+            mirror.vehicles.push_back(fast);
         }
         mirror.orders.clear();
         const auto order = [&mirror](const std::string& id, const std::string& a,
@@ -4170,7 +4226,7 @@ int MainWindow::runActionSelfCheck() {
         MainWindow tieA(mirror, configPath_);
         MainWindow tieB(mirror, configPath_);
         // （前置）两台车每一步都并列：到达时刻数组逐位相同
-        bool tiePremise = tieA.fleet().size() == 2
+        bool tiePremise = tieA.fleet().size() == 3
                           && tieA.fleet()[0].plan.nodeArrivalMin
                                  == tieA.fleet()[1].plan.nodeArrivalMin
                           && tieA.fleet()[0].plan.nodeArrivalMin.size() >= 4;
@@ -4230,14 +4286,14 @@ int MainWindow::runActionSelfCheck() {
         tieOne.onAdvanceStop();   // 全队下一到达时刻 = 两台车并列的那个时刻
         const int t1 = tieOne.fleet().size() > 0 ? tieOne.fleet()[0].state.atTimeMin : -1;
         const int t2 = tieOne.fleet().size() > 1 ? tieOne.fleet()[1].state.atTimeMin : -1;
-        expect(tieOne.fleet().size() == 2 && t1 == expectedArrival && t2 == expectedArrival,
+        expect(tieOne.fleet().size() == 3 && t1 == expectedArrival && t2 == expectedArrival,
                QStringLiteral("X7 并列到达：一次「推进一站」把**两台车**都推到同一时刻 %1"
                               "（实际 V01 %2 / V02 %3）")
                    .arg(expectedArrival)
                    .arg(t1)
                    .arg(t2));
         // 夹具里两台车的第一站都是共用的 H（同刻并列）——断言"两台车都真的前进了一站"。
-        expect(tieOne.fleet().size() == 2 && tieOne.fleet()[0].nodeIndex == 1
+        expect(tieOne.fleet().size() == 3 && tieOne.fleet()[0].nodeIndex == 1
                    && tieOne.fleet()[1].nodeIndex == 1
                    && tieOne.fleet()[0].state.atNodeId == tieOne.fleet()[1].state.atNodeId,
                QStringLiteral("X7 并列到达：两台车都真的前进了一站（实际下标 %1 / %2）")
@@ -4262,9 +4318,13 @@ int MainWindow::runActionSelfCheck() {
     {
         logistics::Config base = reloadInitialConfig();
         base.general.eventIntervalMin = 24 * 60;   // 演示窗口内不触发事件
-        // 夹具：仓库 W、中转站 T、客户 A1/A2（子网络 1）/ B1（子网络 2）/ B2（子网络 1）。
-        // O1（A1→B1）跨簇；时间策略下三阶段分配把 O1 交给 V02 慢车，
-        // 再由 V01 在 T 取走送达 —— 这是转运层**严格更优**才接受的那一版。
+        // 夹具（规格三 §3 / #48 的走廊形态）：仓库 W、中转站 T（子网络 1）/ T3（子网络 3）、
+        // 客户 A1/B2（子网络 1）、A3/B1（子网络 3）。三车同容量同时因子、V01 成本因子高
+        // ⇒ 接力车 = V01，「簇 -> 车」稳定落成「每簇一台慢车」。
+        // O1（A1→B1）是跨簇普通单 ⇒ **只能**走三段腿：V0x 取 A1 卸 T（L1）、V01 T→T3（L2）、
+        // V0y 取 T3 送 B1（L3）。这正是「planFleet 里真的跑通了接力」的最小演示形态。
+        // （旧的两车 + 单站夹具在 #48 之后不再成立：三段腿要求两侧各有中转站，且
+        //  L1/L3 必须由不同车执行 —— 否则运单会在同一台车里倒挂。）
         base.graph = logistics::LogisticsGraph();
         const auto addNodeFixture = [&base](const std::string& id, logistics::NodeType type,
                                             const std::string& name, int sub) {
@@ -4277,10 +4337,11 @@ int MainWindow::runActionSelfCheck() {
         };
         addNodeFixture("W", logistics::NodeType::Warehouse, "仓库", 0);
         addNodeFixture("T", logistics::NodeType::Transit, "中转站T", 1);
+        addNodeFixture("T3", logistics::NodeType::Transit, "中转站T3", 3);
         addNodeFixture("A1", logistics::NodeType::Delivery, "客户A1", 1);
-        addNodeFixture("A2", logistics::NodeType::Delivery, "客户A2", 1);
-        addNodeFixture("B1", logistics::NodeType::Delivery, "客户B1", 2);
         addNodeFixture("B2", logistics::NodeType::Delivery, "客户B2", 1);
+        addNodeFixture("B1", logistics::NodeType::Delivery, "客户B1", 3);
+        addNodeFixture("A3", logistics::NodeType::Delivery, "客户A3", 3);
         const auto addEdgeFixture = [&base](const std::string& a, const std::string& b,
                                             double km) {
             logistics::Edge e;
@@ -4295,53 +4356,51 @@ int MainWindow::runActionSelfCheck() {
             back.toId = a;
             base.graph.addEdge(back);
         };
-        addEdgeFixture("W", "T", 1.0);
-        addEdgeFixture("W", "A1", 1.0);
+        // 走廊：W --4-- T --40-- T3；A1 在 W->T 途中（3+1）；B2 经 T；A3 在 T3 边；
+        // A3->B1（4）与 T3->B1（6）等价，L3 因此零绕行。
+        addEdgeFixture("W", "T", 4.0);
+        addEdgeFixture("W", "A1", 3.0);
         addEdgeFixture("A1", "T", 1.0);
-        addEdgeFixture("W", "A2", 1.0);
-        addEdgeFixture("A2", "T", 2.0);
-        addEdgeFixture("T", "B1", 1.0);
-        addEdgeFixture("B1", "B2", 1.0);
+        addEdgeFixture("W", "B2", 6.0);
+        addEdgeFixture("T", "B2", 6.0);
+        addEdgeFixture("T", "T3", 40.0);
+        addEdgeFixture("T3", "A3", 2.0);
+        addEdgeFixture("A3", "B1", 4.0);
+        addEdgeFixture("T3", "B1", 6.0);
         base.vehicles.clear();
-        logistics::Vehicle fast;
-        fast.id = "V01";
-        fast.startNodeId = "W";
-        fast.capacityKg = 400.0;
-        fast.departTimeMin = 480;
-        fast.timeFactor = 1.00;
-        fast.costFactor = 1.50;
-        logistics::Vehicle slow;
-        slow.id = "V02";
-        slow.startNodeId = "W";
-        slow.capacityKg = 160.0;
-        slow.departTimeMin = 480;
-        slow.timeFactor = 1.25;
-        slow.costFactor = 0.80;
-        base.vehicles.push_back(fast);
-        base.vehicles.push_back(slow);
+        // 三车同容量、同时因子、V01 成本因子高 ⇒ 接力车 = V01（容量并列取成本因子高）。
+        for (const char* vid : {"V01", "V02", "V03"}) {
+            logistics::Vehicle v;
+            v.id = vid;
+            v.startNodeId = "W";
+            v.capacityKg = 160.0;
+            v.departTimeMin = 480;
+            v.timeFactor = 1.00;
+            v.costFactor = (std::string(vid) == "V01") ? 1.50 : 0.80;
+            base.vehicles.push_back(v);
+        }
         base.orders.clear();
-        logistics::Order o2;
-        o2.id = "O2";
-        o2.pickupNodeId = "A2";
-        o2.nodeId = "B2";
-        o2.demandKg = 10.0;
-        o2.windowStartMin = 0;
-        o2.windowEndMin = 1440;
-        o2.source = logistics::OrderSource::Initial;
-        logistics::Order o1;
-        o1.id = "O1";
-        o1.pickupNodeId = "A1";
-        o1.nodeId = "B1";
-        o1.demandKg = 10.0;
-        o1.windowStartMin = 0;
-        o1.windowEndMin = 1440;
-        o1.source = logistics::OrderSource::Initial;
-        base.orders.push_back(o2);
-        base.orders.push_back(o1);
+        // O2（A1->B2）与 O3（A3->B1）是两簇的本地单（把两台慢车带到各自的中转站边），
+        // O1（A1->B1）跨簇 ⇒ 三段接力。
+        const auto makeFixtureOrder = [](const std::string& id, const std::string& a,
+                                         const std::string& b) {
+            logistics::Order o;
+            o.id = id;
+            o.pickupNodeId = a;
+            o.nodeId = b;
+            o.demandKg = 10.0;
+            o.windowStartMin = 0;
+            o.windowEndMin = 1440;
+            o.source = logistics::OrderSource::Initial;
+            return o;
+        };
+        base.orders.push_back(makeFixtureOrder("O2", "A1", "B2"));
+        base.orders.push_back(makeFixtureOrder("O3", "A3", "B1"));
+        base.orders.push_back(makeFixtureOrder("O1", "A1", "B1"));
 
         MainWindow transit(base, configPath_);
-        transit.strategyBox_->setCurrentIndex(1);   // 时间策略（转运唯一的启用策略）
-        // 计划期账本：三阶段分配 + 转运层，两端非空、in≠out、kg=10、dwell ≤ 60
+        transit.strategyBox_->setCurrentIndex(1);   // 时间策略
+        // 计划期账本：三段接力（#48），两端非空、in≠out、kg=10、dwell ≤ 60
         expect(!transit.fleetPlan_.transitLegs.empty(),
                QStringLiteral("G14：三阶段分配 + 时间策略下应有转运计划（计划期账本非空）"));
         bool planLedgerOk = true;
@@ -4349,13 +4408,13 @@ int MainWindow::runActionSelfCheck() {
             const bool twoEnds = !leg.inVehicleId.empty() && !leg.outVehicleId.empty();
             const int dwell = leg.outTimeMin - leg.inTimeMin;
             if (!twoEnds || leg.inVehicleId == leg.outVehicleId || leg.orderId != "O1"
-                || leg.stationId != "T" || leg.kg < 10.0 - 1e-9 || dwell < 0
+                || leg.stationId != "T3" || leg.kg < 10.0 - 1e-9 || dwell < 0
                 || dwell > logistics::kTransferMaxDwellMin) {
                 planLedgerOk = false;
             }
         }
         expect(planLedgerOk,
-               QStringLiteral("G14：账本两端非空 / in≠out / 站点 T / kg=10 / 0≤dwell≤%1（计划期）")
+               QStringLiteral("G14：账本两端非空 / in≠out / 站点 T3 / kg=10 / 0≤dwell≤%1（计划期）")
                    .arg(logistics::kTransferMaxDwellMin));
 
         // 推进到全队收工：卸入 / 取走 / 送达都必须**真的执行**。

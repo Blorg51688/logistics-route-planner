@@ -97,6 +97,21 @@ struct OffloadLeg {
 // 耗时、不产生 penalty；若不管，转运可以把等待搬进站里让完工耗时变好看，而货实际更晚到。
 constexpr int kTransferMaxDwellMin = 60;
 
+// 有界前瞻窗口（规格三 §3 / #48）：**代码常量，不加配置键**（同 kTransferMaxDwellMin）。
+//
+// 语义：车辆可以把「尚未就绪、但可接时刻 readyTime 不晚于 预计到达时刻 + W」的腿纳入
+// 当前路线；到达后若货还没到就原地等到 readyTime（车等货）。可接时刻落在窗口之外的腿
+// **不纳入**——否则车辆会为了一小时后的货物在站里空等，行程荒谬。
+//
+// 为什么有界：readyTime 是精确值（前驱腿的计划完成时刻），但「精确」不等于「值得等」。
+// 窗口就是「值得等多久」这一条唯一的门槛，且它同时是可行性判据（超窗即该候选不可行），
+// 于是有界性由构造保证，不靠事后抽查。反向：窗口=0 退化成就绪才出发（反应式），
+// 接力链会因「货未到 → 不可行」整条退回直达；窗口=无界则空等任意久。
+//
+// 与 kTransferMaxDwellMin 的分工：W 管「车等货」（货在**未来**），dwell 管「货等车」
+// （货在**过去**，货物在站停留上限）。两者都在 replay 的同一处按 (订单, 节点) 判。
+constexpr int kLookaheadWindowMin = 60;
+
 // 转运账本的最小记录单位（规格二 §5.3 / #28 §5.1）。**两端都必填**：
 // 没有「只卸不取」的合法记录；无 outVehicleId 的候选在构造期就被丢弃。
 // 与 OffloadLeg 的分型判据：inVehicleId ≠ outVehicleId（同车卸又取回永远算降载）。
@@ -108,6 +123,57 @@ struct TransitLeg {
     int         inTimeMin = 0;    // 卸入时刻（软件内时间）
     std::string outVehicleId; // 取走车
     int         outTimeMin = 0;   // 取走时刻
+};
+
+// ---- 腿（Leg）与就绪链（规格三 §1 / #45）----
+//
+// 规格三把「订单 → 一台车」改写成「订单展开成带先后依赖的腿」：
+//   跨簇单 A→B（簇(A)=c1 ≠ 簇(B)=c2）⇒ 三段腿 L1: A→S(c1) / L2: S(c1)→S(c2) / L3: S(c2)→B；
+//   本地单 A→B ⇒ 一条腿 A→B。
+//
+// **本票（#45）只立结构与就绪链**：腿的执行车是临时指派、规划上**不执行** L2/L3，
+// 实际路线仍由既有分配/转运链决定（接力与等待留给 #48），因此既有路线与黄金值逐字不变。
+enum class LegKind {
+    CustomerToCustomer,   // 本地单：客户 → 客户（可途经本簇站）
+    CustomerToStation,    // 跨簇 L1：客户 → 本簇中转站
+    StationToStation,     // 跨簇 L2：本簇站 → 对簇站（#46 起只能由快车执行）
+    StationToCustomer     // 跨簇 L3：对簇站 → 客户
+};
+
+// 腿类型的文本写法：--dump-plan 的 LEG 行与日志共用，取值与设计文档的词汇表一致。
+const char* toString(LegKind kind);
+
+// 一条腿。**结构层真源**：--dump-plan 的 LEG 行、GUI 的腿登记都读它。
+struct Leg {
+    int         seq = 1;              // 腿序：本地单恒 1；跨簇单 1 → 2 → 3
+    std::string from;                 // 起点（客户或中转站）
+    std::string to;                   // 止点
+    LegKind     kind = LegKind::CustomerToCustomer;
+    std::string orderId;              // 所属订单（站间腿也带，跨簇单 3 条腿同单号）
+    // 可接时刻。链式定义：L1 = 执行车发车时刻；L2 = L1 的计划完成时刻；
+    // L3 = L2 的计划完成时刻。**由前驱腿的计划时刻反推**，不是常量、不是估计值
+    // （怎么算见 buildLegs 的注释）。单调不减因此是构造性的，不是抽查出来的。
+    int         readyTimeMin = 0;
+    // 该腿的计划完成时刻（到达 to）。本票的算法 = 「readyTime 起步 + 该车因子缩放的
+    // 该腿最短路耗时」；#48 用接力实际执行时刻替换它，字段语义不变。
+    int         plannedArrivalMin = 0;
+    std::string vehicleId;            // 执行车（由职责表定，见 legVehicleEligible）
+    // true = 执行车是**规划期估计**的落点（接力没跑，时刻是估计值）；
+    // false = 接力真的跑了，执行车与时刻都是实际值（#48 的 readRelayExecution 覆盖）。
+    bool        temporaryAssignment = true;
+
+    // ---- 职责表的判据输入（规格三 §1 / #46）----
+    //
+    // 「跨簇紧急单直达」是快车唯一能接客户↔客户腿的通道，判据是**该单**的直达 penalty
+    // 严格小于 relay penalty。Leg 必须自带这两个数，否则职责谓词只能看 kind，
+    // 「紧急直达」这条通道就无从表达（谓词拿不到订单表）。
+    //
+    // 两个 penalty 都是**规划期估计**（图 + 各车 time_factor 的最短路），不是执行值：
+    // 职责表要在规划**之前**回答「谁可以接这条腿」，那时还没有执行时刻。
+    // 估计口径见 RoutePlanner.cpp 的 urgentDirectPenaltyPair。
+    bool        urgent = false;              // 所属订单是否紧急
+    int         directPenaltyMin = -1;       // 直达（快车 A→B）估计 penalty；-1 = 不适用
+    int         relayPenaltyMin = -1;        // 三段接力估计 penalty；-1 = 不适用
 };
 
 // 逐单指标（#29 §2.1 / ADR 0006）。取货准时判据：
@@ -275,28 +341,84 @@ struct FleetPlan {
     // 转运分级播报（判据 / 轮次 / 接受或退回及原因）。GUI 直接追加到运行日志；
     // **不进 --plan-summary**（六行格式不动）。
     std::vector<std::string> transitLog;
+
+    // ---- 腿清单（规格三 §1 / #45：结构层）----
+    //
+    // 订单展开成的腿，**按订单 ID 升序、同单内按腿序 1 -> 2 -> 3**（--dump-plan 的 LEG 行同序）。
+    // 默认 25 单全簇内 => 25 条 customer->customer 单腿；只有跨簇单才出现 3 条腿。
+    std::vector<Leg> legs;
+    // 腿结构的登记日志（「结构已立、接力未启用」+ 临时指派 + 展开退化 + 缺站/无车）。
+    // **不进 --plan-summary**；GUI 追加到运行日志，--dump-plan 不打印。
+    std::vector<std::string> legLog;
 };
 
-// 类型感知三阶段分配（规格二 §4，**默认入口**）。
+// 职责封闭的簇 -> 慢车指派（规格三 §4 / #46，**默认入口**）。
 //   阶段一 聚类：簇 = 取货点 A 的 subNetworkId；A、B 跨网 ⇒ 跨簇单（单独成队列）；
 //                  subNetworkId == 0 的异常数据也并入跨簇队列并记日志（不静默丢单）。
-//   阶段二 整簇指派：枚举全部「簇 -> 车」排列（默认 3 簇 3 车 = 6 种，**手写全排列**），
-//                  每簇的订单交给该车跑**规格一的单车构造器**；候选按车队键
-//                  (Σpenalty, Σ策略权重, 均衡键, tieKey) 取优。簇数 > 车数时按簇货量
-//                  降序取前 k 个各占一车、其余并入「货量最接近且仍可行」的车。
-//   阶段三 有界跨车改派：R ≤ 3 轮、只普通段、EDD 序；两条接受条件**同时**成立才接受
-//                  （① 车队键严格变优；② 完工耗时不得变差）。一轮无改进即停。
-// 失败兜底链（§4.6）：换车（枚举覆盖）-> 拆簇（仅此级触发并记 allocationLog）->
-// 规格一的降载/全量兜底（在 planRoute 内部）-> 拒绝该单并报原因。
+//   阶段二 固定指派：慢车按 **ID 升序**、簇按 **ID 升序**逐位配对（V02→簇1、V03→簇2、
+//                  V04→簇3），每簇的订单交给它的本簇慢车跑**规格一的单车构造器**；
+//                  快车只拿「站间腿」与「跨簇紧急直达」——它不进本簇的订单队列。
+//                  **没有枚举**：职责封闭后「簇 -> 慢车」的自由度是 1，全排列枚举
+//                  （规格二阶段二，3 簇 3 车 = 6 种）已退役，理由见 planFleet 的注释。
+//                  簇数 > 慢车数时按簇 ID 升序**循环**配对（一台慢车守多簇）并记日志；
+//                  慢车数 > 簇数时多出来的慢车空转（不强行派活）。
+//   阶段三 **退役**：有界跨车改派（R ≤ 3 轮、RelocateRecord）在职责封闭后没有改派空间
+//                  —— 一张簇内单只能由本簇慢车接，挪给别的车就越界。relocations 恒空。
+// 跨簇单的处置：普通单走三段接力（#48 的 applyRelayLayer，L1/L2/L3 分别由
+//   本簇慢车 / 快车 / 对簇慢车执行）；紧急单保留「快车直达」通道，判据是
+//   该单直达 penalty **严格小于** relay penalty（见 legVehicleEligible）。
+// 失败兜底链（口径按职责封闭收紧，见 #46）：职责封闭后「换车」与「把半簇挪给别的车」
+//   都会越界，因此那两级随枚举一起退役，只剩「规格一的降载/全量兜底（planRoute 内部）
+//   -> 拒绝该单并点名」；跨簇单另有「接力不可行 ⇒ 职责降级直达（大声记日志）或拒绝」。
 FleetPlan planFleet(const LogisticsGraph& graph,
                     const std::vector<Vehicle>& vehicles,
                     const std::vector<Order>& orders,
                     WeightType weight);
 
+// 订单 -> 腿的展开（规格三 §1 / #45）。读 fleet 的分配表定执行车，产出按「订单 ID 升序、
+// 同单内腿序 1 -> 2 -> 3」排序的腿清单；「结构已立、接力未启用」「执行车是临时指派」
+// 「缺中转站 / 端点不在图上导致退化」如实写进 log，**不声称已转运**。
+// 规划上不执行 L2/L3：本函数只登记结构，**不改任何路线**。
+std::vector<Leg> buildLegs(const LogisticsGraph& graph,
+                           const std::vector<Vehicle>& vehicles,
+                           const std::vector<Order>& orders,
+                           const FleetPlan& fleet,
+                           std::vector<std::string>& log);
+
+// ---- 腿的执行车指派：「谁可以接哪条腿」的**唯一决定点**（规格三 §1 / #46）----
+//
+// 职责表（**可执行判据**，逐字即实现）：
+//   · **慢车**只能接「两端都在本簇」且**非** station→station 的腿；
+//   · **快车**只能接 station→station 腿，或「跨簇**紧急**单且该单 直达 penalty
+//     **严格小于** relay penalty」的 customer→customer 直达腿。
+//
+// 三个分类都是**从数据推出来的**，不硬编码车号：
+//   · 快车 = 站间腿最合适的那台（容量最大 ⇒ 成本因子更高 ⇒ 车辆 ID 小，与接力层同判据）；
+//   · 慢车 = 其余车辆，按**车辆 ID 升序**；
+//   · 簇 = 有配送点的非 0 子网，按**簇 ID 升序**；慢车与簇逐位配对
+//     （⇒ 默认 3 簇 3 慢车时排列数 = 1，#46 因此退役整簇全排列枚举）。
+//
+// 为什么签名要带整个车队（而不是只看单台车 + 腿）：职责是**车队的划分**，
+// 「这台车是慢车还是快车」「本簇的慢车是哪一台」都只有拿着整队才回答得了。
+// 谓词仍然是唯一决定点：chooseLegVehicle 与腿的展开逻辑都只调它。
+bool legVehicleEligible(const LogisticsGraph& graph, const std::vector<Vehicle>& vehicles,
+                        std::size_t vehicleIndex, const Leg& leg);
+
+// 在合资格的车里挑执行车（职责表收窄后的**确定性落点**）：
+// 职责封闭后每类腿的合资格车**只有一个**（慢车腿 = 本簇慢车；站间腿 = 快车）。
+// 若出现多台合资格，只可能是职责表被放宽了 —— 那时按「车辆行序」取第一台，
+// 让越界立刻出现在 LEG 行里（而不是挑一台看起来合理的车掩盖过去）。
+// 站间腿例外：用 betterForStationLeg（与接力层同判据），保证 LEG 与真跑的车一致。
+// 合资格车为空时返回空串（调用方记日志，**不伪造**执行车）。
+std::string chooseLegVehicle(const LogisticsGraph& graph, const std::vector<Vehicle>& vehicles,
+                             const Leg& leg);
+
 // 顺序轮转基线（规格二 §4.5，**对照组不是候选方案**）：
 // 订单 ID 升序、第 i 单 -> 第 (i mod k) 台车、车辆序 = [vehicles] 行序；
 // 不跳车、不重分配、不做可行性预判；分完后各车独立跑 planRoute。
 // 分配只由「订单 ID 升序 + 车队行序」决定，与策略/容量/窗口**全部无关**（不变量 9）。
+// 腿清单的产出口径与 planFleet **相同**（buildLegs 读它自己的分配表）：
+// 对照组也要能回答「每条腿归谁、readyTime 多少」，否则两条入口的结构会漂。
 FleetPlan planFleetSequentialBaseline(const LogisticsGraph& graph,
                                       const std::vector<Vehicle>& vehicles,
                                       const std::vector<Order>& orders,
@@ -529,6 +651,11 @@ struct FleetRescheduleResult {
     std::string reason;
     std::vector<std::size_t> replanned;               // 被重算的车（不变量 5 用它判「未受影响车不变」）
     std::vector<std::string> log;                     // 分级播报行（每行都以「[复调度] 」开头）
+    // 事件**之后**重建的腿结构（规格三 §2④ / US21：事件刷出的跨簇单也走三段腿）。
+    // rescheduleFleet 只在逐车重规划上工作，腿/账本要单独重建 —— 这里用**与 planFleet 同一套**
+    // buildLegs 读事件后的真实计划，让「LEG 说的形态」= 「STOP 里的实际执行」。
+    std::vector<Leg>         legs;
+    std::vector<std::string> legLog;                  // 腿登记日志（含 LEGDEGRADE 降级行）
 };
 
 // §6.4 五级升级链：① 局部重排 → ② 跨车再分配 → ③ 全车队重调度 → ④ 降载/转运并列 → ⑤ 拒绝。

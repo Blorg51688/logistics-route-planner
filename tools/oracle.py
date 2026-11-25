@@ -609,7 +609,7 @@ def _parse_dump_text(text):
       FLEET <17 个数>                  # app 自报：车队 13 字段（总耗时 = 完工耗时）
     空动作集写作 "-"；空车只有 PLAN + METRICS（没有 STOP）。
     """
-    fleet = {"plans": [], "fleet_metrics": None}
+    fleet = {"plans": [], "fleet_metrics": None, "legs": []}
     cur = None
     for raw in text.splitlines():
         line = raw.strip()
@@ -642,7 +642,35 @@ def _parse_dump_text(text):
             cur["infeasible"] = " ".join(tok[2:])
         elif tok[0] == "FLEET":
             fleet["fleet_metrics"] = [float(x) for x in tok[1:]]
+        elif tok[0] == "LEG" and len(tok) >= 8:
+            # LEG <腿序> <from> <to> <订单> <kind> <HH:MM readyTime> <执行车>
+            # 只有 #48 的三段接力会让「含转运取走的停靠」真的需要 readyTime；
+            # 别的行这里一律不碰（只加行、不改旧行的约定）。
+            fleet["legs"].append({
+                "seq": int(tok[1]), "from": tok[2], "to": tok[3], "order": tok[4],
+                "kind": tok[5], "ready": _clock_minutes(tok[6]), "vehicle": tok[7],
+            })
     return fleet
+
+
+def _relay_ready_tables(legs):
+    """从 LEG 行建两张表（**只读 app 的腿结构，不回读 STOP 的 wait/arrival**）。
+
+    ready[(订单, 节点)] = 该腿的可接时刻 —— 用于复算「车等货」的等待；
+    pickups[(车, 节点)] = 该车在该节点站内取走的订单清单 —— 用于认出哪些停靠是
+    接力取货停靠（STOP 行只打真实取货/送达，转运动作不在里面）。
+
+    只取 station->station / station->customer 两类：L1（customer->station）的 ready
+    是执行车发车时刻，不是「货未到」的等待来源；customer->customer 是本地单，恒无约束。
+    """
+    ready = {}
+    pickups = {}
+    for leg in legs:
+        if leg["kind"] not in ("station->station", "station->customer"):
+            continue
+        ready[(leg["order"], leg["from"])] = leg["ready"]
+        pickups.setdefault((leg["vehicle"], leg["from"]), []).append(leg["order"])
+    return ready, pickups
 
 
 def _parse_dump_file(path):
@@ -708,13 +736,16 @@ def aggregate_fleet(results):
 
 
 def recompute_plan(g, plan, kind, time_factor=1.0, cost_factor=1.0, capacity=0.0,
-                   urgent_ids=None):
+                   urgent_ids=None, ready=None, relay_pickups=None):
     """从**停靠级转储**独立复算 13 字段（不实现选路，只按给定停靠序列算算术）。
 
     - 相邻停靠之间用 default.ini 边表的最短路（按 kind 维度），距离/耗时/成本从
       **同一条最短路**上读；耗时乘 time_factor、成本乘 cost_factor、距离不乘。
     - 逐单 penalty：arrival > we 才迟到（严格 >，arrival == we 不算）；早到等待只在
       有送达单的停靠发生，等全部送达单窗口起的最大值；停靠零耗时。
+    - **车等货**（规格三 §3 / #48）：含站内取走的停靠还要等到该 (订单, 节点) 的
+      readyTime（来自 LEG 行）。wait = max(窗口等待, readyTime − raw) —— 这是**独立复算**：
+      readyTime 读的是腿的可接时刻、raw 由边表最短路算出，不回读 STOP 行里的 wait/arrival。
     - 平均在车用**分段积分**（首末空驶段计入分母）：段内在车量 = 上一停靠离站在车量。
     - 峰值 = max(各停靠离站在车量)（停靠内「先卸后装」，卸后 <= 卸前，故峰值必在装后）。
     """
@@ -730,6 +761,11 @@ def recompute_plan(g, plan, kind, time_factor=1.0, cost_factor=1.0, capacity=0.0
     peak = 0.0
     order_pickup = {}       # oid -> (arrival, pickupNode)
     order_deliv = {}        # oid -> (arrival, we, late, penalty, deliveryNode)
+    if ready is None:
+        ready = {}
+    if relay_pickups is None:
+        relay_pickups = {}
+    pending_relay = {k: list(v) for k, v in relay_pickups.items()}
 
     def travel(to):
         nonlocal pos, elapsed, total_dist, total_cost, integral
@@ -758,6 +794,15 @@ def recompute_plan(g, plan, kind, time_factor=1.0, cost_factor=1.0, capacity=0.0
             wait = max(0.0, max_ws - raw)
         else:
             wait = 0.0
+        # 车等货：该车在这个节点的站内取走，要等货到站（readyTime 由 LEG 行给出）。
+        stop_relay = []
+        key_relay = (plan["id"], st["node"])
+        if key_relay in pending_relay and pending_relay[key_relay]:
+            oid = pending_relay[key_relay].pop(0)
+            stop_relay.append(oid)
+            rdy = ready.get((oid, st["node"]))
+            if rdy is not None and rdy - raw > wait:
+                wait = float(rdy) - raw
         arrival = raw + wait
         elapsed = arrival
         for d in st["deliveries"]:
@@ -766,6 +811,8 @@ def recompute_plan(g, plan, kind, time_factor=1.0, cost_factor=1.0, capacity=0.0
             penalty += p
             order_deliv[d["id"]] = (arrival, d["we"], late, p, st["node"])
         for oid in st["pickups"]:
+            order_pickup[oid] = (arrival, st["node"])
+        for oid in stop_relay:
             order_pickup[oid] = (arrival, st["node"])
         cur_load = st["remaining"]
         if cur_load > peak:
@@ -785,10 +832,12 @@ def recompute_plan(g, plan, kind, time_factor=1.0, cost_factor=1.0, capacity=0.0
     urg_total = urg_ok = 0
     norm_total = norm_ok = 0
     for oid, (parr, pnode) in order_pickup.items():
-        pickup_total += 1
         rec = order_deliv.get(oid)
         if rec is None:
+            # 只统计**本车真的送达了**的订单（与 C++ finalize 同口径）：转运中间那台车
+            # 取了货却不送达，它的两率分母不能把这张单算进去，否则同一张单分母翻倍。
             continue
+        pickup_total += 1
         _darr, we, late, _p, dnode = rec
         _path, stime = shortest(g, pnode, dnode, "time")
         scaled = (0.0 if stime == INF else stime * time_factor)
@@ -836,14 +885,15 @@ def recompute_plan(g, plan, kind, time_factor=1.0, cost_factor=1.0, capacity=0.0
     }
 
 
-def _load_dataset():
+def _load_dataset(path=None):
     """从仓库 config/default.ini 读 orders / edges / vehicles（独立于被测代码）。
 
     返回 (graph, orders, vehicles[])：vehicles 按 [vehicles] 行序，供逐车对拍。
+    path 非空时读那份配置（夹具对拍用；--plan 的 --config 参数传进来）。
     """
     import os
-    ini = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                       "config", "default.ini")
+    ini = path if path else os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "default.ini")
     sections = _read_ini_sections(ini)
     orders = []
     for raw in sections.get("orders", "").splitlines():
@@ -949,12 +999,19 @@ def _cli_plan(argv):
     与 app 自报的 METRICS / FLEET 逐项比对，最后打印车队 13 字段
     （供 cli_plan_summary 与 --plan-summary 对拍）。oracle 不实现选路。
     """
+    cfg_path = None
+    if "--config" in argv:
+        i = argv.index("--config")
+        if i + 1 < len(argv):
+            cfg_path = argv[i + 1]
+        del argv[i:i + 2]
     if len(argv) < 2:
-        print("用法: oracle.py --plan <dumpfile> <kind>")
+        print("用法: oracle.py --plan <dumpfile> <kind> [--config <ini>]")
         return 2
     dumpfile, kind = argv[0], argv[1]
     dump = _parse_dump_file(dumpfile)
-    g, orders, vehicles = _load_dataset()
+    g, orders, vehicles = _load_dataset(cfg_path)
+    ready, relay_pickups = _relay_ready_tables(dump.get("legs", []))
     urgent_ids = {o["id"] for o in orders if o["urgent"]}
     by_id = {v["id"]: v for v in vehicles}
     results = []
@@ -971,7 +1028,7 @@ def _cli_plan(argv):
             continue
         m = recompute_plan(g, plan, kind, time_factor=veh["time_factor"],
                            cost_factor=veh["cost_factor"], capacity=veh["capacity"],
-                           urgent_ids=urgent_ids)
+                           urgent_ids=urgent_ids, ready=ready, relay_pickups=relay_pickups)
         if m is None:
             print("[FAIL] %s: dump 复算不可达" % plan["id"])
             ok = False
@@ -1085,6 +1142,7 @@ def _dump_selfcheck():
         summary = subprocess.run([app, "--plan-summary", kind], capture_output=True,
                                  text=True, env=env).stdout
         data = _parse_dump_text(dump)
+        ready, relay_pickups = _relay_ready_tables(data.get("legs", []))
         g, orders, vehicles = _load_dataset()
         urgent_ids = {o["id"] for o in orders if o["urgent"]}
         by_id = {v["id"]: v for v in vehicles}
@@ -1097,7 +1155,8 @@ def _dump_selfcheck():
                 continue
             m = recompute_plan(g, plan, kind, time_factor=veh["time_factor"],
                                cost_factor=veh["cost_factor"], capacity=veh["capacity"],
-                               urgent_ids=urgent_ids)
+                               urgent_ids=urgent_ids, ready=ready,
+                               relay_pickups=relay_pickups)
             if m is None:
                 print("[FAIL] %s: dump 复算不可达" % plan["id"])
                 ok = False
