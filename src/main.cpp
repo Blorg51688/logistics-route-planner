@@ -400,6 +400,16 @@ int main(int argc, char** argv) {
                         minuteClock(leg.inTimeMin).c_str(), leg.outVehicleId.c_str(),
                         minuteClock(leg.outTimeMin).c_str(), leg.outTimeMin - leg.inTimeMin);
         }
+        // 腿结构与就绪链（规格三 §1 / #45）：**只加行，不改既有行格式**（oracle 跳过未知行）。
+        //   LEG <腿序> <from> <to> <orderId> <kind> <HH:MM readyTime> <vehicleId>
+        // 行序固定：订单 ID 升序，同单内 L1 -> L2 -> L3（由 buildLegs 保证，这里不再排序）。
+        // 执行车是**临时指派**（本票职责封闭未启用）；没有执行车的单打 "-"，不代表没有这条腿。
+        for (const logistics::Leg& leg : fleet.legs) {
+            std::printf("LEG %d %s %s %s %s %s %s\n", leg.seq, leg.from.c_str(), leg.to.c_str(),
+                        leg.orderId.c_str(), logistics::toString(leg.kind),
+                        minuteClock(leg.readyTimeMin).c_str(),
+                        leg.vehicleId.empty() ? "-" : leg.vehicleId.c_str());
+        }
         // 规格二 §4（#40）分配可核对：**只加行，不改既有行格式**（oracle 会跳过未知行）。
         //   ALLOC  <orderId>=<vehicleId>,…      按**订单 ID 升序**
         //   ASSIGN <vehicleId> <簇N | 跨簇 | 空车> <订单数>

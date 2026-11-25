@@ -110,6 +110,43 @@ struct TransitLeg {
     int         outTimeMin = 0;   // 取走时刻
 };
 
+// ---- 腿（Leg）与就绪链（规格三 §1 / #45）----
+//
+// 规格三把「订单 → 一台车」改写成「订单展开成带先后依赖的腿」：
+//   跨簇单 A→B（簇(A)=c1 ≠ 簇(B)=c2）⇒ 三段腿 L1: A→S(c1) / L2: S(c1)→S(c2) / L3: S(c2)→B；
+//   本地单 A→B ⇒ 一条腿 A→B。
+//
+// **本票（#45）只立结构与就绪链**：腿的执行车是临时指派、规划上**不执行** L2/L3，
+// 实际路线仍由既有分配/转运链决定（接力与等待留给 #48），因此既有路线与黄金值逐字不变。
+enum class LegKind {
+    CustomerToCustomer,   // 本地单：客户 → 客户（可途经本簇站）
+    CustomerToStation,    // 跨簇 L1：客户 → 本簇中转站
+    StationToStation,     // 跨簇 L2：本簇站 → 对簇站（#46 起只能由快车执行）
+    StationToCustomer     // 跨簇 L3：对簇站 → 客户
+};
+
+// 腿类型的文本写法：--dump-plan 的 LEG 行与日志共用，取值与设计文档的词汇表一致。
+const char* toString(LegKind kind);
+
+// 一条腿。**结构层真源**：--dump-plan 的 LEG 行、GUI 的腿登记都读它。
+struct Leg {
+    int         seq = 1;              // 腿序：本地单恒 1；跨簇单 1 → 2 → 3
+    std::string from;                 // 起点（客户或中转站）
+    std::string to;                   // 止点
+    LegKind     kind = LegKind::CustomerToCustomer;
+    std::string orderId;              // 所属订单（站间腿也带，跨簇单 3 条腿同单号）
+    // 可接时刻。链式定义：L1 = 执行车发车时刻；L2 = L1 的计划完成时刻；
+    // L3 = L2 的计划完成时刻。**由前驱腿的计划时刻反推**，不是常量、不是估计值
+    // （怎么算见 buildLegs 的注释）。单调不减因此是构造性的，不是抽查出来的。
+    int         readyTimeMin = 0;
+    // 该腿的计划完成时刻（到达 to）。本票的算法 = 「readyTime 起步 + 该车因子缩放的
+    // 该腿最短路耗时」；#48 用接力实际执行时刻替换它，字段语义不变。
+    int         plannedArrivalMin = 0;
+    std::string vehicleId;            // 执行车（本票为**临时指派**，见 chooseLegVehicle）
+    // 本票恒 true：职责封闭（#46）尚未启用，执行车只是「让腿可被观测」的占位指派。
+    bool        temporaryAssignment = true;
+};
+
 // 逐单指标（#29 §2.1 / ADR 0006）。取货准时判据：
 //   t_pick + shortestTime_vehicle(A_i -> B_i) <= we_i
 // 其中 shortestTime_vehicle 是**该车缩放后**的耗时（== 基础图 A->B 最短耗时 × time_factor）。
@@ -275,6 +312,15 @@ struct FleetPlan {
     // 转运分级播报（判据 / 轮次 / 接受或退回及原因）。GUI 直接追加到运行日志；
     // **不进 --plan-summary**（六行格式不动）。
     std::vector<std::string> transitLog;
+
+    // ---- 腿清单（规格三 §1 / #45：结构层）----
+    //
+    // 订单展开成的腿，**按订单 ID 升序、同单内按腿序 1 -> 2 -> 3**（--dump-plan 的 LEG 行同序）。
+    // 默认 25 单全簇内 => 25 条 customer->customer 单腿；只有跨簇单才出现 3 条腿。
+    std::vector<Leg> legs;
+    // 腿结构的登记日志（「结构已立、接力未启用」+ 临时指派 + 展开退化 + 缺站/无车）。
+    // **不进 --plan-summary**；GUI 追加到运行日志，--dump-plan 不打印。
+    std::vector<std::string> legLog;
 };
 
 // 类型感知三阶段分配（规格二 §4，**默认入口**）。
@@ -293,10 +339,36 @@ FleetPlan planFleet(const LogisticsGraph& graph,
                     const std::vector<Order>& orders,
                     WeightType weight);
 
+// 订单 -> 腿的展开（规格三 §1 / #45）。读 fleet 的分配表定执行车，产出按「订单 ID 升序、
+// 同单内腿序 1 -> 2 -> 3」排序的腿清单；「结构已立、接力未启用」「执行车是临时指派」
+// 「缺中转站 / 端点不在图上导致退化」如实写进 log，**不声称已转运**。
+// 规划上不执行 L2/L3：本函数只登记结构，**不改任何路线**。
+std::vector<Leg> buildLegs(const LogisticsGraph& graph,
+                           const std::vector<Vehicle>& vehicles,
+                           const std::vector<Order>& orders,
+                           const FleetPlan& fleet,
+                           std::vector<std::string>& log);
+
+// ---- 腿的执行车指派：「谁可以接哪条腿」的**唯一决定点**（#46 只换这里）----
+//
+// 本票是结构层，职责表**不设边界**（任何车都能接任何腿，恒 true）——「慢车不出网、
+// 快车只接站间腿与跨簇紧急直达」是 #46 的内容。legVehicleEligible 就是 #46 要替换
+// 的那个谓词；替换后 chooseLegVehicle 与展开逻辑一行都不用动。
+bool legVehicleEligible(const Vehicle& vehicle, const Leg& leg, const LogisticsGraph& graph);
+
+// 在合资格的车里挑执行车（本票的**临时**规则，Leg::temporaryAssignment 恒 true）：
+//   · StationToStation（站间 L2）=> capacityKg 最大者（并列取 costFactor 更高，再并列取车辆 ID 小）；
+//   · 其余腿 => 沿用该单在既有分配里的执行车（Δkey 择优的落点，等于「现有规则」）。
+// 合资格车为空、或该单没有执行车时返回空串（调用方记日志，**不伪造**执行车）。
+std::string chooseLegVehicle(const LogisticsGraph& graph, const std::vector<Vehicle>& vehicles,
+                             const Leg& leg, const std::string& orderVehicleId);
+
 // 顺序轮转基线（规格二 §4.5，**对照组不是候选方案**）：
 // 订单 ID 升序、第 i 单 -> 第 (i mod k) 台车、车辆序 = [vehicles] 行序；
 // 不跳车、不重分配、不做可行性预判；分完后各车独立跑 planRoute。
 // 分配只由「订单 ID 升序 + 车队行序」决定，与策略/容量/窗口**全部无关**（不变量 9）。
+// 腿清单的产出口径与 planFleet **相同**（buildLegs 读它自己的分配表）：
+// 对照组也要能回答「每条腿归谁、readyTime 多少」，否则两条入口的结构会漂。
 FleetPlan planFleetSequentialBaseline(const LogisticsGraph& graph,
                                       const std::vector<Vehicle>& vehicles,
                                       const std::vector<Order>& orders,

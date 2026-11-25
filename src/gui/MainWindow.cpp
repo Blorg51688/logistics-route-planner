@@ -712,6 +712,11 @@ void MainWindow::replanFleet() {
             appendLog(QStringLiteral("[分配] %1")
                           .arg(QString::fromStdString(fp.allocationLog[i])));
         }
+        // 腿结构的登记（规格三 §1 / #45）：「结构已立、接力未启用」必须在运行日志里
+        // 看得见 —— 否则用户会以为 LEG 行意味着已经转运。日志行已自带「[腿] 」前缀。
+        for (std::size_t i = 0; i < fp.legLog.size(); ++i) {
+            appendLog(QString::fromStdString(fp.legLog[i]));
+        }
         allocationSnapshot_ = allocationTextOf(fp);
         appendLog(QStringLiteral("[分配] 三阶段分配（%1 台车）：%2")
                       .arg(k)
