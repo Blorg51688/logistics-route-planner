@@ -22,8 +22,8 @@
 ```bash
 bash 启动软件.sh                  # 启动 GUI（首次会自动 CMake 配置 + 编译）
 (cd build && ctest)              # 全部自动化测试：17 个目标（以 ctest -N 为准）
-                                 # 四套断言口径：9 个二进制 3603 项 / cli_plan_summary 515 项 /
-                                 # cli_demo_transfer 6 项 / --self-check-actions 111 条 OK
+                                 # 四套断言口径（以 §3 的实测为准）：9 个二进制 3955 项 / cli_plan_summary 773 项 /
+                                 # cli_demo_transfer 22 项 / --self-check-actions 112 条 OK
 ./build/app --help               # 主程序全部命令行选项
 ```
 
