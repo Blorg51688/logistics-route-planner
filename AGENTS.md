@@ -56,8 +56,8 @@ bash 启动软件.sh                  # 启动 GUI（首次会自动 CMake 配�
     **规格二 102 常量与 9 行摘要**（139.900 / 429.000 / 172.970 等）**均已作废、只留历史**
     （见 `tests/plan_golden.h` 注释与 `docs/测试用例表.md` §6.3）。
 - `ctest` 全绿；**四套断言口径，不许混**（2026-11-25 实测，**已提交基线** `main` 提交 `a028865`）：
-  ① 9 个 C++ 测试二进制自报合计 **3952 项**（core 101 / config 688 / minheap 28 / simevent 53 /
-  dijkstra 19 / routeplanner 1517 / integration 1413 / traffic 99 / graphedit 34）；
+  ① 9 个 C++ 测试二进制自报合计 **3955 项**（core 101 / config 688 / minheap 28 / simevent 53 /
+  dijkstra 19 / routeplanner 1517 / integration 1416 / traffic 99 / graphedit 34）；
   ② `cli_plan_summary`（L2 文本守卫）**773 项**；③ `cli_demo_transfer` **22 项**；
   ④ `--self-check-actions` **112 条 OK**。
   这四者与 ctest 目标数（当前 **17**）是**不同载体**的计数，不能相加。
