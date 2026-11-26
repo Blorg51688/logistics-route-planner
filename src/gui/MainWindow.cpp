@@ -233,32 +233,55 @@ void MainWindow::buildDocks() {
     clockLabel_->setTextFormat(Qt::PlainText);
     statusBar()->addPermanentWidget(clockLabel_);
 
-    auto* routeDock = new QDockWidget(QStringLiteral("路线信息"), this);
-    routeDock->setMinimumWidth(360);
-    routeInfo_ = new QTextBrowser(routeDock);
-    routeDock->setWidget(routeInfo_);
-    addDockWidget(Qt::RightDockWidgetArea, routeDock);
-
-    auto* vehicleDock = new QDockWidget(QStringLiteral("车辆信息"), this);
-    vehicleDock->setMinimumWidth(360);
-    // 车辆信息（MC-E04）：**每车一个页签**，标题 = `<车辆 ID> · <容量>kg`；
-    // 页内再分「固定信息 / 运行状态」两块标题：
-    //   · 固定信息 —— 车辆的**固有参数**（ID / 起始仓库 / 载重上限 / 发车时刻 /
-    //     耗时倍率 / 成本倍率），整场模拟都不会变，任何时候看都一样；
-    //   · 运行状态 —— **随模拟推进而变**的量（车上载重及构成 / 剩余待送 / 已送达 /
-    //     已发生 penalty）。软件内时间不在这里重复打印（状态栏常驻显示）。
-    // 页签数由 updatePanels 首刷时按 config_.vehicles 重建。
-    vehicleTabs_ = new QTabWidget(vehicleDock);
-    vehicleDock->setWidget(vehicleTabs_);
+    // ---- 右侧 4 个 dock（#56：从 6 个收敛到 4 个）----
+    //
+    // 为什么合并（不是"为了少几个窗口"）：
+    //   · 路线信息 + 停靠明细 = 同一份计划的两个视图（摘要 / 明细）。拆成两个窗口后，
+    //     用户核对「这站为什么晚」要在两个堆叠页签之间来回切；合到一块后摘要在上、
+    //     明细在下，一眼对上。**9 列停靠表原样保留**，只是不再单独占一个 dock。
+    //   · 中转站 + 转运账本 = 同一件事的两端：站里有谁、货在哪个站、压了多久。
+    //     账本独立成窗时，"这单现在在哪"必须切页签才答得出来——这正是用户抱怨的拥挤。
+    //   · 超时订单**不再独立开窗**：它本来就是订单的一个状态。独立窗口把同一张单在
+    //     两块面板里各显示一遍，且默认数据里常常 0 行、白占一个页签。现在状态列内联
+    //     「超时 +Nmin」并把超时行排到最前——不切窗也能第一眼看到，信息反而更全。
+    //   · 车辆固定参数（两因子 / 起始仓库 / 发车时刻）不占版面，移进行 tooltip。
+    //
+    // 排布 = 2×2：左列 车辆 / 订单，右列 中转与配送网 / 路线与停靠。四块同屏可见
+    // （旧布局把 5 块 tabify 叠在一起，同一时刻只看得到其中一块）。
+    auto* vehicleDock = new QDockWidget(QStringLiteral("车辆"), this);
+    vehicleDock->setMinimumWidth(400);
+    // 车辆表（MC-E04 改版）：**一车一行**。列序 = 车辆 | 状态 | 载货(kg) | 额定(kg) |
+    // 利用率 | 在途单数 | 位置 | 下一站。
+    // 「载货 / 额定 / 利用率」并排，正是用户说的「各个车辆的载货量/总货量」；
+    // 旧布局把这三项塞进每车页签、要逐页切换才能横向比，表格化后四台车同屏可比。
+    vehicleTable_ = new QTableWidget(0, 6, vehicleDock);
+    vehicleTable_->setHorizontalHeaderLabels(
+        // 8 列太宽、右侧 dock 里「下一站」会被裁掉（#56 lead 复核）。合并成 6 列：
+        // 「载货/额定」同行并排 = 用户要的「载货量/总货量」，「位置→下一站」合成一格。
+        {QStringLiteral("车辆"), QStringLiteral("状态"), QStringLiteral("载货/额定(kg)"),
+         QStringLiteral("利用率"), QStringLiteral("在途单数"), QStringLiteral("位置→下一站")});
+    vehicleTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    vehicleTable_->horizontalHeader()->setStretchLastSection(true);
+    vehicleTable_->verticalHeader()->setVisible(false);
+    vehicleTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    // 一次选一行（选中行 = 画布上被加粗的那台车，替代旧的"选中页签"）。
+    vehicleTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    vehicleTable_->setSelectionMode(QAbstractItemView::SingleSelection);
+    vehicleDock->setWidget(vehicleTable_);
     addDockWidget(Qt::RightDockWidgetArea, vehicleDock);
 
-    auto* orderDock = new QDockWidget(QStringLiteral("订单列表"), this);
-    orderDock->setMinimumWidth(360);
-    orderTable_ = new QTableWidget(0, 5, orderDock);
+    auto* orderDock = new QDockWidget(QStringLiteral("订单"), this);
+    orderDock->setMinimumWidth(400);
+    // 订单表（#56）：**一单一行 8 列** = 订单 | 取货 | 送货 | kg | 窗口 | 状态 | 车辆 | 当前位置。
+    // 旧表的「配送点」只写送达点 B，取货点 A 无处可看；现在 A/B 分列。
+    // 新增「当前位置」是这张表的核心：车上(V02) / 站内·T01 / 已送达(D18) / 待取·D08——
+    // 用户不必再去账本面板对照"这批货现在在哪"。
+    // 7 列（原 8 列）：把「取货 / 送货」合成「取送」一格（A→B），右侧 dock 里才不会被裁。
+    orderTable_ = new QTableWidget(0, 7, orderDock);
     orderTable_->setHorizontalHeaderLabels(
-        {QStringLiteral("订单"), QStringLiteral("配送点"), QStringLiteral("货量"),
-         QStringLiteral("窗口"), QStringLiteral("状态")});
-    // 前 4 列按内容自适应、状态列拉伸，保证"状态"不会被挤到可视区之外
+        {QStringLiteral("订单"), QStringLiteral("取送"), QStringLiteral("kg"),
+         QStringLiteral("窗口"), QStringLiteral("状态"), QStringLiteral("车辆"),
+         QStringLiteral("当前位置")});
     orderTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     orderTable_->horizontalHeader()->setStretchLastSection(true);
     orderTable_->verticalHeader()->setVisible(false);
@@ -266,27 +289,36 @@ void MainWindow::buildDocks() {
     orderDock->setWidget(orderTable_);
     addDockWidget(Qt::RightDockWidgetArea, orderDock);
 
-    // 中转站 / 集散面板：承担 P3 的"子网络分组标识"与下属配送点归属；
-    // 第 4 列反映紧急降载暂存货（issue #10，无暂存为 0）。
-    auto* transitDock = new QDockWidget(QStringLiteral("中转站 / 集散"), this);
-    transitDock->setMinimumWidth(360);
-    transitTable_ = new QTableWidget(0, 4, transitDock);
+    // 中转与配送网（#56 合并「中转站 / 集散」+「转运账本」，上下两块）：
+    // 上半 5 列 = 中转站 | 子网络 | 下属配送点 | 当前暂存货(kg) | 站内待取走(kg)；
+    // 下半 7 列 = 订单 | 中转站 | kg | 卸入 | 取走 | 站内等待(min) | 状态。
+    //
+    // 为什么第 5 列非加不可：第 4 列读的是 veh.state.stashItems，只统计**降载暂存**；
+    // 转运卸入的货**故意不进那个堆**（见 onAdvanceStopFor 的注释），所以跨簇接力期间
+    // 站内明明有货、这一列永远是 0 —— 用户看到的就是"站里有货但面板说 0"。
+    // 新列直接读 transitLedger_ 里 pickedUp == false 的行求和，卸入后、取走前必然 > 0。
+    auto* transitDock = new QDockWidget(QStringLiteral("中转与配送网"), this);
+    transitDock->setMinimumWidth(400);
+    auto* transitPage = new QWidget(transitDock);
+    auto* transitLay = new QVBoxLayout(transitPage);
+    transitLay->setContentsMargins(0, 0, 0, 0);
+    transitLay->setSpacing(2);
+    auto* stationLabel = new QLabel(QStringLiteral("配送网（中转站）"), transitPage);
+    stationLabel->setContentsMargins(6, 2, 0, 0);
+    transitLay->addWidget(stationLabel);
+    transitTable_ = new QTableWidget(0, 5, transitPage);
     transitTable_->setHorizontalHeaderLabels(
         {QStringLiteral("中转站"), QStringLiteral("子网络"), QStringLiteral("下属配送点"),
-         QStringLiteral("当前暂存货(kg)")});
+         QStringLiteral("当前暂存货(kg)"), QStringLiteral("站内待取走(kg)")});
     transitTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
     transitTable_->horizontalHeader()->setStretchLastSection(true);
     transitTable_->verticalHeader()->setVisible(false);
     transitTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    transitDock->setWidget(transitTable_);
-    addDockWidget(Qt::RightDockWidgetArea, transitDock);
-
-    // 转运账本（规格二 §7.5⑥）：新增 dock，与「中转站 / 集散」tabify 叠放，7 列。
-    // 与中转站面板第 4 列的分工：第 4 列是**降载暂存堆**（同车取回、聚合 kg）；
-    // 账本是**转运**（跨车、逐笔）。只记已实际执行的卸入；期末若有「在站」行 = 缺陷。
-    auto* ledgerDock = new QDockWidget(QStringLiteral("转运账本"), this);
-    ledgerDock->setMinimumWidth(360);
-    transitLedgerTable_ = new QTableWidget(0, 7, ledgerDock);
+    transitLay->addWidget(transitTable_, 1);
+    auto* ledgerLabel = new QLabel(QStringLiteral("转运账本"), transitPage);
+    ledgerLabel->setContentsMargins(6, 2, 0, 0);
+    transitLay->addWidget(ledgerLabel);
+    transitLedgerTable_ = new QTableWidget(0, 7, transitPage);
     transitLedgerTable_->setHorizontalHeaderLabels(
         {QStringLiteral("订单"), QStringLiteral("中转站"), QStringLiteral("kg"),
          QStringLiteral("卸入"), QStringLiteral("取走"), QStringLiteral("站内等待(min)"),
@@ -296,17 +328,34 @@ void MainWindow::buildDocks() {
     transitLedgerTable_->horizontalHeader()->setStretchLastSection(true);
     transitLedgerTable_->verticalHeader()->setVisible(false);
     transitLedgerTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    ledgerDock->setWidget(transitLedgerTable_);
-    addDockWidget(Qt::RightDockWidgetArea, ledgerDock);
+    transitLay->addWidget(transitLedgerTable_, 1);
+    // 空态提示：账本无行时**明写原因**。默认数据没有跨簇单，账本必然为空；
+    // 不解释的话下一个人会把它当"面板坏了/数据丢了"再立一张票。
+    ledgerEmptyHint_ = new QLabel(
+        QStringLiteral("本次运行未发生入站转运（默认数据无跨簇单）"), transitPage);
+    ledgerEmptyHint_->setAlignment(Qt::AlignCenter);
+    ledgerEmptyHint_->setWordWrap(true);
+    ledgerEmptyHint_->setEnabled(false);   // 灰色提示，不抢表头的注意力
+    transitLay->addWidget(ledgerEmptyHint_);
+    transitDock->setWidget(transitPage);
+    addDockWidget(Qt::RightDockWidgetArea, transitDock);
 
-    // 停靠明细（MC-E01）：**9 列**、按每车铺行（规格一阶段只有 1 台车，但车辆列
-    // 不写死单值）：车辆 | 序号 | 阶段 | 配送点 | 动作（取<a>·送<b>）| 原始到达 |
-    // 等待(分) | 送达 | 余货(kg)。趟结构已退役，**无「趟」列**；「动作」列显示**计数**
-    // （取<a>·送<b>，380px 面板放不下订单 ID 列表，见 #29 §4.2）；
-    // 「余货(kg)」= `Stop::remainingLoadKg`（离开该站时的**在车货量**）。
-    auto* stopDock = new QDockWidget(QStringLiteral("停靠明细"), this);
-    stopDock->setMinimumWidth(360);
-    stopTable_ = new QTableWidget(0, 9, stopDock);
+    // 路线与停靠（#56 合并「路线信息」+「停靠明细」，上摘要下明细）：
+    // 上半 = 原路线信息全文（策略 / 汇总 / 逐车指标 / 均衡度）；
+    // 下半 = 停靠明细 **9 列**（列序、口径一律不变，只是不再单独开窗）。
+    auto* routeDock = new QDockWidget(QStringLiteral("路线与停靠"), this);
+    routeDock->setMinimumWidth(400);
+    auto* routePage = new QWidget(routeDock);
+    auto* routeLay = new QVBoxLayout(routePage);
+    routeLay->setContentsMargins(0, 0, 0, 0);
+    routeLay->setSpacing(2);
+    routeInfo_ = new QTextBrowser(routePage);
+    routeInfo_->setMinimumHeight(120);
+    routeLay->addWidget(routeInfo_, 2);
+    auto* stopLabel = new QLabel(QStringLiteral("停靠明细"), routePage);
+    stopLabel->setContentsMargins(6, 2, 0, 0);
+    routeLay->addWidget(stopLabel);
+    stopTable_ = new QTableWidget(0, 9, routePage);
     stopTable_->setHorizontalHeaderLabels(
         {QStringLiteral("车辆"), QStringLiteral("序号"), QStringLiteral("阶段"),
          QStringLiteral("配送点"), QStringLiteral("动作"), QStringLiteral("原始到达"),
@@ -316,25 +365,9 @@ void MainWindow::buildDocks() {
     stopTable_->horizontalHeader()->setStretchLastSection(true);
     stopTable_->verticalHeader()->setVisible(false);
     stopTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    stopDock->setWidget(stopTable_);
-    addDockWidget(Qt::RightDockWidgetArea, stopDock);
-
-    auto* lateDock = new QDockWidget(QStringLiteral("超时订单"), this);
-    lateDock->setMinimumWidth(360);
-    // 超时订单（MC-E02）：**逐单一行**、8 列：车辆 | 订单 | 配送点 | 档位 | 状态 |
-    // 到达 | 窗口 | penalty(min)。窗口用**该单自己的** [ws, we]（不再取同停靠
-    // 多单的并集——那正是合并窗口口径的残留）。
-    lateTable_ = new QTableWidget(0, 8, lateDock);
-    lateTable_->setHorizontalHeaderLabels(
-        {QStringLiteral("车辆"), QStringLiteral("订单"), QStringLiteral("配送点"),
-         QStringLiteral("档位"), QStringLiteral("状态"), QStringLiteral("到达"),
-         QStringLiteral("窗口"), QStringLiteral("penalty(min)")});
-    lateTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
-    lateTable_->horizontalHeader()->setStretchLastSection(true);
-    lateTable_->verticalHeader()->setVisible(false);
-    lateTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    lateDock->setWidget(lateTable_);
-    addDockWidget(Qt::RightDockWidgetArea, lateDock);
+    routeLay->addWidget(stopTable_, 3);
+    routeDock->setWidget(routePage);
+    addDockWidget(Qt::RightDockWidgetArea, routeDock);
 
     auto* logDock = new QDockWidget(QStringLiteral("日志"), this);
     logView_ = new QPlainTextEdit(logDock);
@@ -342,23 +375,21 @@ void MainWindow::buildDocks() {
     logDock->setWidget(logView_);
     addDockWidget(Qt::BottomDockWidgetArea, logDock);
 
-    // 订单列表与超时订单叠成标签页：笔记本屏幕高度有限，
-    // 四个面板纵向平铺会把每个都压到不可用
-    tabifyDockWidget(orderDock, lateDock);
-    tabifyDockWidget(lateDock, transitDock);
-    // 转运账本与「中转站 / 集散」叠放（§7.5⑥：不新增右侧栏纵向高度）。
-    tabifyDockWidget(transitDock, ledgerDock);
-    tabifyDockWidget(ledgerDock, stopDock);
-    orderDock->raise();
+    // 2×2 网格（Qt 的 splitDockWidget 按"被分割的那块区域"切半）：
+    //   addDockWidget 先把车辆铺满右栏 → 用 transitDock 横切成左右两列 →
+    //   再分别在左列（车辆/订单）与右列（中转与配送网/路线与停靠）纵切上下两格。
+    splitDockWidget(vehicleDock, transitDock, Qt::Horizontal);
+    splitDockWidget(vehicleDock, orderDock, Qt::Vertical);
+    splitDockWidget(transitDock, routeDock, Qt::Vertical);
 
-    resizeDocks({routeDock, vehicleDock}, {240, 110}, Qt::Vertical);
-    resizeDocks({orderDock}, {240}, Qt::Vertical);
+    // 高度：车辆表 4 台车一屏看完（约 180px），剩下的给订单表；
+    // 右列账本 + 停靠明细都要能看见表头与若干行。
+    resizeDocks({vehicleDock, orderDock}, {180, 520}, Qt::Vertical);
+    resizeDocks({transitDock, routeDock}, {330, 370}, Qt::Vertical);
+    // 右栏整体留出足够宽度，避免 8/9 列表被折成两行字。
+    resizeDocks({vehicleDock, transitDock}, {380, 380}, Qt::Horizontal);
     resizeDocks({logDock}, {140}, Qt::Vertical);
-
-    // 右侧栏整体留出足够宽度，避免"总距离：220.1 / km"这种被折断的显示
-    resizeDocks({routeDock, vehicleDock, orderDock}, {380, 380, 380}, Qt::Horizontal);
 }
-
 std::string MainWindow::currentPositionId() const {
     return active().state.atNodeId;
 }
@@ -474,10 +505,13 @@ int MainWindow::vehicleServedOrderCount(std::size_t v) const {
 }
 
 int MainWindow::selectedVehicleIndex() const {
-    if (vehicleTabs_ == nullptr) {
+    // #56：选中页签 -> 选中行。表格允许"无选中"（-1），此时按行序 0 处理，
+    // 与旧实现的 currentIndex()<0 回退 0 保持同一语义。
+    if (vehicleTable_ == nullptr) {
         return 0;
     }
-    return vehicleTabs_->currentIndex() >= 0 ? vehicleTabs_->currentIndex() : 0;
+    const int row = vehicleTable_->currentRow();
+    return row >= 0 ? row : 0;
 }
 
 // 画布与 G15 快照共用的**唯一**路线数据源（规格三 GUI §7「只画到自己的目标」）。
@@ -2598,51 +2632,73 @@ void MainWindow::updatePanels() {
     }
     routeInfo_->setPlainText(route);
 
-    // ---- 车辆信息页签（§7.5②）：每车一页，页内两块 ----
-    // 固定信息 6 行（ID / 起始仓库 / 载重上限 / 发车时刻 / 耗时倍率 / 成本倍率）；
-    // 运行状态**六项**：当前位置 / 下一站 / 阶段 / 车上载重（物理事实，不反推）/
-    // 已送达 X 单 · 剩余待送 Y kg / 已发生 penalty。
-    // 软件内时间**不进页签**（全局量，状态栏常驻显示）。
-    if (vehicleTabs_ != nullptr) {
-        // 页签按车辆重建：标题 = `<车辆 ID> · <容量>kg`；数量以 vehicles.size() 为准。
-        while (vehicleTabs_->count() > static_cast<int>(config_.vehicles.size())) {
-            QWidget* w = vehicleTabs_->widget(vehicleTabs_->count() - 1);
-            vehicleTabs_->removeTab(vehicleTabs_->count() - 1);
-            delete w;
-        }
+    // ---- 车辆表（#56 重设计）：一车一行，取代「每车一个页签」 ----
+    // 列：车辆 | 状态 | 载货(kg) | 额定(kg) | 利用率 | 在途单数 | 位置 | 下一站。
+    // 每行 tooltip 里保留固定参数（ID / 起始仓库 / 载重上限 / 发车时刻 / 两因子）
+    // 与面板不再单列的运行细节（阶段 / 已送达 / 剩余待送 / 已发生 penalty）——
+    // 信息没丢，只是从占版面的标签块搬到了悬停提示里。
+    bool vehicleSelectionChanged = false;
+    if (vehicleTable_ != nullptr) {
+        vehicleTable_->setRowCount(static_cast<int>(config_.vehicles.size()));
         for (std::size_t vi = 0; vi < config_.vehicles.size(); ++vi) {
             const logistics::Vehicle& vehicle = config_.vehicles[vi];
-            const QString tabTitle = QStringLiteral("%1 · %2kg")
-                                         .arg(QString::fromStdString(vehicle.id))
-                                         .arg(vehicle.capacityKg, 0, 'f', 0);
-            if (vi >= static_cast<std::size_t>(vehicleTabs_->count())) {
-                QWidget* page = new QWidget(vehicleTabs_);
-                QVBoxLayout* lay = new QVBoxLayout(page);
-                lay->setContentsMargins(0, 0, 0, 0);
-                lay->setSpacing(0);
-                QLabel* fixed = new QLabel(page);
-                QLabel* run = new QLabel(page);
-                for (QLabel* l : {fixed, run}) {
-                    l->setTextFormat(Qt::PlainText);
-                    l->setMargin(6);
-                    l->setAlignment(Qt::AlignTop | Qt::AlignLeft);
-                }
-                lay->addWidget(fixed);
-                lay->addWidget(run);
-                page->setProperty("vehicleFixedLabel", QVariant::fromValue<QLabel*>(fixed));
-                page->setProperty("vehicleRunLabel", QVariant::fromValue<QLabel*>(run));
-                vehicleTabs_->addTab(page, tabTitle);
+            const VehicleRuntime& rt = veh(vi);
+            // 状态 = 空闲 / 配送中 / 已收工。
+            // 为什么不再沿用页签里的「紧急 / 普通」：那两项是**计划阶段**，而这张表
+            // 回答的是"这台车现在忙不忙"；阶段仍留在 tooltip 里，审计时照样看得到。
+            QString statusText;
+            if (rt.plan.status != logistics::PlanStatus::Ok
+                || rt.stopCursor >= rt.plan.stops.size()) {
+                statusText = QStringLiteral("已收工");
+            } else if (!rt.state.onboard.empty() || !rt.state.pickedOrderIds.empty()) {
+                statusText = QStringLiteral("配送中");
             } else {
-                vehicleTabs_->setTabText(static_cast<int>(vi), tabTitle);
+                statusText = QStringLiteral("空闲");
+            }
+            const double cap = vehicle.capacityKg;
+            const double load = rt.state.loadKg;   // 物理事实，不从计划反推
+            const QString utilText =
+                cap > 0.0 ? QStringLiteral("%1%").arg(100.0 * load / cap, 0, 'f', 1)
+                          : QStringLiteral("—");
+            const std::string nextNode = nextStopNodeId(vi);
+            const QString here = QString::fromStdString(rt.state.atNodeId);
+            const QStringList cells = {
+                QString::fromStdString(vehicle.id),
+                statusText,
+                // 载货 / 额定 一格并排：一眼能看出「装了多少 / 能装多少」。
+                QStringLiteral("%1/%2").arg(load, 0, 'f', 1).arg(cap, 0, 'f', 0),
+                utilText,
+                QString::number(rt.state.onboard.size()),
+                nextNode.empty() ? here
+                                 : here + QStringLiteral("→")
+                                       + QString::fromStdString(nextNode)};
+            const QString tooltip =
+                QStringLiteral("固定信息\nID：%1\n起始仓库：%2\n载重上限：%3 kg\n发车时刻：%4\n"
+                               "耗时倍率：%5\n成本倍率：%6\n运行状态\n阶段：%7\n"
+                               "已送达 %8 单 · 剩余待送 %9 kg\n已发生 penalty：%10 min")
+                    .arg(QString::fromStdString(vehicle.id))
+                    .arg(QString::fromStdString(vehicle.startNodeId))
+                    .arg(vehicle.capacityKg, 0, 'f', 0)
+                    .arg(minutesToClock(vehicle.departTimeMin))
+                    .arg(vehicle.timeFactor, 0, 'f', 2)
+                    .arg(vehicle.costFactor, 0, 'f', 2)
+                    .arg(vehiclePhaseText(vi))
+                    .arg(vehicleServedOrderCount(vi))
+                    .arg(vehicleRemainingDemandKg(vi), 0, 'f', 0)
+                    .arg(rt.state.incurredPenaltyMin);
+            for (int col = 0; col < cells.size(); ++col) {
+                QTableWidgetItem* item = new QTableWidgetItem(cells[col]);
+                item->setToolTip(tooltip);
+                item->setFlags(item->flags() & ~Qt::ItemIsEditable);
+                vehicleTable_->setItem(static_cast<int>(vi), col, item);
             }
         }
-        // 默认落点：选中的页签应当**有路线可看**。
+        // 默认落点：选中行应当**有路线可看**（与旧页签同一策略）。
         // 职责封闭（#46）之后行序 0 的快车在默认数据上恒为空车 —— 若把选中停在它身上，
         // 画布上既没有加粗边、也没有可核对的信息（--ui-probe 的「选中车加粗」会落空）。
-        // 因此只在「当前选中的是空车、而别的车有活」这一种情形下改选第一台有路线的车；
-        // 用户自己切到哪一页就留在哪一页（有路线时一律不覆盖）。
-        if (vehicleTabs_ != nullptr && !config_.vehicles.empty()) {
-            const int cur = vehicleTabs_->currentIndex();
+        // 因此只在「当前选中行没有路线、而别的车有活」时改选第一台有路线的车。
+        if (!config_.vehicles.empty()) {
+            const int cur = vehicleTable_->currentRow();
             bool curHasRoute = false;
             if (cur >= 0 && static_cast<std::size_t>(cur) < fleet_.size()) {
                 curHasRoute = fleet_[static_cast<std::size_t>(cur)].plan.status
@@ -2653,71 +2709,131 @@ void MainWindow::updatePanels() {
                 for (std::size_t vi = 0; vi < fleet_.size(); ++vi) {
                     if (fleet_[vi].plan.status == logistics::PlanStatus::Ok
                         && !fleet_[vi].plan.stops.empty()) {
-                        vehicleTabs_->setCurrentIndex(static_cast<int>(vi));
+                        vehicleTable_->setCurrentCell(static_cast<int>(vi), 0);
+                        vehicleSelectionChanged = true;
                         break;
                     }
                 }
             }
         }
-        // **逐车**填两块（不按当前页签填：切页状态会影响断言结果）。
-        for (std::size_t vi = 0; vi < config_.vehicles.size(); ++vi) {
-            QWidget* page = vehicleTabs_->widget(static_cast<int>(vi));
-            if (page == nullptr) {
-                continue;
-            }
-            QLabel* fixed = page->property("vehicleFixedLabel").value<QLabel*>();
-            QLabel* run = page->property("vehicleRunLabel").value<QLabel*>();
-            if (fixed == nullptr || run == nullptr) {
-                continue;
-            }
-            const logistics::Vehicle& vehicle = config_.vehicles[vi];
-            const VehicleRuntime& rt = veh(vi);
-
-            // ---- 固定信息：整场模拟都不变的车辆固有参数（6 行）----
-            fixed->setText(
-                QStringLiteral("固定信息\n"
-                               "ID：%1\n起始仓库：%2\n载重上限：%3 kg\n发车时刻：%4\n"
-                               "耗时倍率：%5\n成本倍率：%6\n"
-                               "（以上为配置给定的固有参数，模拟过程中不会变化）")
-                    .arg(QString::fromStdString(vehicle.id))
-                    .arg(QString::fromStdString(vehicle.startNodeId))
-                    .arg(vehicle.capacityKg, 0, 'f', 0)
-                    .arg(minutesToClock(vehicle.departTimeMin))
-                    .arg(vehicle.timeFactor, 0, 'f', 2)
-                    .arg(vehicle.costFactor, 0, 'f', 2));
-
-            // ---- 运行状态六项 ----
-            const std::string nextNode = nextStopNodeId(vi);
-            run->setText(
-                QStringLiteral("运行状态\n"
-                               "当前位置：%1\n"
-                               "下一站：%2\n"
-                               "阶段：%3\n"
-                               "车上载重：%4 kg\n"
-                               "已送达 %5 单 · 剩余待送 %6 kg\n"
-                               "已发生 penalty：%7 min")
-                    .arg(QString::fromStdString(rt.state.atNodeId))
-                    .arg(nextNode.empty() ? QStringLiteral("—")
-                                          : QString::fromStdString(nextNode))
-                    .arg(vehiclePhaseText(vi))
-                    .arg(rt.state.loadKg, 0, 'f', 0)
-                    .arg(vehicleServedOrderCount(vi))
-                    .arg(vehicleRemainingDemandKg(vi), 0, 'f', 0)
-                    .arg(rt.state.incurredPenaltyMin));
-        }
     }
 
-    // 订单列表：按"未送达的紧急 → 未送达普通 → 已送达"排序。
-    // 新插入的紧急订单会立刻出现在**第一行**，不必滚动到表格末尾去找
-    // （早先直接按 config_.orders 的插入顺序显示，紧急单被追加在最底下，
-    //  用户看不见，会以为"根本没有添加这条紧急订单"）。
+    // ---- 订单「当前位置」与「车辆」两列共用的事实源：货现在在谁手里 ----
+    // 「站内」有两种物理来源，必须都算：
+    //   ① 转运账本里已卸入、未取走（跨车接力，货在站上等下一台车）；
+    //   ② 本车降载暂存 stashItems（同车卸、同车取回）。
+    // 两者都只读**已执行**的状态，不做任何计划期推断。
+    const auto onboardVehicleOf = [this](const std::string& orderId) -> QString {
+        for (std::size_t v = 0; v < fleet_.size(); ++v) {
+            for (const logistics::OnboardItem& it : fleet_[v].state.onboard) {
+                if (it.orderId == orderId) {
+                    return QString::fromStdString(config_.vehicles[v].id);
+                }
+            }
+        }
+        return QString();
+    };
+    const auto stationOfOrder = [this](const std::string& orderId) -> QString {
+        for (const TransitLedgerEntry& e : transitLedger_) {
+            if (e.orderId == orderId && !e.pickedUp) {
+                return QString::fromStdString(e.stationId);
+            }
+        }
+        for (const VehicleRuntime& rt : fleet_) {
+            if (rt.state.stashStation.empty()) {
+                continue;
+            }
+            for (const logistics::OnboardItem& it : rt.state.stashItems) {
+                if (it.orderId == orderId) {
+                    return QString::fromStdString(rt.state.stashStation);
+                }
+            }
+        }
+        return QString();
+    };
+    // 订单「车辆」列：已送达 -> 真正送它的那台车；在车 -> 车上那台；在站 -> 账本里的
+    // 取走车（计划中的接力车）；否则看计划里谁排到了它（多台 = 接力，不谎报单台）。
+    const auto vehicleTextOfOrder = [this](const Order& o, const QString& onboardVeh,
+                                            const QString& station) -> QString {
+        if (o.served) {
+            for (std::size_t v = 0; v < fleet_.size(); ++v) {
+                if (fleet_[v].state.deliveredOrderIds.count(o.id) > 0) {
+                    return QString::fromStdString(config_.vehicles[v].id);
+                }
+            }
+            return QStringLiteral("—");
+        }
+        if (!onboardVeh.isEmpty()) {
+            return onboardVeh;
+        }
+        if (!station.isEmpty()) {
+            for (const TransitLedgerEntry& e : transitLedger_) {
+                if (e.orderId == o.id && !e.pickedUp && !e.outVehicleId.empty()) {
+                    return QString::fromStdString(e.outVehicleId);
+                }
+            }
+            return QStringLiteral("—");
+        }
+        QStringList owners;
+        for (std::size_t v = 0; v < fleet_.size(); ++v) {
+            bool hit = false;
+            for (const Stop& s : fleet_[v].plan.stops) {
+                for (const std::string& pid : s.pickups) {
+                    if (pid == o.id) {
+                        hit = true;
+                    }
+                }
+                for (const logistics::StopDelivery& d : s.deliveries) {
+                    if (d.orderId == o.id) {
+                        hit = true;
+                    }
+                }
+            }
+            if (hit) {
+                owners << QString::fromStdString(config_.vehicles[v].id);
+            }
+        }
+        if (owners.size() == 1) {
+            return owners.front();
+        }
+        if (owners.size() > 1) {
+            return QStringLiteral("接力");
+        }
+        return QStringLiteral("—");
+    };
+
+    // ---- 订单表（#56）：**一单一行 8 列**，超时行排最前 ----
+    // 每张单的超时分钟数 = 已发生（deliveredLate，物理事实）+ 剩余计划预计（逐单 late），
+    // 按订单累加。这取代了原来的「超时订单」独立窗口：同一张单只在一处出现，
+    // 状态列内联「超时 +Nmin」并把这些行排到表头 —— 不切窗也第一眼可见。
+    std::map<std::string, int> latePenaltyMin;
+    for (const VehicleRuntime& rt : fleet_) {
+        for (const VehicleState::LateStop& ls : rt.state.deliveredLate) {
+            latePenaltyMin[ls.orderId] += ls.penaltyMin;
+        }
+        if (rt.plan.status != logistics::PlanStatus::Ok) {
+            continue;
+        }
+        for (std::size_t k = rt.stopCursor; k < rt.plan.stops.size(); ++k) {
+            for (const logistics::StopDelivery& d : rt.plan.stops[k].deliveries) {
+                if (d.late) {
+                    latePenaltyMin[d.orderId] += d.penaltyMin;
+                }
+            }
+        }
+    }
+    // 排序：超时 → 未送达紧急 → 未送达普通 → 已送达。
+    // 超时排最前是票面要求：用户第一眼要知道"哪张单出问题了"。
+    // 新插入的紧急订单也仍会立刻出现在前面（不必滚动到表尾去找）。
     std::vector<std::size_t> order;
-    for (std::size_t pass = 0; pass < 3; ++pass) {
+    for (std::size_t pass = 0; pass < 4; ++pass) {
         for (std::size_t i = 0; i < config_.orders.size(); ++i) {
             const Order& o = config_.orders[i];
-            const bool wanted = (pass == 0) ? (!o.served && o.urgent)
-                                : (pass == 1) ? (!o.served && !o.urgent)
-                                              : o.served;
+            const bool late = latePenaltyMin.find(o.id) != latePenaltyMin.end();
+            const bool wanted = (pass == 0) ? late
+                                : (pass == 1) ? (!late && !o.served && o.urgent)
+                                : (pass == 2) ? (!late && !o.served && !o.urgent)
+                                              : (!late && o.served);
             if (wanted) {
                 order.push_back(i);
             }
@@ -2736,22 +2852,54 @@ void MainWindow::updatePanels() {
     orderTable_->setRowCount(static_cast<int>(order.size()));
     for (int row = 0; row < static_cast<int>(order.size()); ++row) {
         const Order& o = config_.orders[order[static_cast<std::size_t>(row)]];
+        const QString onboardVeh = onboardVehicleOf(o.id);
+        const QString station = stationOfOrder(o.id);
+        QString status;
+        if (!o.served && !station.isEmpty()) {
+            // 站内待取走：货已卸进站、还没被下一台车取走（跨簇接力的中间态）。
+            // 与「站内待取走(kg)」列是同一事实的两个视角（单 / 公斤）。
+            status = QStringLiteral("站内待取走");
+        } else if (o.served) {
+            status = QStringLiteral("已送达");
+        } else if (o.urgent) {
+            status = pickedAnywhere(o.id) ? QStringLiteral("执行中") : QStringLiteral("紧急");
+        } else {
+            status = pickedAnywhere(o.id) ? QStringLiteral("配送中") : QStringLiteral("待配送");
+        }
+        const std::map<std::string, int>::const_iterator lateIt = latePenaltyMin.find(o.id);
+        if (lateIt != latePenaltyMin.end()) {
+            status += QStringLiteral(" · 超时 +%1min").arg(lateIt->second);
+        }
+        QString location;
+        if (o.served) {
+            location = QStringLiteral("已送达(%1)").arg(QString::fromStdString(o.nodeId));
+        } else if (!onboardVeh.isEmpty()) {
+            location = QStringLiteral("车上(%1)").arg(onboardVeh);
+        } else if (!station.isEmpty()) {
+            location = QStringLiteral("站内·%1").arg(station);
+        } else {
+            location = QStringLiteral("待取·%1")
+                           .arg(QString::fromStdString(o.pickupNodeId.empty() ? o.nodeId
+                                                                              : o.pickupNodeId));
+        }
         orderTable_->setItem(row, 0, new QTableWidgetItem(QString::fromStdString(o.id)));
-        orderTable_->setItem(row, 1, new QTableWidgetItem(QString::fromStdString(o.nodeId)));
+        // 取送合成一格：`A→B`；取货点缺失时只显示送货点（数据里没有这种单，但不伪造）。
+        const QString pickText = o.pickupNodeId.empty()
+                                     ? QStringLiteral("—")
+                                     : QString::fromStdString(o.pickupNodeId);
+        orderTable_->setItem(row, 1,
+                             new QTableWidgetItem(pickText + QStringLiteral("→")
+                                                  + QString::fromStdString(o.nodeId)));
         orderTable_->setItem(row, 2, new QTableWidgetItem(QString::number(o.demandKg, 'f', 0)));
         orderTable_->setItem(row, 3,
                              new QTableWidgetItem(minutesToClock(o.windowStartMin)
                                                   + QStringLiteral("-")
                                                   + minutesToClock(o.windowEndMin)));
-        orderTable_->setItem(row, 4,
-                             new QTableWidgetItem(
-                                 o.served ? QStringLiteral("已送达")
-                                          : (o.urgent ? (pickedAnywhere(o.id)
-                                                             ? QStringLiteral("执行中")
-                                                             : QStringLiteral("紧急"))
-                                                      : QStringLiteral("待配送"))));
+        orderTable_->setItem(row, 4, new QTableWidgetItem(status));
+        orderTable_->setItem(row, 5,
+                             new QTableWidgetItem(vehicleTextOfOrder(o, onboardVeh, station)));
+        orderTable_->setItem(row, 6, new QTableWidgetItem(location));
     }
-
     // ---- 停靠明细（§7.5③）：9 列，**逐车铺行**，行序 = 车辆行序 → 序号 ----
     // 动作列显示**计数**（取<a>·送<b>）；余货(kg) = `Stop::remainingLoadKg`。
     // 只列**尚未走过**的停靠点：推进一站与重规划效果一致（已送达的行从表里消失）。
@@ -2796,7 +2944,11 @@ void MainWindow::updatePanels() {
         stopTable_->setRowCount(row);
     }
 
-    // 中转站 / 集散：子网络标识 + 下属配送点数 + 当前暂存货（kg）
+    // ---- 中转站表（#56 起 5 列）：子网络 + 下属配送点 + 当前暂存货 + **站内待取走** ----
+    // 第 4 列（当前暂存货）= 降载暂存堆 stashItems，只统计"同车卸、同车取回"的寄存；
+    // 第 5 列（站内待取走）= 转运账本里 pickedUp == false 的行的 kg 之和，即"跨车接力
+    // 卸进站、还没被下一台车取走"的货。两列必须分开：转运卸入**故意**不进 stashItems
+    // （见 onAdvanceStopFor 的注释），合并成一列会让跨簇接力期间站内的货凭空消失。
     {
         struct TransitRow {
             QString     name;
@@ -2833,6 +2985,14 @@ void MainWindow::updatePanels() {
                     }
                 }
             }
+            // 站内待取走：只认**已实际执行**的卸入（账本），且尚未被取走。
+            // 已送达的行在送达时同时被标成 pickedUp（贷随车走），不会重复计入。
+            double pendingKg = 0.0;
+            for (const TransitLedgerEntry& e : transitLedger_) {
+                if (e.stationId == rows[i].id && !e.pickedUp) {
+                    pendingKg += e.kg;
+                }
+            }
             transitTable_->setItem(i, 0, new QTableWidgetItem(rows[i].name));
             transitTable_->setItem(i, 1,
                                    new QTableWidgetItem(QString::number(rows[i].sub)));
@@ -2840,10 +3000,12 @@ void MainWindow::updatePanels() {
                                    new QTableWidgetItem(QString::number(rows[i].serves)));
             transitTable_->setItem(i, 3,
                                    new QTableWidgetItem(QString::number(stashKg, 'f', 0)));
+            transitTable_->setItem(i, 4,
+                                   new QTableWidgetItem(QString::number(pendingKg, 'f', 0)));
         }
     }
 
-    // ---- 转运账本（§7.5⑥）：7 列，**逐笔**一行（只含已实际执行的卸入）----
+    // ---- 转运账本（§7.5⑥；#56 起与中转站表同属「中转与配送网」dock）：7 列，逐笔一行 ----
     // 列序：订单 | 中转站 | kg | 卸入(<车> <HH:MM>) | 取走(同形；未取走 —) |
     //       站内等待(min)(未取走 —) | 状态(在站 / 已送达)
     {
@@ -2878,64 +3040,20 @@ void MainWindow::updatePanels() {
                 new QTableWidgetItem(e.delivered ? QStringLiteral("已送达")
                                                  : QStringLiteral("在站")));
         }
+        // 空态提示与账本行数严格互斥：无行才有提示。
+        if (ledgerEmptyHint_ != nullptr) {
+            ledgerEmptyHint_->setVisible(transitLedger_.empty());
+        }
     }
 
-    // ---- 超时订单（§7.5④）：8 列，**逐车铺行**、逐单一行 ----
-    // 区分**已经发生**的超时（事实，跨重规划保留）与**剩余计划预计**的超时。
-    {
-        std::map<std::string, const Order*> orderById;
-        for (const Order& o : config_.orders) {
-            orderById[o.id] = &o;
-        }
-        int lateRows = 0;
-        const auto putLate = [&](const QString& vehicleId, const std::string& orderId,
-                                 const std::string& nodeId, const QString& status,
-                                 int arrivalMin, int penaltyMin) {
-            QString windowText = QStringLiteral("-");
-            QString tier = QStringLiteral("普通");
-            const std::map<std::string, const Order*>::const_iterator it =
-                orderById.find(orderId);
-            if (it != orderById.end()) {
-                windowText = minutesToClock(it->second->windowStartMin)
-                             + QStringLiteral("-")
-                             + minutesToClock(it->second->windowEndMin);
-                tier = it->second->urgent ? QStringLiteral("紧急") : QStringLiteral("普通");
-            }
-            lateTable_->setRowCount(lateRows + 1);
-            lateTable_->setItem(lateRows, 0, new QTableWidgetItem(vehicleId));
-            lateTable_->setItem(lateRows, 1,
-                                new QTableWidgetItem(QString::fromStdString(orderId)));
-            lateTable_->setItem(lateRows, 2,
-                                new QTableWidgetItem(QString::fromStdString(nodeId)));
-            lateTable_->setItem(lateRows, 3, new QTableWidgetItem(tier));
-            lateTable_->setItem(lateRows, 4, new QTableWidgetItem(status));
-            lateTable_->setItem(lateRows, 5, new QTableWidgetItem(minutesToClock(arrivalMin)));
-            lateTable_->setItem(lateRows, 6, new QTableWidgetItem(windowText));
-            lateTable_->setItem(lateRows, 7, new QTableWidgetItem(QString::number(penaltyMin)));
-            ++lateRows;
-        };
-        for (std::size_t vi = 0; vi < fleet_.size() && vi < config_.vehicles.size(); ++vi) {
-            const VehicleRuntime& rt = fleet_[vi];
-            const QString vehicleId = QString::fromStdString(config_.vehicles[vi].id);
-            for (const VehicleState::LateStop& ls : rt.state.deliveredLate) {
-                putLate(vehicleId, ls.orderId, ls.nodeId, QStringLiteral("已超时"),
-                        ls.arrivalMin, ls.penaltyMin);
-            }
-            if (rt.plan.status == logistics::PlanStatus::Ok) {
-                // 逐单列（penalty 逐单：一个停靠上可能一单一迟一早）。
-                for (std::size_t k = rt.stopCursor; k < rt.plan.stops.size(); ++k) {
-                    const Stop& s = rt.plan.stops[k];
-                    for (const logistics::StopDelivery& d : s.deliveries) {
-                        if (!d.late) {
-                            continue;
-                        }
-                        putLate(vehicleId, d.orderId, s.nodeId, QStringLiteral("预计超时"),
-                                s.arrivalMin, d.penaltyMin);
-                    }
-                }
-            }
-        }
-        lateTable_->setRowCount(lateRows);
+    // 超时订单独立窗口已退役（#56）：它在订单表里变成「状态」列的「超时 +Nmin」后缀
+    // 并排到表头，同一张单不再在两块面板里各显示一遍。这里不再需要第三次填表。
+
+    // 选中行 → 画布加粗：updatePanels 在 syncScene 之后调用，改选后必须再同步一次画布，
+    // 否则首刷的加粗落在旧选中车上（用户看到的那台车"没被选中"）。
+    if (vehicleSelectionChanged && scene_ != nullptr) {
+        scene_->setFleetRoutes(canvasTargetRoutes(), selectedVehicleIndex(),
+                               logistics::fastVehicleFlags(config_.vehicles));
     }
 }
 
@@ -3149,17 +3267,23 @@ QString MainWindow::transitPanelSummary() const {
 // 「面板 1 行 vs 计数 0」立刻分叉。这是**计数口径的缺陷**，不是数据问题：
 // 修的是「数谁」，不是放宽判据。
 int MainWindow::lateOrderCount() const {
-    int late = 0;
+    // #56：超时订单并入订单表后，口径必须**按订单去重**。旧实现按车累加，
+    // 一张跨簇单在接力中会同时出现在两台车的 metrics.orders 里（各一段腿），
+    // 按车计数会把它算成两行，而订单表里只有一行。
+    // 仍然读规划器逐单真源（metrics.orders）+ deliveredLate 物理事实，不重算面板公式。
+    std::set<std::string> ids;
     for (std::size_t v = 0; v < fleet_.size(); ++v) {
         const VehicleRuntime& rt = fleet_[v];
         for (const logistics::OrderMetric& om : rt.plan.metrics.orders) {
             if (om.late) {
-                ++late;
+                ids.insert(om.orderId);
             }
         }
-        late += static_cast<int>(rt.state.deliveredLate.size());
+        for (const VehicleState::LateStop& ls : rt.state.deliveredLate) {
+            ids.insert(ls.orderId);
+        }
     }
-    return late;
+    return static_cast<int>(ids.size());
 }
 
 QStringList MainWindow::transitPanelHeaders() const {
@@ -3171,6 +3295,26 @@ QStringList MainWindow::transitPanelHeaders() const {
         }
     }
     return names;
+}
+
+double MainWindow::stationPendingKg(const std::string& stationId) const {
+    // 读**界面上这一格**（第 5 列 = 站内待取走(kg)），不重算求和：
+    // 新增列的守卫要能发现"列填错了数据源"，重算一遍公式就会把错误一起重算成"正确"。
+    if (transitTable_ == nullptr) {
+        return 0.0;
+    }
+    const QString prefix = QString::fromStdString(stationId) + QStringLiteral("（");
+    for (int row = 0; row < transitTable_->rowCount(); ++row) {
+        const QTableWidgetItem* nameItem = transitTable_->item(row, 0);
+        if (nameItem == nullptr || !nameItem->text().startsWith(prefix)) {
+            continue;
+        }
+        const QTableWidgetItem* cell = transitTable_->item(row, 4);
+        bool ok = false;
+        const double kg = cell != nullptr ? cell->text().trimmed().toDouble(&ok) : 0.0;
+        return ok ? kg : 0.0;
+    }
+    return 0.0;
 }
 
 QStringList MainWindow::transitLedgerHeaders() const {
@@ -3204,66 +3348,86 @@ int MainWindow::transitLedgerRowCount() const {
     return transitLedgerTable_ != nullptr ? transitLedgerTable_->rowCount() : 0;
 }
 
-int MainWindow::vehicleTabCount() const {
-    return vehicleTabs_ != nullptr ? vehicleTabs_->count() : 0;
+bool MainWindow::transitLedgerEmptyHintVisible() const {
+    return ledgerEmptyHint_ != nullptr && ledgerEmptyHint_->isVisible();
 }
 
-QString MainWindow::vehicleTabTitles() const {
+QString MainWindow::transitLedgerEmptyHintText() const {
+    return ledgerEmptyHint_ != nullptr ? ledgerEmptyHint_->text() : QString();
+}
+
+int MainWindow::vehicleRowCount() const {
+    return vehicleTable_ != nullptr ? vehicleTable_->rowCount() : 0;
+}
+
+QStringList MainWindow::vehiclePanelHeaders() const {
     QStringList names;
-    if (vehicleTabs_ != nullptr) {
-        for (int i = 0; i < vehicleTabs_->count(); ++i) {
-            names << vehicleTabs_->tabText(i);
+    if (vehicleTable_ != nullptr) {
+        for (int col = 0; col < vehicleTable_->columnCount(); ++col) {
+            const QTableWidgetItem* item = vehicleTable_->horizontalHeaderItem(col);
+            names << (item != nullptr ? item->text() : QString());
         }
     }
-    return names.join(QStringLiteral(" | "));
+    return names;
 }
 
-QString MainWindow::vehiclePanelSection(int index) const {
-    if (vehicleTabs_ == nullptr || index < 0 || index >= vehicleTabs_->count()) {
+QString MainWindow::vehicleRowText(int row) const {
+    if (vehicleTable_ == nullptr || row < 0 || row >= vehicleTable_->rowCount()) {
         return QString();
     }
-    const QWidget* page = vehicleTabs_->widget(index);
-    if (page == nullptr) {
+    QStringList cells;
+    for (int col = 0; col < vehicleTable_->columnCount(); ++col) {
+        const QTableWidgetItem* item = vehicleTable_->item(row, col);
+        cells << (item != nullptr ? item->text() : QString());
+    }
+    return cells.join(QStringLiteral(" | "));
+}
+
+QString MainWindow::vehicleRowTooltip(int row) const {
+    if (vehicleTable_ == nullptr || row < 0 || row >= vehicleTable_->rowCount()) {
         return QString();
     }
-    const QLabel* fixed = page->property("vehicleFixedLabel").value<QLabel*>();
-    const QLabel* run = page->property("vehicleRunLabel").value<QLabel*>();
-    QString out = QStringLiteral("[") + vehicleTabs_->tabText(index) + QStringLiteral("]\n");
-    if (fixed != nullptr) {
-        out += fixed->text();
-        out += QLatin1Char('\n');
-    }
-    if (run != nullptr) {
-        out += run->text();
+    // 取第 0 格的 tooltip：同一行每格挂的是同一份文本（见 updatePanels）。
+    const QTableWidgetItem* item = vehicleTable_->item(row, 0);
+    return item != nullptr ? item->toolTip() : QString();
+}
+
+QString MainWindow::vehiclePanelSummary() const {
+    // **逐行**都给出去：--ui-probe 要逐车核对载货/额定/利用率与 tooltip，
+    // 只给当前选中行会让选中状态影响断言结果。
+    QString out;
+    if (vehicleTable_ != nullptr) {
+        for (int row = 0; row < vehicleTable_->rowCount(); ++row) {
+            out += vehicleRowText(row);
+            out += QLatin1Char('\n');
+        }
     }
     return out;
 }
 
-QString MainWindow::vehiclePanelSummary() const {
-    // **每车**页签都给出去：--ui-probe 要能逐车核对页签标题、固定信息与运行状态
-    //（只给当前页签的话，切页状态会影响断言结果）。
-    QString out;
-    if (vehicleTabs_ != nullptr) {
-        for (int i = 0; i < vehicleTabs_->count(); ++i) {
-            const QWidget* page = vehicleTabs_->widget(i);
-            if (page == nullptr) {
-                continue;
-            }
-            const QLabel* fixed = page->property("vehicleFixedLabel").value<QLabel*>();
-            const QLabel* run = page->property("vehicleRunLabel").value<QLabel*>();
-            if (!out.isEmpty()) {
-                out += QLatin1Char('\n');
-            }
-            out += QStringLiteral("[") + vehicleTabs_->tabText(i)
-                    + QStringLiteral("]\n");
-            if (fixed != nullptr) {
-                out += fixed->text();
-                out += QLatin1Char('\n');
-            }
-            if (run != nullptr) {
-                out += run->text();
-            }
+QStringList MainWindow::orderPanelHeaders() const {
+    QStringList names;
+    if (orderTable_ != nullptr) {
+        for (int col = 0; col < orderTable_->columnCount(); ++col) {
+            const QTableWidgetItem* item = orderTable_->horizontalHeaderItem(col);
+            names << (item != nullptr ? item->text() : QString());
         }
+    }
+    return names;
+}
+
+QString MainWindow::orderPanelSummary() const {
+    QString out;
+    if (orderTable_ == nullptr) {
+        return out;
+    }
+    for (int row = 0; row < orderTable_->rowCount(); ++row) {
+        QStringList cells;
+        for (int col = 0; col < orderTable_->columnCount(); ++col) {
+            const QTableWidgetItem* item = orderTable_->item(row, col);
+            cells << (item != nullptr ? item->text() : QString());
+        }
+        out += cells.join(QStringLiteral(" | ")) + QLatin1Char('\n');
     }
     return out;
 }
@@ -3303,28 +3467,6 @@ QString MainWindow::dockTitles() const {
 
 QString MainWindow::routePanelSummary() const {
     return routeInfo_ != nullptr ? routeInfo_->toPlainText() : QString();
-}
-
-QString MainWindow::latePanelSummary() const {
-    QString out;
-    for (int row = 0; row < lateTable_->rowCount(); ++row) {
-        QStringList cells;
-        for (int col = 0; col < lateTable_->columnCount(); ++col) {
-            const QTableWidgetItem* item = lateTable_->item(row, col);
-            cells << (item != nullptr ? item->text() : QString());
-        }
-        out += cells.join(QStringLiteral(" | ")) + QLatin1Char('\n');
-    }
-    return out;
-}
-
-QStringList MainWindow::latePanelHeaders() const {
-    QStringList out;
-    for (int col = 0; col < lateTable_->columnCount(); ++col) {
-        const QTableWidgetItem* item = lateTable_->horizontalHeaderItem(col);
-        out << (item != nullptr ? item->text() : QString());
-    }
-    return out;
 }
 
 QString MainWindow::stopPanelSummary() const {
@@ -3809,16 +3951,20 @@ int MainWindow::runActionSelfCheck() {
             bool panelMatchesState = true;
             bool panelColumnsOk = true;
             bool panelNumeric = true;
+            bool pendingStaysZero = true;
             for (int i = 0; i < 600 && !solo.atRouteEnd(); ++i) {
                 solo.onAdvanceStop();
-                // issue #10：中转站面板第 4 列必须逐帧反映车辆物理状态
+                // issue #10：中转站面板第 4 列（当前暂存货）必须逐帧反映车辆物理状态
                 //（stashStation/stashItems），无暂存为 0、有暂存为该站的非 0 kg。
+                // #56：表变成 5 列；第 5 列（站内待取走）在本段**必须恒为 0** ——
+                // 本段只有"同车降载暂存"、没有任何跨车转运，若第 5 列跟着变非 0，
+                // 说明它被错接成了 stashItems（正是本票要修的错误数据源）。
                 const QStringList rows =
                     solo.transitPanelSummary().split(QLatin1Char('\n'), Qt::SkipEmptyParts);
                 bool anyNonZero = false;
                 for (const QString& row : rows) {
                     const QStringList cells = row.split(QStringLiteral(" | "));
-                    if (cells.size() != 4) {
+                    if (cells.size() != 5) {
                         panelColumnsOk = false;
                         continue;
                     }
@@ -3826,6 +3972,13 @@ int MainWindow::runActionSelfCheck() {
                     cells[3].trimmed().toDouble(&isNumber);
                     if (!isNumber) {
                         panelNumeric = false;
+                    }
+                    bool pendingNumeric = false;
+                    const double pendingKg = cells[4].trimmed().toDouble(&pendingNumeric);
+                    if (!pendingNumeric) {
+                        panelNumeric = false;
+                    } else if (pendingKg != 0.0) {
+                        pendingStaysZero = false;
                     }
                     if (cells[3].trimmed().toDouble() > 0.0) {
                         anyNonZero = true;
@@ -3855,11 +4008,15 @@ int MainWindow::runActionSelfCheck() {
                                .arg(QString::fromStdString(maxNode))
                                .arg(cap, 0, 'f', 0)
                                .arg(QString::fromStdString(maxBreak)));
-            expect(panelColumnsOk, QStringLiteral("中转站面板始终为 4 列"));
-            expect(panelNumeric, QStringLiteral("中转站「当前暂存货」列始终是数字"));
+            expect(panelColumnsOk, QStringLiteral("中转站表始终为 5 列（#56 新增站内待取走）"));
+            expect(panelNumeric,
+                   QStringLiteral("中转站「当前暂存货 / 站内待取走」两列始终是数字"));
             expect(panelMatchesState,
                    QStringLiteral("中转站「当前暂存货」列必须逐帧反映车辆暂存物理状态"
                                   "（无暂存为 0、有暂存为非 0）"));
+            expect(pendingStaysZero,
+                   QStringLiteral("（本段无跨车转运）「站内待取走」列必须恒为 0 —— "
+                                  "它只读转运账本，不得把降载暂存误算进来"));
             // 若降载真的执行了（未被中途重规划改道），日志里应能看到「降载」
             if (!solo.active().state.appliedOffloads.empty()) {
                 expect(solo.runLogText().contains(QStringLiteral("降载")),
@@ -4484,11 +4641,64 @@ int MainWindow::runActionSelfCheck() {
                    .arg(logistics::kTransferMaxDwellMin));
 
         // 推进到全队收工：卸入 / 取走 / 送达都必须**真的执行**。
+        //
+        // #56 新增守卫（票面要求）：中转站表第 5 列「站内待取走(kg)」必须在**中途**
+        //（卸入后、取走前）> 0，且**期末**回到 0。
+        // 为什么必须看中途：这一列的语义就是"货已卸进站、下一台车还没来取"的瞬态，
+        // 期末看一定是 0（货都送达了）——只断言期末等于什么都没测。
+        // 为什么这能反向验证：若把它改回只读 stashItems（本段的接力**没有**降载暂存），
+        // 中途也会是 0 ⇒ 守卫立刻变红（失败输出见 docs/测试用例表.md 的 R 条目）。
         int steps = 0;
+        bool sawPendingFrame = false;   // 前提：真的出现过「卸入后、取走前」的帧
+        bool midPendingVisible = true;  // 那些帧上面板该站必须 > 0
+        bool endPendingZero = true;     // 期末必须全部回到 0
         while (!transit.atRouteEnd() && steps < 800) {
             transit.onAdvanceStop();
             ++steps;
+            // 先读**账本事实**：哪些站当前压着未取走的货
+            std::vector<std::string> pendingStations;
+            for (const TransitLedgerEntry& e : transit.transitLedger_) {
+                if (e.pickedUp) {
+                    continue;
+                }
+                bool seen = false;
+                for (const std::string& s : pendingStations) {
+                    if (s == e.stationId) {
+                        seen = true;
+                    }
+                }
+                if (!seen) {
+                    pendingStations.push_back(e.stationId);
+                }
+            }
+            if (pendingStations.empty()) {
+                continue;
+            }
+            sawPendingFrame = true;
+            // 再读**界面单元格**（stationPendingKg 读的是表里第 5 列）
+            for (const std::string& stationId : pendingStations) {
+                if (transit.stationPendingKg(stationId) <= 0.0) {
+                    midPendingVisible = false;
+                }
+            }
         }
+        expect(sawPendingFrame,
+               QStringLiteral("（前提）跨簇接力中途真的出现「已卸入、未取走」帧 —— "
+                              "否则下面两条守卫会空跑"));
+        expect(midPendingVisible,
+               QStringLiteral("G14/#56：卸入后、取走前，中转站「站内待取走(kg)」必须 > 0"
+                              "（读面板单元格；改回只读 stashItems 时本条必红）"));
+        // 期末：账本无「在站」行 ⇒ 面板第 5 列必须全部为 0
+        for (const logistics::Node& n : transit.config_.graph.nodes()) {
+            if (n.type != logistics::NodeType::Transit) {
+                continue;
+            }
+            if (transit.stationPendingKg(n.id) != 0.0) {
+                endPendingZero = false;
+            }
+        }
+        expect(endPendingZero,
+               QStringLiteral("G14/#56：期末中转站「站内待取走(kg)」必须回到 0"));
         expect(transit.atRouteEnd(), QStringLiteral("G14：转运演示全队走完路线（%1 步）").arg(steps));
         const logistics::Order* after = transit.findOrderById("O1");
         expect(after != nullptr && after->served,
@@ -4769,6 +4979,52 @@ int MainWindow::runActionSelfCheck() {
         const Order* still = win.findOrderById(ghost.id);
         expect(still != nullptr && !still->served,
                QStringLiteral("X5：被拒绝的单不得从订单集合里消失（不丢单）"));
+    }
+
+    // ---- 12. #56：超时并入订单表的「状态」列（原「超时订单」独立窗口退役）----
+    //
+    // 为什么必须单独测：默认数据（distance 策略）迟到单恰为 0，--ui-probe 的
+    // 「超时行数 == 迟到订单数」在那份数据上是**空跑**（0 == 0）。这里造一张必然迟到的单，
+    // 让「状态列内联超时 + 排到最前」这条口径真的被测到。
+    {
+        logistics::Config lateCfg = reloadInitialConfig();
+        lateCfg.general.eventIntervalMin = 24 * 60;   // 不要事件打扰
+        // 把第一张单的窗口止压到 00:01（任何到达都晚于它）⇒ 规划期必然记迟到。
+        Order& first = lateCfg.orders.front();
+        first.windowStartMin = 0;
+        first.windowEndMin = 1;
+        MainWindow lateWin(lateCfg, configPath_);
+        expect(lateWin.lateOrderCount() >= 1,
+               QStringLiteral("（前置）窗口止 00:01 的单必然迟到（lateOrderCount=%1）")
+                   .arg(lateWin.lateOrderCount()));
+        const QStringList orderRows =
+            lateWin.orderPanelSummary().split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+        expect(!orderRows.isEmpty()
+                   && orderRows.front().contains(QStringLiteral("超时 +")),
+               QStringLiteral("#56：订单表第一行应是超时单且状态列内联「超时 +Nmin」"
+                              "（实际首行：%1）")
+                   .arg(orderRows.isEmpty() ? QString() : orderRows.front()));
+        const QStringList firstCells =
+            orderRows.isEmpty() ? QStringList() : orderRows.front().split(QStringLiteral(" | "));
+        const QRegularExpression lateStatusRe(
+            QStringLiteral("^[^|]+ · 超时 \\+([0-9]+)min$"));
+        // 列序（#56 lead 复核后合并取送，7 列）：
+        // 0 订单 | 1 取送 | 2 kg | 3 窗口 | 4 状态 | 5 车辆 | 6 当前位置。
+        const QRegularExpressionMatch lm =
+            firstCells.size() == 7 ? lateStatusRe.match(firstCells[4])
+                                   : QRegularExpressionMatch();
+        expect(firstCells.size() == 7 && lm.hasMatch() && lm.captured(1).toInt() > 0,
+               QStringLiteral("#56：超时行的「状态」列形如「<基态> · 超时 +Nmin」且 N>0"
+                              "（实际：%1）")
+                   .arg(firstCells.size() >= 5 ? firstCells[4] : QString()));
+        // 该行仍是**逐单一行**（订单列单张 ID），窗口列显示被改过的该单窗口。
+        expect(firstCells.size() == 7
+                   && firstCells[0] == QString::fromStdString(first.id)
+                   && firstCells[3] == QStringLiteral("00:00-00:01"),
+               QStringLiteral("#56：超时行仍逐单一行，且窗口列 = 该单自己的 [00:00-00:01]"
+                              "（实际订单=%1 窗口=%2）")
+                   .arg(firstCells.size() >= 4 ? firstCells[0] : QString(),
+                        firstCells.size() >= 4 ? firstCells[3] : QString()));
     }
 
     return failures;

@@ -592,10 +592,27 @@ int main(int argc, char** argv) {
         std::printf("[ui-probe] 面板: %s\n", window.dockTitles().toUtf8().constData());
         // 下限随模拟模式重做同步：原「Debug 模式」更名并新增「推进一刻」「按时间模拟」，
         // 工具栏动作由 15 个增至 17 个（见 docs/records/specs/sim-time-events.md §7.1）。
-        if (actions < 18 || docks < 6) {
+        //
+        // #56 重设计把右侧面板由 6 个收敛到 4 个（车辆 / 订单 / 中转与配送网 / 路线与停靠），
+        // 底部日志保留 ⇒ dock 总数 8 → 5。这里**不是放宽下限**：从「docks < 6」
+        // 改成「docks != 5」（更严），并逐名核对四个新面板都在 —— 原意
+        //「右侧信息面板必须真实存在且在界面上」不变。
+        if (actions < 18 || docks != 5) {
             std::fprintf(stderr,
-                         "[ui-probe] UI 不完整：预期至少 18 个工具栏动作、6 个停靠面板\n");
+                         "[ui-probe] UI 不完整：预期至少 18 个工具栏动作、5 个停靠面板"
+                         "（右侧 4 + 日志），实际 %d 个动作 / %d 个面板\n",
+                         actions, docks);
             return 1;
+        }
+        {
+            const QStringList dockNames = window.dockTitles().split(QStringLiteral(" | "));
+            for (const char* need : {"车辆", "订单", "中转与配送网", "路线与停靠", "日志"}) {
+                if (!dockNames.contains(QString::fromUtf8(need))) {
+                    std::fprintf(stderr, "[ui-probe] 停靠面板缺少「%s」（应有 车辆 / 订单 / "
+                                         "中转与配送网 / 路线与停靠 / 日志）\n", need);
+                    return 1;
+                }
+            }
         }
         // 动作名清单同步：这些名字是向导第 7 关让用户去点的按钮，必须**真实存在**。
         // 读的是界面上真正的动作名（findChildren<QAction*>），不是把预期列表再背一遍。
@@ -633,40 +650,70 @@ int main(int argc, char** argv) {
             }
         }
 
-        // 中转站面板的内容快照：无头环境下据此确定性核对（不必靠肉眼裁图）
+        // 中转站表的内容快照：无头环境下据此确定性核对（不必靠肉眼裁图）
         //
-        // 4 列：中转站 / 子网络 / 下属配送点 / 当前暂存货(kg)（issue #10）。
-        // 「当前库存」旧列随 D23 缓冲退役；本列反映紧急降载暂存货（无暂存为 0）。
+        // #56 起 **5 列**：中转站 / 子网络 / 下属配送点 / 当前暂存货(kg) / 站内待取走(kg)。
+        // 第 4 列（当前暂存货）仍只反映紧急降载暂存货（issue #10，无暂存为 0）；
+        // 第 5 列（站内待取走）是新增的跨车接力事实（账本 pickedUp == false 的行求和）。
+        // 两列**必须分开**：转运卸入的货故意不进 stashItems，合并或只看第 4 列会让
+        // 跨簇接力期间的站内库存凭空显示为 0 —— 这正是本票要修的缺陷。
         // 守卫读**界面真实表头**与**实际单元格**，不重算公式、不背预期清单。
         const QStringList transitHeaders = window.transitPanelHeaders();
         bool hasStashHeader = false;
+        bool hasPendingHeader = false;
         for (const QString& h : transitHeaders) {
             if (h.contains(QStringLiteral("当前暂存货"))) {
                 hasStashHeader = true;
             }
+            if (h.contains(QStringLiteral("站内待取走"))) {
+                hasPendingHeader = true;
+            }
         }
-        if (transitHeaders.size() != 4 || !hasStashHeader) {
+        if (transitHeaders.size() != 5 || !hasStashHeader || !hasPendingHeader) {
             const QByteArray headers = transitHeaders.join(QStringLiteral(" | ")).toUtf8();
             std::fprintf(stderr,
-                         "[ui-probe] 中转站面板应有 4 列且含「当前暂存货」表头，实际 [%s]\n",
+                         "[ui-probe] 中转站面板应有 5 列且含「当前暂存货」「站内待取走」"
+                         "两个表头，实际 [%s]\n",
                          headers.constData());
             return 1;
         }
         for (const QString& row : panelRows) {
             const QStringList cells = row.split(QStringLiteral(" | "));
-            if (cells.size() != 4) {
+            if (cells.size() != 5) {
                 const QByteArray bad = row.toUtf8();
                 std::fprintf(stderr,
-                             "[ui-probe] 中转站面板应有 4 列，实际不足：%s\n",
+                             "[ui-probe] 中转站面板应有 5 列，实际不足：%s\n",
                              bad.constData());
                 return 1;
             }
-            bool numeric = false;
-            cells[3].trimmed().toDouble(&numeric);
-            if (!numeric) {
+            bool stashNumeric = false;
+            bool pendingNumeric = false;
+            cells[3].trimmed().toDouble(&stashNumeric);
+            cells[4].trimmed().toDouble(&pendingNumeric);
+            if (!stashNumeric) {
                 const QByteArray bad = row.toUtf8();
                 std::fprintf(stderr,
                              "[ui-probe] 中转站「当前暂存货」列必须是数字：%s\n",
+                             bad.constData());
+                return 1;
+            }
+            if (!pendingNumeric) {
+                const QByteArray bad = row.toUtf8();
+                std::fprintf(stderr,
+                             "[ui-probe] 中转站「站内待取走」列必须是数字：%s\n",
+                             bad.constData());
+                return 1;
+            }
+        }
+        // 启动时两列都必须是 0：此刻没有任何"已执行"的卸入或暂存（计划期候选不算）。
+        for (const QString& row : panelRows) {
+            const QStringList cells = row.split(QStringLiteral(" | "));
+            if (cells[3].trimmed().toDouble() != 0.0
+                || cells[4].trimmed().toDouble() != 0.0) {
+                const QByteArray bad = row.toUtf8();
+                std::fprintf(stderr,
+                             "[ui-probe] 启动时中转站两列库存都应为 0（尚未执行任何卸入）："
+                             "%s\n",
                              bad.constData());
                 return 1;
             }
@@ -675,9 +722,9 @@ int main(int argc, char** argv) {
         std::printf("[ui-probe] 中转站面板（%s）:\n%s",
                     transitHeaders.join(QStringLiteral("|")).toUtf8().constData(),
                     transit.constData());
-        // 转运账本面板（G14 / 规格二 §7.5⑥）：7 列、列序固定；启动时账本为空
-        // （只记已实际执行的卸入，计划期候选不进表）。逐笔内容由
-        // --self-check-actions 在真的执行一次转运后核对。
+        // 转运账本面板（G14 / 规格二 §7.5⑥；#56 起并入「中转与配送网」dock 的下半）：
+        // 7 列、列序固定；启动时账本为空（只记已实际执行的卸入，计划期候选不进表）。
+        // 逐笔内容由 --self-check-actions 在真的执行一次转运后核对。
         {
             const QStringList ledgerHeaders = window.transitLedgerHeaders();
             const QStringList expectHeaders = {QStringLiteral("订单"),    QStringLiteral("中转站"),
@@ -694,132 +741,189 @@ int main(int argc, char** argv) {
                              headers.constData());
                 return 1;
             }
-            if (!window.dockTitles().contains(QStringLiteral("转运账本"))) {
-                std::fprintf(stderr, "[ui-probe] 停靠面板缺少「转运账本」\n");
-                return 1;
-            }
             if (window.transitLedgerRowCount() != 0) {
                 std::fprintf(stderr,
                              "[ui-probe] 启动时转运账本应为空（只记已实际执行的卸入），实际 %d 行\n",
                              window.transitLedgerRowCount());
                 return 1;
             }
-            std::printf("[ui-probe] 转运账本（%s）：空（规划期候选不进表）\n",
-                        ledgerHeaders.join(QStringLiteral("|")).toUtf8().constData());
-        }
-        // 车辆面板（G11）：页签数 == vehicles.size()，每页含「固定信息 / 运行状态」
-        // 两块标题；**逐车**核对 ID / 容量 / 两因子与配置一致，且逐车
-        // 「车上载重 ≤ 该车容量」（不得再用 vehicles.front() 一笔带过）。
-        //
-        // 历史：用户手工测试发现面板把"剩余待送总量 740kg"当成"当前载重"显示，
-        // 而载重上限只有 200kg —— 数据层没错，是显示口径错了，所以必须查显示值本身
-        //（读用户看得到的文本，不重算公式）。
-        {
-            const int vehicleTabs = window.vehicleTabCount();
-            if (config.vehicles.empty() || vehicleTabs != static_cast<int>(config.vehicles.size())) {
-                std::fprintf(stderr, "[ui-probe] 车辆信息页签数 %d != 车辆数 %zu\n",
-                             vehicleTabs, config.vehicles.size());
+            // 空态必须**解释清楚**：默认数据没有跨簇单，账本必然为空。
+            // 这条同时钉住"提示与行数互斥"——有行还挂着空态提示就是骗人。
+            if (!window.transitLedgerEmptyHintVisible()
+                || !window.transitLedgerEmptyHintText().contains(
+                       QStringLiteral("本次运行未发生入站转运"))) {
+                std::fprintf(stderr,
+                             "[ui-probe] 账本为空时必须在面板里显示空态提示"
+                             "「本次运行未发生入站转运（默认数据无跨簇单）」，实际可见=%d 文本=「%s」\n",
+                             window.transitLedgerEmptyHintVisible() ? 1 : 0,
+                             window.transitLedgerEmptyHintText().toUtf8().constData());
                 return 1;
             }
-            std::printf("[ui-probe] 车辆信息 %d 个标签页：%s\n", vehicleTabs,
-                        window.vehicleTabTitles().toUtf8().constData());
-            const QStringList tabTitles =
-                window.vehicleTabTitles().split(QStringLiteral(" | "));
+            std::printf("[ui-probe] 转运账本（%s）：空（规划期候选不进表；空态提示可见）\n",
+                        ledgerHeaders.join(QStringLiteral("|")).toUtf8().constData());
+        }
+        // 车辆表（G11 改写 / #56）：**一车一行**（旧口径：每车一个页签）。
+        // 原意逐条保留，只换载体：
+        //   · 「每车一台车」→ 表格行数 == 车辆数；
+        //   · 「固定信息与配置一致（ID / 容量 / 两因子）」→ 这些字段移入行 tooltip，
+        //     仍逐行与配置比对（信息没丢，只是不再占面板版面）；
+        //   · 「运行状态六项」→ 拆成表格列（状态 / 载货 / 位置 / 下一站）+ tooltip
+        //     （阶段 / 已送达 / 剩余待送 / penalty），逐项仍可核；
+        //   · 「车上载重 ≤ 该车容量」(G12) → 逐行比「载货(kg) ≤ 额定(kg)」两列**显示值**。
+        {
+            const int vehicleRows = window.vehicleRowCount();
+            if (config.vehicles.empty()
+                || vehicleRows != static_cast<int>(config.vehicles.size())) {
+                std::fprintf(stderr, "[ui-probe] 车辆表行数 %d != 车辆数 %zu\n",
+                             vehicleRows, config.vehicles.size());
+                return 1;
+            }
+            // 6 列（#56 lead 复核后合并）：载货/额定并排、位置→下一站合成一格。
+            const QStringList expectVehicleHeaders{
+                QStringLiteral("车辆"), QStringLiteral("状态"),
+                QStringLiteral("载货/额定(kg)"), QStringLiteral("利用率"),
+                QStringLiteral("在途单数"), QStringLiteral("位置→下一站")};
+            const QStringList vehicleHeaders = window.vehiclePanelHeaders();
+            if (vehicleHeaders != expectVehicleHeaders) {
+                std::fprintf(stderr,
+                             "[ui-probe] 车辆表表头不符（应 8 列）：实际 [%s]，预期 [%s]\n",
+                             vehicleHeaders.join(QStringLiteral(" | ")).toUtf8().constData(),
+                             expectVehicleHeaders.join(QStringLiteral(" | ")).toUtf8().constData());
+                return 1;
+            }
+            std::printf("[ui-probe] 车辆表 %d 行（一车一行）：%s\n", vehicleRows,
+                        window.vehiclePanelSummary().toUtf8().constData());
             for (std::size_t vi = 0; vi < config.vehicles.size(); ++vi) {
                 const logistics::Vehicle& v = config.vehicles[vi];
-                // 页签标题 = `<车辆 ID> · <容量>kg`
-                const QString title = QStringLiteral("%1 · %2kg")
-                                          .arg(QString::fromStdString(v.id))
-                                          .arg(v.capacityKg, 0, 'f', 0);
-                if (vi < static_cast<std::size_t>(tabTitles.size())
-                    && tabTitles[static_cast<int>(vi)] != title) {
-                    std::fprintf(stderr,
-                                 "[ui-probe] 车辆页签标题不符：预期「%s」，实际「%s」\n",
-                                 title.toUtf8().constData(),
-                                 tabTitles[static_cast<int>(vi)].toUtf8().constData());
+                const QString line = window.vehicleRowText(static_cast<int>(vi));
+                const QStringList cells = line.split(QStringLiteral(" | "));
+                if (cells.size() != vehicleHeaders.size()) {
+                    std::fprintf(stderr, "[ui-probe] 车辆行列数 %d != 表头列数 %d：%s\n",
+                                 int(cells.size()), int(vehicleHeaders.size()),
+                                 line.toUtf8().constData());
                     return 1;
                 }
-                const QString seg = window.vehiclePanelSection(static_cast<int>(vi));
-                // 每页两块标题：固定信息 / 运行状态
-                if (!seg.contains(QStringLiteral("固定信息"))
-                    || !seg.contains(QStringLiteral("运行状态"))) {
+                for (const QString& c : cells) {
+                    if (c.isEmpty()) {
+                        std::fprintf(stderr, "[ui-probe] 车辆表出现空白单元格：%s\n",
+                                     line.toUtf8().constData());
+                        return 1;
+                    }
+                }
+                if (cells[0] != QString::fromStdString(v.id)) {
                     std::fprintf(stderr,
-                                 "[ui-probe] 车辆 %s 的页签缺少「固定信息 / 运行状态」两块标题：\n%s\n",
-                                 v.id.c_str(), seg.toUtf8().constData());
+                                 "[ui-probe] 车辆表第 %d 行的车辆 ID 不是 %s：%s\n",
+                                 int(vi), v.id.c_str(), line.toUtf8().constData());
                     return 1;
                 }
-                // 固定信息逐项与配置一致：ID / 容量 / 两因子
+                // 「载货/额定(kg)」是一格两数（`load/cap`）：拆开后逐项核对。
+                const QStringList loadCap = cells[2].split(QLatin1Char('/'));
+                bool capOk = false;
+                bool loadOk = false;
+                const double loadShown = loadCap.size() == 2 ? loadCap[0].toDouble(&loadOk) : 0.0;
+                const double capShown = loadCap.size() == 2 ? loadCap[1].toDouble(&capOk) : 0.0;
+                if (!capOk || !loadOk) {
+                    std::fprintf(stderr,
+                                 "[ui-probe] 车辆 %s 的「载货(kg) / 额定(kg)」不是数字：%s\n",
+                                 v.id.c_str(), line.toUtf8().constData());
+                    return 1;
+                }
+                if (std::fabs(capShown - v.capacityKg) > 1e-6) {
+                    std::fprintf(stderr,
+                                 "[ui-probe] 车辆 %s 的「额定(kg)」与配置不符：显示 %.1f，配置 %.1f\n",
+                                 v.id.c_str(), capShown, v.capacityKg);
+                    return 1;
+                }
+                // G12（原意：逐车「车上载重 ≤ 该车容量」，不用 vehicles.front() 一笔带过）
+                if (loadShown > capShown + 1e-6) {
+                    std::fprintf(stderr,
+                                 "[ui-probe] G12 车辆 %s 面板显示的载货超过该车上限："
+                                 "载货 %.1f > 额定 %.1f\n",
+                                 v.id.c_str(), loadShown, capShown);
+                    return 1;
+                }
+                // 利用率必须与**同一行已显示**的「载货 / 额定」一致（读显示值，不读内部字段）：
+                // 这样"利用率列填了别的数"或"载货列错了而利用率没错"都会被抓到。
+                if (capShown > 0.0) {
+                    const QRegularExpression utilRe(
+                        QStringLiteral("^([0-9.]+)%$"));
+                    const QRegularExpressionMatch um = utilRe.match(cells[3]);
+                    if (!um.hasMatch()
+                        || std::fabs(um.captured(1).toDouble() - 100.0 * loadShown / capShown)
+                               > 0.051) {
+                        std::fprintf(stderr,
+                                     "[ui-probe] 车辆 %s 的「利用率」与同行的载货/额定不符："
+                                     "显示「%s」，按显示值应为 %.1f%%\n",
+                                     v.id.c_str(), cells[3].toUtf8().constData(),
+                                     100.0 * loadShown / capShown);
+                        return 1;
+                    }
+                } else if (cells[3] != QStringLiteral("—")) {
+                    std::fprintf(stderr, "[ui-probe] 车辆 %s 额定为 0 时利用率应显示 —：%s\n",
+                                 v.id.c_str(), cells[3].toUtf8().constData());
+                    return 1;
+                }
+                if (cells[1] != QStringLiteral("空闲") && cells[1] != QStringLiteral("配送中")
+                    && cells[1] != QStringLiteral("已收工")) {
+                    std::fprintf(stderr,
+                                 "[ui-probe] 车辆 %s 的「状态」不是 空闲/配送中/已收工：%s\n",
+                                 v.id.c_str(), cells[1].toUtf8().constData());
+                    return 1;
+                }
+                // 「位置→下一站」合并成一格：至少要有位置（收工车没有下一站，只剩位置）。
+                if (cells[5].isEmpty()
+                    || (!cells[5].contains(QStringLiteral("→"))
+                        && cells[5].trimmed().isEmpty())) {
+                    std::fprintf(stderr, "[ui-probe] 车辆 %s 的「位置→下一站」为空：%s\n",
+                                 v.id.c_str(), line.toUtf8().constData());
+                    return 1;
+                }
+                // 行 tooltip = 原「固定信息 / 运行状态」两块（#56 移入 tooltip，没删）：
+                // 固定 6 项逐项与配置一致；运行 4 项齐备。
+                const QString tip = window.vehicleRowTooltip(static_cast<int>(vi));
                 const auto fieldOk = [&](const char* label, double want) -> bool {
                     const QRegularExpression re(QString::fromUtf8(label)
                                                 + QStringLiteral("：([0-9.]+)"));
-                    const QRegularExpressionMatch m = re.match(seg);
-                    return m.hasMatch() && std::fabs(m.captured(1).toDouble() - want) <= 1e-6;
+                    const QRegularExpressionMatch m = re.match(tip);
+                    return m.hasMatch()
+                           && std::fabs(m.captured(1).toDouble() - want) <= 1e-6;
                 };
                 const QRegularExpression idRe(QStringLiteral("ID：([^\n：]+)"));
-                const QRegularExpressionMatch idm = idRe.match(seg);
-                if (!idm.hasMatch() || idm.captured(1).trimmed() != QString::fromStdString(v.id)
-                    || !fieldOk("载重上限", v.capacityKg) || !fieldOk("耗时倍率", v.timeFactor)
-                    || !fieldOk("成本倍率", v.costFactor)) {
+                const QRegularExpressionMatch idm = idRe.match(tip);
+                const QRegularExpression startRe(QStringLiteral("起始仓库：([^\n：]+)"));
+                const QRegularExpressionMatch startm = startRe.match(tip);
+                bool tipOk = idm.hasMatch()
+                             && idm.captured(1).trimmed() == QString::fromStdString(v.id)
+                             && startm.hasMatch()
+                             && startm.captured(1).trimmed()
+                                    == QString::fromStdString(v.startNodeId)
+                             && fieldOk("载重上限", v.capacityKg)
+                             && fieldOk("耗时倍率", v.timeFactor)
+                             && fieldOk("成本倍率", v.costFactor);
+                for (const char* key : {"固定信息", "发车时刻：", "运行状态", "阶段：",
+                                        "已送达 ", "剩余待送 ", "已发生 penalty："}) {
+                    if (!tip.contains(QString::fromUtf8(key))) {
+                        tipOk = false;
+                    }
+                }
+                const QRegularExpression phaseRe(QStringLiteral("阶段：([^\n]+)"));
+                const QRegularExpressionMatch pm = phaseRe.match(tip);
+                const QString phase = pm.hasMatch() ? pm.captured(1).trimmed() : QString();
+                if (phase != QStringLiteral("紧急") && phase != QStringLiteral("普通")
+                    && phase != QStringLiteral("已收工")) {
+                    tipOk = false;
+                }
+                if (!tipOk) {
                     std::fprintf(stderr,
-                                 "[ui-probe] 车辆 %s 页签固定信息与配置不符"
-                                 "（ID/载重上限/耗时倍率/成本倍率）：\n%s\n",
-                                 v.id.c_str(), seg.toUtf8().constData());
+                                 "[ui-probe] 车辆 %s 的行 tooltip 与配置/口径不符"
+                                 "（ID / 起始仓库 / 载重上限 / 发车时刻 / 耗时倍率 / 成本倍率 /"
+                                 " 阶段 / 已送达 / 剩余待送 / penalty）：\n%s\n",
+                                 v.id.c_str(), tip.toUtf8().constData());
                     return 1;
                 }
-                // G13：运行状态**六项**齐备（§7.5②）。
-                {
-                    const char* need[] = {"当前位置：", "下一站：", "阶段：", "车上载重：",
-                                          "剩余待送", "已发生 penalty："};
-                    for (const char* key : need) {
-                        if (!seg.contains(QString::fromUtf8(key))) {
-                            std::fprintf(stderr,
-                                         "[ui-probe] 车辆 %s 运行状态缺少「%s」：\n%s\n",
-                                         v.id.c_str(), key, seg.toUtf8().constData());
-                            return 1;
-                        }
-                    }
-                    const QRegularExpression phaseRe(QStringLiteral("阶段：([^\n]+)"));
-                    const QRegularExpressionMatch pm = phaseRe.match(seg);
-                    const QString phase = pm.hasMatch() ? pm.captured(1).trimmed() : QString();
-                    if (phase != QStringLiteral("紧急") && phase != QStringLiteral("普通")
-                        && phase != QStringLiteral("已收工")) {
-                        std::fprintf(stderr, "[ui-probe] 车辆 %s 阶段列不是 紧急/普通/已收工：%s\n",
-                                     v.id.c_str(), phase.toUtf8().constData());
-                        return 1;
-                    }
-                    const QRegularExpression doneRe(
-                        QStringLiteral("已送达 ([0-9]+) 单 · 剩余待送 ([0-9.]+) kg"));
-                    if (!doneRe.match(seg).hasMatch()) {
-                        std::fprintf(stderr,
-                                     "[ui-probe] 车辆 %s 缺少「已送达 X 单 · 剩余待送 Y kg」：\n%s\n",
-                                     v.id.c_str(), seg.toUtf8().constData());
-                        return 1;
-                    }
-                }
-                // G12（规格二 §7.9 权威编号）：逐车「车上载重 ≤ 该车容量」
-                //（**该车**的 capacity，不用 vehicles.front() 一笔带过）。
-                const QRegularExpression totalRe(
-                    QStringLiteral("车上载重：([0-9.]+) kg"));
-                const QRegularExpressionMatch total = totalRe.match(seg);
-                if (!total.hasMatch()) {
-                    std::fprintf(stderr, "[ui-probe] 车辆 %s 页签缺少「车上载重」：\n%s\n",
-                                 v.id.c_str(), seg.toUtf8().constData());
-                    return 1;
-                }
-                const double shownTotal = total.captured(1).toDouble();
-                if (shownTotal > v.capacityKg + 1e-6) {
-                    std::fprintf(stderr,
-                                 "[ui-probe] G12 车辆 %s 面板显示的载重超过该车上限："
-                                 "车上载重 %.1f > %.1f\n",
-                                 v.id.c_str(), shownTotal, v.capacityKg);
-                    return 1;
-                }
-                std::printf("[ui-probe] G12 车辆 %s 车上载重 %.1fkg <= 该车容量 %.1fkg\n",
-                            v.id.c_str(), shownTotal, v.capacityKg);
+                std::printf("[ui-probe] G12 车辆 %s 载货 %.1fkg <= 该车额定 %.1fkg\n",
+                            v.id.c_str(), loadShown, capShown);
             }
-            // 把逐车面板文本打出来（报告/人工核对用；也是"用户看得到什么"的证据）。
-            std::printf("[ui-probe] 车辆面板（%d 页）：\n%s\n", vehicleTabs,
-                        window.vehiclePanelSummary().toUtf8().constData());
             if (window.vehiclePanelSummary().contains(QStringLiteral("本趟出发装载"))) {
                 std::fprintf(stderr, "[ui-probe] 车辆面板仍含已退役的「本趟出发装载」\n");
                 return 1;
@@ -1020,79 +1124,195 @@ int main(int argc, char** argv) {
                         sam.captured(2).toUtf8().constData(), metricRows);
         }
 
-        // ---- G10：超时订单面板 **8 列**、逐单一行（MC-E02）----
+        // ---- G10（#56 改写）：超时并入**订单表状态列**，一单一行、含「当前位置」----
+        // 原意逐条保留：
+        //   · 「逐单一行、订单列是单张 ID」→ 订单表每行一张单，ID 不拼 '/'；
+        //   · 「窗口 = 该单自己的 [ws, we]」→ 逐行与配置里该单的窗口逐字比对；
+        //   · 「档位 / 到达 / penalty」→ 档位由「状态」列（紧急/普通/执行中…）体现，
+        //     penalty 由「超时 +Nmin」体现，到达时刻与配送点改由「当前位置 / 送货」列承担；
+        //   · 「行数 == 迟到订单数」→ 统计状态含「超时 +」的行数，与
+        //     window.lateOrderCount()（按订单去重）相等；且这些行必须排在最前。
+        // 新增（票面要求）：「当前位置」列必须能区分 车上(车号) / 站内·站号 / 已送达(站点)。
         {
-            const QStringList lateHeaders = window.latePanelHeaders();
-            const QStringList expectLate{
-                QStringLiteral("车辆"),        QStringLiteral("订单"),   QStringLiteral("配送点"),
-                QStringLiteral("档位"),        QStringLiteral("状态"),   QStringLiteral("到达"),
-                QStringLiteral("窗口"),        QStringLiteral("penalty(min)")};
-            if (lateHeaders != expectLate) {
+            // 7 列（#56 lead 复核后合并取送）：订单 | 取送 | kg | 窗口 | 状态 | 车辆 | 当前位置。
+            const QStringList expectOrderHeaders{
+                QStringLiteral("订单"), QStringLiteral("取送"), QStringLiteral("kg"),
+                QStringLiteral("窗口"), QStringLiteral("状态"), QStringLiteral("车辆"),
+                QStringLiteral("当前位置")};
+            const QStringList orderHeaders = window.orderPanelHeaders();
+            if (orderHeaders != expectOrderHeaders) {
                 std::fprintf(stderr,
-                             "[ui-probe] 超时订单表头不符（应 8 列）：实际 [%s]，预期 [%s]\n",
-                             lateHeaders.join(QStringLiteral(" | ")).toUtf8().constData(),
-                             expectLate.join(QStringLiteral(" | ")).toUtf8().constData());
+                             "[ui-probe] 订单表表头不符（应 8 列）：实际 [%s]，预期 [%s]\n",
+                             orderHeaders.join(QStringLiteral(" | ")).toUtf8().constData(),
+                             expectOrderHeaders.join(QStringLiteral(" | ")).toUtf8().constData());
                 return 1;
             }
-            const QStringList lateLines =
-                window.latePanelSummary().split(QLatin1Char('\n'), Qt::SkipEmptyParts);
-            // 行数 == 迟到订单数（G10）：逐单一行，不得把同停靠多单压成一行。
-            const int expectLateRows = window.lateOrderCount();
-            if (int(lateLines.size()) != expectLateRows) {
-                std::fprintf(stderr, "[ui-probe] 超时面板行数 %d != 迟到订单数 %d\n",
-                             int(lateLines.size()), expectLateRows);
+            const QStringList orderLines =
+                window.orderPanelSummary().split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+            if (int(orderLines.size()) != int(config.orders.size())) {
+                std::fprintf(stderr, "[ui-probe] 订单表行数 %d != 订单数 %zu\n",
+                             int(orderLines.size()), config.orders.size());
                 return 1;
             }
-            const QRegularExpression windowRe(
-                QStringLiteral("^[0-9]{2}:[0-9]{2}-[0-9]{2}:[0-9]{2}$"));
-            for (const QString& line : lateLines) {
+            // 状态 = 基态（已送达 / 站内待取走 / 紧急 / 执行中 / 配送中 / 待配送）
+            //        + 可选「 · 超时 +Nmin」后缀。
+            const QRegularExpression statusRe(
+                QStringLiteral("^(已送达|站内待取走|紧急|执行中|配送中|待配送)"
+                               "( · 超时 \\+[0-9]+min)?$"));
+            // 当前位置的四种形态（票面逐字）：车上(V02) / 站内·T01 / 已送达(D18) / 待取·D08。
+            const QRegularExpression locationRe(
+                QStringLiteral("^(车上\\([A-Za-z0-9_]+\\)|站内·[A-Za-z0-9_]+|"
+                               "已送达\\([A-Za-z0-9_]+\\)|待取·[A-Za-z0-9_]+)$"));
+            std::vector<bool> seen(config.orders.size(), false);
+            int lateRowsSeen = 0;
+            bool lateRowsAreFirst = true;
+            int rowIndex = 0;
+            for (const QString& line : orderLines) {
                 const QStringList cells = line.split(QStringLiteral(" | "));
-                if (cells.size() != lateHeaders.size()) {
-                    std::fprintf(stderr, "[ui-probe] 超时订单行列数 %d != 表头列数 %d：%s\n",
-                                 int(cells.size()), int(lateHeaders.size()),
+                if (cells.size() != orderHeaders.size()) {
+                    std::fprintf(stderr, "[ui-probe] 订单表行列数 %d != 表头列数 %d：%s\n",
+                                 int(cells.size()), int(orderHeaders.size()),
                                  line.toUtf8().constData());
                     return 1;
                 }
                 for (const QString& c : cells) {
                     if (c.isEmpty()) {
-                        std::fprintf(stderr, "[ui-probe] 超时订单出现空白单元格：%s\n",
+                        std::fprintf(stderr, "[ui-probe] 订单表出现空白单元格：%s\n",
                                      line.toUtf8().constData());
                         return 1;
                     }
                 }
-                // 逐单一行：订单列是**单张**订单 ID（旧实现用 '/' 把同停靠多单拼成一格）。
-                if (cells[1].contains(QLatin1Char('/'))) {
-                    std::fprintf(stderr, "[ui-probe] 超时订单未逐单一行（订单列含 '/' 合并）：%s\n",
+                // 逐单一行：订单列是**单张**订单 ID（不得用 '/' 把同停靠多单拼成一格）。
+                if (cells[0].contains(QLatin1Char('/'))) {
+                    std::fprintf(stderr,
+                                 "[ui-probe] 订单表未逐单一行（订单列含 '/' 合并）：%s\n",
                                  line.toUtf8().constData());
                     return 1;
                 }
-                if (cells[3] != QStringLiteral("紧急") && cells[3] != QStringLiteral("普通")) {
-                    std::fprintf(stderr, "[ui-probe] 超时订单「档位」列不是 紧急/普通：%s\n",
+                const logistics::Order* matched = nullptr;
+                int matchedIndex = -1;
+                for (std::size_t oi = 0; oi < config.orders.size(); ++oi) {
+                    if (QString::fromStdString(config.orders[oi].id) == cells[0]) {
+                        matched = &config.orders[oi];
+                        matchedIndex = static_cast<int>(oi);
+                        break;
+                    }
+                }
+                if (matched == nullptr || seen[static_cast<std::size_t>(matchedIndex)]) {
+                    std::fprintf(stderr,
+                                 "[ui-probe] 订单表的订单 ID 不是配置里的单（或重复）：%s\n",
                                  line.toUtf8().constData());
                     return 1;
                 }
-                // 窗口 = 该单自己的 [ws, we]（逐单窗口，不是同停靠多单的并集）。
-                if (!windowRe.match(cells[6]).hasMatch()) {
-                    std::fprintf(stderr, "[ui-probe] 超时订单「窗口」列不是 起-止 时刻：%s\n",
+                seen[static_cast<std::size_t>(matchedIndex)] = true;
+                const logistics::Order& o = *matched;
+                const QString pickupShown = o.pickupNodeId.empty()
+                                                ? QStringLiteral("—")
+                                                : QString::fromStdString(o.pickupNodeId);
+                // 取送合并成一格 `A→B`：拆开后比对两端。
+                if (cells[1] != pickupShown + QStringLiteral("→")
+                                    + QString::fromStdString(o.nodeId)) {
+                    std::fprintf(stderr,
+                                 "[ui-probe] 订单 %s 的「取送」与配置不符：%s\n",
+                                 o.id.c_str(), line.toUtf8().constData());
+                    return 1;
+                }
+                bool kgOk = false;
+                const double kgShown = cells[2].toDouble(&kgOk);
+                if (!kgOk || std::fabs(kgShown - o.demandKg) > 1e-6) {
+                    std::fprintf(stderr, "[ui-probe] 订单 %s 的 kg 与配置不符：%s\n",
+                                 o.id.c_str(), line.toUtf8().constData());
+                    return 1;
+                }
+                // 窗口 = 该单自己的 [ws, we]（不是同停靠多单的并集）：
+                // 把「hh:mm-hh:mm」拆成四个数按分钟与配置比对，不拼字符串
+                //（拼字符串会把"显示格式改了"误判成"窗口口径错了"，主次颠倒）。
+                const QRegularExpression clockWindowRe(
+                    QStringLiteral("^([0-9]{2}):([0-9]{2})-([0-9]{2}):([0-9]{2})$"));
+                const QRegularExpressionMatch wm = clockWindowRe.match(cells[3]);
+                const bool windowOwn = wm.hasMatch()
+                                       && wm.captured(1).toInt() * 60
+                                                  + wm.captured(2).toInt()
+                                              == o.windowStartMin
+                                       && wm.captured(3).toInt() * 60
+                                                  + wm.captured(4).toInt()
+                                              == o.windowEndMin;
+                if (!windowOwn) {
+                    std::fprintf(stderr,
+                                 "[ui-probe] 订单 %s 的「窗口」不是该单自己的 [%02d:%02d-%02d:%02d]：%s\n",
+                                 o.id.c_str(), o.windowStartMin / 60, o.windowStartMin % 60,
+                                 o.windowEndMin / 60, o.windowEndMin % 60,
                                  line.toUtf8().constData());
                     return 1;
                 }
-                bool penOk = false;
-                const int pen = cells[7].toInt(&penOk);
-                if (!penOk || pen <= 0) {
-                    std::fprintf(stderr, "[ui-probe] 超时订单「penalty(min)」不是正整数：%s\n",
-                                 line.toUtf8().constData());
+                const bool late = cells[4].contains(QStringLiteral("超时 +"));
+                if (!statusRe.match(cells[4]).hasMatch()) {
+                    std::fprintf(stderr, "[ui-probe] 订单 %s 的「状态」不是合法取值：%s\n",
+                                 o.id.c_str(), cells[4].toUtf8().constData());
                     return 1;
                 }
+                if (late) {
+                    ++lateRowsSeen;
+                } else if (lateRowsSeen > 0) {
+                    lateRowsAreFirst = false;   // 超时行必须都在最前面
+                }
+                if (cells[4].startsWith(QStringLiteral("已送达"))) {
+                    if (!cells[6].startsWith(QStringLiteral("已送达("))) {
+                        std::fprintf(stderr,
+                                     "[ui-probe] 订单 %s 已送达但「当前位置」不是 已送达(站点)：%s\n",
+                                     o.id.c_str(), line.toUtf8().constData());
+                        return 1;
+                    }
+                }
+                if (cells[4].startsWith(QStringLiteral("站内待取走"))) {
+                    if (!cells[6].startsWith(QStringLiteral("站内·"))) {
+                        std::fprintf(stderr,
+                                     "[ui-probe] 订单 %s 状态为站内待取走但「当前位置」不是 站内·站号：%s\n",
+                                     o.id.c_str(), line.toUtf8().constData());
+                        return 1;
+                    }
+                }
+                if (!locationRe.match(cells[6]).hasMatch()) {
+                    std::fprintf(stderr,
+                                 "[ui-probe] 订单 %s 的「当前位置」不是 车上(车号) / 站内·站号 /"
+                                 " 已送达(站点) / 待取·取货点：%s\n",
+                                 o.id.c_str(), cells[6].toUtf8().constData());
+                    return 1;
+                }
+                // 车辆列：配置里的车号 / 「接力」/「—」。
+                bool vehicleOk = cells[5] == QStringLiteral("接力")
+                                 || cells[5] == QStringLiteral("—");
+                for (const logistics::Vehicle& v : config.vehicles) {
+                    if (cells[5] == QString::fromStdString(v.id)) {
+                        vehicleOk = true;
+                    }
+                }
+                if (!vehicleOk) {
+                    std::fprintf(stderr, "[ui-probe] 订单 %s 的「车辆」列不合法：%s\n",
+                                 o.id.c_str(), cells[5].toUtf8().constData());
+                    return 1;
+                }
+                if (late) {
+                    std::printf("[ui-probe]   超时单：%s\n", line.toUtf8().constData());
+                }
+                ++rowIndex;
             }
-            if (!lateLines.isEmpty()) {
-                std::printf("[ui-probe] 超时订单摘录（逐单一行，窗口 = 该单自己的）：\n");
-                for (const QString& line : lateLines) {
-                    std::printf("[ui-probe]   %s\n", line.toUtf8().constData());
-                }
+            // 行数 == 迟到订单数（G10）：逐单一行，不得把同停靠多单压成一行。
+            const int expectLateRows = window.lateOrderCount();
+            if (lateRowsSeen != expectLateRows) {
+                std::fprintf(stderr,
+                             "[ui-probe] 订单表中「超时」行数 %d != 迟到订单数 %d\n",
+                             lateRowsSeen, expectLateRows);
+                return 1;
             }
-            std::printf("[ui-probe] 超时订单面板表头 8 列（含车辆/档位），%d 行 == 迟到订单数\n",
-                        expectLateRows);
+            if (!lateRowsAreFirst) {
+                std::fprintf(stderr,
+                             "[ui-probe] 超时订单未排到订单表最前面（状态列含超时的行不得排在后面）\n");
+                return 1;
+            }
+            std::printf("[ui-probe] 订单表 7 列（含取送/当前位置），%d 行 == 订单数；"
+                        "「超时」%d 行 == 迟到订单数且排最前\n",
+                        rowIndex, lateRowsSeen);
         }
 
         // ---- G15：画布三色归属快照（规格二 §7.5⑤）----
