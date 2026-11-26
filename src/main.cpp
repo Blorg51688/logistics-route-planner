@@ -388,8 +388,30 @@ int main(int argc, char** argv) {
                             s.rawArrivalMin, s.waitMin, s.arrivalMin,
                             pickups.empty() ? "-" : pickups.c_str(),
                             deliveries.empty() ? "-" : deliveries.c_str(), s.remainingLoadKg);
+                // 转运动作（规格五 #57）：**只加行、不改既有行格式**（oracle 会解析它）。
+                //   XACT <停靠下标> <U=转运卸入|P=转运取走> <订单>
+                // 为什么必须打：STOP 行的动作列只含真实取货/送达，站内易手不可见；同一个站
+                // 可能被同一台车**多次经过**（先卸后取或中途经过），oracle 只按 (车, 站) 猜
+                // 就会把取走认到错的停靠上（实测：V03 的 T02 取走被认到第 1 次经过，误差 23min）。
+                for (const std::string& id : s.transitUnloads) {
+                    std::printf("XACT %zu U %s\n", i, id.c_str());
+                }
+                for (const std::string& id : s.transitPickups) {
+                    std::printf("XACT %zu P %s\n", i, id.c_str());
+                }
             }
             printMetrics("METRICS", vehicle.id, plan, vehicle.capacityKg);
+            // 空闲归位（规格五 §5.13 / #57）：**只加行、不改既有行格式**（oracle 跳过未知行）。
+            //   HOME <车> <归位点> <HH:MM 归位到达> <归位段起点|-> <km> <min> <元> <回仓对照km>
+            // 「归位段起点 -」= 该车本来就在主场（**没有移动**，三项恒 0，不写 0 距离边）；
+            // 「回仓对照km」= 若仍按老规矩回起始仓库、末段要跑多少公里 —— 归位省/多跑多少
+            // 就是 (km − 回仓对照km) 逐车相加，这是「归位带来的额外空驶」的取数口。
+            std::printf("HOME %s %s %s %s %.3f %.3f %.3f %.3f\n", vehicle.id.c_str(),
+                        plan.homeNodeId.empty() ? "-" : plan.homeNodeId.c_str(),
+                        minuteClock(plan.homeArrivalMin).c_str(),
+                        plan.homingFromNodeId.empty() ? "-" : plan.homingFromNodeId.c_str(),
+                        plan.homingDistanceKm, plan.homingTimeMin, plan.homingCostYuan,
+                        plan.warehouseReturnKm);
         }
         // 跨车转运账本（规格二 §5.3 / #28）：**只加行，不改既有行格式**（oracle 跳过未知行）。
         //   TRANSIT <订单> <中转站> <kg> <卸入车> <HH:MM> <取走车> <HH:MM> <站内等待min> <状态>

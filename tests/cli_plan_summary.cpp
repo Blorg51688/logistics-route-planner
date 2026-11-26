@@ -1329,6 +1329,74 @@ void checkLegDegradationVisibleInDump(const std::string& appPath) {
 
 }   // namespace
 
+
+// ---- 规格五 #57 · 空闲归位的 **CLI 文本**守卫（§5.13，--dump-plan 的 HOME 行）----
+//
+// 为什么另有一条：routeplanner_tests 的归位守卫读的是 plan 对象（API 层），这条读的是
+// **用户能看见的 stdout**（HOME 行 + 路线行）—— 两层口径必须同源，否则「内部归位对了、
+// 输出没打出来」这种漏报查不出来。
+// 判据：
+//   ① 每台车恰有一行 HOME，且归位点不是 '-'；
+//   ② 慢车（V02/V03/V04）的归位点 = 本簇中转站（T01/T02/T03），快车（V01）= 起始仓库 W01；
+//   ③ 「路线 <车>」的**末节点** == 该车 HOME 的归位点（两份可见输出自洽）；
+//   ④ 末停靠就在主场的车，归位段 km = 0（**不写 0 距离边**）；其余 > 0。
+// 反向验证：把 planFleet 里的 applyIdleHoming 调用去掉 ⇒ ①②③④ 立刻红
+// （HOME 打 '-'、路线末节点退回 W01/W02、归位段恒 0）。
+void checkIdleHomingRows(const std::string& appPath) {
+    const std::string out = runCapture("'" + appPath + "' --dump-plan distance 2>/dev/null");
+    if (out.empty()) {
+        check(false, "归位·CLI：--dump-plan 有输出");
+        return;
+    }
+    std::map<std::string, std::string> homeNode;   // 车 -> 归位点
+    std::map<std::string, double> homeKm;          // 车 -> 归位段 km
+    std::map<std::string, std::string> routeTail;  // 车 -> 路线行末节点
+    std::vector<std::string> order;                // 车队行序
+    for (const std::string& line : splitLines(out)) {
+        const std::vector<std::string> tok = splitSpaces(line);
+        if (tok.size() >= 7 && tok[0] == "HOME") {
+            homeNode[tok[1]] = tok[2];
+            homeKm[tok[1]] = std::strtod(tok[6].c_str(), nullptr);
+        }
+    }
+    // 路线行在 --plan-summary 的第 7–10 行（「路线 <车> <节点…>」），末节点就是该车终点。
+    const std::string summary =
+        runCapture("'" + appPath + "' --plan-summary distance 2>/dev/null");
+    for (const std::string& line : splitLines(summary)) {
+        const std::vector<std::string> tok = splitSpaces(line);
+        if (tok.size() >= 3 && tok[0] == "路线") {
+            if (routeTail.find(tok[1]) == routeTail.end()) {
+                order.push_back(tok[1]);
+            }
+            routeTail[tok[1]] = tok.back();
+        }
+    }
+    check(homeNode.size() == 4, "归位·CLI①：四台车各有一行 HOME（实际 "
+                                    + std::to_string(homeNode.size()) + "）");
+    // ② 归位点口径（数据事实：V02 守簇 1 / V03 守簇 2 / V04 守簇 3 / V01 快车）
+    const std::pair<const char*, const char*> expect[4] = {
+        {"V01", "W01"}, {"V02", "T01"}, {"V03", "T02"}, {"V04", "T03"}};
+    for (const auto& e : expect) {
+        const std::string got = homeNode[e.first].empty() ? std::string("-") : homeNode[e.first];
+        check(got == e.second, std::string("归位·CLI②：") + e.first + " 的归位点 = " + e.second
+                                   + "（实际 " + got + "）");
+        // ③ 路线末节点 == 归位点
+        check(routeTail[e.first] == e.second,
+              std::string("归位·CLI③：") + e.first + " 的路线末节点 = 归位点（实际 "
+                  + (routeTail[e.first].empty() ? std::string("-") : routeTail[e.first]) + "）");
+    }
+    // ④ 已在主场 ⇒ 0km（V01 空车就在 W01）；其余慢车归位段 > 0。
+    check(std::fabs(homeKm["V01"]) < 1e-9, "归位·CLI④：V01 本来就在仓库 ⇒ 归位段 0km（无 0 距离边）");
+    for (const char* id : {"V02", "V03", "V04"}) {
+        check(homeKm[id] > 0.0, std::string("归位·CLI④：") + id + " 的归位段 > 0（实际 "
+                                    + std::to_string(homeKm[id]) + " km）");
+    }
+    std::printf("    归位·CLI：V01 %s / V02 %s / V03 %s / V04 %s（归位段 %.3f/%.3f/%.3f/%.3f km）\n",
+                homeNode["V01"].c_str(), homeNode["V02"].c_str(), homeNode["V03"].c_str(),
+                homeNode["V04"].c_str(), homeKm["V01"], homeKm["V02"], homeKm["V03"],
+                homeKm["V04"]);
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::printf("用法: cli_plan_summary <app 路径> <策略|all>\n");
@@ -1999,6 +2067,11 @@ int main(int argc, char** argv) {
                   + " 单上不同 —— 界面若退回轮转基线，上面的逐单比对必红");
         std::printf("    X3 界面分配 == CLI ALLOC（%d 单）；轮转基线与之相差 %d 单\n",
                     static_cast<int>(guiPairs.size()), static_cast<int>(seqDiff));
+    }
+
+    // 规格五 #57：空闲归位的 CLI 文本守卫（HOME 行 + 路线末节点）
+    if (argc >= 2) {
+        checkIdleHomingRows(argv[1]);
     }
 
     return testutil::summarize("cli_plan_summary");

@@ -234,6 +234,26 @@ struct RoutePlan {
     double totalCostYuan   = 0.0;
     int    totalPenaltyMin = 0;
     RouteMetrics metrics;
+
+    // ---- 空闲归位（规格五 §5.13 / #57）----
+    //
+    // 语义：一台车跑完自己的全部停靠后**不在主场**时，按最短路空驶回主场待命。
+    // 主场由 homeNodeOf 唯一决定（慢车 = 本簇中转站，快车 = 起始仓库）；归位是**行驶**
+    // （不是 Stop：站内停靠零耗时，归位必然耗时），因此它在 nodes 里表现为**末段节点序列**，
+    // 三项指标照常累加、但**不产生 penalty**（没有订单，penalty 只由送达窗口决定）。
+    //
+    // 由 applyIdleHoming 在车队层一次性写入；单车入口（planRoute / replan / insertOrder）
+    // 仍以「回起始仓库」收尾 —— 那几条链的调用方不掌握车队与簇，推不出主场。
+    std::string homeNodeId;        // 归位点（空 = 该计划不表达归位）
+    int    homeArrivalMin = -1;    // 归位到达时刻（-1 = 不适用）
+    bool   homed = false;          // 是否真的产生了归位行驶（已在主场 ⇒ false，无 0 距离边）
+    std::string homingFromNodeId;  // 归位段起点（homed 时有效）
+    double homingDistanceKm = 0.0; // 归位段三项（计入该车与车队汇总）
+    double homingTimeMin = 0.0;
+    double homingCostYuan = 0.0;
+    // 对照口径：**若仍按老规矩回起始仓库**，末段要跑多少公里（报告「归位省/多跑多少」用）。
+    // -1 = 不可达 / 不适用。
+    double warehouseReturnKm = -1.0;
 };
 
 // 从车辆起始仓库出发、按其发车时刻规划，服务完全部订单后返回该仓库。
@@ -419,6 +439,28 @@ std::string chooseLegVehicle(const LogisticsGraph& graph, const std::vector<Vehi
 // 容量最大 ⇒ 成本因子更高 ⇒ 车辆 ID 小；只有一台车时它就是快车。
 // 为什么公开：GUI 不能自己再推一遍角色 —— 口径一漂，画布颜色与 LEG 行就会互相矛盾。
 std::vector<bool> fastVehicleFlags(const std::vector<Vehicle>& vehicles);
+
+// ---- 空闲归位（规格五 §5.13 / #57）：主场规则与车队层收尾 ----
+//
+// 主场（**唯一决定点**，GUI / 测试 / 规划器都读它，不各推一遍）：
+//   · 快车（容量最大者，判据同职责表）→ 它的**起始仓库**；
+//   · 慢车 → 它所守的**本簇中转站** stationOfCluster(簇)，与职责表同一来源
+//     （簇 ID 升序 × 慢车 ID 升序逐位配对，不硬编码 T01/T02/T03）。
+// 一台慢车守多簇时取**簇 ID 最小**的那一簇的站（降级，调用方记日志）；
+// 找不到簇/站（夹具图里没有中转站）时退化为起始仓库 —— 退化不是静默：日志点名。
+std::string homeNodeOf(const LogisticsGraph& graph, const std::vector<Vehicle>& vehicles,
+                       std::size_t vehicleIndex);
+
+// 把每台车的**末段终点**改成它的主场（规格五 §5.13）：
+//   · 停靠序列、停靠时刻、penalty、账本**逐字不动**（归位只动「跑完之后的去向」）；
+//   · 末段三项（距离/耗时/成本）按新终点重算并计入该车与车队汇总；**不产生 penalty**；
+//   · 已在主场 ⇒ 不产生任何移动（**不写 0 距离边**，三项差分恒 0）；
+//   · 末段本来就已是归位段（重复调用）⇒ 三项**逐字不动**（幂等，供复调度反复收口）。
+// weight = 该策略（末段按策略自己的最短路维度选路，与其他段同一口径）。
+// log 非空时追加降级/不可达说明（不进 --plan-summary）。
+void applyIdleHoming(const LogisticsGraph& graph, const std::vector<Vehicle>& vehicles,
+                     WeightType weight, std::vector<RoutePlan>& plans,
+                     std::vector<std::string>* log = nullptr);
 
 // 顺序轮转基线（规格二 §4.5，**对照组不是候选方案**）：
 // 订单 ID 升序、第 i 单 -> 第 (i mod k) 台车、车辆序 = [vehicles] 行序；

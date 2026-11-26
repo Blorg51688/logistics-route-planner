@@ -636,6 +636,19 @@ def _parse_dump_text(text):
                 "pickups": pickups, "deliveries": deliveries,
                 "remaining": float(tok[9]),
             })
+        elif tok[0] == "XACT" and cur is not None and len(tok) >= 4:
+            # XACT <停靠下标> <U|P> <订单>：站内易手的**精确落点**（#57）。
+            # 之前只能按 (车, 站) 猜，同一站多次经过时会把取走认到错的停靠上。
+            idx = int(tok[1])
+            cur["has_xact"] = True
+            if 0 <= idx < len(cur["stops"]):
+                st = cur["stops"][idx]
+                st.setdefault("relay_pickups", [])
+                st.setdefault("relay_unloads", [])
+                if tok[2] == "P":
+                    st["relay_pickups"].append(tok[3])
+                else:
+                    st["relay_unloads"].append(tok[3])
         elif tok[0] == "METRICS" and cur is not None:
             cur["metrics"] = [float(x) for x in tok[2:]]
         elif tok[0] == "INFEASIBLE" and cur is not None:
@@ -736,7 +749,7 @@ def aggregate_fleet(results):
 
 
 def recompute_plan(g, plan, kind, time_factor=1.0, cost_factor=1.0, capacity=0.0,
-                   urgent_ids=None, ready=None, relay_pickups=None):
+                   urgent_ids=None, ready=None, relay_pickups=None, order_a=None):
     """从**停靠级转储**独立复算 13 字段（不实现选路，只按给定停靠序列算算术）。
 
     - 相邻停靠之间用 default.ini 边表的最短路（按 kind 维度），距离/耗时/成本从
@@ -795,11 +808,17 @@ def recompute_plan(g, plan, kind, time_factor=1.0, cost_factor=1.0, capacity=0.0
         else:
             wait = 0.0
         # 车等货：该车在这个节点的站内取走，要等货到站（readyTime 由 LEG 行给出）。
-        stop_relay = []
-        key_relay = (plan["id"], st["node"])
-        if key_relay in pending_relay and pending_relay[key_relay]:
-            oid = pending_relay[key_relay].pop(0)
-            stop_relay.append(oid)
+        # 一个停靠可以同时取走**多张单**（同站合并停靠），所以这里把该 (车, 站) 的待取
+        # 全部认领：等待取它们的 readyTime 最大值（与 C++ replay 的口径一致）。
+        stop_relay = list(st.get("relay_pickups") or [])
+        if not stop_relay and not plan.get("has_xact"):
+            # 兜底（**旧 dump** 没有 XACT 行）：按 (车, 站) 猜第一个待取的。
+            # 新 dump 一律走 XACT 的精确落点 —— (车, 站) 猜法在同一站多次经过时会认错停靠。
+            key_relay = (plan["id"], st["node"])
+            if key_relay in pending_relay and pending_relay[key_relay]:
+                oid = pending_relay[key_relay].pop(0)
+                stop_relay.append(oid)
+        for oid in stop_relay:
             rdy = ready.get((oid, st["node"]))
             if rdy is not None and rdy - raw > wait:
                 wait = float(rdy) - raw
@@ -831,6 +850,12 @@ def recompute_plan(g, plan, kind, time_factor=1.0, cost_factor=1.0, capacity=0.0
     deliv_total = deliv_ok = 0
     urg_total = urg_ok = 0
     norm_total = norm_ok = 0
+    # 订单表：A（取货点）按订单 ID 查（#57）。取货准时的判据是
+    #   t_pick + shortestTime_vehicle(A -> B) <= we
+    # A 是**订单的取货点**，不是「取货停靠所在的节点」—— 接力单的取货发生在中转站，
+    # 拿站当 A 会把跨簇单的 A->B 算短（实测把 2 张单错算成准时）。
+    if order_a is None:
+        order_a = {}
     for oid, (parr, pnode) in order_pickup.items():
         rec = order_deliv.get(oid)
         if rec is None:
@@ -839,7 +864,7 @@ def recompute_plan(g, plan, kind, time_factor=1.0, cost_factor=1.0, capacity=0.0
             continue
         pickup_total += 1
         _darr, we, late, _p, dnode = rec
-        _path, stime = shortest(g, pnode, dnode, "time")
+        _path, stime = shortest(g, order_a.get(oid, pnode), dnode, "time")
         scaled = (0.0 if stime == INF else stime * time_factor)
         if parr + scaled <= we + EPS:
             pickup_ok += 1
@@ -1028,7 +1053,8 @@ def _cli_plan(argv):
             continue
         m = recompute_plan(g, plan, kind, time_factor=veh["time_factor"],
                            cost_factor=veh["cost_factor"], capacity=veh["capacity"],
-                           urgent_ids=urgent_ids, ready=ready, relay_pickups=relay_pickups)
+                           urgent_ids=urgent_ids, ready=ready, relay_pickups=relay_pickups,
+                           order_a={o["id"]: o["pickup"] for o in orders})
         if m is None:
             print("[FAIL] %s: dump 复算不可达" % plan["id"])
             ok = False
@@ -1156,7 +1182,8 @@ def _dump_selfcheck():
             m = recompute_plan(g, plan, kind, time_factor=veh["time_factor"],
                                cost_factor=veh["cost_factor"], capacity=veh["capacity"],
                                urgent_ids=urgent_ids, ready=ready,
-                               relay_pickups=relay_pickups)
+                               relay_pickups=relay_pickups,
+                               order_a={o["id"]: o["pickup"] for o in orders})
             if m is None:
                 print("[FAIL] %s: dump 复算不可达" % plan["id"])
                 ok = False
