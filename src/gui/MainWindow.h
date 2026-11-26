@@ -163,7 +163,7 @@ public:
     // 画布与快照共用的**唯一**路线数据源（规格三 GUI §7）：每台车只给「当前位置 → 下一目标」
     // 那一段节点序列（含目标节点）；空车/已回库给空序列。两处都调它 ⇒ 画出来的与探针读到的一致。
     std::vector<std::vector<std::string> > canvasTargetRoutes() const;
-    // 当前页签（= 画布选中车）
+    // 车辆表当前选中行（= 画布选中车，#56 起由「每车一页签」改为「一车一行」）
     int selectedVehicleIndex() const;
 
 public:
@@ -212,28 +212,35 @@ public:
     // 因此它始终是**这一局车队分配**的用户可见证据（--ui-probe 会打印它）。
     QString allocationSnapshot() const { return allocationSnapshot_; }
 
-    // 转运账本面板（规格二 §7.5⑥）：7 列表头与**已执行**逐笔内容的文本快照。
+    // 转运账本（规格二 §7.5⑥；#56 起并入「中转与配送网」dock 的下半）：
+    // 7 列表头与**已执行**逐笔内容的文本快照。
     // 供 --ui-probe 校验表头与 --self-check-actions 校验「两端非空 / in≠out / dwell≤60 / 期末0」。
     QString     transitLedgerSummary() const;
     QStringList transitLedgerHeaders() const;
     int         transitLedgerRowCount() const;
+    // 账本空态提示（#56）：无行时在面板里明写「本次运行未发生入站转运（默认数据无跨簇单）」。
+    // 目的不是装饰，而是**把空表解释掉**——否则下一个人会把它当"面板坏了"再立一张票。
+    bool        transitLedgerEmptyHintVisible() const;
+    QString     transitLedgerEmptyHintText() const;
 
-    // 中转站面板的文本快照，供 --ui-probe 在无头环境下确定性核对
+    // 中转站表的文本快照，供 --ui-probe 在无头环境下确定性核对。
+    // #56 起 5 列：末列新增「站内待取走(kg)」= 账本里 pickedUp == false 的行求和。
     QString transitPanelSummary() const;
-    // 中转站面板**真实表头**（供 --ui-probe 校验「当前暂存货」列确实在界面上）。
+    // 中转站表**真实表头**（供 --ui-probe 校验「当前暂存货」「站内待取走」两列都在界面上）。
     // 与 stopPanelHeaders() 同理：守卫读界面上真正的列名，不背预期清单。
     QStringList transitPanelHeaders() const;
-    // 超时订单面板**应有**的行数 = 已经发生的迟到单 + 剩余计划预计迟到单。
-    // 读的是 `RoutePlan::metrics.orders`（规划器逐单真源）+ `deliveredLate`，
-    // 供 --ui-probe 校验「行数 == 迟到订单数」（G10）——不是把面板公式重算一遍。
+    // 「站内待取走(kg)」按站的**用户可见值**（直接读表格单元格，不重算公式）。
+    // 新增列的守卫靠它逐帧核对：卸入后、取走前必须 > 0；期末必须回到 0。
+    double stationPendingKg(const std::string& stationId) const;
+    // 订单表里「超时 +Nmin」标记的**应有**行数 = 已经发生的迟到单 + 剩余计划预计迟到单。
+    // 读的是 `RoutePlan::metrics.orders`（规划器逐单真源）+ `deliveredLate`，**按订单去重**
+    // （一张跨簇单在接力中会被多台车的计划各排一段，按车计数会重复），
+    // 供 --ui-probe 校验「订单表超时行数 == 迟到订单数」（G10 并入订单表后的原意）。
     int lateOrderCount() const;
     // 停靠明细面板的文本快照（供 --ui-probe）
     QString stopPanelSummary() const;
     // 路线信息面板的文本快照（供 --ui-probe 校验三项新指标与「停靠·动作」片段）
     QString routePanelSummary() const;
-    // 超时订单面板的文本快照与**真实表头**（供 --ui-probe 校验 8 列 / 逐单一行）
-    QString     latePanelSummary() const;
-    QStringList latePanelHeaders() const;
     // 停靠明细面板**真实表头**（供 --ui-probe 校验表头与数据不错位）。
     // 守卫必须读界面上真正的列名，而不是把预期列表再背一遍——本项目
     // 正是因此漏过"表头 7 列、数据只填 6 列"的错位。
@@ -241,15 +248,20 @@ public:
     // 工具栏动作名与面板标题（供 --ui-probe，供向导检查器比对）
     QString toolbarActionTexts() const;
     QString dockTitles() const;
-    // 车辆信息面板的文本快照（供 --ui-probe；**每车**页签都收进来）
-    QString vehiclePanelSummary() const;
-    // 第 index 个车辆页签的完整文本（页签标题 + 固定信息块 + 运行状态块）；
-    // --ui-probe 逐车核对 ID/容量/两因子/载重上限时按此读，免去切页状态影响。
-    QString vehiclePanelSection(int index) const;
-    // 车辆信息的页签数与标题（供 --ui-probe 核对页签数 == vehicles.size()，
-    // 每页标题 = `<车辆 ID> · <容量>kg`）
-    int     vehicleTabCount() const;
-    QString vehicleTabTitles() const;
+    // 车辆表（#56：一车一行，取代「每车一个页签」）的文本快照与**真实表头**。
+    // 逐行核对「载货 ≤ 该车容量」「行数 == 车辆数」时读这里——读的是界面上真实单元格。
+    int         vehicleRowCount() const;
+    QStringList vehiclePanelHeaders() const;
+    QString     vehiclePanelSummary() const;
+    QString     vehicleRowText(int row) const;
+    // 行 tooltip：固定信息（ID / 起始仓库 / 载重上限 / 发车时刻 / 两因子）与
+    // 面板上已不再单列的运行细节（阶段 / 已送达 / 剩余待送 / 已发生 penalty）都在这里。
+    // 原「车辆信息」六项运行状态**没有丢**，只是从占版面的标签块搬进了悬停提示。
+    QString vehicleRowTooltip(int row) const;
+    // 订单表（#56：一单一行 8 列，含新增「当前位置」）的真实表头与文本快照。
+    // 「当前位置」= 车上(车号) / 站内·站号 / 已送达(站点) / 待取·取货点。
+    QStringList orderPanelHeaders() const;
+    QString     orderPanelSummary() const;
     // 状态栏"软件内时间"的文本快照（供 --ui-probe 断言它确实常驻可见）
     QString statusClockSummary() const;
     // 供 --self-check-actions 使用：自动验证两个由人工测试发现的缺陷不再复现
@@ -458,10 +470,11 @@ private:
     void deliverAt(std::size_t v, const logistics::Stop& stop);
 
     QTextBrowser*  routeInfo_ = nullptr;
-    // 车辆信息（MC-E04）：**每车一个页签**，页签数 == config_.vehicles.size()，
-    // 标题 = `<车辆 ID> · <容量>kg`；每页内再分「固定信息 / 运行状态」两块标题。
-    // 两块都是 QLabel（PlainText），文本由 updatePanels 按车重建。
-    QTabWidget*    vehicleTabs_ = nullptr;
+    // 车辆表（#56 重设计）：**一车一行**，取代原来的「每车一个页签 + 两块标签」。
+    // 为什么合并：原布局把同一台车的「载货/额定/利用率」拆在页签里，用户要切页才能
+    // 逐车比；改成表格后四台车同屏并排，正是用户说的「各个车辆的载货量/总货量」。
+    // 固定参数（两因子 / 起始仓库 / 发车时刻）不占列，挂在行 tooltip 上。
+    QTableWidget*  vehicleTable_ = nullptr;
     // 状态栏上的**软件内时间**：它是这套模拟的核心驱动量（事件刻、订单窗口、
     // penalty 全按它算），但此前只出现在日志里，一滚就看不见了。
     QLabel*        clockLabel_ = nullptr;
@@ -471,8 +484,9 @@ private:
     // 已实际执行的转运账本（跨重规划保留；计划期候选不在这里）。
     std::vector<TransitLedgerEntry> transitLedger_;
     QTableWidget*  stopTable_ = nullptr;
+    // 账本空态提示（#56）：只在 transitLedger_ 无行时可见。
+    QLabel*        ledgerEmptyHint_ = nullptr;
     // 道路封闭不再用 tick 计数节流——它现在是加权事件的一种（权重最低）。
-    QTableWidget*  lateTable_ = nullptr;
     QPlainTextEdit* logView_ = nullptr;
 
     QTimer* simTimer_ = nullptr;
