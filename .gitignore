@@ -15,6 +15,9 @@ cmake-build-*/
 
 # 会话临时文件
 .dsh-browser-tmp/
+
+# 对齐记录 / 探索草稿（deck 本地工作区，不入课程仓库）
+.scratch/
 .dsh-mattskillsdeck-cache/
 
 # Archify 生成的架构图候选、HTML 与校验截图（本地工件，不入课程仓库）
