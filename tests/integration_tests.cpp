@@ -95,7 +95,17 @@ void checkPlanInvariants(const Config& cfg, const Vehicle& vehicle,
         return;
     }
     check(plan.nodes.front() == vehicle.startNodeId, tag + "从该车起始仓库出发");
-    check(plan.nodes.back() == vehicle.startNodeId, tag + "返回该车起始仓库（同一基地）");
+    // 规格五 #57：末段终点 = 该车的**主场**（慢车 -> 本簇中转站、快车 -> 起始仓库）。
+    // 归位是行驶不是停靠，所以这里核的是「末节点 == homeNodeOf」，不是「== startNodeId」。
+    std::size_t vIndex = cfg.vehicles.size();
+    for (std::size_t i = 0; i < cfg.vehicles.size(); ++i) {
+        if (cfg.vehicles[i].id == vehicle.id) {
+            vIndex = i;
+        }
+    }
+    check(vIndex < cfg.vehicles.size()
+              && plan.nodes.back() == homeNodeOf(cfg.graph, cfg.vehicles, vIndex),
+          tag + "跑完后回到主场（慢车本簇中转站 / 快车起始仓库）");
 
     bool walkable = true;
     for (std::size_t i = 1; i < plan.nodes.size(); ++i) {
@@ -963,8 +973,9 @@ void checkAllocationInvariants(const Config& cfg, const FleetPlan* fleets[3],
             }
             check(plan.nodes.front() == cfg.vehicles[v].startNodeId,
                   tag + cfg.vehicles[v].id + " 从自己的 start_node 出发");
-            check(plan.nodes.back() == cfg.vehicles[v].startNodeId,
-                  tag + cfg.vehicles[v].id + " 回到同一基地");
+            // 规格五 #57：末节点 = 该车**主场**（慢车本簇中转站 / 快车起始仓库）。
+            check(plan.nodes.back() == homeNodeOf(cfg.graph, cfg.vehicles, v),
+                  tag + cfg.vehicles[v].id + " 跑完后回到主场");
             check(!plan.nodeArrivalMin.empty()
                       && plan.nodeArrivalMin.front() == cfg.vehicles[v].departTimeMin,
                   tag + cfg.vehicles[v].id + " 按自己的 depart_time 出发");

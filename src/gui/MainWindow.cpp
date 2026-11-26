@@ -442,7 +442,12 @@ int MainWindow::minDepartMin() const {
 std::string MainWindow::nextStopNodeId(std::size_t v) const {
     const VehicleRuntime& rt = veh(v);
     if (rt.stopCursor >= rt.plan.stops.size()) {
-        return std::string();   // 无剩余 -> 页签显示「—」
+        // 规格五 #57：停靠走完之后，下一个目标就是**归位点**（还没到才显示；到了就显示已归位）。
+        if (rt.plan.homed && !rt.plan.homeNodeId.empty()
+            && rt.nodeIndex + 1 < rt.plan.nodes.size()) {
+            return rt.plan.homeNodeId;
+        }
+        return std::string();
     }
     return rt.plan.stops[rt.stopCursor].nodeId;
 }
@@ -533,6 +538,10 @@ std::vector<std::vector<std::string> > MainWindow::canvasTargetRoutes() const {
                     target = j;
                     break;
                 }
+            }
+            if (target >= rt.plan.nodes.size() && rt.plan.homed && from + 1 < rt.plan.nodes.size()) {
+                // 规格五 #57：停靠走完但归位段还没走完 —— 画整段归位航线（这一段就是「回家」）。
+                target = rt.plan.nodes.size() - 1;
             }
             if (target < rt.plan.nodes.size()) {
                 seg.assign(rt.plan.nodes.begin() + static_cast<std::ptrdiff_t>(from),
@@ -1854,7 +1863,7 @@ void MainWindow::onAdvanceStopFor(std::size_t v) {
         }
         deliverAt(v, stop);
     } else if (veh(v).nodeIndex + 1 == veh(v).plan.nodes.size()) {
-        appendLog(QStringLiteral("返回仓库 %1（到达 %2），本次配送结束")
+        appendLog(QStringLiteral("归位 %1（到达 %2），本次配送结束")
                       .arg(QString::fromStdString(veh(v).state.atNodeId))
                       .arg(minutesToClock(veh(v).state.atTimeMin)));
     } else {
@@ -2669,9 +2678,12 @@ void MainWindow::updatePanels() {
                 QStringLiteral("%1/%2").arg(load, 0, 'f', 1).arg(cap, 0, 'f', 0),
                 utilText,
                 QString::number(rt.state.onboard.size()),
-                nextNode.empty() ? here
-                                 : here + QStringLiteral("→")
-                                       + QString::fromStdString(nextNode)};
+                nextNode.empty()
+                    ? (rt.plan.homeNodeId.empty()
+                           ? here
+                           : here + QStringLiteral("（已归位 %1）")
+                                        .arg(QString::fromStdString(rt.plan.homeNodeId)))
+                    : here + QStringLiteral("→") + QString::fromStdString(nextNode)};
             const QString tooltip =
                 QStringLiteral("固定信息\nID：%1\n起始仓库：%2\n载重上限：%3 kg\n发车时刻：%4\n"
                                "耗时倍率：%5\n成本倍率：%6\n运行状态\n阶段：%7\n"

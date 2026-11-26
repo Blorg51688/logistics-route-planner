@@ -3803,8 +3803,13 @@ void testRescheduleLevel1KeepsUnaffectedRoutesAndTwoVersionRule() {
     check(res.level == 1 && !res.rejected, "第 ① 级：只影响一台车 ⇒ 局部重排成功");
     check(res.replanned.size() == 1 && res.replanned[0] == 0,
           "第 ① 级：只重算受影响的那台车（实际 " + std::to_string(res.replanned.size()) + " 台）");
-    check(planSignature({res.plans[1]}) == planSignature({p2}),
-          "不变量 5：未受影响车（V02）的路线逐字不变");
+    // 规格五 #57：复调度收口会统一做**空闲归位**（幂等）。未受影响车的期望值是「p2 再归位
+    // 一次」——归位段本来就已就位时逐字不变，这条断言因此仍成立且更强（活路线 + 归位点）。
+    std::vector<logistics::RoutePlan> expectUnchanged(2);
+    expectUnchanged[1] = p2;
+    applyIdleHoming(g, vehicles, WeightType::Time, expectUnchanged);
+    check(planSignature({res.plans[1]}) == planSignature({expectUnchanged[1]}),
+          "不变量 5：未受影响车（V02）的路线逐字不变（归位幂等）");
     bool hasLine = false;
     for (std::size_t i = 0; i < res.log.size(); ++i) {
         if (res.log[i] == "[复调度] 局部重排（1 台车）") {
@@ -4862,6 +4867,99 @@ void testRescheduleNewOrderCrossClusterRelay() {
 
 } // namespace
 
+
+// ---- 规格五 #57 · 空闲归位（§5.13）的守卫 ----
+//
+// 判据全部读**用户能看到的东西**（plan 的末节点 / 归位元数据 / 车队汇总），不重算公式。
+// 反向验证（把 planFleet 里的 applyIdleHoming 调用去掉）⇒ 本条必红：
+//   · 末节点退回起始仓库 W（「慢车回本簇站」失守）；
+//   · homeNodeId 全空（--dump-plan 的 HOME 行会打 '-'）。
+LogisticsGraph makeHomingGraph() {
+    LogisticsGraph g;
+    g.addNode(makeSubNode("W", NodeType::Warehouse, "仓库", 0));
+    g.addNode(makeSubNode("T1", NodeType::Transit, "站1", 1));
+    g.addNode(makeSubNode("T2", NodeType::Transit, "站2", 2));
+    g.addNode(makeSubNode("D1", NodeType::Delivery, "客户1", 1));
+    g.addNode(makeSubNode("D2", NodeType::Delivery, "客户2", 1));
+    g.addNode(makeSubNode("D3", NodeType::Delivery, "客户3", 2));
+    g.addNode(makeSubNode("D4", NodeType::Delivery, "客户4", 2));
+    addTwoWay(g, "W", "T1", 10.0, 10.0, 16.0);
+    addTwoWay(g, "W", "T2", 20.0, 20.0, 32.0);
+    addTwoWay(g, "T1", "T2", 30.0, 30.0, 48.0);
+    addTwoWay(g, "T1", "D1", 2.0, 2.0, 2.0);
+    addTwoWay(g, "T1", "D2", 3.0, 3.0, 3.0);
+    addTwoWay(g, "T2", "D3", 2.0, 2.0, 2.0);
+    addTwoWay(g, "T2", "D4", 3.0, 3.0, 3.0);
+    return g;
+}
+
+Vehicle homingVehicle(const std::string& id, double capacityKg, double timeFactor,
+                      double costFactor) {
+    Vehicle v = makeVehicleWithFactors("W", capacityKg, 480, timeFactor, costFactor);
+    v.id = id;
+    return v;
+}
+
+void testIdleHomingSemantics() {
+    const LogisticsGraph g = makeHomingGraph();
+    const std::vector<Vehicle> vehicles = {
+        homingVehicle("V01", 400.0, 1.00, 1.50),
+        homingVehicle("V02", 160.0, 1.25, 0.80),
+        homingVehicle("V03", 160.0, 1.25, 0.80),
+    };
+    const std::vector<Order> orders = {
+        makeOrder("O1", "D1", "D2", 10.0, 0, 1440, false),
+        makeOrder("O2", "D3", "D4", 10.0, 0, 1440, false),
+    };
+
+    // ① 主场规则：慢车 = 本簇中转站（与职责表同源），快车 = 起始仓库。
+    check(homeNodeOf(g, vehicles, 0) == "W",
+          "归位①：快车的主场 = 起始仓库（实际 " + homeNodeOf(g, vehicles, 0) + "）");
+    check(homeNodeOf(g, vehicles, 1) == "T1",
+          "归位①：守簇 1 的慢车主场 = T1（实际 " + homeNodeOf(g, vehicles, 1) + "）");
+    check(homeNodeOf(g, vehicles, 2) == "T2",
+          "归位①：守簇 2 的慢车主场 = T2（实际 " + homeNodeOf(g, vehicles, 2) + "）");
+
+    const FleetPlan fleet = planFleet(g, vehicles, orders, WeightType::Distance);
+    check(fleet.allOk, "归位②：车队可行（" + fleet.reason + "）");
+    if (fleet.vehicles.size() != vehicles.size()) {
+        check(false, "归位②：逐车计划数 == 车辆数");
+        return;
+    }
+    // ② 末节点 = 主场：慢车回本簇站、快车回起始仓库。
+    check(fleet.vehicles[0].nodes.back() == "W", "归位②：快车收工后回到起始仓库");
+    check(fleet.vehicles[1].nodes.back() == "T1",
+          "归位②：慢车收工后回到本簇中转站 T1（实际 " + fleet.vehicles[1].nodes.back() + "）");
+    check(fleet.vehicles[2].nodes.back() == "T2",
+          "归位②：慢车收工后回到本簇中转站 T2（实际 " + fleet.vehicles[2].nodes.back() + "）");
+    // ③ 归位是**行驶**：真跑了距离/耗时且计入汇总；penalty 仍为 0（没有订单）。
+    check(fleet.vehicles[1].homed && fleet.vehicles[1].homingDistanceKm > 0.0,
+          "归位③：慢车 V02 产生了归位行驶（km = "
+              + std::to_string(fleet.vehicles[1].homingDistanceKm) + "）");
+    check(fleet.vehicles[1].homeArrivalMin == fleet.vehicles[1].returnArrivalMin,
+          "归位③：归位到达时刻 = 该车返回时刻");
+    check(fleet.totalPenaltyMin == 0 && fleet.vehicles[1].totalPenaltyMin == 0,
+          "归位③：归位不产生 penalty（无订单）");
+    // ④ 本夹具里归位段比「回起始仓库」短（对照口径由 warehouseReturnKm 给出）。
+    check(fleet.vehicles[1].warehouseReturnKm > fleet.vehicles[1].homingDistanceKm,
+          "归位④：归位段 < 回仓对照（" + std::to_string(fleet.vehicles[1].homingDistanceKm)
+              + " vs " + std::to_string(fleet.vehicles[1].warehouseReturnKm) + "）");
+    // ⑤ 幂等 + 「已在主场不产生移动」。
+    std::vector<RoutePlan> again = fleet.vehicles;
+    const double d0 = again[1].totalDistanceKm;
+    const double t0 = again[1].totalTimeMin;
+    const double c0 = again[1].totalCostYuan;
+    applyIdleHoming(g, vehicles, WeightType::Distance, again, nullptr);
+    check(fixtures::nearlyEqual(again[1].totalDistanceKm, d0)
+              && fixtures::nearlyEqual(again[1].totalTimeMin, t0)
+              && fixtures::nearlyEqual(again[1].totalCostYuan, c0),
+          "归位⑤：幂等 —— 已在主场再跑一次，三项逐字不变");
+    check(!again[0].homed && fixtures::nearlyEqual(again[0].homingDistanceKm, 0.0),
+          "归位⑤：快车本来就在仓库 => homed = false、归位段 0km（不写 0 距离边）");
+    check(again[0].nodes.size() == 1,
+          "归位⑤：空车不因归位多出节点（实际 " + std::to_string(again[0].nodes.size()) + "）");
+}
+
 int main() {
 #define RUN(fn) do { std::printf("== " #fn "\n"); fn(); } while (0)
     RUN(testSingleOrderRouteIsFullyCorrect);
@@ -4921,6 +5019,9 @@ int main() {
     RUN(testTransitUrgentDoubleGate);
     RUN(testTransitDwellBoundary);
     RUN(testRelayThreeLegChainViaPlanFleet);
+
+    // 规格五 #57：空闲归位（§5.13）
+    RUN(testIdleHomingSemantics);
 
     RUN(testRescheduleLevel1KeepsUnaffectedRoutesAndTwoVersionRule);
     RUN(testRescheduleLevel2CrossVehicleReassignment);
