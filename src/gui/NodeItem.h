@@ -19,6 +19,7 @@ public:
     int type() const override { return Type; }
 
     const std::string& nodeId() const { return node_.id; }
+    const logistics::Node& node() const { return node_; }   // 道路分级要读节点类型（规格四 §2）
 
     void addEdge(EdgeItem* edge);
 

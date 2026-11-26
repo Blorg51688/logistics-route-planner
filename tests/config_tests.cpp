@@ -245,20 +245,29 @@ void testLoadDefaultConfig() {
             double      capacityKg;
             double      timeFactor;
             double      costFactor;
+            const char* startNode;   // 规格四 #54：慢车就近驻场，不再全部 W01
+            int         departMin;   // 规格四 #54：V03 提前发车覆盖跨城通勤
         };
-        const ExpectVehicle expect[4] = {{"V01", 400.0, 1.00, 1.50},
-                                         {"V02", 160.0, 1.25, 0.80},
-                                         {"V03", 160.0, 1.25, 0.80},
-                                         {"V04", 160.0, 1.25, 0.80}};
+        // 起始仓库与发车时刻是**数据事实**，随规格四改动：
+        //   · V02 守簇 1，从 W01（本国仓）出发，08:00；
+        //   · V03 守簇 2，从 W02 出发；因 W02→簇 2 首批客户要走 180km 干线，
+        //     06:30 发车才能赶上三张紧窗单（O13 止 09:30 / O12 止 11:00 / O11 止 10:30）；
+        //   · V04 守簇 3，从 W02 出发（比 W01 近 20km），08:00。
+        // 为什么这些要写进测试而不是"随便哪个仓库都行"：它们直接决定黄金值，
+        // 漂了就是真回归（每台车跑哪片区域、什么时候出发，都是可核对的承诺）。
+        const ExpectVehicle expect[4] = {{"V01", 400.0, 1.00, 1.50, "W01", 8 * 60},
+                                         {"V02", 160.0, 1.25, 0.80, "W01", 8 * 60},
+                                         {"V03", 160.0, 1.25, 0.80, "W02", 6 * 60 + 30},
+                                         {"V04", 160.0, 1.25, 0.80, "W02", 8 * 60}};
         for (int i = 0; i < 4; ++i) {
             const logistics::Vehicle& v = cfg.vehicles[static_cast<std::size_t>(i)];
             const std::string tag = std::string("默认车辆 ") + expect[i].id + "：";
             check(v.id == expect[i].id, tag + "行序与 ID 一致");
             check(v.capacityKg == expect[i].capacityKg, tag + "载重");
-            check(v.departTimeMin == 8 * 60, tag + "发车时刻 08:00 解析为 480 分钟");
+            check(v.departTimeMin == expect[i].departMin, tag + "发车时刻");
             check(v.timeFactor == expect[i].timeFactor, tag + "耗时倍率");
             check(v.costFactor == expect[i].costFactor, tag + "成本倍率");
-            check(v.startNodeId == "W01", tag + "起始仓库 W01");
+            check(v.startNodeId == expect[i].startNode, tag + "起始仓库");
             const logistics::Node* start = cfg.graph.findNode(v.startNodeId);
             check(start != nullptr && start->type == NodeType::Warehouse, tag + "起始节点是仓库");
         }

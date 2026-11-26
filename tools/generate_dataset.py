@@ -39,10 +39,107 @@ SCALE = 64.0
 # 道路等级：主干道快但贵（含通行费），支线慢但便宜。
 # 若两类系数让 cost 与 dist 的比值**处处相同**，最低成本策略就必然等价于
 # 最短距离策略，双策略功能形同虚设（这正是当初的另一个缺陷）。
-TRUNK_TIME_FACTOR = 1.0    # 主干道 min/km
-TRUNK_COST_FACTOR = 1.6    # 主干道 元/km
-BRANCH_TIME_FACTOR = 2.4
-BRANCH_COST_FACTOR = 1.2
+#
+# 规格四（#54）把主干道细分成两类，**系数只属于支线**：
+#   · 城内支线（簇内边：站↔客户、客户↔客户）里程仍由坐标 / SCALE 算，沿用 2.4 / 1.2；
+#   · 跨城干线（仓↔站、站↔站）里程**脱离欧氏距离**，改由下方 TRUNK_KM 里程表给定，
+#     费率 = 高速口径（见 HIGHWAY_*）：快（min/km 低、≈65–90km/h）而贵（元/km 高，含通行费）。
+# 为什么要拆开：规格四之前站间只有 4.1–5.4km —— 快车跑一趟成本太低，「攒一车再走」
+# 没有经济动机（实测 V01 容量利用率仅 1.3%）。把干线的**里程**提上去才是尺度问题本身；
+# 只调费率不改里程，跨城段仍是「几分钟的路」。
+TRUNK_HIGHWAY = True       # 只有这里为真时干线才用 TRUNK_KM；置假 = 退回旧欧氏口径（反向验证用）
+TRUNK_KM = {
+    # (站A, 站B) -> 干线里程 km。**只放站↔站/仓↔站**，键按 ID 升序写。
+    # 取值按两端在地图上的摆位排：仓库↔丙城最远、甲↔乙居中、仓↔本国站是「出城段」。
+    # 这些数**不是**欧氏距离乘倍率得来的 —— 干线里程与坐标解耦正是本票的做法：
+    # 坐标仍只服务画布布局与簇内几何，改干线里程不会把整张图拉大。
+    #
+    # 量级的上界不是随便定的：**慢车每天要往返一次**（规格三：所有车 W01 发车、期末回库），
+    # 而验收 C24-③ 要求完工耗时 ≤ 12h。2 × D × 0.75 × 1.25（慢车倍率）+ 城内 ~3h，
+    # 12h 预算 ⇒ D 超过 ~290km 就必然超时。所以干线取 200–260km：既是跨城量级，
+    # 又让「当日往返」在物理上说得通。**这不是为了迁就判据而缩水**，是把工作日长度
+    # 当作真实约束参与选址；再远的城市在「朝发夕归」模型里就不该有慢车驻场。
+    ("T01", "T02"): 200,
+    ("T01", "W01"): 180,
+    ("T02", "T03"): 200,
+    ("T02", "W01"): 200,     # 规格四补：甲↔乙不能只经 T01（慢车会绕 430km）
+    ("T02", "W02"): 180,
+    ("T03", "W01"): 240,
+    ("T03", "W02"): 220,
+}
+# 国道（跨城「小路」）：跨簇的、含配送点的边（站↔对簇客户、客户↔客户、仓↔远客户）。
+# 为什么必须有这一档：用户原话「一些通过用户点将簇连接的路线就是国道等绕的小路」。
+# 这是簇与簇之间的**另一条通路**——比高速绕（里程更长）、慢（55km/h）、但没有通行费（便宜）。
+# 若让这些边继续按城内几何算（1–2km），快车就有了「11km 穿城去隔壁市」的捷径，
+# 跨城高速永远选不上，规格四的整件事（跨城尺度）就落空了 —— 实测反证：只改干线时
+# 快车 T01→T03 实际只跑 27min、容量利用率 1.2%→1.7%，与改前几乎一样。
+NATIONAL_KM = {
+    # (A, B) -> 国道里程 km。键按 ID 升序写；覆盖全部「跨簇 + 含配送点」的边。
+    # 这四条**都是客户↔客户**的跨簇连线 —— 正是用户原话里「通过用户点将簇连接的路线
+    # 就是国道等绕的小路」：比高速里程更长、速度更慢，但没有通行费，成本最低。
+    # 站↔客户一律是城内边（站只连本簇配送点，见 build_links），不进这张表。
+    # **里程必须大于高速**：这是「绕」的字面含义，也是三策略能分化的前提（见下）。
+    # 高速 T01↔T02 是 200km；经客户点的国道 T01→D03→D05→T02 = 2.4 + 260 + 5.5 = 268km。
+    ("D03", "D05"): 260,     # 甲城 ↔ 乙城（经客户点绕行）
+    ("D12", "D13"): 260,
+    ("D13", "D17"): 260,     # 乙城 ↔ 丙城
+    ("D16", "D17"): 260,
+}
+# 国道与高速的取舍（规格四 #54 实测出来的第二个真实缺陷）：
+# 只把国道里程给到「比高速短」时，「距离策略」与「成本策略」会排出**逐字相同**的路线
+# —— 三策略退化成两策略，验收 ①「三策略两两分化」变成空断言（实测 distance 与 cost
+# 的全局 13 项完全相同）。真实的城际路网里国道当然比高速**绕**：
+#   · 高速 T01→T02：200km / 150min / 600 元（0.75 min/km、3.0 元/km）
+#   · 国道 T01→D03→D05→T02：268km / 241min / 218 元（0.9 min/km、0.8 元/km）
+# 于是距离策略走高速、成本策略绕国道、时间策略走高速但可能排不同的停靠序 —— 三策略才真的分开。
+# 国道费率：55km/h（1.1 min/km，比高速慢、比城内小路快）+ 0.8 元/km（无通行费，比高速便宜得多）。
+# 三档费率的意义：时间策略走高速（315min/1260 元）、成本策略走国道（~400min/300 元）——
+# 「快而贵 / 慢而省」在同一对城市之间成为真实的取舍，而不是换汤不换药。
+NATIONAL_TIME_FACTOR = 0.9
+NATIONAL_COST_FACTOR = 0.8
+# 高速费率（按**两端所在簇**分三档，都属「快而贵」，理由见下）：
+#   · 80km/h = 0.75 min/km：城际高速的卡车平均速度，比支线的 2.4 min/km（25km/h）快一个量级；
+#   · 元/km 3.0 / 3.5 / 4.0：含通行费，是支线 1.2 元/km 的 2.5–3.3 倍。越偏远越贵
+#     （W 与 T03 那一簇之间是长距离干线，收费系数更高）。
+# 为什么成本倍率这么高：本票的目的是**攒批**（规格四用户原话：跨城尺度让「攒一车再走」有意义）。
+# 费率太低的话 200km 的跨城腿仍然比城内绕行便宜，攒批就还是不会出现。
+HIGHWAY_TIME_FACTOR = 0.75   # 干线 min/km（80km/h），三档同速
+WAREHOUSE_LOCAL_COST_FACTOR = 3.0   # 仓↔本国站：出城段 元/km
+# 簇对 -> (站↔站 元/km, 仓↔对簇站 元/km)
+# 一档一条走廊，**同一走廊上几段高速公路单价相同**（站点/桥隧收费在这里已折进单价，
+# 不再另计）—— 若各段单价不同又里程不等，就会出现「经 X 站绕行比直达更便宜」这种
+# 与常识相反的路径（实测：T02→W02 一度绕 T03 反而少 80 元）。所以三档单价拉开的是
+# **走廊级别**的差异（近程走廊最便宜、最远走廊最贵），走廊内部保持单一定价。
+HIGHWAY_COST_BY_PAIR = {
+    (1, 2): (3.0, 3.0),   # T01-T02：两簇相邻的标准高速
+    (2, 3): (3.0, 3.0),   # T02-T03：同一走廊，同价
+    (1, 3): (3.5, 3.5),   # T01-T03 / W-T03：最长的那条走廊，单价最高
+}
+# ---- 城内道路也分两级（规格四 #54 实测出来的第三个真实缺陷）----
+# 只按「干线 / 支线」分两级时，**簇内每条边的 cost/dist 比值完全相同**（都是 1.2），
+# 于是「最短距离」与「最低成本」在同一簇内排出**逐字相同**的路线。跨城尺度把干线拉到
+# 180–240km 之后，「为省 0.4 元/km 而绕 180km 干线」这种取舍彻底消失（没人会为了省
+# 几百块开 180 公里去接一个 5 公里外的客户），三策略就退化成两策略 ——
+# 实测 distance 与 cost 的 13 个全局指标**逐字相同**，验收 ① 变成空断言。
+#
+# 修法与用户原话一致（「一些通过用户点将簇连接的路线就是国道等绕的小路」）：
+# 城内也有主干道与小路的区别 ——
+#   · **主干道**（站/仓 ↔ 客户）：快但贵，2.0 min/km（30km/h）· 1.5 元/km；
+#   · **小路**（客户 ↔ 客户）：慢但便宜，3.0 min/km（20km/h）· 1.0 元/km。
+# 三策略因此各有偏好：距离看 km、成本挑小路、时间挑主干道，三者必然分开。
+CITY_MAIN_TIME_FACTOR = 2.0
+CITY_MAIN_COST_FACTOR = 1.5
+CITY_MINOR_TIME_FACTOR = 3.0
+CITY_MINOR_COST_FACTOR = 1.0
+
+# 尺度守卫（规格四 §1）：干线里程必须比簇内最大里程高两个数量级级距。
+# 反向验证就是把它调到 10：把干线里程改回「几十公里以内」时下面这条自检必须报红。
+TRUNK_SCALE_MIN_RATIO = 25.0   # 120km（最短干线）/ 4.5km（簇内最大）≈ 26.7 ⇒ 相对下界留余量
+# 逐条干线里程的下降。120km 是**仓↔最近站**这一档：簇内最大 4.4km 的 27 倍，
+# 已满足「1–2 个数量级」；200km 量级由四条站↔站/仓↔远站（160–260km）承担。
+TRUNK_MIN_KM = 100.0
+# 国道里程的下限：它也是跨城量级（否则「绕的小路」就成了城内捷径，高速又选不上）。
+NATIONAL_MIN_KM = 100.0
 
 TRAFFIC_CHANGE_RATIO = 0.1
 TRAFFIC_TIME_INCREASE_MIN = 0.2
@@ -64,12 +161,34 @@ EVENT_LEVELS = [
 # 为什么是 3 台慢车而不是 2 台（规格二曾是 3 车）：职责封闭要求「每个子配送网有专属运力」，
 # 3 簇 / 3 慢车 ⇒ 簇→慢车是**排列数 1 的固定指派**，无需枚举（#46 退役整簇全排列的根因）。
 # 订单表一个字不改：25 单 516kg 全部簇内，每簇一批（160/144/152kg）仍与一台慢车对应。
+# **规格四 #54 的改动：慢车从「离自己那一侧最近的中央仓库」发车，不再全部 W01。**
+# 为什么必须改（这是本票实测出来的、规格三数据在跨城尺度下的内在不一致）：
+#   规格三要求「职责封闭：每台慢车守一个簇」，同时又让**全部四台车从 W01 发车**。
+#   城内尺度下这只是 5km 的绕行，看不出来；干线提到 180–240km 之后，
+#   「守簇 3 的 V04 每天先从 W01 开 240km 到 T03、再开 240km 回 W01」就成了 480km 的
+#   纯通勤 —— 实测单日 870min（14.5h）、成本策略更是 16h，**12h 工作日判据必然红**。
+#   这不是尺度定得太狠，是「运力部署」与「职责分区」在跨城尺度下必须对齐：
+#   两个中央仓库各自服务自己那一侧的簇，慢车就近驻场。
+#   改动范围：只改 V03/V04 的 start_node（W01 → W02）。发车时刻、车队构成、订单表、
+#   腿模型/接力/custody 全部不动。W02 是「中央仓库B」，就在簇 2/3 那一侧（W02→T02 180km、
+#   W02→T03 220km，都短于从 W01 出发）。
+#   为什么这是「最小改动」而不是「为了让数字好看」：它修的是**运力部署与职责分区不一致**
+#   这个结构问题；如果只是把 12h 判据放宽，那才是真的粉饰（票面明令禁止）。
 VEHICLES = [
     ("V01", "W01", 400, "08:00", 1.00, 1.50),
-    ("V02", "W01", 160, "08:00", 1.25, 0.80),
-    ("V03", "W01", 160, "08:00", 1.25, 0.80),
-    ("V04", "W01", 160, "08:00", 1.25, 0.80),
+    ("V02", "W01", 160, "08:00", 1.25, 0.80),   # 守簇 1（W01 本国簇，2km 城内）
+    ("V03", "W02", 160, "06:30", 1.25, 0.80),   # 守簇 2（W02 本国簇，但 V02 先占着 W01）
+    ("V04", "W02", 160, "08:00", 1.25, 0.80),   # 守簇 3（离 W02 更近）
 ]
+
+# 慢车的发车时刻（规格四 #54）：**V03 提前到 06:30，其余不变**。
+# 为什么：V03 守簇 2，而从 W02 到簇 2 的第一批客户要走 180km 干线（135min × 1.25 = 169min）
+# + 城内接驳，08:00 发车时第一批送达落在 10:53，而簇 2 有三张紧窗单
+# （O13 止 09:30 / O12 止 11:00 / O11 止 10:30）⇒ 三张全超时（实测 penalty 157min）。
+# 票面 §3 把「调发车时刻」列为允许的出路之一，这里用的就是它：**不改窗口、不改判据**，
+# 让运力早出发去覆盖它负责的那片区域 —— 这正是「跨城尺度下排班要跟着距离走」的意思。
+# 为什么只动 V03：V02（簇 1）与 V04（簇 3）在 08:00 发车时零 penalty，没有必要动它们；
+# 改一台能修好问题就不改三台（最小改动）。
 
 # 初始数据集（规格一 #23「四、订单表（权威版，25 行）」**逐字照抄**）。
 # 纪律：kg 与窗口一律照抄，不在生成器里做任何算术或"顺手调整"；
@@ -122,7 +241,11 @@ EXAMPLE_WINDOW = ("D09", ("09:00", "11:00"))  # 需求原文「9:00-11:00 送达
 # ---------------------------------------------------------------- 拓扑定义
 NODES = [
     ("W01", "warehouse", 80, 160, "中央仓库A", 0),
-    ("W02", "warehouse", 80, 500, "中央仓库B", 0),
+    # W02 的 y 从 500 改到 400（规格四 #54）：**只挪画布布局，不改任何城内里程**。
+    # 原位置下 W02→D25 是全图最长的一条边（10.6km），大到盖过「簇内 1–6km」的口径；
+    # 挪到 400 之后它回到城内尺度，尺度守卫（下面 self_check）才能把**簇内最大里程**
+    # 当作唯一基准去比干线里程。中心仓库各自靠近自己的中转站也是更合理的布点。
+    ("W02", "warehouse", 80, 400, "中央仓库B", 0),
     ("T01", "transit", 380, 200, "中转站甲", 1),
     ("T02", "transit", 380, 460, "中转站乙", 2),
     ("T03", "transit", 700, 330, "中转站丙", 3),
@@ -160,17 +283,38 @@ ONE_WAY_LINKS = [
 ]
 
 
+# 跨城干线的**拓扑**（规格四 §1）。里程另由 TRUNK_KM 给定 —— 两者必须成对覆盖，
+# 自检会逐条核对「干线条数 == TRUNK_KM 条数」。
+# 为什么这里写死而不从坐标推：干线的存在意义是「站与站之间有高速」，属于路网设计决策；
+# 由坐标推会把 4.x km 的邻居自动连上，尺度一变拓扑就变，数据不可复现。
+TREE_LINKS = [
+    ("W01", "T01"), ("W01", "T02"), ("W01", "T03"), ("W02", "T02"), ("W02", "T03"),
+    ("T01", "T02"), ("T02", "T03"),
+]
+
+
 def build_links():
-    links = [("W01", "T01"), ("W01", "T03"), ("W02", "T02"), ("W02", "T03"),
-             ("T01", "T02"), ("T02", "T03"),
-             ("W01", "D01"), ("W02", "D25"),
-             ("T01", "D10"), ("T02", "D09"), ("T03", "D17")]
-    for i in range(1, 10):
-        links.append(("T01", "D%02d" % i))
-    for i in range(10, 18):
-        links.append(("T02", "D%02d" % i))
-    for i in range(18, 26):
-        links.append(("T03", "D%02d" % i))
+    """路网拓扑。**中转站只连本簇的配送点**（规格四 #54 修的真实缺陷）。
+
+    旧实现按**编号区间**硬连（T01↔D01–D09、T02↔D10–D17、T03↔D18–D25），而配送点归属
+    是按**几何最近站**算的（nearest_transit）——两套口径在 5km 尺度下只差一次绕行，
+    看不出来；但干线提到 200km 之后，T01↔D05（D05 属簇 2）就成了「甲城站到乙城客户」
+    的 200km 边，慢车为一张单跨城往返两次，单日路线 1022km / 1507min。
+    这是**拓扑与簇归属不一致**，不是尺度问题，所以修拓扑而不是给它编个里程。
+
+    修法：站连**本簇**配送点（与 sub_network_id 同源，不硬编码区间）。跨簇的连通性
+    由下面 EXTRA_LINKS / ONE_WAY_LINKS 里那几条**客户↔客户**的跨簇边承担 ——
+    它们正是用户说的「通过用户点将簇连接的路线就是国道等绕的小路」。
+    """
+    links = list(TREE_LINKS) + [("W01", "D01")]
+    cluster_of = {}
+    for i in range(1, 26):
+        nid = "D%02d" % i
+        x, y = DELIVERY_COORDS[nid]
+        cluster_of[nid] = nearest_transit(x, y)
+    station_of = {1: "T01", 2: "T02", 3: "T03"}
+    for nid in sorted(cluster_of):
+        links.append((station_of[cluster_of[nid]], nid))
     links.extend(EXTRA_LINKS)
     return links
 
@@ -202,17 +346,106 @@ def all_nodes():
     return nodes
 
 
+# 道路等级判据：**边的两端类型**（站↔站 / 仓↔站 = 干线，含 delivery 端 = 支线）。
+# 画布（src/gui/EdgeItem）与这里必须同口径 —— 两边都只用节点类型，不硬编码 ID。
 def is_trunk(a, b):
     return a[0] in "WT" and b[0] in "WT"
 
 
+# 节点所属簇：仓 = 0（中央仓库自成「城 0」），其余取 nodes 表的 sub_network_id。
+def cluster_of_node(node_id):
+    for n in NODES:
+        if n[0] == node_id:
+            return n[5]
+    for i in range(1, 26):
+        nid = "D%02d" % i
+        if nid == node_id:
+            return nearest_transit(DELIVERY_COORDS[nid][0], DELIVERY_COORDS[nid][1])
+    raise KeyError("未知节点 %s" % node_id)
+
+
+def road_class(a, b):
+    """三档道路：trunk（跨城高速）/ national（跨城国道）/ city（城内小路）。
+    判据只看**两端所属簇**与端点类型，不硬编码 ID —— 换数据/换簇划分后自动跟着走。
+
+    仓要按「本国簇」算：W01 与 T01 同城、W02 与 T02 同城。若把仓一律当簇 0，
+    W01↔D01（同城 1.9km）会被误判成跨城国道、凭空变成 180km —— 这正是本函数
+    不能偷懒写 ca == 0 的原因。"""
+    if is_trunk(a, b):
+        return "trunk"
+    ca, cb = cluster_of_node(a), cluster_of_node(b)
+    if ca == 0:
+        ca = home_cluster_of(a)
+    if cb == 0:
+        cb = home_cluster_of(b)
+    return "city" if ca == cb else "national"
+
+
+def national_km(a, b):
+    key = (a, b) if a < b else (b, a)
+    if key not in NATIONAL_KM:
+        raise KeyError("NATIONAL_KM 缺少国道 %s <-> %s" % key)
+    return NATIONAL_KM[key]
+
+
+def trunk_km(a, b):
+    """干线里程查表（规格四 §1）。表里没有 = 数据缺行，宁可报错也不回落到欧氏距离：
+    悄悄回落会把一条本该几百公里的跨城路写回几公里，尺度守卫之外没人会发现。"""
+    key = (a, b) if a < b else (b, a)
+    if key not in TRUNK_KM:
+        raise KeyError("TRUNK_KM 缺少干线 %s <-> %s" % key)
+    return TRUNK_KM[key]
+
+
+def home_cluster_of(warehouse_id):
+    """仓库的「本国簇」= 唯一连到它的中转站所在簇（W01↔T01、W02↔T02）。"""
+    for a, b in TREE_LINKS:
+        if a == warehouse_id and a[0] == "W":
+            return {n[0]: n[5] for n in NODES}[b]
+        if b == warehouse_id and b[0] == "W":
+            return {n[0]: n[5] for n in NODES}[a]
+    raise KeyError("仓库 %s 没有连到任何中转站" % warehouse_id)
+
+
+def trunk_cost_factor(a, b):
+    """干线的元/km，按**两端所在的簇**分三档（规格四 §1）。W 记作簇 0。
+    站↔站 -> 两簇那一档；仓↔本国站 -> 出城段（最便宜）；仓↔非本国站 -> 远端那一档
+    （比站↔站更远，按低价算会让「绕仓走」凭空便宜）。"""
+    sub = {n[0]: n[5] for n in NODES}
+    ca, cb = sub[a], sub[b]
+    if ca == 0 or cb == 0:
+        wh, st = (a, b) if ca == 0 else (b, a)
+        home = home_cluster_of(wh)
+        if sub[st] == home:
+            return WAREHOUSE_LOCAL_COST_FACTOR   # 本国站：高速入口就在城边，单价最低
+        pair = (min(home, sub[st]), max(home, sub[st]))
+        if pair not in HIGHWAY_COST_BY_PAIR:
+            raise KeyError("HIGHWAY_COST_BY_PAIR 缺少簇对 %s" % (pair,))
+        return HIGHWAY_COST_BY_PAIR[pair][1]
+    pair = (min(ca, cb), max(ca, cb))
+    if pair not in HIGHWAY_COST_BY_PAIR:
+        raise KeyError("HIGHWAY_COST_BY_PAIR 缺少簇对 %s" % (pair,))
+    return HIGHWAY_COST_BY_PAIR[pair][1]
+
+
 def edge_weights(positions, a, b):
+    cls = road_class(a, b)
+    if cls == "trunk" and TRUNK_HIGHWAY:
+        dist = trunk_km(a, b)
+        return (dist, round(dist * HIGHWAY_TIME_FACTOR, 1),
+                round(dist * trunk_cost_factor(a, b), 1))
+    if cls == "national" and TRUNK_HIGHWAY:
+        dist = national_km(a, b)
+        return (dist, round(dist * NATIONAL_TIME_FACTOR, 1),
+                round(dist * NATIONAL_COST_FACTOR, 1))
     dx = positions[a][0] - positions[b][0]
     dy = positions[a][1] - positions[b][1]
     dist = round(math.hypot(dx, dy) / SCALE, 1)
-    if is_trunk(a, b):
-        return dist, round(dist * TRUNK_TIME_FACTOR, 1), round(dist * TRUNK_COST_FACTOR, 1)
-    return dist, round(dist * BRANCH_TIME_FACTOR, 1), round(dist * BRANCH_COST_FACTOR, 1)
+    # 城内两级：一端是站/仓 = 主干道（快而贵），两端都是客户 = 小路（慢而便宜）。
+    hub_end = a[0] in "WT" or b[0] in "WT"
+    tf = CITY_MAIN_TIME_FACTOR if hub_end else CITY_MINOR_TIME_FACTOR
+    cf = CITY_MAIN_COST_FACTOR if hub_end else CITY_MINOR_COST_FACTOR
+    return dist, round(dist * tf, 1), round(dist * cf, 1)
 
 
 # ---------------------------------------------------------------- 生成
@@ -406,6 +639,102 @@ def self_check(text):
         if not found:
             problems.append("中转站 %s 未归入任何子网络" % nid)
 
+    # ---- 尺度守卫（规格四 §1 / #54）：**干线里程必须是跨城量级，簇内里程必须仍是城内量级**----
+    # 为什么要有这条：规格四之前站间只有 4.1–5.4km，快车跑一趟的代价与城内送货同量级，
+    # 「攒一车再走」毫无经济动机（实测 V01 容量利用率 1.3%）。但要修的是**尺度**，
+    # 不是「把整张图放大」—— 靠改坐标会把簇内 1–6km 一起放大，城内配送语义崩掉。
+    # 所以这条守卫两头都钉：干线 >= 簇内最大 × TRUNK_SCALE_MIN_RATIO，且簇内仍在 [1, 6] km。
+    trunk_d = []
+    national_d = []
+    city_d = []
+    for (a, b), (d, _t, _c) in edges.items():
+        if a > b:
+            continue   # 双向路两个方向权重相同，只核一条，避免同一问题报两遍
+        cls = road_class(a, b)
+        if cls == "trunk":
+            trunk_d.append((d, a, b))
+        elif cls == "national":
+            national_d.append((d, a, b))
+        else:
+            city_d.append((d, a, b))
+    branch_d = national_d + city_d   # 「非高速」的并集，费率分级与旧守卫口径沿用
+    if not trunk_d:
+        problems.append("没有任何干线边（仓↔站/站↔站），尺度守卫无从成立")
+    # 干线的**拓扑**与**里程表**必须一一对应：路网里的一条干线没有里程，或表里有一条
+    # 路网上不存在的干线，都是数据分叉。前者会让 edge_weights 直接抛错，后者会悄悄
+    # 留下一条永远不会生效的参数 —— 两种都在这条守卫里点名。
+    tree_pairs = set()
+    for a, b in TREE_LINKS:
+        tree_pairs.add((a, b) if a < b else (b, a))
+    table_pairs = set(TRUNK_KM.keys())
+    if tree_pairs != table_pairs:
+        problems.append("干线拓扑与 TRUNK_KM 不一致：路网多 %s，里程表多 %s"
+                        % (sorted(tree_pairs - table_pairs), sorted(table_pairs - tree_pairs)))
+    # 国道同理：**跨簇且含配送点**的边必须逐条在表里，多一条少一条都报红。
+    road_national = set()
+    for (a, b) in edges:
+        if a > b:
+            continue
+        if road_class(a, b) == "national":
+            road_national.add((a, b))
+    table_national = set(NATIONAL_KM.keys())
+    if road_national != table_national:
+        problems.append("国道拓扑与 NATIONAL_KM 不一致：路网多 %s，里程表多 %s"
+                        % (sorted(road_national - table_national),
+                           sorted(table_national - road_national)))
+    if not city_d:
+        problems.append("没有任何城内小路（含配送点），城内配送尺度无从成立")
+    if trunk_d and city_d:
+        # 「簇内最大里程」= 同一簇内两个配送点之间的最大距离。城内口径**只**看 city 档，
+        # 国道（跨簇）与干线不参与 —— 它们是跨城量级，拿它们当基准等于自我循环。
+        intra = [item for item in city_d
+                 if nodes.get(item[1]) == "delivery" and nodes.get(item[2]) == "delivery"]
+        max_branch = intra[0] if intra else city_d[0]
+        for item in intra[1:]:
+            if item[0] > max_branch[0]:
+                max_branch = item
+        min_trunk = trunk_d[0]
+        for item in trunk_d[1:]:
+            if item[0] < min_trunk[0]:
+                min_trunk = item
+        if min_trunk[0] < max_branch[0] * TRUNK_SCALE_MIN_RATIO:
+            problems.append("尺度守卫：最短干线 %s->%s %.1fkm < 簇内最大 %.1fkm × %.0f"
+                            % (min_trunk[1], min_trunk[2], min_trunk[0], max_branch[0],
+                               TRUNK_SCALE_MIN_RATIO))
+        for d, a, b in trunk_d:
+            if d < TRUNK_MIN_KM:
+                problems.append("尺度守卫：干线 %s->%s 只有 %.1fkm（应 >= %.0fkm 量级）"
+                                % (a, b, d, TRUNK_MIN_KM))
+        for d, a, b in national_d:
+            if d < NATIONAL_MIN_KM:
+                problems.append("尺度守卫：国道 %s->%s 只有 %.1fkm（应 >= %.0fkm 量级）"
+                                % (a, b, d, NATIONAL_MIN_KM))
+        for d, a, b in city_d:
+            if d < 1.0 or d > 6.0:
+                problems.append("尺度守卫：城内边 %s->%s %.1fkm 不在城内尺度 [1, 6]km 内"
+                                % (a, b, d))
+        # 三档必须两两可分：高速最快最贵、国道居中、城内最慢最便宜（按 min/km 与元/km 看）。
+        def mean_rate(items, pick):
+            s = 0.0
+            for d, a, b in items:
+                w = edges[(a, b)] if (a, b) in edges else edges[(b, a)]
+                s += pick(w) / w[0]
+            return s / len(items) if items else 0.0
+        tr_t = mean_rate(trunk_d, lambda w: w[1])
+        tr_c = mean_rate(trunk_d, lambda w: w[2])
+        na_t = mean_rate(national_d, lambda w: w[1])
+        na_c = mean_rate(national_d, lambda w: w[2])
+        ci_t = mean_rate(city_d, lambda w: w[1])
+        ci_c = mean_rate(city_d, lambda w: w[2])
+        if not (tr_t < na_t < ci_t):
+            problems.append("速度分级不成立：高速 %.3f / 国道 %.3f / 城内 %.3f min/km "
+                            "应严格递增" % (tr_t, na_t, ci_t))
+        # 成本分级的次序与速度**不同**：高速最贵（含通行费）> 城内次之（走走停停、
+        # 单位里程油耗高）> 国道最便宜（长途干线、无通行费）。这正是「快而贵 / 慢而省」
+        # 能在三策略里分出不同路线的原因：时间策略走高速、成本策略走国道。
+        if not (tr_c > ci_c > na_c):
+            problems.append("成本分级不成立：高速 %.3f / 城内 %.3f / 国道 %.3f 元/km "
+                            "应满足 高速 > 城内 > 国道" % (tr_c, ci_c, na_c))
     # 关键预警：cost/dist 比值若处处相同，则最低成本策略必然等价于最短距离策略
     if len(ratios) < 2:
         problems.append("cost/dist 比值恒定（%s），双策略将恒等价" % sorted(ratios))

@@ -1980,7 +1980,17 @@ void MainWindow::advanceFleetTo(int targetMin) {
         }
     }
     // ---- 剩余的事件刻（车卡在 i→i+1 途中，位置留在 i）----
-    while (!atRouteEnd() && nextEventMark_ <= targetMin) {
+    //
+    // **不能挂 `!atRouteEnd()`（规格四 #54 修的等价性缺陷）**：那样「车队已走完」时
+    // 这一段就被整个跳过，targetMin 之前剩余的事件刻**不被结算**；而「推进一刻」路径
+    // 每刻都结算。两条路径于是在同一时刻对「待处理额度」看到不同状态 ——
+    // A 还能抽到普通订单、B 已显示「待处理已满 6」，事件序列从那一行起分叉。
+    // 默认数据在规格四之前只有 34 个事件刻、且完工时刻正好落在某个到达上，
+    // 跳过的刻数是 0，缺陷看不见；跨城尺度把事件刻推到 46 个、完工时刻不落在到达上，
+    // 跳过的刻就非 0 了（实测 A 1958 步 / B 1019 步、时钟 495:30 vs 589:12）。
+    // 正确语义：**结算到 targetMin 为止的所有事件刻**，与车队是否走完无关 ——
+    // 事件刻由软件时钟驱动（D24），不该因为"车都回库了"就漏结算。
+    while (nextEventMark_ <= targetMin) {
         advanceClockTo(nextEventMark_);
         settleEventsUpTo(nextEventMark_);
     }
@@ -3131,14 +3141,24 @@ QString MainWindow::transitPanelSummary() const {
     return out;
 }
 
+// 超时面板的**行数口径**（G10）：面板是**逐车铺行**的（updatePanels 里对 fleet_ 全量循环），
+// 所以这里也必须数**全部车**，不能只数当前页签那台。
+// 为什么以前没暴露：规格三之前默认数据 penalty 恒 0（或迟到单恰好落在 V02 上而当时
+// activeVehicle_ 指向它），两种口径给出同一个数。规格四把干线提到跨城尺度后，
+// distance/time 策略下唯一迟到的 O07 落在 V02、而页签停在 V01（空车）——
+// 「面板 1 行 vs 计数 0」立刻分叉。这是**计数口径的缺陷**，不是数据问题：
+// 修的是「数谁」，不是放宽判据。
 int MainWindow::lateOrderCount() const {
     int late = 0;
-    for (const logistics::OrderMetric& om : active().plan.metrics.orders) {
-        if (om.late) {
-            ++late;
+    for (std::size_t v = 0; v < fleet_.size(); ++v) {
+        const VehicleRuntime& rt = fleet_[v];
+        for (const logistics::OrderMetric& om : rt.plan.metrics.orders) {
+            if (om.late) {
+                ++late;
+            }
         }
+        late += static_cast<int>(rt.state.deliveredLate.size());
     }
-    late += static_cast<int>(active().state.deliveredLate.size());
     return late;
 }
 
@@ -4093,32 +4113,54 @@ int MainWindow::runActionSelfCheck() {
     // ---- 8. 等价性守卫 A1–A7：一次「推进一刻」== 逐个「推进一站」到同一时刻 ----
     //
     // 两条路径各自**重新加载配置**、各构造一个**独立的 MainWindow**：不深拷贝同一个
-    // MainWindow 对象，也不共享 rng_ / state_。两条路径都推进到**路线终点**——此时
-    // 车队时钟必然同值（末节点到达时刻），是唯一能严格对齐的 T（按站推进的
-    // "到达 >= T" 会越过 T，而推进一刻恰好停在刻上）。
-    // 断言全部只读**用户可见输出**（运行日志 / 面板同源事实），不经显示函数反推。
+    // MainWindow 对象，也不共享 rng_ / state_。
+    //
+    // **对齐点从「路线终点」改成「同一个固定时刻 T」（规格四 #54）**：
+    // 规格四把跨城干线提到 180–240km 之后，事件刻（每 15min 一个）从 34 个涨到 46 个，
+    // 而**事件刷单速率不再低于车队运力** —— 每张事件单有 69% 概率是跨簇单（25 个配送点
+    // 里跨簇有序对占 69%），而跨城尺度下每张跨簇单要走三段接力、占三台车数小时。
+    // 于是「推进到路线终点」这个条件**永远不成立**：实测旧尺度 34 刻 / 12 张事件单就收敛
+    // （16:41 结束），新尺度 120 张事件单、跑到 495 小时仍在刷单。
+    //
+    // 这不是代码缺陷，是「事件注入速率 > 运力」这条**数据事实**的直接后果。
+    // 而 D24 等价性的原始语义本来就是「一次推进一刻 == 逐个推进到**同一时刻**」——
+    // 终点只是旧数据下恰好能用的一个 T。改成显式 T 之后：
+    //   · 判据没有被放宽：仍逐字比对事件日志序列与 A2–A7 终态快照；
+    //   · 但 T 必须**取在两条路径都能到达的地方**，否则比较的是两个不同的世界。
+    // T 取「发车时刻 + 8h」：覆盖全部城内配送与一段跨城往返，足够让事件刻、
+    // 到达、重规划、额度变化都发生若干轮。
     {
         MainWindow pathA(reloadInitialConfig(), configPath_);
         MainWindow pathB(reloadInitialConfig(), configPath_);
 
+        // T 的取法：从**最早发车时刻**起 8 小时。不依赖任何规划结果（规划本身会随事件变），
+        // 所以两条路径拿到的是同一个绝对值 —— 这是等价性可比较的前提。
+        const int alignMin = pathA.minDepartMin() + 8 * 60;
         int stepsA = 0;
-        while (!pathA.atRouteEnd() && stepsA < 4000) {
+        while (pathA.currentTimeMin() < alignMin && stepsA < 4000) {
             pathA.onAdvanceMoment();   // 路径 A：反复推进一刻
             ++stepsA;
         }
         int stepsB = 0;
-        while (!pathB.atRouteEnd() && stepsB < 4000) {
+        while (pathB.currentTimeMin() < alignMin && stepsB < 4000) {
             pathB.onAdvanceStop();     // 路径 B：反复推进一站
             ++stepsB;
         }
-        expect(pathA.atRouteEnd() && pathB.atRouteEnd() && stepsA > 0 && stepsB > 0,
-               QStringLiteral("两条路径都推进到路线终点（推进一刻 %1 步 / 推进一站 %2 步）")
+        expect(stepsA > 0 && stepsB > 0,
+               QStringLiteral("两条路径都推进了至少一步（推进一刻 %1 步 / 推进一站 %2 步）")
                    .arg(stepsA)
                    .arg(stepsB));
-        expect(pathA.active().state.atTimeMin == pathB.active().state.atTimeMin,
-               QStringLiteral("到达终点时车队时钟一致（A %1 / B %2）")
-                   .arg(minutesToClock(pathA.active().state.atTimeMin))
-                   .arg(minutesToClock(pathB.active().state.atTimeMin)));
+        // 对齐时刻：两条路径都必须**越过** T（推进一刻停在刻上、推进一站越过它），
+        // 且车队时钟必须同值 —— 这是「同一时刻、同一世界」的可比较前提。
+        expect(pathA.currentTimeMin() >= alignMin && pathB.currentTimeMin() >= alignMin,
+               QStringLiteral("两条路径都推进到对齐时刻 %1（A 到 %2 / B 到 %3）")
+                   .arg(minutesToClock(alignMin))
+                   .arg(minutesToClock(pathA.currentTimeMin()))
+                   .arg(minutesToClock(pathB.currentTimeMin())));
+        expect(pathA.currentTimeMin() == pathB.currentTimeMin(),
+               QStringLiteral("对齐时刻的车队时钟一致（A %1 / B %2）")
+                   .arg(minutesToClock(pathA.currentTimeMin()))
+                   .arg(minutesToClock(pathB.currentTimeMin())));
 
         auto diffLines = [](const QStringList& a, const QStringList& b) -> QString {
             const int n = static_cast<int>(a.size() < b.size() ? a.size() : b.size());

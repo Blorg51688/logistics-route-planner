@@ -1267,9 +1267,14 @@ void checkTrafficAndUrgentOrderOnRealData(const Config& cfg) {
     const TrafficReport report = simulateTrafficChange(
         g, cfg.general.trafficChangeRatio, cfg.general.trafficTimeIncreaseMin,
         cfg.general.trafficTimeIncreaseMax, 42u);
-    // oracle: round(0.1 * 106 边) = 11
-    check(report.changes.size() == 11,
-          "按 traffic_change_ratio=0.1 改动 11 条边（106 边），实际 "
+    // 期望条数 = round(ratio × 边数)，**从数据算**而不是背死数（规格四 #54 改拓扑后
+    // 边数从 106 变成 100，硬编码的 11 就假红了）。口径本身没变：仍是「改 10% 的路」。
+    const std::size_t expectedChanges = static_cast<std::size_t>(
+        std::lround(cfg.general.trafficChangeRatio
+                    * static_cast<double>(cfg.graph.edgeCount())));
+    check(report.changes.size() == expectedChanges,
+          "按 traffic_change_ratio=0.1 改动 " + std::to_string(expectedChanges) + " 条边（"
+              + std::to_string(cfg.graph.edgeCount()) + " 边），实际 "
               + std::to_string(report.changes.size()));
 
     std::size_t i = 0;
@@ -1279,7 +1284,8 @@ void checkTrafficAndUrgentOrderOnRealData(const Config& cfg) {
             baseIntact = false;
         }
     }
-    check(baseIntact, "全部 72 条边的 baseTimeMin 保持不变");
+    check(baseIntact, "全部 " + std::to_string(cfg.graph.edgeCount())
+                          + " 条边的 baseTimeMin 保持不变");
 
     // 车已服务前 5 站，停在第 5 站；剩余订单为其余配送点
     const std::size_t served = 5;
