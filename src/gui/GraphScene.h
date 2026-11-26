@@ -12,6 +12,22 @@
 class EdgeItem;
 class NodeItem;
 
+// 道路等级判据（规格四 §2 / #54）。三档，只看**节点类型**、不看 ID：
+//   · **Trunk**（跨城高速）：两端都是仓库/中转站 —— 用户说的「中转站间的连线，类似跨城高速」；
+//   · **National**（跨城国道）：任一端是配送点、且两端**不同簇** —— 用户说的「通过用户点
+//     将簇连接的路线就是国道等绕的小路」；
+//   · **City**（城内小路）：其余（同一簇内的站↔客户、客户↔客户）。
+// 判据与生成器 tools/generate_dataset.py::road_class 同一句口径。放在命名空间外是为了让
+// 离屏渲染（main.cpp）与测试能直接复用，不必再造一份判据。
+enum class RoadClass { Trunk, National, City };
+
+// 簇号：仓库按「本国簇」算（W01↔T01 同城、W02↔T02 同城），与生成器 home_cluster_of 同口径。
+// 为什么不能让仓库一律算 0 簇：那样 W01↔D01（同城 1.9km）会被判成跨城国道，
+// 画布上把一条城内路画成国道，图就假了。
+int homeClusterOf(const logistics::LogisticsGraph& graph, const std::string& warehouseId);
+RoadClass roadClassOf(const logistics::LogisticsGraph& graph,
+                      const logistics::Node& a, const logistics::Node& b);
+
 // 配送网络的图形场景：按配置坐标摆放节点，按有向边绘制箭头与权重标签，
 // 并支持路径高亮与权重维度切换。
 class GraphScene : public QGraphicsScene {

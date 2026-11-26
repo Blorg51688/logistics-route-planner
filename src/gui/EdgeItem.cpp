@@ -16,6 +16,7 @@ namespace {
 constexpr qreal kArrowSize = 11.0;
 constexpr qreal kHitWidth = 10.0;      // 命中区域宽度；1px 的线否则几乎点不中
 constexpr qreal kLabelOffset = 13.0;   // 标签相对线段的垂直偏移，避免压在线上
+constexpr qreal kTrunkWidth = 12.0;    // 干线的命中区域宽度（视觉线宽 4.2 的命中余量）
 constexpr qreal kLabelPadX = 4.0;
 constexpr qreal kLabelPadY = 1.0;
 
@@ -128,7 +129,8 @@ QPainterPath EdgeItem::shape() const {
     line.lineTo(targetPoint_);
 
     QPainterPathStroker stroker;
-    stroker.setWidth(kHitWidth);
+    // 高速画得更粗（6.0），命中区必须跟着变宽，否则点在粗线上却没反应。
+    stroker.setWidth(trunk() ? kTrunkWidth : kHitWidth);
     return stroker.createStroke(line);
 }
 
@@ -143,34 +145,95 @@ void EdgeItem::paint(QPainter* painter, const QStyleOptionGraphicsItem*, QWidget
     const QPointF unit(dir.x() / len, dir.y() / len);
     const QPointF perp(-unit.y(), unit.x());
 
-    // 车队三色（§7.5⑤）：选中车 不透明度 1.00 / 线宽 3；其余车 0.45 / 1.5；
-    // 未被任何车使用的边保持中性灰。**权重标签内容仍是基础边权**（不按车缩放）。
+    // ---- 第一层：道路等级（规格四 §2 / #54）。这是**底图**，先画。----
+    // 三档的视觉语言（要一眼可分，且都不与角色两色混淆）：
+    //   · **跨城高速**：墨蓝粗实线 + 浅色中线（读作"有分隔带的高速公路"）；
+    //   · **跨城国道**：土黄中粗**虚线**（读作"绕的普通公路"）；
+    //   · **城内小路**：浅灰细实线（退到背景里）。
+    // 为什么高速用双线、国道用虚线：只靠颜色区分对色觉障碍不友好，也必须能在
+    // 黑白打印/灰度截图里分辨。线型 + 粗细 + 明度三重差异，任一维度失效都还认得出来。
+    // 为什么城内小路不用虚线：它数量最多（74 条有向边），全虚线会让画面噪；
+    // 而国道只有 8 条，虚线正好强调"这是少数几条绕行路"。
+    const QColor kTrunkInk(0x0F, 0x27, 0x40);      // 高速墨蓝
+    const QColor kNationalInk(0x8A, 0x62, 0x14);   // 国道土黄
+    const QColor kCityInk(0xA9, 0xAF, 0xB8);       // 城内小路灰
+    if (roadClass_ == RoadClass::Trunk) {
+        QPen base(kTrunkInk);
+        base.setWidthF(6.0);
+        base.setCapStyle(Qt::FlatCap);
+        painter->setPen(base);
+        painter->drawLine(sourcePoint_, targetPoint_);
+        QPen core(QColor(0xE8, 0xEF, 0xF8));       // 浅色中线 = 分隔带
+        core.setWidthF(1.4);
+        painter->setPen(core);
+        painter->drawLine(sourcePoint_, targetPoint_);
+    } else if (roadClass_ == RoadClass::National) {
+        QPen base(kNationalInk);
+        base.setWidthF(2.8);
+        base.setStyle(Qt::DashLine);
+        base.setDashPattern(QVector<qreal>() << 5.0 << 3.5);
+        base.setCapStyle(Qt::FlatCap);
+        painter->setPen(base);
+        painter->drawLine(sourcePoint_, targetPoint_);
+    } else {
+        QPen base(kCityInk);
+        base.setWidthF(1.3);
+        painter->setPen(base);
+        painter->drawLine(sourcePoint_, targetPoint_);
+    }
+
+    // ---- 第二层：车队角色两色（§7.5⑤）——**叠加**在底图之上，不盖住等级 ----
+    // 选中车 不透明度 1.00 / 线宽 3；其余车 0.45 / 1.5；路径高亮红同档。
+    // 为什么压细而不是更粗：底图表达"这是高速还是小路"（结构），角色色表达"谁在跑"
+    // （此刻状态）。把角色色做得比底图更粗，用户就再也看不出被跑的那条是高速还是小路了。
+    // **权重标签内容仍是基础边权**（不按车缩放）。
     QColor color(130, 130, 130);
-    qreal width = 1.2;
+    qreal width = 0.0;
     qreal alpha = 1.0;
+    bool overlay = true;
     if (routeOwned_) {
         color = routeColor_;
-        width = routeSelected_ ? 3.0 : 1.5;
-        alpha = routeSelected_ ? 1.00 : 0.45;
+        width = routeSelected_ ? 2.6 : 1.8;
+        alpha = routeSelected_ ? 1.00 : 0.85;
     } else if (highlighted_) {
         color = QColor(214, 45, 32);
-        width = 3.0;
+        width = 2.6;
+    } else {
+        // 没有任何车跑过：就只剩底图（底图上面已经画过）。这里的颜色只给箭头用 ——
+        // 箭头永远跟着"这条路"的等级色走，不跟着"谁在跑"走。
+        color = (roadClass_ == RoadClass::Trunk)    ? kTrunkInk
+                : (roadClass_ == RoadClass::National) ? kNationalInk
+                                                      : kCityInk;
+        overlay = false;
     }
-    QColor stroke = color;
-    stroke.setAlphaF(alpha);
-    QPen pen(stroke);
-    pen.setWidthF(width);
-    painter->setPen(pen);
-    painter->setBrush(stroke);
+    if (overlay) {
+        QColor stroke = color;
+        stroke.setAlphaF(alpha);
+        QPen pen(stroke);
+        pen.setWidthF(width);
+        pen.setCapStyle(Qt::RoundCap);
+        painter->setPen(pen);
+        painter->setBrush(stroke);
+        painter->drawLine(sourcePoint_, targetPoint_);
+    }
 
-    painter->drawLine(sourcePoint_, targetPoint_);
-
-    // 箭头：尖端在 targetPoint_，基底沿边回退 kArrowSize，再向两侧各展开半个箭头宽
-    const QPointF base = targetPoint_ - unit * kArrowSize;
-    const QPointF left = base + perp * (kArrowSize * 0.5);
-    const QPointF right = base - perp * (kArrowSize * 0.5);
+    // 箭头：尖端在 targetPoint_，基底沿边回退 kArrowSize，再向两侧各展开半个箭头宽。
+    // 箭头也用底图色 —— 方向是**路网属性**，不属于某台车；角色色只盖在线身上。
+    const qreal headSize = (roadClass_ == RoadClass::Trunk) ? 14.0 : kArrowSize;
+    const QPointF base = targetPoint_ - unit * headSize;
+    const QPointF left = base + perp * (headSize * 0.5);
+    const QPointF right = base - perp * (headSize * 0.5);
     QPolygonF head;
     head << targetPoint_ << left << right;
+    QColor headColor = (roadClass_ == RoadClass::Trunk)    ? kTrunkInk
+                           : (roadClass_ == RoadClass::National) ? kNationalInk
+                                                                 : kCityInk;
+    if (overlay) {
+        headColor = color;
+        headColor.setAlphaF(alpha);
+    }
+    painter->setPen(Qt::NoPen);
+    painter->setBrush(headColor);
     painter->drawPolygon(head);
 
     if (!labelVisible_) {

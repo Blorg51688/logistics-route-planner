@@ -41,6 +41,10 @@ void GraphScene::build(const logistics::LogisticsGraph& graph, logistics::Weight
             continue;
         }
         EdgeItem* item = new EdgeItem(source, target, edge, weight_);
+        // 道路等级（规格四 §2）：判据是**边的两端类型**——两端都是仓/站即跨城干线，
+        // 任一端是配送点即城内支线。与生成器 tools/generate_dataset.py::is_trunk 同一句，
+        // 不硬编码任何 ID（换数据后分级自动跟着走）。
+        item->setRoadClass(roadClassOf(graph, source->node(), target->node()));
         addItem(item);
         source->addEdge(item);
         if (target != source) {
@@ -86,6 +90,51 @@ QColor GraphScene::vehicleColor(int vehicleIndex) {
         case 2:  return QColor(0x1A, 0x7F, 0x37);   // 行序 2 绿
         default: return QColor(0x7B, 0x2E, 0xA6);   // 行序 3 紫（与红/蓝/绿都易分辨）
     }
+}
+
+// 道路等级的**唯一判据**（规格四 §2 / #54）。三档，只看类型与簇号，不看 ID。
+// 与生成器 tools/generate_dataset.py::road_class 同一句口径 —— 两处判据一漂，
+// 画布上「高速/国道/小路」的分级就和数据里的里程分级对不上，图会骗人。
+namespace {
+
+bool isHubType(logistics::NodeType t) {
+    return t == logistics::NodeType::Warehouse || t == logistics::NodeType::Transit;
+}
+
+} // namespace
+
+// 仓库的「本国簇」= 唯一与它相连的中转站所在簇。与生成器 home_cluster_of 同口径。
+// 找不到（手工增删后的异常数据）返回 0 —— 那类边一律按国道画，如实反映「跨城」。
+int homeClusterOf(const logistics::LogisticsGraph& graph, const std::string& warehouseId) {
+    for (const logistics::Edge& e : graph.edges()) {
+        const std::string other = (e.fromId == warehouseId) ? e.toId
+                                                            : (e.toId == warehouseId ? e.fromId
+                                                                                     : std::string());
+        if (other.empty()) {
+            continue;
+        }
+        const logistics::Node* n = graph.findNode(other);
+        if (n != nullptr && n->type == logistics::NodeType::Transit && n->subNetworkId != 0) {
+            return n->subNetworkId;
+        }
+    }
+    return 0;
+}
+
+RoadClass roadClassOf(const logistics::LogisticsGraph& graph,
+                      const logistics::Node& a, const logistics::Node& b) {
+    if (isHubType(a.type) && isHubType(b.type)) {
+        return RoadClass::Trunk;
+    }
+    int ca = a.subNetworkId;
+    int cb = b.subNetworkId;
+    if (ca == 0) {
+        ca = homeClusterOf(graph, a.id);
+    }
+    if (cb == 0) {
+        cb = homeClusterOf(graph, b.id);
+    }
+    return (ca != cb) ? RoadClass::National : RoadClass::City;
 }
 
 QColor GraphScene::roleColor(bool fast) {

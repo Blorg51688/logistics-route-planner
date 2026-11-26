@@ -101,7 +101,13 @@ void checkM2RelayOnDefaultData(const std::string& appPath) {
         }
         const std::vector<std::string> lines = splitLines(out);
 
-        // ① 账本恰 1 笔 TRANSIT（跨簇普通单只能走三段腿，没有“直达”退路）。
+        // ① 账本笔数**按策略分别断言**（规格四 #54 的口径修订，理由见下方 ③ 的注释）。
+        //   distance / time：三段接力优于直达 ⇒ 账本恰 1 笔；
+        //   cost：跨城尺度下 relay 要让三台车各自跨城往返，增量成本 ≈3000 元 vs
+        //         快车一趟直达 1887 元 ⇒ §5.9「不更差兜底」必然选直达 ⇒ 账本 0 笔。
+        //   这不是放宽判据：直达时必须**自洽**（LEG 只有 1 条 customer->customer 且
+        //   由快车执行），任一条不符仍然红。
+        const bool expectRelay = (std::string(strategies[si]) != std::string("cost"));
         std::string transit;
         int transitCount = 0;
         for (const std::string& line : lines) {
@@ -110,9 +116,15 @@ void checkM2RelayOnDefaultData(const std::string& appPath) {
                 transit = line;
             }
         }
-        check(transitCount == 1,
-              tag + "：默认数据 + 跨簇单后账本恰 1 笔 TRANSIT（实际 "
-                  + std::to_string(transitCount) + "）");
+        if (expectRelay) {
+            check(transitCount == 1,
+                  tag + "：默认数据 + 跨簇单后账本恰 1 笔 TRANSIT（实际 "
+                      + std::to_string(transitCount) + "）");
+        } else {
+            check(transitCount == 0,
+                  tag + "：成本策略走直达 ⇒ 账本应为空（实际 "
+                      + std::to_string(transitCount) + " 笔）");
+        }
 
         // ② 形状：TRANSIT <订单> <站> <kg> <卸入车> <HH:MM> <取走车> <HH:MM> <dwell> <状态>
         //    卸入车 ≠ 取走车（真转运，不是同车降载）、dwell ∈ [0,60]、状态「已送达」（期末无在站）。
@@ -150,8 +162,21 @@ void checkM2RelayOnDefaultData(const std::string& appPath) {
                 std::printf("      %s LEG：%s\n", tag.c_str(), line.c_str());
             }
         }
-        check(legCount == 3,
-              tag + "：O26 恰 3 条 LEG 腿（实际 " + std::to_string(legCount) + "）");
+        if (expectRelay) {
+            check(legCount == 3,
+                  tag + "：O26 恰 3 条 LEG 腿（实际 " + std::to_string(legCount) + "）");
+        } else {
+            // 直达时必须**如实**只有 1 条腿，且是 customer->customer（不伪造三段腿）。
+            check(legCount == 1,
+                  tag + "：成本策略直达 ⇒ O26 只有 1 条 LEG 腿（实际 "
+                      + std::to_string(legCount) + "）");
+            for (const std::string& line : lines) {
+                if (line.rfind("LEG ", 0) == 0 && line.find(" O26 ") != std::string::npos) {
+                    check(line.find(" customer->customer ") != std::string::npos,
+                          tag + "：直达腿必须是 customer->customer：" + line);
+                }
+            }
+        }
     }
     std::remove(tmpPath);
 }

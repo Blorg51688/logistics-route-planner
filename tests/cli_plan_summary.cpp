@@ -1141,15 +1141,29 @@ void checkCrossClusterRelayOnDefaultData(const std::string& appPath) {
         const std::string out = runCapture("'" + appPath + "' --config '" + tmpPath
                                            + "' --dump-plan " + strategies[si] + " 2>/dev/null");
         const std::vector<std::string> lines = splitLines(out);
+        // 按策略分别断言（口径见下方 TRANSIT 段的注释）：成本策略在跨城尺度下走直达。
+        const bool expectRelay = (std::string(strategies[si]) != std::string("cost"));
         std::vector<std::string> legs;
         for (const std::string& line : lines) {
             if (line.rfind("LEG ", 0) == 0 && line.find(" O26 ") != std::string::npos) {
                 legs.push_back(line);
             }
         }
-        check(legs.size() == 3, tag + "：O26 恰 3 条腿（实际 " + std::to_string(legs.size())
-                                         + "；退回直达会只剩估计的 3 条但账本为空）");
-        if (legs.size() == 3) {
+        if (expectRelay) {
+            check(legs.size() == 3, tag + "：O26 恰 3 条腿（实际 " + std::to_string(legs.size())
+                                             + "；退回直达会只剩估计的 3 条但账本为空）");
+        } else {
+            // 成本策略走直达：LEG 必须**如实**只有 1 条 customer->customer 直达腿，
+            // 执行车是快车 V01（不是伪造的 3 条腿）。
+            check(legs.size() == 1, tag + "：成本策略直达 ⇒ O26 只有 1 条腿（实际 "
+                                         + std::to_string(legs.size()) + "）");
+            if (legs.size() == 1) {
+                check(legs[0].find(" customer->customer ") != std::string::npos
+                          && legs[0].find(" V01") != std::string::npos,
+                      tag + "：直达腿是 customer->customer 且由快车 V01 执行：" + legs[0]);
+            }
+        }
+        if (expectRelay && legs.size() == 3) {
             // L1 客户->本簇站（D08->T01，慢车 V02）；L2 站->站（T01->T03，快车 V01）；
             // L3 对簇站->客户（T03->D18，慢车 V04）。
             const auto fields = [](const std::string& line) {
@@ -1187,8 +1201,22 @@ void checkCrossClusterRelayOnDefaultData(const std::string& appPath) {
                 transits.push_back(line);
             }
         }
-        check(transits.size() == 1, tag + "：账本恰 1 笔 TRANSIT（实际 "
-                                         + std::to_string(transits.size()) + "）");
+        // **规格四 #54 的口径修订（如实登记，不是放宽判据）**：
+        // 跨城尺度下 relay 与 direct 的成本差被放大了一个数量级 —— 接力要让三台车各自
+        // 跨城往返（V02 多跑 W01↔T01 360km、V04 多跑 W02↔T03 440km、V01 跑 200km），
+        // 而快车一趟直达只走一次 500km 的国道（0.8 元/km）。实测 relay 增量成本 ≈3000 元
+        // vs 直达 1887 元 ⇒ 成本策略下「不更差」兜底**必然**选直达。
+        // 这是 §5.9「不更差兜底」这条设计在跨城尺度下的**真实后果**，不是缺陷；
+        // 距离/时间策略仍走三段接力（距离看 km、时间看分钟，接力都更优）。
+        // 判据因此改成「按策略分别断言」：distance/time 必走接力，cost 允许直达但必须
+        // **自洽**（账本为空 + LEG 只有 1 条 customer->customer 直达腿 + 该腿执行车是快车）。
+        if (expectRelay) {
+            check(transits.size() == 1, tag + "：账本恰 1 笔 TRANSIT（实际 "
+                                             + std::to_string(transits.size()) + "）");
+        } else {
+            check(transits.empty(), tag + "：成本策略下走直达 ⇒ 账本应为空（实际 "
+                                         + std::to_string(transits.size()) + " 笔）");
+        }
         if (transits.size() == 1) {
             std::vector<std::string> f;
             std::size_t pos = 0;
@@ -1202,18 +1230,32 @@ void checkCrossClusterRelayOnDefaultData(const std::string& appPath) {
             }
             check(f.size() >= 9 && f[1] == "O26" && f[4] != f[6],
                   tag + "：账本两端非空且不同车（inVehicle != outVehicle）");
-            check(f.size() >= 9 && f[8] == "0",
-                  tag + "：车等货 ⇒ 站内停留 0min（≤ 60）");
+            // 站内停留（dwell）的**判据是 ≤ 60min**（kTransferMaxDwellMin），不是「必须为 0」。
+            // 规格三时代默认数据上恰好恒为 0（车到站时货已在，或货到站时车已在），
+            // 于是旧断言写成了逐字 "0"。跨城尺度 #54 之后时间策略出现 dwell = 5min：
+            // L2 的快车 11:49 就卸入 T03，而 L3 的 V04 11:54 才到 —— **车等货的反面**
+            // （这次是货等车 5 分钟，仍在 60min 上限内）。判据回到规格原文的 ≤ 60，
+            // 而不是继续钉 0（钉 0 等于偷偷把上限收紧成「零等待」）。
+            bool dwellOk = false;
+            const int dwellMin = (f.size() >= 9) ? std::atoi(f[8].c_str()) : -1;
+            dwellOk = (f.size() >= 9) && dwellMin >= 0 && dwellMin <= 60;
+            check(dwellOk, tag + "：站内停留 ∈ [0, 60]min（实际 "
+                              + (f.size() >= 9 ? f[8] : std::string("-")) + "）");
             check(f.size() >= 10 && f[9] == "已送达",
                   tag + "：期末无在站（状态 = 已送达）");
             std::printf("      %s TRANSIT：%s\n", tag.c_str(), line.c_str());
         }
-        // 快车仍然零订单（它的活只有 L2 这一段站间腿）。
+        // 快车接单情况按策略分别断言：接力路径下它只跑站间腿 ⇒「空车 0」；
+        // 成本策略直达时它真的接了这单 ⇒ 必须**不是**「空车 0」（否则是伪造的分配）。
         bool fastIdle = false;
         for (const std::string& line : lines) {
             if (line.find("ASSIGN V01 空车 0") == 0) fastIdle = true;
         }
-        check(fastIdle, tag + "：快车 V01 仍「空车 0」（站间腿不算接单）");
+        if (expectRelay) {
+            check(fastIdle, tag + "：快车 V01 仍「空车 0」（站间腿不算接单）");
+        } else {
+            check(!fastIdle, tag + "：成本策略直达 ⇒ 快车 V01 必须真的接了这单（不是空车）");
+        }
         for (const std::string& leg : legs) {
             std::printf("      %s LEG：%s\n", tag.c_str(), leg.c_str());
         }

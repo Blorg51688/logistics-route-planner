@@ -7,6 +7,7 @@
 
 #include "core/Edge.h"
 #include "core/WeightType.h"
+#include "gui/GraphScene.h"   // RoadClass（道路等级判据的唯一落点）
 
 class NodeItem;
 
@@ -42,6 +43,14 @@ public:
     const QColor& routeColor() const { return routeColor_; }
     bool routeSelected() const { return routeSelected_; }
 
+    // ---- 道路等级（规格四 §2 / #54）----
+    // 三档道路在画布上是**底图**样式，与车队角色两色（慢车青 / 快车洋红）叠加：
+    // 底图先画（粗细/明度不同），角色色再压在上面（更细，不盖住等级）。
+    // 判据由 GraphScene::roadClassOf 按**端点类型与簇号**给出，图元不自己推 ID。
+    void setRoadClass(RoadClass cls) { roadClass_ = cls; }
+    RoadClass roadClass() const { return roadClass_; }
+    bool trunk() const { return roadClass_ == RoadClass::Trunk; }
+
     // 权重标签默认只在被高亮的边上显示，避免密集网络里 72 个标签互相遮挡
     void setLabelVisible(bool on);
 
@@ -64,6 +73,7 @@ private:
     logistics::WeightType weight_;
     bool                  highlighted_ = false;
     bool                  labelVisible_ = false;
+    RoadClass             roadClass_ = RoadClass::City;   // 底图等级（默认城内小路）
     bool                  routeOwned_ = false;      // 是否属于某台车的路线（有归属）
     bool                  routeSelected_ = false;   // 是否属于**选中车**的路线（加粗）
     QColor                routeColor_ = QColor(214, 45, 32);
