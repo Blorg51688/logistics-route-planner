@@ -82,7 +82,9 @@ void checkM2RelayOnDefaultData(const std::string& appPath) {
             outFile << line << "\n";
         }
         // 跨簇普通单：D08（子网 1）→ D18（子网 3）。
-        outFile << "O26, D08, D18, 8, 08:00, 13:00, 0\n";
+        // 规格六 #60：1->3 走廊的批量站间腿 14:02 之后才卸到 T03，13:00 的截止会让它
+        // 按客户 penalty 退回直达（那就测不到接力结构）。夹具参数放到 15:00。
+        outFile << "O26, D08, D18, 8, 08:00, 15:00, 0\n";
     }
 
     const char* strategies[3] = {"distance", "cost", "time"};

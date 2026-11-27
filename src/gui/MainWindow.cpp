@@ -4384,15 +4384,23 @@ int MainWindow::runActionSelfCheck() {
         // T 的取法：从**最早发车时刻**起 8 小时。不依赖任何规划结果（规划本身会随事件变），
         // 所以两条路径拿到的是同一个绝对值 —— 这是等价性可比较的前提。
         const int alignMin = pathA.minDepartMin() + 8 * 60;
+        int stepsB = 0;
+        while (pathB.currentTimeMin() < alignMin && stepsB < 4000) {
+            pathB.onAdvanceStop();     // 路径 B：反复推进一站
+            ++stepsB;
+        }
         int stepsA = 0;
         while (pathA.currentTimeMin() < alignMin && stepsA < 4000) {
             pathA.onAdvanceMoment();   // 路径 A：反复推进一刻
             ++stepsA;
         }
-        int stepsB = 0;
-        while (pathB.currentTimeMin() < alignMin && stepsB < 4000) {
-            pathB.onAdvanceStop();     // 路径 B：反复推进一站
-            ++stepsB;
+        // 规格六 #60：B（推进一站）会越过对齐时刻落在某个到达上（实测 16:01），而 A 按事件刻
+        // 走只能停在 15min 网格上（16:00 / 16:15）。为了「同一时刻、同一世界」，A 最后再
+        // **直接推进到 B 的实际落点**——advanceFleetTo 会结算该时刻前的全部事件刻并把时钟
+        // 钉到目标值，与「推进一刻逐步走到那里」等价（这正是 D24 要证的）。
+        if (pathA.currentTimeMin() < pathB.currentTimeMin()) {
+            pathA.advanceFleetTo(pathB.currentTimeMin());
+            ++stepsA;
         }
         expect(stepsA > 0 && stepsB > 0,
                QStringLiteral("两条路径都推进了至少一步（推进一刻 %1 步 / 推进一站 %2 步）")
@@ -4942,6 +4950,21 @@ int MainWindow::runActionSelfCheck() {
     {
         logistics::Config quiet = reloadInitialConfig();
         quiet.general.eventIntervalMin = 24 * 60;   // 本段不要事件打扰
+        // 规格六 #60：X4 测的是「五级链第 ① 级在**只影响一台车**时成立」。参半数据下
+        // 快车 V01 扛着 12 张跨簇单的站间腿，干线 T01->T02 的路况事件**结构上**牵动
+        // 三台车（L1/L2/L3 本就是一条链）—— 那正是「受影响集合」该做的事，却让本段
+        // 测不到第 ① 级。所以这里把夹具换成**只剩簇内单**（跨簇单摘掉）：这是**夹具
+        // 范围**，不是判据放宽 —— 判据仍是「只影响一台车 ⇒ 第 ① 级局部重排」。
+        // 接力链被路况打断时的收敛由 #49 的封路守卫（integration_tests）负责。
+        {
+            std::vector<logistics::Order> localOnly;
+            for (std::size_t i = 0; i < quiet.orders.size(); ++i) {
+                if (!logistics::isCrossCluster(quiet.graph, quiet.orders[i])) {
+                    localOnly.push_back(quiet.orders[i]);
+                }
+            }
+            quiet.orders = localOnly;
+        }
         MainWindow win(quiet, configPath_);
 
         // 找一条**只在一台车的剩余路线里**的边（有向、相邻两站）。

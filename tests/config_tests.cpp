@@ -237,7 +237,7 @@ void testLoadDefaultConfig() {
     // 车辆：规格三 §4 的**默认四车车队**（六列，含两因子），行序即车辆序。
     //   一台快车（400kg / 成本因子 1.50：簇间搬运贵而快）+ 三台慢车（160kg / 0.80：
     //   每台守一个簇）。**这是职责封闭的前提**：三簇三慢车 ⇒「簇 -> 慢车」排列数 = 1。
-    //   订单表一个字没动（见 #44/#46：车队形状变了，需求数据不变）。
+    //   订单表在规格六 #60 换成「簇内 / 跨簇参半」（13 簇内 + 12 跨簇 = 25 单 456kg）。
     check(cfg.vehicles.size() == 4, "默认车队恰有 4 辆车（V01 快车 + V02/V03/V04 慢车）");
     if (cfg.vehicles.size() == 4) {
         struct ExpectVehicle {
@@ -248,17 +248,18 @@ void testLoadDefaultConfig() {
             const char* startNode;   // 规格四 #54：慢车就近驻场，不再全部 W01
             int         departMin;   // 规格四 #54：V03 提前发车覆盖跨城通勤
         };
-        // 起始仓库与发车时刻是**数据事实**，随规格四改动：
+        // 起始仓库与发车时刻是**数据事实**，随规格六 #60 改动：
         //   · V02 守簇 1，从 W01（本国仓）出发，08:00；
-        //   · V03 守簇 2，从 W02 出发；因 W02→簇 2 首批客户要走 180km 干线，
-        //     06:30 发车才能赶上三张紧窗单（O13 止 09:30 / O12 止 11:00 / O11 止 10:30）；
-        //   · V04 守簇 3，从 W02 出发（比 W01 近 20km），08:00。
+        //   · V03 守簇 2，从 W02 出发，08:00（规格四的 06:30 在参半数据上不再需要，
+        //     反而会让它在 T02 空等快车 82min ⇒ 改回四台同班）；
+        //   · V04 守簇 3，从 W02 出发，**10:30**（簇 3 没有簇内单，它的第一件活是
+        //     13:40 在 T03 接跨簇货 —— 班次跟着接货时刻走）。
         // 为什么这些要写进测试而不是"随便哪个仓库都行"：它们直接决定黄金值，
         // 漂了就是真回归（每台车跑哪片区域、什么时候出发，都是可核对的承诺）。
         const ExpectVehicle expect[4] = {{"V01", 400.0, 1.00, 1.50, "W01", 8 * 60},
                                          {"V02", 160.0, 1.25, 0.80, "W01", 8 * 60},
-                                         {"V03", 160.0, 1.25, 0.80, "W02", 6 * 60 + 30},
-                                         {"V04", 160.0, 1.25, 0.80, "W02", 8 * 60}};
+                                         {"V03", 160.0, 1.25, 0.80, "W02", 8 * 60},
+                                         {"V04", 160.0, 1.25, 0.80, "W02", 10 * 60 + 30}};
         for (int i = 0; i < 4; ++i) {
             const logistics::Vehicle& v = cfg.vehicles[static_cast<std::size_t>(i)];
             const std::string tag = std::string("默认车辆 ") + expect[i].id + "：";
@@ -334,9 +335,50 @@ void testLoadDefaultConfig() {
     }
     check(deliveryNodes == allDeliveryNodes, "B 集合 = 全部 25 个配送点");
     check(deliveryNodes.size() == 25, "B 集合恰有 25 个节点");
-    const std::set<std::string> expectedPickups = {"D01", "D05", "D08", "D14", "D20", "D23"};
-    check(pickupNodes == expectedPickups, "A 集合 = {D01,D05,D08,D14,D20,D23}");
-    check(totalDemand(cfg) == 516.0, "默认数据集总重 516kg");
+    // 规格六 #60：集货点收敛到每簇的枢纽客户（跨簇单的 L1 要「一站取完」才能在
+    // W=60min 的站内交接窗口内把整组货交到快车手上）。
+    const std::set<std::string> expectedPickups = {"D01", "D08", "D14"};
+    check(pickupNodes == expectedPickups, "A 集合 = {D01,D08,D14}");
+    check(totalDemand(cfg) == 456.0, "默认数据集总重 456kg");
+
+    // ---- 规格六 #60 守卫 B（本票新增）：**参半数据**的三条形状 ----
+    // 反向验证：把订单表改回「全簇内」（规格五的 25 单），①②立刻变红。
+    int crossOrders = 0;
+    std::set<std::pair<int, int> > corridors;
+    for (std::size_t i = 0; i < cfg.orders.size(); ++i) {
+        const logistics::Order& o = cfg.orders[i];
+        const logistics::Node* a = cfg.graph.findNode(o.pickupNodeId);
+        const logistics::Node* b = cfg.graph.findNode(o.nodeId);
+        if (a == nullptr || b == nullptr) {
+            continue;
+        }
+        if (a->subNetworkId != b->subNetworkId) {
+            ++crossOrders;
+            int lo = a->subNetworkId < b->subNetworkId ? a->subNetworkId : b->subNetworkId;
+            int hi = a->subNetworkId < b->subNetworkId ? b->subNetworkId : a->subNetworkId;
+            corridors.insert(std::make_pair(lo, hi));
+        }
+    }
+    const double crossRatio =
+        static_cast<double>(crossOrders) / static_cast<double>(cfg.orders.size());
+    check(crossRatio >= 0.40 && crossRatio <= 0.60,
+          "数据参半①：跨簇单占比 " + std::to_string(crossRatio * 100.0) + "% 应在 [40%, 60%]"
+              "（跨簇 " + std::to_string(crossOrders) + " / 总 "
+              + std::to_string(cfg.orders.size()) + "）");
+    std::set<std::pair<int, int> > expectedCorridors;
+    expectedCorridors.insert(std::make_pair(1, 2));
+    expectedCorridors.insert(std::make_pair(1, 3));
+    expectedCorridors.insert(std::make_pair(2, 3));
+    check(corridors == expectedCorridors,
+          "数据参半②：三条走廊齐备（1-2 / 1-3 / 2-3），实际 " + std::to_string(corridors.size())
+              + " 条");
+    bool anyUrgent = false;
+    for (std::size_t i = 0; i < cfg.orders.size(); ++i) {
+        if (cfg.orders[i].urgent) {
+            anyUrgent = true;
+        }
+    }
+    check(!anyUrgent, "数据参半③：无紧急单（is_urgent 全 0）");
 
     // Q1：跨节校验是**严格小于**——任何一台车都要能至少单独装下一张单
     check(maxOrderDemand < minCapacity(cfg),

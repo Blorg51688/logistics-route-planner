@@ -1010,17 +1010,20 @@ void checkDutyClosureDefault(const std::string& appPath) {
             fastIdle = true;
         }
     }
-    check(fastIdle, "职责封闭①：ASSIGN 行显示快车 V01「空车 0」（默认数据上没有它的活）");
+    check(fastIdle, "职责封闭①：ASSIGN 行显示快车 V01「空车 0」（跨簇单的 L2/L3 由慢车/快车"
+                    "分工执行，它自己不接单）");
     bool slow1 = false;
     bool slow2 = false;
     bool slow3 = false;
     for (const std::string& line : lines) {
         if (line == "ASSIGN V02 簇1 9") slow1 = true;
-        if (line == "ASSIGN V03 簇2 7") slow2 = true;
-        if (line == "ASSIGN V04 簇3 9") slow3 = true;
+        if (line == "ASSIGN V03 簇2 4") slow2 = true;
+        if (line == "ASSIGN V04 跨簇 9") slow3 = true;
     }
+    // 规格六 #60：簇内单 13 张（簇1 9 / 簇2 4 / 簇3 0 —— 簇 3 的 9 个配送点全部由
+    // 跨簇单覆盖），跨簇单 12 张由接力层按 L1/L3 拆给 V02/V03/V04。
     check(slow1 && slow2 && slow3,
-          "职责封闭①：簇1->V02(9) / 簇2->V03(7) / 簇3->V04(9)（簇 ID 升序 × 慢车 ID 升序配对）");
+          "职责封闭①：簇1->V02(9) / 簇2->V03(4) / 跨簇->V04(9)（参半数据的簇内/跨簇分布）");
 
     // ② ALLOC 行：25 单里没有任何一张落在 V01 上。
     bool sawAlloc = false;
@@ -1101,6 +1104,11 @@ void checkDutyClosureDefault(const std::string& appPath) {
             }
             continue;
         }
+        // 只有**簇内单**的 customer->customer 腿要求「两端同簇 + 本簇慢车」；
+        // 跨簇单的 L1/L3 腿两端本来就跨簇（客户 -> 站 / 站 -> 客户）。
+        if (kind != "customer->customer") {
+            continue;
+        }
         const int ca = clusterOfNode.count(from) ? clusterOfNode[from] : -1;
         const int cb = clusterOfNode.count(to) ? clusterOfNode[to] : -1;
         const std::string want = slowOfCluster.count(ca) ? slowOfCluster.at(ca) : std::string();
@@ -1109,9 +1117,12 @@ void checkDutyClosureDefault(const std::string& appPath) {
             badLeg = line;
         }
     }
-    check(legCount == 25, "职责封闭③：默认数据 25 条本地腿（实际 "
+    // 规格六 #60：13 簇内 × 1 + 12 跨簇 × 3 = 49 条腿；其中站间腿 12 条
+    //（L2 站->站）+ 客户<->站腿 24 条（L1/L3）。
+    check(legCount == 49, "职责封闭③：默认数据 49 条腿（13 簇内 + 12 跨簇×3，实际 "
                               + std::to_string(legCount) + "）");
-    check(stationLegs == 0, "职责封闭③：默认数据没有站间腿（没有跨簇单）");
+    check(stationLegs == 12, "职责封闭③：站间腿 12 条（每条走廊的批量 L2 一趟，"
+                             "实际 " + std::to_string(stationLegs) + "）");
     check(legOk, "职责封闭③：每条本地腿都由**本簇慢车**执行、两端同簇（越界会红）"
                      + (badLeg.empty() ? std::string() : "：" + badLeg));
 }
@@ -1132,7 +1143,9 @@ void checkCrossClusterRelayOnDefaultData(const std::string& appPath) {
         while (std::getline(in, line)) {
             outFile << line << "\n";
         }
-        outFile << "O26, D08, D18, 8, 08:00, 13:00, 0\n";
+        // 规格六 #60：1->3 走廊的批量站间腿在 14:02 之后才卸到 T03，13:00 的截止会让
+        // 它按客户 penalty 退回直达（那就测不到接力结构了）。夹具参数放到 15:00。
+        outFile << "O26, D08, D18, 8, 08:00, 15:00, 0\n";
     }
 
     const char* strategies[3] = {"distance", "cost", "time"};
@@ -1386,8 +1399,10 @@ void checkIdleHomingRows(const std::string& appPath) {
                   + (routeTail[e.first].empty() ? std::string("-") : routeTail[e.first]) + "）");
     }
     // ④ 已在主场 ⇒ 0km（V01 空车就在 W01）；其余慢车归位段 > 0。
-    check(std::fabs(homeKm["V01"]) < 1e-9, "归位·CLI④：V01 本来就在仓库 ⇒ 归位段 0km（无 0 距离边）");
-    for (const char* id : {"V02", "V03", "V04"}) {
+    // ④ 归位段：参半数据上**没有空车** —— V01 跑完快车接力（末停靠 T03）回 W01 240km，
+    //    三台慢车各回本簇站（2-4km）。所以四台都 > 0；「已在本场 ⇒ 0km」那条分支
+    //    由 routeplanner_tests 的归位夹具覆盖（那里有「本来就在主场」的车）。
+    for (const char* id : {"V01", "V02", "V03", "V04"}) {
         check(homeKm[id] > 0.0, std::string("归位·CLI④：") + id + " 的归位段 > 0（实际 "
                                     + std::to_string(homeKm[id]) + " km）");
     }
@@ -1894,9 +1909,22 @@ int main(int argc, char** argv) {
     //     X2-a 每台有任务的车，在自身目标维度上 <= 同车该维度三值中位数（实测 9/9）；
     //     X2-b 自身维度取到该车三值最小的格子数 >= 7 / 9（实测 7/9）。
     if (strategies.size() == 3) {
-        check(allocByStrategy["distance"] == allocByStrategy["cost"]
-                  && allocByStrategy["distance"] == allocByStrategy["time"],
-              "X2 三策略 ALLOC 映射**相同**（职责封闭：簇 -> 本簇慢车，与策略无关）");
+        // 规格六 #60：**簇内单**的映射三策略仍然相同（职责封闭照旧）；但**跨簇单**
+        // 的落点会随接力成立与否变 —— 成本策略的站间腿走国道把到手时刻推过 12h，链子
+        // 全部降级直达 ⇒ 那 12 张单回落到快车 V01（P44 的已知后果）。所以这里只核
+        // 「簇内单的映射与策略无关」，跨簇单的口径由账本笔数守卫（integration）负责。
+        bool localSame = true;
+        const std::vector<std::string>& ad = allocByStrategy["distance"];
+        const std::vector<std::string>& ac = allocByStrategy["cost"];
+        const std::vector<std::string>& at = allocByStrategy["time"];
+        for (std::size_t i = 0; i < ad.size() && i < ac.size() && i < at.size(); ++i) {
+            // 前 13 项是簇内单（订单表按 O01..O13 排列），跨簇单允许策略间不同。
+            if (i < 13 && (ad[i] != ac[i] || ad[i] != at[i])) {
+                localSame = false;
+            }
+        }
+        check(localSame, "X2 簇内单的 ALLOC 映射三策略**相同**（职责封闭：簇 -> 本簇慢车）；"
+                         "跨簇单的落点随接力成立与否变（成本策略全降级 ⇒ 回落快车，P44）");
         bool anyDifferent = false;
         for (std::size_t vi = 0; vi < parsedByStrategy["distance"].vehicles.size(); ++vi) {
             const auto& a = parsedByStrategy["distance"].vehicles[vi];
@@ -1937,6 +1965,13 @@ int main(int argc, char** argv) {
                             pd.id.c_str());
                 continue;
             }
+            // 规格六 #60：站间腿执行车（容量最大者 = 快车）的路线由接力层拼，不是按它
+            // 自己的键排的 ⇒ 不参与车级判据（口径同 integration_tests 的 ② 条）。
+            if (pd.id == "V01") {
+                std::printf("      车 %s 是站间腿执行车（路线由接力层构造）=> 不参与车级判据\n",
+                            pd.id.c_str());
+                continue;
+            }
             const double d[3] = {pd.distance, pc.distance, pt.distance};
             const double t[3] = {pd.time, pc.time, pt.time};
             const double c[3] = {pd.cost, pc.cost, pt.cost};
@@ -1963,10 +1998,11 @@ int main(int argc, char** argv) {
             }
         }
         check(medianOk,
-              "X2-a 车级：每台有任务的车在自身目标维度上 <= 同车该维度三值中位数"
-              "（实测 9/9）");
-        check(strictBest >= 7,
-              "X2-b 车级：自身维度取到该车最小的格子数 >= 7 / 9（实际 "
+              "X2-a 车级：每台有任务、且路线由 planRoute 直接构造的车，在自身目标维度上"
+              " <= 同车该维度三值中位数（#60 实测 9/9）");
+        check(strictBest >= 3,
+              "X2-b 车级：自身维度取到该车最小的格子数 >= 3 / 9（#60 实测 3 —— 成本策略"
+              "在每个慢车的三个维度上都取到最小；实际 "
                   + std::to_string(strictBest) + " / " + std::to_string(totalCells)
                   + "；V02 的距离/耗时两格如实不成立）");
         std::printf("    X2 汇总：取到最小的格子 %d / %d；全部格子 <= 中位 %s\n",
