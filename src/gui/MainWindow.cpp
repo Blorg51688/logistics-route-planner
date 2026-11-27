@@ -212,13 +212,11 @@ void MainWindow::buildActions() {
     logBar->addAction(QStringLiteral("另存日志…"), this, &MainWindow::onExportRunLog);
 
     // ---- 视图菜单：面板与工具栏的显隐（面板关闭后还能找回来）----
-    QMenu* viewMenu = menuBar()->addMenu(QStringLiteral("视图"));
+    // 工具栏开关在这里挂；**停靠面板开关在 buildDocks 末尾补挂**——此时 dock 尚未
+    // 创建，旧代码的 findChildren<QDockWidget*>() 恒为空，面板关掉后找不回来。
+    viewMenu_ = menuBar()->addMenu(QStringLiteral("视图"));
     for (QToolBar* b : {planBar, eventBar, simBar, toolBar, logBar}) {
-        viewMenu->addAction(b->toggleViewAction());
-    }
-    viewMenu->addSeparator();
-    for (QDockWidget* dock : findChildren<QDockWidget*>()) {
-        viewMenu->addAction(dock->toggleViewAction());
+        viewMenu_->addAction(b->toggleViewAction());
     }
 
     simTimer_ = new QTimer(this);
@@ -233,28 +231,32 @@ void MainWindow::buildDocks() {
     clockLabel_->setTextFormat(Qt::PlainText);
     statusBar()->addPermanentWidget(clockLabel_);
 
-    // ---- 右侧 4 个 dock（#56：从 6 个收敛到 4 个）----
+    // ---- 右侧**一个**「信息」dock（#59：三页标签，同一时刻只显示一页）----
     //
-    // 为什么合并（不是"为了少几个窗口"）：
-    //   · 路线信息 + 停靠明细 = 同一份计划的两个视图（摘要 / 明细）。拆成两个窗口后，
-    //     用户核对「这站为什么晚」要在两个堆叠页签之间来回切；合到一块后摘要在上、
-    //     明细在下，一眼对上。**9 列停靠表原样保留**，只是不再单独占一个 dock。
-    //   · 中转站 + 转运账本 = 同一件事的两端：站里有谁、货在哪个站、压了多久。
-    //     账本独立成窗时，"这单现在在哪"必须切页签才答得出来——这正是用户抱怨的拥挤。
-    //   · 超时订单**不再独立开窗**：它本来就是订单的一个状态。独立窗口把同一张单在
-    //     两块面板里各显示一遍，且默认数据里常常 0 行、白占一个页签。现在状态列内联
-    //     「超时 +Nmin」并把超时行排到最前——不切窗也能第一眼看到，信息反而更全。
-    //   · 车辆固定参数（两因子 / 起始仓库 / 发车时刻）不占版面，移进行 tooltip。
+    // #56 的 2×2 网格（车辆/订单 左列、中转与配送网/路线与停靠 右列）四块同屏，
+    // 右栏总宽 ~760px，在 1360px 窗口里吃掉一半以上画布——用户原话「遮挡地图」。
+    // #59 把右侧收敛成**一个 dock + 一个 QTabWidget**：① 车辆 ② 订单 ③ 中转与配送网，
+    // 随时切换、同一时刻只显示一页；右栏宽降到 ~400px，画布恢复 ≥900px。
+    // 信息本身**一条没少**：三张表 / 账本 / 空态提示都原样搬进各自页签。
     //
-    // 排布 = 2×2：左列 车辆 / 订单，右列 中转与配送网 / 路线与停靠。四块同屏可见
-    // （旧布局把 5 块 tabify 叠在一起，同一时刻只看得到其中一块）。
-    auto* vehicleDock = new QDockWidget(QStringLiteral("车辆"), this);
-    vehicleDock->setMinimumWidth(400);
-    // 车辆表（MC-E04 改版）：**一车一行**。列序 = 车辆 | 状态 | 载货(kg) | 额定(kg) |
-    // 利用率 | 在途单数 | 位置 | 下一站。
+    // 路线摘要 + 停靠明细不再占右侧版面，移到底部 dock 的第二个标签页
+    // （日志 / 路线与停靠）：这两份信息一条不删，G8/G9 守卫仍读表格对象。
+    auto* infoDock = new QDockWidget(QStringLiteral("信息"), this);
+    infoDock->setMinimumWidth(400);
+    auto* infoTabs = new QTabWidget(infoDock);
+    infoTabs->setDocumentMode(true);
+    rightTabs_ = infoTabs;
+
+    // ---- 页①：车辆（一车一行 6 列）----
+    // 列序 = 车辆 | 状态 | 载货/额定(kg) | 利用率 | 在途单数 | 位置→下一站。
     // 「载货 / 额定 / 利用率」并排，正是用户说的「各个车辆的载货量/总货量」；
-    // 旧布局把这三项塞进每车页签、要逐页切换才能横向比，表格化后四台车同屏可比。
-    vehicleTable_ = new QTableWidget(0, 6, vehicleDock);
+    // 表格化后四台车同屏可比，固定参数（两因子 / 起始仓库 / 发车时刻）移进行 tooltip。
+    auto* vehiclePage = new QWidget(infoTabs);
+    rightVehiclePage_ = vehiclePage;
+    auto* vehicleLay = new QVBoxLayout(vehiclePage);
+    vehicleLay->setContentsMargins(0, 0, 0, 0);
+    vehicleLay->setSpacing(0);
+    vehicleTable_ = new QTableWidget(0, 6, vehiclePage);
     vehicleTable_->setHorizontalHeaderLabels(
         // 8 列太宽、右侧 dock 里「下一站」会被裁掉（#56 lead 复核）。合并成 6 列：
         // 「载货/额定」同行并排 = 用户要的「载货量/总货量」，「位置→下一站」合成一格。
@@ -267,17 +269,19 @@ void MainWindow::buildDocks() {
     // 一次选一行（选中行 = 画布上被加粗的那台车，替代旧的"选中页签"）。
     vehicleTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
     vehicleTable_->setSelectionMode(QAbstractItemView::SingleSelection);
-    vehicleDock->setWidget(vehicleTable_);
-    addDockWidget(Qt::RightDockWidgetArea, vehicleDock);
+    vehicleLay->addWidget(vehicleTable_);
+    infoTabs->addTab(vehiclePage, QStringLiteral("车辆"));
 
-    auto* orderDock = new QDockWidget(QStringLiteral("订单"), this);
-    orderDock->setMinimumWidth(400);
-    // 订单表（#56）：**一单一行 8 列** = 订单 | 取货 | 送货 | kg | 窗口 | 状态 | 车辆 | 当前位置。
-    // 旧表的「配送点」只写送达点 B，取货点 A 无处可看；现在 A/B 分列。
+    // ---- 页②：订单（一单一行 7 列）----
+    // 订单 | 取送(A→B) | kg | 窗口 | 状态 | 车辆 | 当前位置。
     // 新增「当前位置」是这张表的核心：车上(V02) / 站内·T01 / 已送达(D18) / 待取·D08——
-    // 用户不必再去账本面板对照"这批货现在在哪"。
-    // 7 列（原 8 列）：把「取货 / 送货」合成「取送」一格（A→B），右侧 dock 里才不会被裁。
-    orderTable_ = new QTableWidget(0, 7, orderDock);
+    // 用户不必再去账本页对照"这批货现在在哪"。超时并入状态列（「· 超时 +Nmin」）。
+    auto* orderPage = new QWidget(infoTabs);
+    rightOrderPage_ = orderPage;
+    auto* orderLay = new QVBoxLayout(orderPage);
+    orderLay->setContentsMargins(0, 0, 0, 0);
+    orderLay->setSpacing(0);
+    orderTable_ = new QTableWidget(0, 7, orderPage);
     orderTable_->setHorizontalHeaderLabels(
         {QStringLiteral("订单"), QStringLiteral("取送"), QStringLiteral("kg"),
          QStringLiteral("窗口"), QStringLiteral("状态"), QStringLiteral("车辆"),
@@ -286,10 +290,10 @@ void MainWindow::buildDocks() {
     orderTable_->horizontalHeader()->setStretchLastSection(true);
     orderTable_->verticalHeader()->setVisible(false);
     orderTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    orderDock->setWidget(orderTable_);
-    addDockWidget(Qt::RightDockWidgetArea, orderDock);
+    orderLay->addWidget(orderTable_);
+    infoTabs->addTab(orderPage, QStringLiteral("订单"));
 
-    // 中转与配送网（#56 合并「中转站 / 集散」+「转运账本」，上下两块）：
+    // ---- 页③：中转与配送网（上配送网表 + 下转运账本 + 空态提示）----
     // 上半 5 列 = 中转站 | 子网络 | 下属配送点 | 当前暂存货(kg) | 站内待取走(kg)；
     // 下半 7 列 = 订单 | 中转站 | kg | 卸入 | 取走 | 站内等待(min) | 状态。
     //
@@ -297,9 +301,8 @@ void MainWindow::buildDocks() {
     // 转运卸入的货**故意不进那个堆**（见 onAdvanceStopFor 的注释），所以跨簇接力期间
     // 站内明明有货、这一列永远是 0 —— 用户看到的就是"站里有货但面板说 0"。
     // 新列直接读 transitLedger_ 里 pickedUp == false 的行求和，卸入后、取走前必然 > 0。
-    auto* transitDock = new QDockWidget(QStringLiteral("中转与配送网"), this);
-    transitDock->setMinimumWidth(400);
-    auto* transitPage = new QWidget(transitDock);
+    auto* transitPage = new QWidget(infoTabs);
+    rightTransitPage_ = transitPage;
     auto* transitLay = new QVBoxLayout(transitPage);
     transitLay->setContentsMargins(0, 0, 0, 0);
     transitLay->setSpacing(2);
@@ -337,15 +340,25 @@ void MainWindow::buildDocks() {
     ledgerEmptyHint_->setWordWrap(true);
     ledgerEmptyHint_->setEnabled(false);   // 灰色提示，不抢表头的注意力
     transitLay->addWidget(ledgerEmptyHint_);
-    transitDock->setWidget(transitPage);
-    addDockWidget(Qt::RightDockWidgetArea, transitDock);
+    infoTabs->addTab(transitPage, QStringLiteral("中转与配送网"));
 
-    // 路线与停靠（#56 合并「路线信息」+「停靠明细」，上摘要下明细）：
-    // 上半 = 原路线信息全文（策略 / 汇总 / 逐车指标 / 均衡度）；
-    // 下半 = 停靠明细 **9 列**（列序、口径一律不变，只是不再单独开窗）。
-    auto* routeDock = new QDockWidget(QStringLiteral("路线与停靠"), this);
-    routeDock->setMinimumWidth(400);
-    auto* routePage = new QWidget(routeDock);
+    // 默认选中页①（车辆）——用户打开就要先看车。
+    infoTabs->setCurrentIndex(0);
+    infoDock->setWidget(infoTabs);
+    addDockWidget(Qt::RightDockWidgetArea, infoDock);
+
+    // ---- 底部 dock：两个标签页（日志 / 路线与停靠）----
+    // 「路线与停靠」上半 = 原路线信息全文（策略 / 汇总 / 逐车指标 / 均衡度）；
+    // 下半 = 停靠明细 **9 列**（列序、口径一律不变，只是换到底部页签）。
+    auto* logDock = new QDockWidget(QStringLiteral("日志"), this);
+    auto* bottomTabs = new QTabWidget(logDock);
+    bottomTabs->setDocumentMode(true);
+    bottomTabs_ = bottomTabs;
+    logView_ = new QPlainTextEdit(bottomTabs);
+    logView_->setReadOnly(true);
+    bottomTabs->addTab(logView_, QStringLiteral("日志"));
+
+    auto* routePage = new QWidget(bottomTabs);
     auto* routeLay = new QVBoxLayout(routePage);
     routeLay->setContentsMargins(0, 0, 0, 0);
     routeLay->setSpacing(2);
@@ -366,29 +379,28 @@ void MainWindow::buildDocks() {
     stopTable_->verticalHeader()->setVisible(false);
     stopTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
     routeLay->addWidget(stopTable_, 3);
-    routeDock->setWidget(routePage);
-    addDockWidget(Qt::RightDockWidgetArea, routeDock);
+    bottomTabs->addTab(routePage, QStringLiteral("路线与停靠"));
 
-    auto* logDock = new QDockWidget(QStringLiteral("日志"), this);
-    logView_ = new QPlainTextEdit(logDock);
-    logView_->setReadOnly(true);
-    logDock->setWidget(logView_);
+    // 默认选中页①（日志）。
+    bottomTabs->setCurrentIndex(0);
+    logDock->setWidget(bottomTabs);
     addDockWidget(Qt::BottomDockWidgetArea, logDock);
 
-    // 2×2 网格（Qt 的 splitDockWidget 按"被分割的那块区域"切半）：
-    //   addDockWidget 先把车辆铺满右栏 → 用 transitDock 横切成左右两列 →
-    //   再分别在左列（车辆/订单）与右列（中转与配送网/路线与停靠）纵切上下两格。
-    splitDockWidget(vehicleDock, transitDock, Qt::Horizontal);
-    splitDockWidget(vehicleDock, orderDock, Qt::Vertical);
-    splitDockWidget(transitDock, routeDock, Qt::Vertical);
+    // 宽度：右侧一页一表，~400px 足够（#56 的四块同屏要 ~760px，正是「遮挡地图」的根因）。
+    resizeDocks({infoDock}, {400}, Qt::Horizontal);
+    // 高度：底部两页共享；日志页要能看到若干行，路线页要能看见摘要与停靠表头。
+    resizeDocks({logDock}, {230}, Qt::Vertical);
 
-    // 高度：车辆表 4 台车一屏看完（约 180px），剩下的给订单表；
-    // 右列账本 + 停靠明细都要能看见表头与若干行。
-    resizeDocks({vehicleDock, orderDock}, {180, 520}, Qt::Vertical);
-    resizeDocks({transitDock, routeDock}, {330, 370}, Qt::Vertical);
-    // 右栏整体留出足够宽度，避免 8/9 列表被折成两行字。
-    resizeDocks({vehicleDock, transitDock}, {380, 380}, Qt::Horizontal);
-    resizeDocks({logDock}, {140}, Qt::Vertical);
+    // 「视图」菜单的停靠面板显隐开关（#59 复核）：dock 此时才存在，在这里补挂。
+    // 关掉「信息」或「日志」后必须能从菜单找回来（否则 #59 只剩一个右侧框，
+    // 误关即再也看不到车辆/订单）。读的是 QDockWidget 自己的 toggleViewAction，
+    // 菜单文字与面板标题同源，不会漂移。
+    if (viewMenu_ != nullptr) {
+        viewMenu_->addSeparator();
+        for (QDockWidget* dock : findChildren<QDockWidget*>()) {
+            viewMenu_->addAction(dock->toggleViewAction());
+        }
+    }
 }
 std::string MainWindow::currentPositionId() const {
     return active().state.atNodeId;
@@ -554,7 +566,7 @@ std::vector<std::vector<std::string> > MainWindow::canvasTargetRoutes() const {
 }
 
 // 画布归属快照（G15）：逐条车路线边给出归属车（行序最前）与「是否属于选中车」。
-// 读的是与画布同一份数据（canvasTargetRoutes + 页签选中），不重算任何公式。
+// 读的是与画布同一份数据（canvasTargetRoutes + 车辆表选中行），不重算任何公式。
 QString MainWindow::canvasOwnershipSnapshot() const {
     // 收集全部车路线边（有向），并记录**经过它的全部车**（行序）：
     // owner = 其中行序最前的那台车（共享边不重复绘制）。
@@ -646,7 +658,9 @@ void MainWindow::arriveAt(std::size_t v, const std::string& nodeId, int timeMin)
     rt.state.atNodeId = nodeId;
     rt.state.atTimeMin = timeMin;
     // 单条连续路线（规格一 MC-A01）：没有"趟"这回事，回仓库只是路线终点。
-    // 只记"是否已驶离"，供界面上「本趟出发装载」的冻结语义继续成立。
+    // `departed` 是**物理事实**（是否已驶离出发点）：回仓库（路线终点）后置 false，
+    // 重规划不得改写；唯一消费者是 fleetPristine()（判断「这一局还没动过」）。
+    // 旧界面的「本趟出发装载」已退役（#56/#59），不再有别的消费者。
     const std::string& home = config_.vehicles[v].startNodeId;
     if (nodeId == home && rt.plan.nodes.size() > 1) {
         rt.state.departed = false;
@@ -710,8 +724,8 @@ std::vector<Order> MainWindow::remainingOrders() const {
     return remaining;
 }
 
-// 画布（规格二 §7.5⑤）：三色路线 + 选中页签那台车加粗。
-// 每条车路线边都有归属（共享边归行序最前那台车）；空车不参与绘制但页签仍在。
+// 画布（规格二 §7.5⑤；#50 起每车只画目标箭头、按角色两色）：选中行那台车加粗。
+// 每条车路线边都有归属（共享边归行序最前那台车）；空车不参与绘制但车辆表里仍有行。
 // **权重标签仍是基础边权**（pickWeight 不接车辆参数）。
 void MainWindow::syncScene() {
     scene_->build(config_.graph, scene_->weightType());
@@ -1207,7 +1221,7 @@ std::string MainWindow::insertOrderAt(const std::string& a, const std::string& b
     order.source = source;
     order.served = false;
 
-    // 冲突提示按**页签选中的车**先算一遍（"这单在它那儿最早什么时候到"），
+    // 冲突提示按**车辆表选中的车**先算一遍（"这单在它那儿最早什么时候到"），
     // 真正的分配仍走车队重规划（顺序轮转基线，#40 换成类型感知分配）。
     const std::vector<Order> pending = remainingOrders();
     logistics::StashState stashIns;
@@ -1609,8 +1623,9 @@ void MainWindow::onAdvanceStopFor(std::size_t v) {
 
     // ---- 按**停靠动作集**执行状态转移（规格一 MC-E09）----
     //
-    // 旧实现靠 nodeTripIndex -> Trip 反查"本趟的 pickups/offloads/reclaimStation"，
-    // 并按 nodeId 扣货。新模型下 stops 的动作集就是真源，且**按订单记账**：
+    // 历史：旧实现靠 `nodeTripIndex → Trip` 反查「本趟」的 pickups/offloads/
+    // reclaimStation 并按 nodeId 扣货（Trip 已退役，规格一 MC-A01）。
+    // 现模型下 stops 的动作集就是真源，且**按订单记账**：
     // 同节点多单（A∪B 合并停靠）下按 nodeId 扣货会把别的单一起扣掉（issue #5 的坑）。
     const bool isStopHere = veh(v).nodeIndex < veh(v).plan.nodeIsStop.size()
                             && veh(v).plan.nodeIsStop[veh(v).nodeIndex];
@@ -1793,7 +1808,8 @@ void MainWindow::onAdvanceStopFor(std::size_t v) {
     // 只有**下标与节点对得上**时才认作一次停靠送达。
     // 曾经这里只看 nodeIsStop 与下标，重规划后两者可能失同步，
     // 于是拿到的是**另一个停靠点**：扣错货（车上有的没扣、没有的扣了），
-    // 表现为"2 趟送完 740kg"这种物理上不可能的结果。
+    // 表现为"2 趟送完 740kg"这种物理上不可能的结果（**已退役口径**：
+    // 旧「趟」模型下的历史事故举例，现行单条连续路线不存在「趟」）。
     if (hereStop != nullptr) {
         const Stop& stop = *hereStop;
         ++veh(v).stopCursor;
@@ -2612,7 +2628,7 @@ void MainWindow::updatePanels() {
                      .arg(fm.loadUtilization * 100.0, 0, 'f', 1)
                      .arg(fm.peakLoadKg, 0, 'f', 1);
         // ---- `── 逐车指标 ──`：每车一行 7 项（§7.2：距离/耗时/成本/penalty/
-        // 利用率/取货率/送达率）。这是**计划级**结果，与页签里的运行态不同源。
+        // 利用率/取货率/送达率）。这是**计划级**结果，与车辆表里的运行态不同源。
         route += QStringLiteral("── 逐车指标 ──\n");
         for (std::size_t v = 0; v < fleet_.size() && v < config_.vehicles.size(); ++v) {
             const VehicleRuntime& rt = fleet_[v];
@@ -2631,7 +2647,7 @@ void MainWindow::updatePanels() {
                          .arg(rateText(vm.deliveryOnTimeCount, vm.deliveryTotal));
         }
         // 均衡度（规格二 §4.3 / #40）：峰值利用率极差，越小越均衡。**纯增量一行**，
-        // 不新增控件；分母按全部车（空车 utilization 记 0）。计划级结果，与页签运行态不同源。
+        // 不新增控件；分母按全部车（空车 utilization 记 0）。计划级结果，与车辆表运行态不同源。
         route += QStringLiteral("均衡度（峰值利用率极差）：%1\n")
                      .arg(fleetPlan_.balanceSpread, 0, 'f', 2);
         if (!fleetPlan_.allOk) {
@@ -3272,10 +3288,10 @@ QString MainWindow::transitPanelSummary() const {
 }
 
 // 超时面板的**行数口径**（G10）：面板是**逐车铺行**的（updatePanels 里对 fleet_ 全量循环），
-// 所以这里也必须数**全部车**，不能只数当前页签那台。
+// 所以这里也必须数**全部车**，不能只数车辆表当前选中行那台。
 // 为什么以前没暴露：规格三之前默认数据 penalty 恒 0（或迟到单恰好落在 V02 上而当时
 // activeVehicle_ 指向它），两种口径给出同一个数。规格四把干线提到跨城尺度后，
-// distance/time 策略下唯一迟到的 O07 落在 V02、而页签停在 V01（空车）——
+// distance/time 策略下唯一迟到的 O07 落在 V02、而选中行停在 V01（空车）——
 // 「面板 1 行 vs 计数 0」立刻分叉。这是**计数口径的缺陷**，不是数据问题：
 // 修的是「数谁」，不是放宽判据。
 int MainWindow::lateOrderCount() const {
@@ -3475,6 +3491,69 @@ QString MainWindow::dockTitles() const {
     names.removeDuplicates();
     names.sort();
     return names.join(QStringLiteral(" | "));
+}
+
+QStringList MainWindow::rightTabTitles() const {
+    QStringList titles;
+    if (rightTabs_ == nullptr) {
+        return titles;
+    }
+    for (int i = 0; i < rightTabs_->count(); ++i) {
+        titles << rightTabs_->tabText(i);
+    }
+    return titles;
+}
+
+QStringList MainWindow::bottomTabTitles() const {
+    QStringList titles;
+    if (bottomTabs_ == nullptr) {
+        return titles;
+    }
+    for (int i = 0; i < bottomTabs_->count(); ++i) {
+        titles << bottomTabs_->tabText(i);
+    }
+    return titles;
+}
+
+int MainWindow::rightTabCurrentIndex() const {
+    return rightTabs_ != nullptr ? rightTabs_->currentIndex() : -1;
+}
+
+int MainWindow::bottomTabCurrentIndex() const {
+    return bottomTabs_ != nullptr ? bottomTabs_->currentIndex() : -1;
+}
+
+void MainWindow::activateRightTab(int index) {
+    if (rightTabs_ != nullptr && index >= 0 && index < rightTabs_->count()) {
+        rightTabs_->setCurrentIndex(index);
+    }
+}
+
+int MainWindow::rightVisiblePageCount() const {
+    // 数的是**三个已知页面**的可见状态，而不是「QTabWidget 有几页」：
+    // QTabWidget 天然只显示当前页；若以后有人把三页改成同屏（QVBoxLayout 等），
+    // 这里会得到 3，守卫随即变红。#59 的反向验证正是这么做的。
+    int visible = 0;
+    for (const QWidget* page : {rightVehiclePage_, rightOrderPage_, rightTransitPage_}) {
+        if (page != nullptr && page->isVisible()) {
+            ++visible;
+        }
+    }
+    return visible;
+}
+
+int MainWindow::bottomVisiblePageCount() const {
+    if (bottomTabs_ == nullptr) {
+        return -1;
+    }
+    int visible = 0;
+    for (int i = 0; i < bottomTabs_->count(); ++i) {
+        const QWidget* page = bottomTabs_->widget(i);
+        if (page != nullptr && page->isVisible()) {
+            ++visible;
+        }
+    }
+    return visible;
 }
 
 QString MainWindow::routePanelSummary() const {
@@ -3764,7 +3843,7 @@ int MainWindow::runActionSelfCheck() {
         }
 
         // X 必须真的进路线（只看"新增节点"太弱：节点加了但没被配送等于没有需求）。
-        // 读**全队**路线而不是当前页签那一台车：职责封闭（#46）之后新客户按它的子网归属
+        // 读**全队**路线而不是车辆表当前选中行那一台车：职责封闭（#46）之后新客户按它的子网归属
         // 落到**该簇的慢车**上，未必是界面当前选中的那台（默认选中的是「第一台有路线的车」）。
         // 只看 active() 会把它判成"没进路线"，那是口径错、不是缺陷。
         bool inPlan = false;
@@ -4511,7 +4590,7 @@ int MainWindow::runActionSelfCheck() {
         // 这是 A6 那条反向验证（把并列分支改成「只推进第一台」）的**可观测载体**：
         // 双跑在终态会收敛（都到家、都送达），单看终态吃不掉这条反向补丁；
         // 而「一次推进一站必须让并列的两台车都前进」是用户能直接看到的结构事实
-        //（车辆页签/状态栏的位置与时刻）。
+        //（车辆表选中行 / 状态栏的位置与时刻）。
         MainWindow tieOne(mirror, configPath_);
         // 期望值从**推进前**的计划里读（推进可能触发事件重规划，事后读会变）
         const int expectedArrival =
