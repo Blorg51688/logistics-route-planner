@@ -552,7 +552,11 @@ int main(int argc, char** argv) {
                 atNodes.push_back(fleet.vehicles[v].nodes.empty() ? config.vehicles[v].startNodeId
                                                                  : fleet.vehicles[v].nodes.front());
             }
-            scene.setVehicleMarks(atNodes, fastFlags);
+            std::vector<std::string> vehicleIds;
+            for (const logistics::Vehicle& v : config.vehicles) {
+                vehicleIds.push_back(v.id);
+            }
+            scene.setVehicleMarks(atNodes, fastFlags, vehicleIds);
             if (fleet.allOk) {
                 std::printf("规划（%s）：距离 %.1fkm  完工耗时 %.1fmin（车时合计 %.1fmin）  "
                             "成本 %.1f元  penalty %dmin  停靠 %d 站  车 %zu 台\n",
@@ -677,15 +681,14 @@ int main(int argc, char** argv) {
                         rightTabs.value(window.rightTabCurrentIndex()).toUtf8().constData(),
                         rightVisible);
         }
-        // ---- 底部日志 dock：两个标签页逐名核对（日志 / 路线与停靠）----
-        // 路线摘要 + 停靠明细**没有删**，只是从右侧移到底部第二页（G8/G9 仍读表格对象）。
+        // ---- 底部日志 dock：#62 只剩「日志」一个标签 ----
+        // 「路线与停靠」页已退役；路线关键信息并入日志文本（见下面的 G9' 守卫）。
         {
             const QStringList bottomTabs = window.bottomTabTitles();
-            const QStringList wantBottom{QStringLiteral("日志"),
-                                         QStringLiteral("路线与停靠")};
+            const QStringList wantBottom{QStringLiteral("日志")};
             if (bottomTabs != wantBottom) {
                 std::fprintf(stderr,
-                             "[ui-probe] 底部日志框标签不符（应 日志 / 路线与停靠）："
+                             "[ui-probe] 底部日志框标签不符（#62 应只剩「日志」一页）："
                              "实际 [%s]\n",
                              bottomTabs.join(QStringLiteral(" | ")).toUtf8().constData());
                 return 1;
@@ -703,8 +706,18 @@ int main(int argc, char** argv) {
                              bottomVisible);
                 return 1;
             }
-            std::printf("[ui-probe] 底部日志框: 2 个标签页 [%s]，当前第 %d 页「%s」，"
-                        "同屏可见 %d 页\n",
+            // 守卫「退役对象不得回到界面」：隐藏载体一旦被塞回 dock/布局，这里立刻红。
+            if (window.routePanelVisible() || window.stopPanelVisible()) {
+                std::fprintf(stderr,
+                             "[ui-probe] 已退役的「路线信息 / 停靠明细」重新出现在界面"
+                             "（route=%d stop=%d）\n",
+                             window.routePanelVisible() ? 1 : 0,
+                             window.stopPanelVisible() ? 1 : 0);
+                return 1;
+            }
+            std::printf("[ui-probe] 底部日志框: %d 个标签页 [%s]，当前第 %d 页「%s」，"
+                        "同屏可见 %d 页；路线/停靠面板不可见\n",
+                        bottomTabs.size(),
                         bottomTabs.join(QStringLiteral(" | ")).toUtf8().constData(),
                         window.bottomTabCurrentIndex() + 1,
                         bottomTabs.value(window.bottomTabCurrentIndex()).toUtf8().constData(),
@@ -1059,15 +1072,19 @@ int main(int argc, char** argv) {
             std::printf("[ui-probe] 状态栏时间：%s\n", clockText.toUtf8().constData());
         }
 
-        // ---- G8：停靠明细 **9 列**、无「趟」、含 序号/阶段/动作/余货(kg)（MC-E01）----
+        // ---- G8（#62 改写）：停靠明细已从界面退役；若仍有载体则格式必须正确 ----
+        // 「不许只删断言」：下面逐列/逐行断言全部保留，只是把「必须存在」改成
+        // 「若存在则格式正确」；新增的退役守卫与日志汇总守卫负责证明信息没丢。
         const QString stopPanel = window.stopPanelSummary();
         const std::size_t stopRows =
             static_cast<std::size_t>(stopPanel.count(QLatin1Char('\n')));
         if (stopRows == 0) {
-            std::fprintf(stderr, "[ui-probe] 停靠明细面板为空\n");
-            return 1;
+            std::printf("[ui-probe] #62 停靠明细已从界面退役（无表格载体），"
+                        "G8 格式断言暂无对象；保留断言待重新出现时生效\n");
         }
-        std::printf("[ui-probe] 停靠明细 %zu 行（车辆|序号|阶段|配送点|动作|原始到达|等待(分)|送达|余货(kg)）\n",
+        if (stopRows > 0) {
+        std::printf("[ui-probe] 停靠明细 %zu 行（车辆|序号|阶段|配送点|动作|原始到达|等待(分)|送达|余货(kg)）"
+                    "（隐藏守卫载体，不在界面）\n",
                     stopRows);
         {
             const QStringList lines = stopPanel.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
@@ -1181,9 +1198,15 @@ int main(int argc, char** argv) {
                         pairs);
         }
 
-        // ---- G9：路线信息面板含四片段（MC-E03）----
-        {
-            const QString routePanel = window.routePanelSummary();
+        }  // if (stopRows > 0) —— G8：若载体存在才逐列校验
+
+        // ---- G9（#62 改写）：路线信息面板已退役；若仍有载体则四片段必须正确 ----
+        const QString routePanel = window.routePanelSummary();
+        if (routePanel.isEmpty()) {
+            std::printf("[ui-probe] #62 路线信息面板已从界面退役（无文本载体），"
+                        "G9 片段断言暂无对象；改由日志汇总守卫覆盖\n");
+        }
+        if (!routePanel.isEmpty()) {
             const QRegularExpression stopsActions(
                 QStringLiteral("停靠 ([0-9]+) 站 · 动作 ([0-9]+) 次"));
             const QRegularExpressionMatch sam = stopsActions.match(routePanel);
@@ -1236,9 +1259,91 @@ int main(int argc, char** argv) {
                 return 1;
             }
             std::printf("[ui-probe] 路线信息面板：停靠 %s 站 · 动作 %s 次（四片段齐备）；"
-                        "逐车指标 %d 行（每行 7 项）\n",
+                        "逐车指标 %d 行（每行 7 项）（隐藏守卫载体，不在界面）\n",
                         sam.captured(1).toUtf8().constData(),
                         sam.captured(2).toUtf8().constData(), metricRows);
+        }  // if (!routePanel.isEmpty()) —— G9：若载体存在才校验片段
+
+        // ---- G9'（#62 新增）：路线关键信息必须在**日志文本**里能看到 ----
+        // 「不许只删断言」：G8/G9 的旧断言保留为「若存在则格式正确」；这一条读
+        // 底部日志 dock 的用户可见文本，证明退役页承载的信息一条没丢。
+        {
+            const QString logText = window.logPanelText();
+            for (const char* key : {"路线摘要：", "策略 ", "总距离 ", "完工耗时 ",
+                                    "总成本 ", "penalty ", "停靠 ", "动作 ",
+                                    "取货准时率 ", "送达准时率 ", "平均在车 ",
+                                    "均衡度（峰值利用率极差）"}) {
+                if (!logText.contains(QString::fromUtf8(key))) {
+                    std::fprintf(stderr,
+                                 "[ui-probe] G9'：日志文本缺少路线关键片段「%s」\n", key);
+                    return 1;
+                }
+            }
+            // 逐车指标：每台车一行，且七个字段都在同一行上。
+            int logMetricRows = 0;
+            const QStringList logLines =
+                logText.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+            for (const QString& line : logLines) {
+                if (!line.startsWith(QStringLiteral("逐车指标 "))) {
+                    continue;
+                }
+                if (!line.contains(QStringLiteral("距离 "))
+                    || !line.contains(QStringLiteral("耗时 "))
+                    || !line.contains(QStringLiteral("成本 "))
+                    || !line.contains(QStringLiteral("penalty "))
+                    || !line.contains(QStringLiteral("利用率 "))
+                    || !line.contains(QStringLiteral("取货 "))
+                    || !line.contains(QStringLiteral("送达 "))) {
+                    std::fprintf(stderr, "[ui-probe] G9'：日志逐车指标行字段不全：%s\n",
+                                 line.toUtf8().constData());
+                    return 1;
+                }
+                ++logMetricRows;
+            }
+            if (logMetricRows != static_cast<int>(config.vehicles.size())) {
+                std::fprintf(stderr, "[ui-probe] G9'：日志逐车指标 %d 行 != 车辆数 %zu\n",
+                             logMetricRows, config.vehicles.size());
+                return 1;
+            }
+            for (const logistics::Vehicle& v : config.vehicles) {
+                const QString rowPrefix = QStringLiteral("逐车指标 ")
+                                          + QString::fromStdString(v.id) + QStringLiteral("：");
+                if (!logText.contains(rowPrefix)) {
+                    std::fprintf(stderr, "[ui-probe] G9'：日志缺少车 %s 的逐车指标行\n",
+                                 v.id.c_str());
+                    return 1;
+                }
+            }
+            // 与原面板载体交叉核对：率与均衡度的**数值**必须逐字一致（信息没丢，不是另造一套）。
+            if (!routePanel.isEmpty()) {
+                const auto valueAfter = [&routePanel](const QString& label) -> QString {
+                    const int at = routePanel.indexOf(label);
+                    if (at < 0) {
+                        return QString();
+                    }
+                    const int begin = at + label.size();
+                    const int end = routePanel.indexOf(QLatin1Char('\n'), begin);
+                    return routePanel.mid(begin, end < 0 ? -1 : end - begin).trimmed();
+                };
+                for (const QString& label : {QStringLiteral("取货准时率："),
+                                             QStringLiteral("送达准时率："),
+                                             QStringLiteral("平均在车："),
+                                             QStringLiteral("均衡度（峰值利用率极差）：")}) {
+                    const QString value = valueAfter(label);
+                    const QString logLabel = label.isEmpty() ? label
+                                                             : label.chopped(1) + QStringLiteral(" ");
+                    if (value.isEmpty() || !logText.contains(logLabel + value)) {
+                        std::fprintf(stderr,
+                                     "[ui-probe] G9'：日志与原路线面板的数值不一致"
+                                     "（%s→「%s」）\n",
+                                     label.toUtf8().constData(), value.toUtf8().constData());
+                        return 1;
+                    }
+                }
+            }
+            std::printf("[ui-probe] G9' 日志汇总：关键片段 %d 项 + 逐车指标 %d 行齐备"
+                        "（退役页信息未丢失）\n",
+                        12, logMetricRows);
         }
 
         // ---- G10（#56 改写）：超时并入**订单表状态列**，一单一行、含「当前位置」----
@@ -1572,6 +1677,94 @@ int main(int argc, char** argv) {
             }
             std::printf("[ui-probe] 画布归属 %zu 条边（归属按行序最前，选中车加粗 %d 条）\n",
                         rows.size(), selectedRows);
+        }
+
+        // ---- #62：慢车越簇核查 + 车辆环 tooltip 可辨车号 ----
+        // 用户截图里 T03 多个同心环，疑似「慢车离开簇」。静态审计以**计划节点**为准：
+        // 慢车只许跑本簇客户，快车才能跨簇；T03 的同站环必须是快车 + 本簇慢车。
+        {
+            const logistics::FleetPlan audit = logistics::planFleet(
+                config.graph, config.vehicles, config.orders, logistics::WeightType::Distance);
+            const std::vector<bool> fastFlags = logistics::fastVehicleFlags(config.vehicles);
+            bool slowClusterOk = true;
+            bool fastCrossesClusters = false;
+            bool t03HasFast = false;
+            bool t03HasSlow = false;
+            for (std::size_t v = 0; v < config.vehicles.size(); ++v) {
+                std::vector<int> clusters;
+                for (const std::string& nodeId : audit.vehicles[v].nodes) {
+                    if (nodeId == "T03") {
+                        if (v < fastFlags.size() && fastFlags[v]) {
+                            t03HasFast = true;
+                        } else {
+                            t03HasSlow = true;
+                        }
+                    }
+                    const logistics::Node* node = config.graph.findNode(nodeId);
+                    // 中转站也算簇归属（快车的跨簇证据就是 T01→T02→T03）；仓库不算。
+                    if (node == nullptr || node->type == logistics::NodeType::Warehouse) {
+                        continue;
+                    }
+                    bool seen = false;
+                    for (int c : clusters) {
+                        if (c == node->subNetworkId) {
+                            seen = true;
+                        }
+                    }
+                    if (!seen) {
+                        clusters.push_back(node->subNetworkId);
+                    }
+                }
+                const bool isFast = (v < fastFlags.size()) && fastFlags[v];
+                if (!isFast && clusters.size() > 1) {
+                    slowClusterOk = false;   // 慢车越簇 —— 真违规
+                }
+                if (isFast && clusters.size() > 1) {
+                    fastCrossesClusters = true;
+                }
+            }
+            if (!slowClusterOk) {
+                std::fprintf(stderr, "[ui-probe] #62：发现慢车路线跨越多个簇（真违规，需修根因）\n");
+                return 1;
+            }
+            if (!fastCrossesClusters || !t03HasFast || !t03HasSlow) {
+                std::fprintf(stderr,
+                             "[ui-probe] #62：T03 叠加环的前提不成立"
+                             "（快车跨簇=%d / T03快车=%d / T03慢车=%d）\n",
+                             fastCrossesClusters ? 1 : 0, t03HasFast ? 1 : 0,
+                             t03HasSlow ? 1 : 0);
+                return 1;
+            }
+            // 真实图元的 tooltip：把 V01(快) + V04(慢) 放在 T03 上，逐车号与角色可见。
+            GraphScene tipScene;
+            tipScene.build(config.graph, logistics::WeightType::Distance);
+            const std::vector<std::string> atNodes{"T03", "T03"};
+            const std::vector<std::string> ids{"V01", "V04"};
+            const std::vector<bool> roles{true, false};
+            tipScene.setVehicleMarks(atNodes, roles, ids);
+            const QString t03Tip = tipScene.nodeVehicleTooltip("T03");
+            for (const char* key : {"V01", "快车", "V04", "慢车"}) {
+                if (!t03Tip.contains(QString::fromUtf8(key))) {
+                    std::fprintf(stderr,
+                                 "[ui-probe] #62：T03 车辆环 tooltip 缺少「%s」：%s\n",
+                                 key, t03Tip.toUtf8().constData());
+                    return 1;
+                }
+            }
+            // GUI 自己的画布：初始停车节点的 tooltip 必须逐车号（不是只有颜色）。
+            for (std::size_t v = 0; v < config.vehicles.size(); ++v) {
+                const QString tip = window.vehicleRingTooltip(config.vehicles[v].startNodeId);
+                if (!tip.contains(QString::fromStdString(config.vehicles[v].id))) {
+                    std::fprintf(stderr,
+                                 "[ui-probe] #62：节点 %s 的 tooltip 缺车号 %s：%s\n",
+                                 config.vehicles[v].startNodeId.c_str(),
+                                 config.vehicles[v].id.c_str(), tip.toUtf8().constData());
+                    return 1;
+                }
+            }
+            std::printf("[ui-probe] #62 慢车越簇核查：慢车全在本簇、快车跨簇；"
+                        "T03 = V01(快)+V04(慢)，tooltip 逐车号可见：%s\n",
+                        t03Tip.toUtf8().constData());
         }
 
         std::printf("[ui-probe] 通过\n");

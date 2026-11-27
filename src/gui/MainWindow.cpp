@@ -89,6 +89,18 @@ QString minutesToClock(int minutes) {
         .arg(m, 2, 10, QLatin1Char('0'));
 }
 
+// 分母为 0 的率显示「—」（规格一 §6.3），不是 0%/100%。
+// #62：路线摘要在日志里也播报一次，与界面面板共用同一函数，口径不会漂。
+QString onTimeRateText(int hit, int total) {
+    if (total <= 0) {
+        return QStringLiteral("—");
+    }
+    return QStringLiteral("%1%（%2/%3）")
+        .arg(100.0 * static_cast<double>(hit) / static_cast<double>(total), 0, 'f', 1)
+        .arg(hit)
+        .arg(total);
+}
+
 } // namespace
 
 MainWindow::MainWindow(Config config, const std::string& configPath, QWidget* parent)
@@ -347,9 +359,17 @@ void MainWindow::buildDocks() {
     infoDock->setWidget(infoTabs);
     addDockWidget(Qt::RightDockWidgetArea, infoDock);
 
-    // ---- 底部 dock：两个标签页（日志 / 路线与停靠）----
-    // 「路线与停靠」上半 = 原路线信息全文（策略 / 汇总 / 逐车指标 / 均衡度）；
-    // 下半 = 停靠明细 **9 列**（列序、口径一律不变，只是换到底部页签）。
+    // ---- 底部 dock：#62 退役「路线与停靠」页，只剩「日志」一个标签 ----
+    // 用户 2026-11-27 原话：「日志旁已经退役的标签页又出现了」——#59 把路线摘要与
+    // 停靠明细塞进底部第二页是误判。这里删掉那页：路线关键信息（策略 / 总距离 /
+    // 总耗时 / 总成本 / penalty / 取货率 / 送达率 / 逐车指标）改由**日志文本**承载
+    //（规划完成时逐字播报，见 replan 的「路线摘要：」与「逐车指标 Vxx：」两行），
+    // 停靠明细从界面退役。
+    //
+    // routeInfo_ / stopTable_ 两个对象**不再属于任何可见界面**，只是保留为守卫载体：
+    // G8/G9 在 --ui-probe 里仍能读它们的真实表头/文本（「若存在则格式正确」），
+    // 而新增的「不可见」守卫禁止它们被重新挂回界面。数据结构与填充逻辑不变，
+    // 一旦有人再把它们塞进 dock，守卫立即变红。
     auto* logDock = new QDockWidget(QStringLiteral("日志"), this);
     auto* bottomTabs = new QTabWidget(logDock);
     bottomTabs->setDocumentMode(true);
@@ -357,18 +377,14 @@ void MainWindow::buildDocks() {
     logView_ = new QPlainTextEdit(bottomTabs);
     logView_->setReadOnly(true);
     bottomTabs->addTab(logView_, QStringLiteral("日志"));
+    bottomTabs->setCurrentIndex(0);
+    logDock->setWidget(bottomTabs);
+    addDockWidget(Qt::BottomDockWidgetArea, logDock);
 
-    auto* routePage = new QWidget(bottomTabs);
-    auto* routeLay = new QVBoxLayout(routePage);
-    routeLay->setContentsMargins(0, 0, 0, 0);
-    routeLay->setSpacing(2);
-    routeInfo_ = new QTextBrowser(routePage);
-    routeInfo_->setMinimumHeight(120);
-    routeLay->addWidget(routeInfo_, 2);
-    auto* stopLabel = new QLabel(QStringLiteral("停靠明细"), routePage);
-    stopLabel->setContentsMargins(6, 2, 0, 0);
-    routeLay->addWidget(stopLabel);
-    stopTable_ = new QTableWidget(0, 9, routePage);
+    // 退役载体：无父布局、显式隐藏。不进 tab、不进 dock、不可见。
+    routeInfo_ = new QTextBrowser(this);
+    routeInfo_->setVisible(false);
+    stopTable_ = new QTableWidget(0, 9, this);
     stopTable_->setHorizontalHeaderLabels(
         {QStringLiteral("车辆"), QStringLiteral("序号"), QStringLiteral("阶段"),
          QStringLiteral("配送点"), QStringLiteral("动作"), QStringLiteral("原始到达"),
@@ -378,17 +394,11 @@ void MainWindow::buildDocks() {
     stopTable_->horizontalHeader()->setStretchLastSection(true);
     stopTable_->verticalHeader()->setVisible(false);
     stopTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    routeLay->addWidget(stopTable_, 3);
-    bottomTabs->addTab(routePage, QStringLiteral("路线与停靠"));
-
-    // 默认选中页①（日志）。
-    bottomTabs->setCurrentIndex(0);
-    logDock->setWidget(bottomTabs);
-    addDockWidget(Qt::BottomDockWidgetArea, logDock);
+    stopTable_->setVisible(false);
 
     // 宽度：右侧一页一表，~400px 足够（#56 的四块同屏要 ~760px，正是「遮挡地图」的根因）。
     resizeDocks({infoDock}, {400}, Qt::Horizontal);
-    // 高度：底部两页共享；日志页要能看到若干行，路线页要能看见摘要与停靠表头。
+    // 高度：底部只有日志页，给若干行可读高度。
     resizeDocks({logDock}, {230}, Qt::Vertical);
 
     // 「视图」菜单的停靠面板显隐开关（#59 复核）：dock 此时才存在，在这里补挂。
@@ -738,12 +748,16 @@ void MainWindow::syncScene() {
     scene_->setFleetRoutes(routes, selectedVehicleIndex(), fastFlags);
 
     // 车辆环：每台车在自己所在节点外一个环；同节点多车按行序 slot 错开。
+    // #62：车号一并交给节点 tooltip，解决 T03 上 V01 快车 + V04 慢车两环叠加的视觉误解。
     std::vector<std::string> atNodes;
+    std::vector<std::string> vehicleIds;
     atNodes.reserve(fleet_.size());
-    for (std::size_t v = 0; v < fleet_.size(); ++v) {
+    vehicleIds.reserve(fleet_.size());
+    for (std::size_t v = 0; v < fleet_.size() && v < config_.vehicles.size(); ++v) {
         atNodes.push_back(fleet_[v].state.atNodeId);
+        vehicleIds.push_back(config_.vehicles[v].id);
     }
-    scene_->setVehicleMarks(atNodes, fastFlags);
+    scene_->setVehicleMarks(atNodes, fastFlags, vehicleIds);
 }
 
 // 换计划之后必须做的三件事，只此一处。三处重规划路径（replan /
@@ -878,6 +892,54 @@ void MainWindow::replanFleet() {
     } else {
         appendLog(QStringLiteral("车队规划有不可行车辆：%1")
                       .arg(QString::fromStdString(fleetPlan_.reason)));
+    }
+    // ---- #62：底部「路线与停靠」页退役后，路线关键信息改由**日志文本**承载 ----
+    // 规划完成时播报一次（不是每次 updatePanels 都写，避免刷屏）。口径与路线面板
+    // 原文本逐项一致：策略 / 总距离 / 完工耗时 / 总成本 / penalty / 停靠·动作 /
+    // 取货率 / 送达率（紧急·普通分列） / 平均在车 / 均衡度；随后每车一行 7 项。
+    {
+        const logistics::RouteMetrics& fm = fleetPlan_.metrics;
+        const QString deliveryRate =
+            onTimeRateText(fm.deliveryOnTimeCount, fm.deliveryTotal)
+            + QStringLiteral("（紧急 %1 · 普通 %2）")
+                  .arg(onTimeRateText(fm.urgentOnTimeCount, fm.urgentTotal),
+                       onTimeRateText(fm.normalOnTimeCount, fm.normalTotal));
+        appendLog(QStringLiteral("路线摘要：策略 %1 | 总距离 %2 km | 完工耗时 %3 min"
+                                 "（车时合计 %4 min） | 总成本 %5 元 | penalty %6 min | "
+                                 "停靠 %7 站 · 动作 %8 次 | 取货准时率 %9 | "
+                                 "送达准时率 %10 | 平均在车 %11 kg"
+                                 "（利用率 %12% · 峰值 %13 kg） | "
+                                 "均衡度（峰值利用率极差） %14")
+                      .arg(strategyBox_ != nullptr ? strategyBox_->currentText() : QString())
+                      .arg(fleetPlan_.totalDistanceKm, 0, 'f', 1)
+                      .arg(fleetPlan_.completionTimeMin, 0, 'f', 1)
+                      .arg(fleetPlan_.sumVehicleTimeMin, 0, 'f', 1)
+                      .arg(fleetPlan_.totalCostYuan, 0, 'f', 1)
+                      .arg(fleetPlan_.totalPenaltyMin)
+                      .arg(fleetPlan_.stopCount)
+                      .arg(fleetPlan_.actionCount)
+                      .arg(onTimeRateText(fm.pickupOnTimeCount, fm.pickupTotal))
+                      .arg(deliveryRate)
+                      .arg(fm.avgLoadKg, 0, 'f', 1)
+                      .arg(fm.loadUtilization * 100.0, 0, 'f', 1)
+                      .arg(fm.peakLoadKg, 0, 'f', 1)
+                      .arg(fleetPlan_.balanceSpread, 0, 'f', 2));
+        for (std::size_t v = 0; v < k && v < fleetPlan_.vehicles.size(); ++v) {
+            const logistics::Vehicle& vehicle = config_.vehicles[v];
+            const logistics::RoutePlan& plan = fleetPlan_.vehicles[v];
+            const logistics::RouteMetrics& vm = plan.metrics;
+            appendLog(QStringLiteral("逐车指标 %1：距离 %2 km · 耗时 %3 min · 成本 %4 元 · "
+                                     "penalty %5 · 停靠 %6 · 利用率 %7% · 取货 %8 · 送达 %9")
+                          .arg(QString::fromStdString(vehicle.id))
+                          .arg(plan.totalDistanceKm, 0, 'f', 1)
+                          .arg(plan.totalTimeMin, 0, 'f', 1)
+                          .arg(plan.totalCostYuan, 0, 'f', 1)
+                          .arg(plan.totalPenaltyMin)
+                          .arg(vm.stopCount)
+                          .arg(vm.loadUtilization * 100.0, 0, 'f', 1)
+                          .arg(onTimeRateText(vm.pickupOnTimeCount, vm.pickupTotal))
+                          .arg(onTimeRateText(vm.deliveryOnTimeCount, vm.deliveryTotal)));
+        }
     }
     syncScene();
     updatePanels();
@@ -2558,17 +2620,6 @@ void MainWindow::updatePanels() {
                                  .arg(minutesToClock(currentTimeMin())));
     }
 
-    // 分母为 0 的率显示「—」（规格一 §6.3），不是 0%/100%。
-    const auto rateText = [](int hit, int total) -> QString {
-        if (total <= 0) {
-            return QStringLiteral("—");
-        }
-        return QStringLiteral("%1%（%2/%3）")
-            .arg(100.0 * static_cast<double>(hit) / static_cast<double>(total), 0, 'f', 1)
-            .arg(hit)
-            .arg(total);
-    };
-
     // ---- 路线信息面板（规格二 §7.5①）：车队汇总 + `── 逐车指标 ──` 小节 ----
     // 车队口径：Σ 距离/成本/penalty/停靠/动作；总耗时 = **完工耗时**（主口径），
     // 车时合计作为参考口径并列显示（§3.4：二者不得互相顶替）。
@@ -2618,11 +2669,11 @@ void MainWindow::updatePanels() {
                      .arg(actions)
                      .arg(servedStops);
         route += QStringLiteral("取货准时率：%1\n")
-                     .arg(rateText(fm.pickupOnTimeCount, fm.pickupTotal));
+                     .arg(onTimeRateText(fm.pickupOnTimeCount, fm.pickupTotal));
         route += QStringLiteral("送达准时率：%1（紧急 %2 · 普通 %3）\n")
-                     .arg(rateText(fm.deliveryOnTimeCount, fm.deliveryTotal))
-                     .arg(rateText(fm.urgentOnTimeCount, fm.urgentTotal))
-                     .arg(rateText(fm.normalOnTimeCount, fm.normalTotal));
+                     .arg(onTimeRateText(fm.deliveryOnTimeCount, fm.deliveryTotal))
+                     .arg(onTimeRateText(fm.urgentOnTimeCount, fm.urgentTotal))
+                     .arg(onTimeRateText(fm.normalOnTimeCount, fm.normalTotal));
         route += QStringLiteral("平均在车：%1 kg（利用率 %2% · 峰值 %3 kg）\n")
                      .arg(fm.avgLoadKg, 0, 'f', 1)
                      .arg(fm.loadUtilization * 100.0, 0, 'f', 1)
@@ -2643,8 +2694,8 @@ void MainWindow::updatePanels() {
                          .arg(rt.plan.totalPenaltyMin)
                          .arg(vm.stopCount)
                          .arg(vm.loadUtilization * 100.0, 0, 'f', 1)
-                         .arg(rateText(vm.pickupOnTimeCount, vm.pickupTotal))
-                         .arg(rateText(vm.deliveryOnTimeCount, vm.deliveryTotal));
+                         .arg(onTimeRateText(vm.pickupOnTimeCount, vm.pickupTotal))
+                         .arg(onTimeRateText(vm.deliveryOnTimeCount, vm.deliveryTotal));
         }
         // 均衡度（规格二 §4.3 / #40）：峰值利用率极差，越小越均衡。**纯增量一行**，
         // 不新增控件；分母按全部车（空车 utilization 记 0）。计划级结果，与车辆表运行态不同源。
@@ -3035,7 +3086,12 @@ void MainWindow::updatePanels() {
 
     // ---- 转运账本（§7.5⑥；#56 起与中转站表同属「中转与配送网」dock）：7 列，逐笔一行 ----
     // 列序：订单 | 中转站 | kg | 卸入(<车> <HH:MM>) | 取走(同形；未取走 —) |
-    //       站内等待(min)(未取走 —) | 状态(在站 / 已送达)
+    //       站内等待(min)(未取走 —) | 状态（#62 三态）
+    // #62：旧写法 delivered ? 已送达 : 在站 把「已取走、在车上、尚未送达」也说成在站，
+    // 用户同时看到「站内待取走=0」自然判成信息冲突。状态必须按物理事实分三态：
+    //   !pickedUp            → 在站（货在站上等下一台车；站内待取走计入）
+    //   pickedUp && !delivered → 在途（<车> <HH:MM> 取走）（货已上车；站内待取走不计）
+    //   delivered            → 已送达（送达时若还没取走也一并补齐 pickedUp，见 deliverAt）
     {
         transitLedgerTable_->setRowCount(static_cast<int>(transitLedger_.size()));
         for (std::size_t i = 0; i < transitLedger_.size(); ++i) {
@@ -3063,10 +3119,23 @@ void MainWindow::updatePanels() {
                 transitLedgerTable_->setItem(row, 4, new QTableWidgetItem(QStringLiteral("—")));
                 transitLedgerTable_->setItem(row, 5, new QTableWidgetItem(QStringLiteral("—")));
             }
-            transitLedgerTable_->setItem(
-                row, 6,
-                new QTableWidgetItem(e.delivered ? QStringLiteral("已送达")
-                                                 : QStringLiteral("在站")));
+            // #62：三态，不再把「已取走但未送达」误报成「在站」。
+            // 站内待取走列仍只读 pickedUp == false 的行（上方第 5 列），两列语义一致。
+            QString statusText;
+            if (e.delivered) {
+                statusText = QStringLiteral("已送达");
+            } else if (e.pickedUp) {
+                statusText = QStringLiteral("在途（%1 %2 取走）")
+                                 .arg(QString::fromStdString(e.outVehicleId))
+                                 .arg(minutesToClock(e.outTimeMin));
+            } else {
+                statusText = QStringLiteral("在站");
+            }
+            QTableWidgetItem* statusCell = new QTableWidgetItem(statusText);
+            // 状态列在窄面板里可能被裁掉（「在途（V01 11:34 取走）」较长），
+            // tooltip 保留完整文本——用户不必为读一句话去拉宽 dock。
+            statusCell->setToolTip(statusText);
+            transitLedgerTable_->setItem(row, 6, statusCell);
         }
         // 空态提示与账本行数严格互斥：无行才有提示。
         if (ledgerEmptyHint_ != nullptr) {
@@ -3372,6 +3441,18 @@ QString MainWindow::transitLedgerSummary() const {
     return out;
 }
 
+QStringList MainWindow::transitLedgerStatuses() const {
+    QStringList out;
+    if (transitLedgerTable_ == nullptr) {
+        return out;
+    }
+    for (int row = 0; row < transitLedgerTable_->rowCount(); ++row) {
+        const QTableWidgetItem* item = transitLedgerTable_->item(row, 6);
+        out << (item != nullptr ? item->text() : QString());
+    }
+    return out;
+}
+
 int MainWindow::transitLedgerRowCount() const {
     return transitLedgerTable_ != nullptr ? transitLedgerTable_->rowCount() : 0;
 }
@@ -3554,6 +3635,22 @@ int MainWindow::bottomVisiblePageCount() const {
         }
     }
     return visible;
+}
+
+bool MainWindow::routePanelVisible() const {
+    return routeInfo_ != nullptr && routeInfo_->isVisible();
+}
+
+bool MainWindow::stopPanelVisible() const {
+    return stopTable_ != nullptr && stopTable_->isVisible();
+}
+
+QString MainWindow::logPanelText() const {
+    return logView_ != nullptr ? logView_->toPlainText() : QString();
+}
+
+QString MainWindow::vehicleRingTooltip(const std::string& nodeId) const {
+    return scene_ != nullptr ? scene_->nodeVehicleTooltip(nodeId) : QString();
 }
 
 QString MainWindow::routePanelSummary() const {
@@ -4834,6 +4931,58 @@ int MainWindow::runActionSelfCheck() {
                QStringLiteral("G14：转运账本面板 7 列（表头 %1 列）")
                    .arg(transit.transitLedgerHeaders().size()));
         std::printf("[self-check] 转运账本：\n%s", ledgerText.toUtf8().constData());
+
+        // ---- #62：账本三态（在站 / 在途 / 已送达）与「站内待取走」一致 ----
+        // 真实执行段在 dwell=0 的夹具里可能没有「取走后、送达前」的可观测帧，
+        // 所以这里用同一张**界面表格**摆三行夹具，逐行读状态列单元格（不是读内部布尔）。
+        // 反向验证：把状态列改回 delivered ? 已送达 : 在站，第二行必红；把第 5 列
+        // 改成读 pickedUp == true 的行，末条「站内待取走」必红。
+        {
+            const std::vector<TransitLedgerEntry> savedLedger = transit.transitLedger_;
+            TransitLedgerEntry station;
+            station.orderId = "STA";
+            station.stationId = "T3";
+            station.kg = 10.0;
+            station.inVehicleId = "V03";
+            station.inTimeMin = 690;            // 11:30 卸入
+            station.outVehicleId = "V01";
+            station.outTimeMin = -1;
+            TransitLedgerEntry moving = station;
+            moving.orderId = "MOV";
+            moving.outTimeMin = 694;            // 11:34 取走
+            moving.pickedUp = true;
+            TransitLedgerEntry done = moving;
+            done.orderId = "DONE";
+            done.delivered = true;
+
+            transit.transitLedger_.clear();
+            transit.transitLedger_.push_back(station);
+            transit.transitLedger_.push_back(moving);
+            transit.transitLedger_.push_back(done);
+            transit.updatePanels();
+            const QStringList states = transit.transitLedgerStatuses();
+            expect(states.size() == 3,
+                   QStringLiteral("#62（前提）账本三态夹具 3 行（实际 %1 行）")
+                       .arg(states.size()));
+            expect(states.value(0) == QStringLiteral("在站"),
+                   QStringLiteral("#62：未取走 ⇒ 状态「在站」（实际「%1」）")
+                       .arg(states.value(0)));
+            expect(states.value(1) == QStringLiteral("在途（V01 11:34 取走）"),
+                   QStringLiteral("#62：取走未送达 ⇒ 状态「在途（V01 11:34 取走）」"
+                                  "（实际「%1」）")
+                       .arg(states.value(1)));
+            expect(states.value(2) == QStringLiteral("已送达"),
+                   QStringLiteral("#62：已送达 ⇒ 状态「已送达」（实际「%1」）")
+                       .arg(states.value(2)));
+            // 第 5 列口径不随状态改动：只算 pickedUp == false 的行（这里 10kg）。
+            expect(std::fabs(transit.stationPendingKg("T3") - 10.0) < 1e-6,
+                   QStringLiteral("#62：「站内待取走(kg)」仍只读未取走行"
+                                  "（实际 %1kg，期望 10kg）")
+                       .arg(transit.stationPendingKg("T3")));
+
+            transit.transitLedger_ = savedLedger;
+            transit.updatePanels();
+        }
 
         // G18 的动作本身（不是只调底层插单函数）：无头路径（offscreen）退化为随机 A/B，
         // 走的是工具栏「插入普通订单…」同一入口。断读订单集合与来源/前缀。

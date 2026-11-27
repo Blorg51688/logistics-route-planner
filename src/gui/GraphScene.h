@@ -64,8 +64,12 @@ public:
 
     // 每台车在自己所在节点外的**环**（规格三 GUI §7）。
     // atNodeIds[i] = 第 i 台车当前所在节点（空串=不画）；同节点多车按行序 slot 错开。
+    // #62：vehicleIds[i] = 第 i 台车车号，写进该节点 tooltip，区分同站叠加的多个环。
     void setVehicleMarks(const std::vector<std::string>& atNodeIds,
-                         const std::vector<bool>& fastFlags);
+                         const std::vector<bool>& fastFlags,
+                         const std::vector<std::string>& vehicleIds);
+    // #62：读**真实图元**的 tooltip（供探针核对车号可见，不重算预期清单）。
+    QString nodeVehicleTooltip(const std::string& nodeId) const;
 
     // 标记车辆当前所在节点（空串表示不标记任何节点）
     void setVehiclePosition(const std::string& nodeId);

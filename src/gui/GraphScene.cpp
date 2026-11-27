@@ -187,7 +187,8 @@ void GraphScene::setVehiclePosition(const std::string& nodeId) {
 // 每台车在自己所在节点外画环：先按节点分组（同一节点上的车按行序拿 slot），
 // 再一次性把「谁在这里」交给该节点图元 —— 环的错开与配色都在 NodeItem 里完成。
 void GraphScene::setVehicleMarks(const std::vector<std::string>& atNodeIds,
-                                 const std::vector<bool>& fastFlags) {
+                                 const std::vector<bool>& fastFlags,
+                                 const std::vector<std::string>& vehicleIds) {
     // 每个节点上已分配了几个环（slot 计数）
     std::map<std::string, int> used;
     std::map<std::string, std::vector<NodeItem::VehicleMark> > byNode;
@@ -197,6 +198,7 @@ void GraphScene::setVehicleMarks(const std::vector<std::string>& atNodeIds,
             continue;
         }
         NodeItem::VehicleMark mark;
+        mark.vehicleId = (v < vehicleIds.size()) ? vehicleIds[v] : std::string();
         mark.fast = (v < fastFlags.size()) ? fastFlags[v] : false;
         mark.slot = used[id];
         ++used[id];
@@ -209,6 +211,15 @@ void GraphScene::setVehicleMarks(const std::vector<std::string>& atNodeIds,
                                                 : it->second);
     }
     update();
+}
+
+QString GraphScene::nodeVehicleTooltip(const std::string& nodeId) const {
+    for (NodeItem* node : nodes_) {
+        if (node->nodeId() == nodeId) {
+            return node->toolTip();
+        }
+    }
+    return QString();
 }
 
 void GraphScene::setAllLabelsVisible(bool on) {
