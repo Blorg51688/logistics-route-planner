@@ -59,8 +59,9 @@ public:
         double                              loadKg = 0.0;
         std::vector<logistics::OnboardItem> onboard;
 
-        // 趟次结构已退役（规格一 MC-A01，界面与探针已由 #37 改造）。
-        // 「是否已驶离」保留：回仓库后置 false，是**物理事实**（重规划不得改写）。
+        // 趟次结构已退役（规格一 MC-A01；GUI 现行是「一车一行」车辆表，见 #56/#59）。
+        // 「是否已驶离」保留：回仓库后置 false，是**物理事实**（重规划不得改写），
+        // 也是 fleetPristine()（车队是否还没动过）的判据之一。
         bool   departed = false;          // 是否已驶离出发点
 
         // 累计量
@@ -85,7 +86,7 @@ public:
         // 不能从当前计划反推（重规划会换掉计划，已送完的单就不在计划里了）。
         std::set<std::string> deliveredOrderIds;
 
-        // 已执行过的降载键（issue #4），防止 S 一趟出现两次时重复执行。
+        // 已执行过的降载键（issue #4），防止同一辆车在路线中两次经过 S 时重复执行。
         // 结构化键取代旧的「站@点@kg」分隔符字符串：kg 存 lround 后的整数值，
         // 比较口径与旧字符串键一致（同站同点同整数 kg 视为同一件事）。
         // 取回不再进这个键（由本停靠动作集 pickups/reclaims 单独判定）。
@@ -149,7 +150,7 @@ public:
     int fleetClockMin() const { return fleetClockMin_; }
     // 各车发车时刻的最小值（完工耗时的下界，§3.4）
     int minDepartMin() const;
-    // 该车下一站的节点 ID；无剩余则空串（页签「下一站」显示「—」）
+    // 该车下一站的节点 ID；无剩余则空串（车辆表「位置→下一站」列显示「—」）
     std::string nextStopNodeId(std::size_t v) const;
     // 该车阶段：紧急 / 普通 / 已收工（由剩余路线的阶段标记推出，§7.5②）
     QString vehiclePhaseText(std::size_t v) const;
@@ -163,7 +164,7 @@ public:
     // 画布与快照共用的**唯一**路线数据源（规格三 GUI §7）：每台车只给「当前位置 → 下一目标」
     // 那一段节点序列（含目标节点）；空车/已回库给空序列。两处都调它 ⇒ 画出来的与探针读到的一致。
     std::vector<std::vector<std::string> > canvasTargetRoutes() const;
-    // 车辆表当前选中行（= 画布选中车，#56 起由「每车一页签」改为「一车一行」）
+    // 车辆表当前选中行（= 画布加粗车；#56 起一车一行，#59 起在右侧「车辆」标签页）
     int selectedVehicleIndex() const;
 
 public:
@@ -248,6 +249,20 @@ public:
     // 工具栏动作名与面板标题（供 --ui-probe，供向导检查器比对）
     QString toolbarActionTexts() const;
     QString dockTitles() const;
+    // #59：右侧单一「信息」dock 内三个标签页、底部日志 dock 两个标签页的**真实标题**
+    // （直接读 QTabWidget::tabText，供 --ui-probe 逐名核对，不背预期清单）。
+    QStringList rightTabTitles() const;
+    QStringList bottomTabTitles() const;
+    // 当前选中页（-1 = 控件不存在）。默认 0 = 车辆 / 日志。
+    int rightTabCurrentIndex() const;
+    int bottomTabCurrentIndex() const;
+    // 供 --ui-probe 逐页核对：页内控件（如账本空态提示）的 isVisible() 只在该页
+    // 被选中时为真，探针需要临时切到目标页，核对完切回默认页。
+    void activateRightTab(int index);
+    // 「同一时刻只有一页可见」守卫：数 QTabWidget 里 isVisible() 为真的页数。
+    // 正常恰 1；若三页被摆成同屏（如塞进 QVBoxLayout），这里会 > 1 ⇒ 守卫红。
+    int rightVisiblePageCount() const;
+    int bottomVisiblePageCount() const;
     // 车辆表（#56：一车一行，取代「每车一个页签」）的文本快照与**真实表头**。
     // 逐行核对「载货 ≤ 该车容量」「行数 == 车辆数」时读这里——读的是界面上真实单元格。
     int         vehicleRowCount() const;
@@ -384,7 +399,8 @@ private:
     VehicleState                emptyState_;   // 无车辆配置时的只读占位
     // 车队时钟：全局唯一，= 各车时刻的最大值（事件刻/窗口/penalty 的共同基准）。
     int                         fleetClockMin_ = 0;
-    // 页签选中的车（手动动作、单车站位显示的作用对象；默认 0 = 队首）。
+    // 当前选中的车（手动动作、画布加粗的作用对象；#59 起是「车辆」标签页里选中的
+    // 行，默认 0 = 队首）。
     std::size_t                 activeVehicle_ = 0;
     // 车队级汇总（每次 replan 后由 planFleet/逐车计划重算；GUI 与 CLI 同口径）
     logistics::FleetPlan        fleetPlan_;
@@ -423,7 +439,7 @@ private:
     void applyRescheduleResult(const logistics::FleetRescheduleResult& res);
     // 跑一次复调度（事件 → 五级升级链 → 写回）。返回结果，供调用方播报/守卫。
     logistics::FleetRescheduleResult runReschedule(const logistics::RescheduleEvent& event);
-    // 单车的计划替换后的统一收尾（游标归零 + 终点播报复位）。
+    // 该车的计划替换后的统一收尾（游标归零 + 终点播报复位）。
     void afterVehiclePlanReplaced(std::size_t v);
     // #41 的转运层作为**后置有界改进**再跑一遍（只在跨簇新单插入后调用：
     // 判据①跨簇；不改分配，严格更优才替换计划，完全并列保留禁转运版）。
@@ -448,7 +464,8 @@ private:
     //   · incurredPenaltyMin_：**已经发生**的超时惩罚合计。
     //     重规划只算剩余计划的 penalty，不记账的话总数会往回跳。
     //   · deliveredLate_：已送达且超时的订单（逐单：订单/配送点/到达/penalty），
-    //     供"超时订单"表区分「已经超时」与「预计会超时」。
+    //     供订单表的「· 超时 +Nmin」状态区分「已经超时」与「预计会超时」
+    //     （独立的"超时订单"窗已在 #56 退役）。
     struct LateStop {
         std::string orderId;
         std::string nodeId;
@@ -484,10 +501,24 @@ private:
     // 已实际执行的转运账本（跨重规划保留；计划期候选不在这里）。
     std::vector<TransitLedgerEntry> transitLedger_;
     QTableWidget*  stopTable_ = nullptr;
+    // #59：右侧「信息」dock 的三页标签（车辆 / 订单 / 中转与配送网）与底部
+    // 「日志」dock 的两页标签（日志 / 路线与停靠）。表格对象的指针与填充逻辑不变，
+    // 只是父容器从多个 dock 换成 QTabWidget 的页。
+    QTabWidget*    rightTabs_ = nullptr;
+    QTabWidget*    bottomTabs_ = nullptr;
+    // #59：「同一时刻只有一页可见」守卫读这三页的**真实可见状态**。
+    // 存页面指针（而不只靠 QTabWidget）是为了让守卫对「改成同屏」也敏感：
+    // 三页若被 QVBoxLayout 一次铺开，三者的 isVisible() 都为真 ⇒ 守卫红。
+    QWidget*       rightVehiclePage_ = nullptr;
+    QWidget*       rightOrderPage_ = nullptr;
+    QWidget*       rightTransitPage_ = nullptr;
     // 账本空态提示（#56）：只在 transitLedger_ 无行时可见。
     QLabel*        ledgerEmptyHint_ = nullptr;
     // 道路封闭不再用 tick 计数节流——它现在是加权事件的一种（权重最低）。
     QPlainTextEdit* logView_ = nullptr;
+    // 「视图」菜单：buildActions 建菜单，dock 建好后在 buildDocks 末尾补挂显隐开关
+    // （旧代码建菜单时 dock 还不存在，findChildren<QDockWidget*>() 恒为空）。
+    QMenu*         viewMenu_ = nullptr;
 
     QTimer* simTimer_ = nullptr;
     // 模拟模式：0 = 关闭；1 = 按站模拟；2 = 按时间模拟。两者**互斥**（同一 QActionGroup）。

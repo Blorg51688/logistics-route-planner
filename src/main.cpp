@@ -615,26 +615,100 @@ int main(int argc, char** argv) {
         // 下限随模拟模式重做同步：原「Debug 模式」更名并新增「推进一刻」「按时间模拟」，
         // 工具栏动作由 15 个增至 17 个（见 docs/records/specs/sim-time-events.md §7.1）。
         //
-        // #56 重设计把右侧面板由 6 个收敛到 4 个（车辆 / 订单 / 中转与配送网 / 路线与停靠），
-        // 底部日志保留 ⇒ dock 总数 8 → 5。这里**不是放宽下限**：从「docks < 6」
-        // 改成「docks != 5」（更严），并逐名核对四个新面板都在 —— 原意
-        //「右侧信息面板必须真实存在且在界面上」不变。
-        if (actions < 18 || docks != 5) {
+        // #59 把右侧由 #56 的 2×2 四块（车辆 / 订单 / 中转与配送网 / 路线与停靠）收敛成
+        // **一个**「信息」dock 的**三个标签页**，路线与停靠移到底部日志 dock 的第二页
+        // ⇒ dock 总数 5 → 2。这里**不是放宽下限**：从「docks != 5」改成「docks != 2」
+        // （更严），并逐标签核对三页 / 两页都在 —— 原意
+        //「信息必须真实存在且在界面上」不变，只是载体从 dock 换成标签页。
+        if (actions < 18 || docks != 2) {
             std::fprintf(stderr,
-                         "[ui-probe] UI 不完整：预期至少 18 个工具栏动作、5 个停靠面板"
-                         "（右侧 4 + 日志），实际 %d 个动作 / %d 个面板\n",
+                         "[ui-probe] UI 不完整：预期至少 18 个工具栏动作、2 个停靠面板"
+                         "（右侧信息 + 底部日志），实际 %d 个动作 / %d 个面板\n",
                          actions, docks);
             return 1;
         }
         {
             const QStringList dockNames = window.dockTitles().split(QStringLiteral(" | "));
-            for (const char* need : {"车辆", "订单", "中转与配送网", "路线与停靠", "日志"}) {
+            for (const char* need : {"信息", "日志"}) {
                 if (!dockNames.contains(QString::fromUtf8(need))) {
-                    std::fprintf(stderr, "[ui-probe] 停靠面板缺少「%s」（应有 车辆 / 订单 / "
-                                         "中转与配送网 / 路线与停靠 / 日志）\n", need);
+                    std::fprintf(stderr, "[ui-probe] 停靠面板缺少「%s」（应有 信息 / 日志）\n",
+                                 need);
                     return 1;
                 }
             }
+        }
+        // ---- 右侧「信息」dock：三个标签页逐名核对（车辆 / 订单 / 中转与配送网）----
+        // 读的是 QTabWidget 上真正的 tabText（MainWindow::rightTabTitles），
+        // 不是把预期列表再背一遍。原 #56 按 dock 名核对四块，现在按标签名核对三页。
+        {
+            // 新增守卫（#59）：「同一时刻只有一页可见」——先于标签名核对，
+            // 这样「把三页改成同屏」的反向验证会明确红在这一条上。
+            // 读的是三个**已知页面**的真实 isVisible() 状态（MainWindow 存页面指针），
+            // 不是「QTabWidget 有几页」：三页若被 QVBoxLayout 一次铺开，这里 = 3。
+            const int rightVisible = window.rightVisiblePageCount();
+            if (rightVisible != 1) {
+                std::fprintf(stderr,
+                             "[ui-probe] 右侧信息框同一时刻可见页数 %d != 1"
+                             "（三个标签页必须随时切换、只显示一页）\n",
+                             rightVisible);
+                return 1;
+            }
+            const QStringList rightTabs = window.rightTabTitles();
+            const QStringList wantRight{QStringLiteral("车辆"), QStringLiteral("订单"),
+                                        QStringLiteral("中转与配送网")};
+            if (rightTabs != wantRight) {
+                std::fprintf(stderr,
+                             "[ui-probe] 右侧信息框标签不符（应 车辆 / 订单 / 中转与配送网）："
+                             "实际 [%s]\n",
+                             rightTabs.join(QStringLiteral(" | ")).toUtf8().constData());
+                return 1;
+            }
+            // 默认选中页①（车辆）：用户打开就要先看车。
+            if (window.rightTabCurrentIndex() != 0) {
+                std::fprintf(stderr,
+                             "[ui-probe] 右侧信息框默认页不是「车辆」：currentIndex %d\n",
+                             window.rightTabCurrentIndex());
+                return 1;
+            }
+            std::printf("[ui-probe] 右侧信息框: 3 个标签页 [%s]，当前第 %d 页「%s」，"
+                        "同屏可见 %d 页\n",
+                        rightTabs.join(QStringLiteral(" | ")).toUtf8().constData(),
+                        window.rightTabCurrentIndex() + 1,
+                        rightTabs.value(window.rightTabCurrentIndex()).toUtf8().constData(),
+                        rightVisible);
+        }
+        // ---- 底部日志 dock：两个标签页逐名核对（日志 / 路线与停靠）----
+        // 路线摘要 + 停靠明细**没有删**，只是从右侧移到底部第二页（G8/G9 仍读表格对象）。
+        {
+            const QStringList bottomTabs = window.bottomTabTitles();
+            const QStringList wantBottom{QStringLiteral("日志"),
+                                         QStringLiteral("路线与停靠")};
+            if (bottomTabs != wantBottom) {
+                std::fprintf(stderr,
+                             "[ui-probe] 底部日志框标签不符（应 日志 / 路线与停靠）："
+                             "实际 [%s]\n",
+                             bottomTabs.join(QStringLiteral(" | ")).toUtf8().constData());
+                return 1;
+            }
+            if (window.bottomTabCurrentIndex() != 0) {
+                std::fprintf(stderr,
+                             "[ui-probe] 底部日志框默认页不是「日志」：currentIndex %d\n",
+                             window.bottomTabCurrentIndex());
+                return 1;
+            }
+            const int bottomVisible = window.bottomVisiblePageCount();
+            if (bottomVisible != 1) {
+                std::fprintf(stderr,
+                             "[ui-probe] 底部日志框同一时刻可见页数 %d != 1\n",
+                             bottomVisible);
+                return 1;
+            }
+            std::printf("[ui-probe] 底部日志框: 2 个标签页 [%s]，当前第 %d 页「%s」，"
+                        "同屏可见 %d 页\n",
+                        bottomTabs.join(QStringLiteral(" | ")).toUtf8().constData(),
+                        window.bottomTabCurrentIndex() + 1,
+                        bottomTabs.value(window.bottomTabCurrentIndex()).toUtf8().constData(),
+                        bottomVisible);
         }
         // 动作名清单同步：这些名字是向导第 7 关让用户去点的按钮，必须**真实存在**。
         // 读的是界面上真正的动作名（findChildren<QAction*>），不是把预期列表再背一遍。
@@ -744,10 +818,15 @@ int main(int argc, char** argv) {
         std::printf("[ui-probe] 中转站面板（%s）:\n%s",
                     transitHeaders.join(QStringLiteral("|")).toUtf8().constData(),
                     transit.constData());
-        // 转运账本面板（G14 / 规格二 §7.5⑥；#56 起并入「中转与配送网」dock 的下半）：
-        // 7 列、列序固定；启动时账本为空（只记已实际执行的卸入，计划期候选不进表）。
-        // 逐笔内容由 --self-check-actions 在真的执行一次转运后核对。
+        // 转运账本面板（G14 / 规格二 §7.5⑥；#59 起在右侧「信息」dock 的页③
+        // 「中转与配送网」下半）：7 列、列序固定；启动时账本为空（只记已实际执行的
+        // 卸入，计划期候选不进表）。逐笔内容由 --self-check-actions 在真的执行一次
+        // 转运后核对。
         {
+            // #59：页内控件的 isVisible() 只在该页签被选中时为真。空态提示在页③，
+            // 探针先切到页③核对「用户点开就看到它」，核对完切回默认页①（车辆）。
+            window.activateRightTab(2);
+            QCoreApplication::processEvents();
             const QStringList ledgerHeaders = window.transitLedgerHeaders();
             const QStringList expectHeaders = {QStringLiteral("订单"),    QStringLiteral("中转站"),
                                                QStringLiteral("kg"),     QStringLiteral("卸入"),
@@ -781,8 +860,10 @@ int main(int argc, char** argv) {
                              window.transitLedgerEmptyHintText().toUtf8().constData());
                 return 1;
             }
-            std::printf("[ui-probe] 转运账本（%s）：空（规划期候选不进表；空态提示可见）\n",
+            std::printf("[ui-probe] 转运账本（%s）：空（规划期候选不进表；页③里空态提示可见）\n",
                         ledgerHeaders.join(QStringLiteral("|")).toUtf8().constData());
+            window.activateRightTab(0);
+            QCoreApplication::processEvents();
         }
         // 车辆表（G11 改写 / #56）：**一车一行**（旧口径：每车一个页签）。
         // 原意逐条保留，只换载体：
@@ -946,8 +1027,22 @@ int main(int argc, char** argv) {
                 std::printf("[ui-probe] G12 车辆 %s 载货 %.1fkg <= 该车额定 %.1fkg\n",
                             v.id.c_str(), loadShown, capShown);
             }
-            if (window.vehiclePanelSummary().contains(QStringLiteral("本趟出发装载"))) {
-                std::fprintf(stderr, "[ui-probe] 车辆面板仍含已退役的「本趟出发装载」\n");
+            // 已退役口径守卫（#37 → #56 → #59 复核）：车辆面板已是**表格**（一车一行
+            // 6 列），旧页签里的文本块「本趟出发装载」不可能再出现。守卫改为读
+            // **真实表头 + 逐行文本**——若它以列名或单元格形式回到界面，仍然会红；
+            // 只查旧的固定短语会变成空转断言。
+            const QStringList realVehicleHeaders = window.vehiclePanelHeaders();
+            bool legacyTripHeader = false;
+            for (const QString& header : realVehicleHeaders) {
+                if (header.contains(QStringLiteral("趟"))) {
+                    legacyTripHeader = true;
+                }
+            }
+            if (legacyTripHeader
+                || window.vehiclePanelSummary().contains(QStringLiteral("本趟出发装载"))) {
+                std::fprintf(stderr,
+                             "[ui-probe] 车辆表仍含已退役的「趟 / 本趟出发装载」口径：%s\n",
+                             realVehicleHeaders.join(QStringLiteral(" | ")).toUtf8().constData());
                 return 1;
             }
 
