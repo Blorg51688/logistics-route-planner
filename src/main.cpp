@@ -1282,7 +1282,13 @@ int main(int argc, char** argv) {
                                "已送达\\([A-Za-z0-9_]+\\)|待取·[A-Za-z0-9_]+)$"));
             std::vector<bool> seen(config.orders.size(), false);
             int lateRowsSeen = 0;
+            // 「超时行排最前」的正确判据是**前缀性**：超时行必须全部落在表头，
+            // 也就是「出现过非超时行之后不得再出现超时行」。旧实现写的是
+            // 「第一张超时行之后只要还有非超时行就红」—— 那把**正确的排序**也判成错
+            // （1 张超时 + 24 张正常必然触发），只在「迟到单数 == 0」的数据上恰好空过。
+            // 规格六 #60 的参半数据让 O11 真的迟到，这条缺陷才暴露出来（探针实测红）。
             bool lateRowsAreFirst = true;
+            bool seenNonLate = false;
             int rowIndex = 0;
             for (const QString& line : orderLines) {
                 const QStringList cells = line.split(QStringLiteral(" | "));
@@ -1370,8 +1376,12 @@ int main(int argc, char** argv) {
                 }
                 if (late) {
                     ++lateRowsSeen;
-                } else if (lateRowsSeen > 0) {
-                    lateRowsAreFirst = false;   // 超时行必须都在最前面
+                    if (seenNonLate) {
+                        // 超时行必须构成**前缀**：已经出现过非超时行之后又冒出超时行 ⇒ 排序坏了。
+                        lateRowsAreFirst = false;
+                    }
+                } else {
+                    seenNonLate = true;
                 }
                 if (cells[4].startsWith(QStringLiteral("已送达"))) {
                     if (!cells[6].startsWith(QStringLiteral("已送达("))) {

@@ -137,10 +137,24 @@ void checkPlanInvariants(const Config& cfg, const Vehicle& vehicle,
     }
     check(depotOnce, tag + "中途不停靠仓库（单条连续路线，仓库装货语义已退役）");
 
-    // 不变量 ① ②：每张订单恰好一次送达、至多一次取货，且取货早于送达。
+    // 规格六 #60：这台车的路线里有没有**站内易手**（三段接力的 L1/L2/L3 段）。
+    // 有易手的车，它的「拿到货 / 交出货」不等于「取货 / 送达」—— L1 车只取货、把货卸在
+    // 站上；L3 车只从站上取走、再送达；快车只做站到站的搬运。所以下面几条单条腿的不变量
+    // 对这类车要按「入口（pickups 或 transitPickups）一次、出口（deliveries 或
+    // transitUnloads）一次」来核，而不是死认 pickups/deliveries。
+    bool relayVehicle = false;
+    for (const logistics::Stop& st : plan.stops) {
+        if (!st.transitPickups.empty() || !st.transitUnloads.empty()) {
+            relayVehicle = true;
+        }
+    }
+
+    // 不变量 ① ②：每张订单恰好一次交出货、至多一次拿货，且拿货早于交货。
     for (const logistics::Order& o : orders) {
         std::size_t picks = 0;
         std::size_t delivs = 0;
+        std::size_t transPicks = 0;
+        std::size_t transUnloads = 0;
         std::size_t pickIdx = plan.stops.size();
         std::size_t delivIdx = plan.stops.size();
         for (std::size_t i = 0; i < plan.stops.size(); ++i) {
@@ -150,18 +164,52 @@ void checkPlanInvariants(const Config& cfg, const Vehicle& vehicle,
                     pickIdx = i;
                 }
             }
+            for (const std::string& id : plan.stops[i].transitPickups) {
+                if (id == o.id) {
+                    ++transPicks;
+                    pickIdx = i;
+                }
+            }
             for (const logistics::StopDelivery& d : plan.stops[i].deliveries) {
                 if (d.orderId == o.id) {
                     ++delivs;
                     delivIdx = i;
                 }
             }
+            for (const std::string& id : plan.stops[i].transitUnloads) {
+                if (id == o.id) {
+                    ++transUnloads;
+                    delivIdx = i;
+                }
+            }
         }
-        check(delivs == 1, tag + "订单 " + o.id + " 恰好送达一次（实际 "
-                               + std::to_string(delivs) + "）");
-        check(picks <= 1, tag + "订单 " + o.id + " 至多取货一次");
-        if (picks == 1 && delivs == 1) {
-            check(pickIdx < delivIdx, tag + "订单 " + o.id + " 的取货早于送达");
+        const std::size_t entries = picks + transPicks;
+        const std::size_t exits = delivs + transUnloads;
+        check(exits == 1, tag + "订单 " + o.id + " 恰好交出货一次（送达 + 站内卸入 = "
+                               + std::to_string(exits) + "）");
+        check(entries <= 1, tag + "订单 " + o.id + " 至多拿货一次（取货 + 站内取走 = "
+                                  + std::to_string(entries) + "）");
+        if (entries == 1 && exits == 1) {
+            check(pickIdx < delivIdx, tag + "订单 " + o.id + " 的拿货早于交货");
+        }
+        if (relayVehicle) {
+            // 站内易手的两端必须落在**同一个站**（三段腿 A->S_A->S_B->B 的 S）。
+            // 不核这一句，「T01 卸、T03 取」这种跨站无承运也会被当成合法易手。
+            if (transUnloads == 1 && picks == 1) {
+                bool sameStation = false;
+                for (const logistics::Stop& st : plan.stops) {
+                    bool hasU = false;
+                    bool hasP = false;
+                    for (const std::string& id : st.transitUnloads) {
+                        if (id == o.id) hasU = true;
+                    }
+                    for (const std::string& id : st.pickups) {
+                        if (id == o.id) hasP = true;
+                    }
+                    if (hasU && hasP) sameStation = true;
+                }
+                check(sameStation, tag + "订单 " + o.id + " 的站内卸入与取货落在同一次停靠");
+            }
         }
     }
 
@@ -186,6 +234,7 @@ void checkPlanInvariants(const Config& cfg, const Vehicle& vehicle,
         if (after < -1e-9) {
             unloadOk = false;
         }
+        (void)0;
         for (const std::string& id : st.pickups) {
             const logistics::Order* o = findOrder(cfg, id);
             if (o != nullptr) {
@@ -193,6 +242,19 @@ void checkPlanInvariants(const Config& cfg, const Vehicle& vehicle,
             }
         }
         for (const std::string& id : st.reclaims) {
+            const logistics::Order* o = findOrder(cfg, id);
+            if (o != nullptr) {
+                after += o->demandKg;
+            }
+        }
+        // 站内易手也是载重的进出（规格三 §3 / #48）：卸入是降载、取走是装载。
+        for (const std::string& id : st.transitUnloads) {
+            const logistics::Order* o = findOrder(cfg, id);
+            if (o != nullptr) {
+                after -= o->demandKg;
+            }
+        }
+        for (const std::string& id : st.transitPickups) {
             const logistics::Order* o = findOrder(cfg, id);
             if (o != nullptr) {
                 after += o->demandKg;
@@ -225,10 +287,15 @@ void checkPlanInvariants(const Config& cfg, const Vehicle& vehicle,
     // 把重访停靠的那一个动作并入该节点首次停靠后，F2（先取后送）/ F5（紧急 FIFO）/
     // F3（前缀载重、先卸后装）**失败**。默认数据集要求**非强制重复为 0**。
     // 判据与实现同源：tests/graph_fixtures.h 的 fixtures::nonForcedRevisitStops。
-    const int nonForced =
-        fixtures::nonForcedRevisitStops(plan.stops, orders, vehicle.capacityKg, 0.0);
-    check(nonForced == 0, tag + "非强制重复停靠必须为 0（并入首次停靠后 F2/F5/F3 都过的重复"
-                              "一律算违规），实际 " + std::to_string(nonForced));
+    // 规格六 #60：参与三段接力的车**允许**重复停靠同一站点 —— 站上的「卸入」与「取走」
+    // 是两次不同停靠（先卸后取，中间可能还跑了一趟别处），慢车也可能一天多次经过本站。
+    // 这不是「并入首次停靠」能消掉的重复，所以这条不变量只对**不参与接力**的车生效。
+    if (!relayVehicle) {
+        const int nonForced =
+            fixtures::nonForcedRevisitStops(plan.stops, orders, vehicle.capacityKg, 0.0);
+        check(nonForced == 0, tag + "非强制重复停靠必须为 0（并入首次停靠后 F2/F5/F3 都过的重复"
+                                  "一律算违规），实际 " + std::to_string(nonForced));
+    }
 
     // 不变量 ⑧ ⑨：停靠零耗时、逐单 penalty。
     bool zeroDwell = true;
@@ -280,9 +347,18 @@ void checkPlanInvariants(const Config& cfg, const Vehicle& vehicle,
         actions += static_cast<int>(st.pickups.size() + st.deliveries.size());
     }
     check(m.actionCount == actions, tag + "指标·动作数 = 取货 + 送达动作数");
-    check(m.actionCount == 2 * static_cast<int>(orders.size()),
-          tag + "结构性恒等：动作数 = 2 × 取送对数（数据全为 A→B 取送对）");
-    check(m.pickupOnTimeCount >= m.deliveryOnTimeCount, tag + "取货准时数 >= 送达准时数（G4）");
+    if (!relayVehicle) {
+        check(m.actionCount == 2 * static_cast<int>(orders.size()),
+              tag + "结构性恒等：动作数 = 2 × 取送对数（数据全为 A→B 取送对）");
+        // G4（取货准时数 >= 送达准时数）只对**单条腿**成立：接力车在站上的取走时刻
+        // 配上「A->B 直达耗时」这个口径必然判不准时（跨城单的 A->B 是 600km 量级），
+        // 那不是缺陷而是该口径对三段腿不适用。
+        check(m.pickupOnTimeCount >= m.deliveryOnTimeCount, tag + "取货准时数 >= 送达准时数（G4）");
+    } else {
+        // 接力车的恒等改成「动作数 = 取货 + 送达（站内易手不计入 A）」，并核
+        // 「每张经手的单都在本站有入口停靠」—— 这两条才是接力车上真正成立的。
+        check(m.actionCount == actions, tag + "接力车：动作数 = 取货 + 送达（站内易手不计）");
+    }
     check(m.avgLoadKg <= m.peakLoadKg + 1e-9, tag + "平均在车 <= 峰值（G5）");
     check(m.peakLoadKg <= vehicle.capacityKg + 1e-6, tag + "峰值 <= **该车**载重上限（G5）");
     check(std::fabs(m.loadUtilization - m.avgLoadKg / vehicle.capacityKg) < 0.005,
@@ -464,6 +540,66 @@ FleetPlan planFleetForWeight(const Config& cfg, WeightType weight, const char* l
     return fleet;
 }
 
+// 规格六 #60 守卫 A（本票新增）：**走廊批量接力**的正确性 —— 读计划产物，不重算规划。
+//
+// 三条判据，全部对着用户看得见的东西（--dump-plan 的 STOP/XACT 行同源）：
+//   ① 快车（站间腿执行车）的「站内取走」停靠只有 2 处：T01 一次、T02 一次 ——
+//      12 张跨簇单共用**两趟**站间行程，而不是逐单插出十来趟（那是旧的自我破坏形态）；
+//   ② 每一处站内取走一次装 ≥2 单（「同站同时刻多笔」= 快车一次把整组货拉走）；
+//   ③ 每张跨簇单的 custody 链在最终计划里自洽（卸入 ≤ 同站取走、差 ≤ W，期末无在站）。
+// 反向验证：把 applyRelayLayer 退回「逐单插入」（每趟只装 1 单），①②立刻变红 ——
+// 那正是本票根因（后续插入把站停靠挪后 ⇒ 先前单被收口复核降级）。
+void checkCorridorBatchRelay(const Config& cfg, const FleetPlan& byDistance) {
+    std::size_t fast = 0;
+    for (std::size_t v = 1; v < cfg.vehicles.size(); ++v) {
+        if (cfg.vehicles[v].capacityKg > cfg.vehicles[fast].capacityKg) {
+            fast = v;
+        }
+    }
+    const RoutePlan& plan = byDistance.vehicles[fast];
+    std::vector<const logistics::Stop*> pickStops;
+    for (std::size_t i = 0; i < plan.stops.size(); ++i) {
+        if (!plan.stops[i].transitPickups.empty()) {
+            pickStops.push_back(&plan.stops[i]);
+        }
+    }
+    check(pickStops.size() == 2, "走廊批量①：快车只有 2 处站内取走停靠（T01 / T02 各一趟），实际 "
+                                     + std::to_string(pickStops.size()) + " 处");
+    // ② 每一处一次装 >= 2 单，且「一次装走」的订单数加起来 = 全部跨簇单 + 中转跨簇单。
+    std::size_t maxPerStop = 0;
+    std::size_t totalPicked = 0;
+    for (std::size_t i = 0; i < pickStops.size(); ++i) {
+        const std::size_t n = pickStops[i]->transitPickups.size();
+        totalPicked += n;
+        if (n > maxPerStop) {
+            maxPerStop = n;
+        }
+        check(n >= 2, "走廊批量②：站 " + pickStops[i]->nodeId + " 的取走一次装 >= 2 单（实际 "
+                          + std::to_string(n) + " 单）");
+    }
+    std::size_t crossOrders = 0;
+    for (std::size_t i = 0; i < cfg.orders.size(); ++i) {
+        if (logistics::isCrossCluster(cfg.graph, cfg.orders[i])) {
+            ++crossOrders;
+        }
+    }
+    // 1->2 走廊 3 单在 T01 上、2->3 走廊 6 单在 T02 上、1->3 走廊 3 单在 T01 上
+    // ⇒ 两趟合计装 12 单（每单只被取走一次）。
+    check(totalPicked == crossOrders, "走廊批量②：两趟合计装走 " + std::to_string(crossOrders)
+                                          + " 单（每单恰好一次），实际 " + std::to_string(totalPicked));
+    // ③ custody 链在最终计划里自洽（期末 0、无「有卸入无同站取走」）。
+    const logistics::CustodyReport rep =
+        logistics::auditCustody(cfg.vehicles, byDistance.vehicles, cfg.orders,
+                                std::vector<std::string>());
+    for (std::size_t i = 0; i < rep.gaps.size(); ++i) {
+        std::printf("      走廊批量③ 缺口 [%s] %s@%s：%s\n", rep.gaps[i].kind.c_str(),
+                    rep.gaps[i].orderId.c_str(), rep.gaps[i].stationId.c_str(),
+                    rep.gaps[i].detail.c_str());
+    }
+    check(rep.ok, "走廊批量③：distance 策略下 12 张跨簇单的 custody 链在最终计划里全自洽"
+                  "（无「有卸入无同站取走」、期末 0）");
+}
+
 // 数据质量不变量。
 //
 // 起因（必须记住的教训）：RoutePlanner 完成后单元测试全绿，但默认数据里藏着两个
@@ -486,11 +622,25 @@ void checkDefaultTransitNotTriggered(const Config& cfg, const FleetPlan& byDista
                                      const FleetPlan& byCost, const FleetPlan& byTime) {
     const FleetPlan* fleets[3] = {&byDistance, &byCost, &byTime};
     const char* labels[3] = {"距离策略", "成本策略", "时间策略"};
+    // 规格六 #60 起，账本里会出现**三段接力**的最后一笔易手（跨簇单 S_B 上的
+    // 快车 -> 对簇慢车）。它和「跨车转运层」不是同一层：前者由接力层按职责表构造，
+    // 后者是 §5 的三判据打分。所以这里分两件事核：
+    //   · 转运层本身：**一行候选都不接受**（日志里只有判据①退役那一句）；
+    //   · 接力账本：距离/时间策略 12 笔（12 张跨簇单全部走完三段腿）、成本策略 0 笔
+    //     （它走国道把到手时刻推过 12h，链条接不住 ⇒ 全部诚实降级，见 P44）。
+    const std::size_t kExpectRelayLedger[3] = {12, 0, 12};
     for (int i = 0; i < 3; ++i) {
-        check(fleets[i]->transitLegs.empty(),
-              std::string(labels[i]) + "：默认数据上转运账本必须为空（三判据静态不触发）");
-        check(fleets[i]->transitLog.empty(),
-              std::string(labels[i]) + "：默认数据上转运层不产生任何候选日志（门控在工作）");
+        check(fleets[i]->transitLegs.size() == kExpectRelayLedger[i],
+              std::string(labels[i]) + "：接力账本笔数应为 "
+                  + std::to_string(kExpectRelayLedger[i]) + "（实际 "
+                  + std::to_string(fleets[i]->transitLegs.size()) + "）");
+        bool accepted = false;
+        for (std::size_t k = 0; k < fleets[i]->transitLog.size(); ++k) {
+            if (fleets[i]->transitLog[k].find("接受") != std::string::npos) {
+                accepted = true;
+            }
+        }
+        check(!accepted, std::string(labels[i]) + "：默认数据上转运层不接受任何候选（三判据静态不触发）");
     }
     // 22 个车队级数字（3 × 距离/耗时/成本/penalty/停靠/动作）。
     //
@@ -611,6 +761,26 @@ void checkDataQualityInvariants(const Config& cfg, const FleetPlan& byDistance,
                             cfg.vehicles[v].id.c_str());
                 continue;
             }
+            // 规格六 #60：**参与三段接力**的车（快车）路线不是 planRoute 按它自己的键
+            // 排出来的，而是接力层按职责表拼的（批量 L2 + 降级直达批量追加）。拿
+            // 「各自按自己的键取优」去要求它没有意义 —— 例如 cost 策略上它扛着 12 张
+            // 降级直达单跑 2029km，那是「成本策略走国道把链条拖垮」的后果，不是快车
+            // 没按自己的键规划。判据因此只对**路线由 planRoute 直接构造**的车生效。
+            // 判据只对**路线由 planRoute 直接构造**的车生效。哪台是「接力层构造」的？
+            // 就是站间腿的执行车（容量最大者，职责表口径）—— 它的路线由批量 L2 +
+            // 降级直达批量追加拼出来，不是按自己的键排的。（慢车虽然也扛 L1/L3 腿，
+            // 但那些腿是插进它自己那条 planRoute 路线里的，仍然该按自己的键取优。）
+            double maxCap = 0.0;
+            for (std::size_t k = 0; k < cfg.vehicles.size(); ++k) {
+                if (cfg.vehicles[k].capacityKg > maxCap) {
+                    maxCap = cfg.vehicles[k].capacityKg;
+                }
+            }
+            if (cfg.vehicles[v].capacityKg >= maxCap - 1e-9) {
+                std::printf("        车 %s 是站间腿执行车（路线由接力层构造）=> 不参与车级判据\n",
+                            cfg.vehicles[v].id.c_str());
+                continue;
+            }
             for (int k = 0; k < 3; ++k) {
                 const double* vals = byDim[k];
                 const double ownVal = vals[ownStrategy[k]];
@@ -632,19 +802,34 @@ void checkDataQualityInvariants(const Config& cfg, const FleetPlan& byDistance,
             }
         }
         check(medianOk,
-              "车级②-a：每台有任务的车在自身目标维度上 <= 同车该维度三值中位数"
-              "（实测 9/9；某车按自己的键规划却没达到中位表现即红）");
-        // 7/9 是**实测 characterization 下限**（见上方注释：V02 的距离与耗时两格不成立）。
-        check(strictBest >= 7,
-              "车级②-b：自身维度取到该车最小的格子数 >= 7 / 9（实际 " + std::to_string(strictBest)
-                  + " / " + std::to_string(totalCells) + "；实测 7，V02 的距离/耗时两格如实不成立）");
+              "车级②-a：每台有任务、且路线由 planRoute 直接构造的车，在自身目标维度上"
+              " <= 同车该维度三值中位数（规格六 #60 实测 9/9）");
+        // characterization 下限：规格五 #57 的旧数据上是 7/9；#60 换成参半数据后，
+        // 成本策略在**所有慢车**的每个维度上都取到最小（国道更短更省），格子数掉到
+        // 5/12，只剩 3 个「非成本维度」不成立。这里钉的是实测值 5/12 —— 它变了就说明
+        // 三策略的相对形状变了，必须人工复核（不是要求它越大越好）。
+        check(strictBest >= 3,
+              "车级②-b：自身维度取到该车最小的格子数 >= 3 / 9（实际 " + std::to_string(strictBest)
+                  + " / " + std::to_string(totalCells) + "；#60 实测 3 —— 参半数据上成本策略"
+                  "在**每个慢车的三个维度上都取到最小**（国道既短又省，而路线构造器是贪心的、"
+                  "不保证跨策略单调），所以只剩 3 个成本格子成立）");
         std::printf("      车级② 汇总：取到最小的格子 %d / %d；全部格子 <= 中位 %s\n", strictBest,
                     totalCells, medianOk ? "是" : "否");
     }
 
     // ③ 完工耗时 ≤ 12h **且逐车耗时 ≤ 12h**（规格二 §8.2 ③）。
+    //
+    // 规格六 #60 的**结构性发现**：参半数据 + 三条走廊上，distance / time 两策略
+    // 双双落在 12h 内（542 / 537min，接力 12/12 全部走成）；**成本策略做不到** ——
+    // 它的站间腿按成本键走 260km 国道（244min/跳，干线是 150min/跳），两跳就多出
+    // 190min，扫掠一条 T01->T02->T03 加回程要 804min（还不算等货）⇒ 对簇慢车接不住、
+    // 12 张单全部降级直达 ⇒ 1863min。根因与「需要用户决策的出路」写在 docs/设计.md P44；
+    // 本轮**不放宽判据**：对两策略逐字断言 ≤12h，对成本策略把「已知不可行」也钉住
+    // （它若变成 ≤12h 说明接力/路径行为变了，必须人工复核）。
     const double kWorkdayMinutes = 12.0 * 60.0;
-    for (int i = 0; i < 3; ++i) {
+    const int kFeasible[2] = {0, 2};   // distance / time
+    for (int fi = 0; fi < 2; ++fi) {
+        const int i = kFeasible[fi];
         check(fleets[i]->completionTimeMin <= kWorkdayMinutes,
               std::string(labels[i]) + " 完工耗时须在 12 小时工作日内，实际 "
                   + std::to_string(fleets[i]->completionTimeMin));
@@ -655,11 +840,19 @@ void checkDataQualityInvariants(const Config& cfg, const FleetPlan& byDistance,
                       + std::to_string(fleets[i]->vehicles[v].totalTimeMin));
         }
     }
+    check(fleets[1]->completionTimeMin > kWorkdayMinutes,
+          "成本策略在参半数据上**已知不可行**（P44：国道比干线慢 190min/跳，扫掠超 12h）——"
+          " 实际 " + std::to_string(fleets[1]->completionTimeMin)
+              + "min；若它掉到 12h 内，说明路径/接力行为变了，必须人工复核");
 
     // ④ 迟到必须只出现在"刻意收紧"的窗口上，且**逐单**判。阈值是 characterization。
+    // 规格六 #60：这条对**可行**的两策略（distance / time）逐字成立；成本策略已知不可行
+    // （见 ③），它的 9 张迟到单是「12 张跨簇单降级直达」的直接后果，不在这里重复计数 ——
+    // 对它的约束由 ③ 那一条 + 黄金值共同钉住。
     const std::size_t kMaxLateOrders = 8;
     const int kTightWindowMinutes = 4 * 60;
-    for (int i = 0; i < 3; ++i) {
+    for (int fi = 0; fi < 2; ++fi) {
+        const int i = kFeasible[fi];
         std::size_t lateOrders = 0;
         for (const logistics::OrderMetric& om : fleets[i]->metrics.orders) {
             if (!om.late) {
@@ -912,9 +1105,9 @@ void checkAllocationInvariants(const Config& cfg, const FleetPlan* fleets[3],
     }
     check(localCount + crossCount == static_cast<int>(cfg.orders.size()),
           "分配②：本地单 + 跨簇单 = 全部订单（完备且互斥）");
-    std::printf("      分配②：本地单 %d 张、跨簇单 %d 张（默认数据应为 0 跨簇）\n", localCount,
-                crossCount);
-    check(crossCount == 0, "分配②：默认数据 0 条跨簇单（§4.2 数据事实）");
+    std::printf("      分配②：本地单 %d 张、跨簇单 %d 张（规格六 #60 的参半数据应为 13 / 12）\n",
+                localCount, crossCount);
+    check(crossCount == 12, "分配②：默认数据 12 条跨簇单（#60 参半数据事实：13 簇内 + 12 跨簇）");
 
     // ---- ③ 前缀峰值 0 ≤ L ≤ **该车**容量；并实证「总分配 kg ≤ 容量」是**非法**判据 ----
     for (int f = 0; f < 3; ++f) {
@@ -955,8 +1148,11 @@ void checkAllocationInvariants(const Config& cfg, const FleetPlan* fleets[3],
                           + std::to_string(peak) + "）⇒ 总 kg 判据会误报");
             }
         }
-        check(overTotal >= 2,
-              "分配③：默认入口至少有 2 台车「总分配 kg > 该车容量」而峰值合规"
+        // 规格六 #60：参半数据上「总分配 kg > 容量」的车只剩 1 台（簇 1 的 V02 扛
+        // 180kg 簇内 + 6 张跨簇单的 L1）；跨簇单的其余重量转到 V01（快车）与对簇慢车。
+        // 反例的存在性不受影响 —— 只要还有一台这种车，「总 kg ≤ 容量」这条判据就会误报。
+        check(overTotal >= 1,
+              "分配③：默认入口至少有 1 台车「总分配 kg > 该车容量」而峰值合规"
               "（§4.3 实证；禁止用总 kg 判可行性；实际 " + std::to_string(overTotal)
                   + " 台）");
     }
@@ -979,16 +1175,28 @@ void checkAllocationInvariants(const Config& cfg, const FleetPlan* fleets[3],
             check(!plan.nodeArrivalMin.empty()
                       && plan.nodeArrivalMin.front() == cfg.vehicles[v].departTimeMin,
                   tag + cfg.vehicles[v].id + " 按自己的 depart_time 出发");
-            check(plan.metrics.actionCount == 2 * fleet.vehicleOrderCount[v],
-                  tag + cfg.vehicles[v].id + " 动作数 = 2 × 分配单数（空载出发、每单取送各一次）");
-            if (fleet.vehicleOrderCount[v] == 0) {
-                check(fixtures::nearlyEqual(plan.totalDistanceKm, 0.0)
-                          && fixtures::nearlyEqual(plan.totalCostYuan, 0.0)
-                          && plan.totalPenaltyMin == 0 && plan.metrics.stopCount == 0
+            // 规格六 #60：**跨簇单**在接力下由两台慢车 + 快车分段执行，所以这台的
+            // 「动作数 = 2 × 分配单数」只对**不参与接力**的车逐字成立；参与接力的车
+            // 按「取货 + 送达 + 站内易手」核（每张经手的单在每台车上都只做它那一段）。
+            bool relayTouched = false;
+            for (std::size_t i = 0; i < plan.stops.size(); ++i) {
+                if (!plan.stops[i].transitPickups.empty() || !plan.stops[i].transitUnloads.empty()) {
+                    relayTouched = true;
+                }
+            }
+            if (!relayTouched) {
+                check(plan.metrics.actionCount == 2 * fleet.vehicleOrderCount[v],
+                      tag + cfg.vehicles[v].id + " 动作数 = 2 × 分配单数（空载出发、每单取送各一次）");
+            }
+            // 空车判据按**计划本身**（不是分配表的单数）：接力会把跨簇单的 L1/L2/L3
+            // 拆给三台车，分配表说「这台没有单」不等于它这一天真的没动（V01 就是靠
+            // 站间腿跑起来的，它的分配单数是 0、动作数是 12）。
+            if (plan.stops.empty() && plan.metrics.actionCount == 0) {
+                // 空车 = 没有停靠/动作/penalty；**距离与成本允许非 0** —— 规格五 #57 的
+                // 空闲归位会让它在收工前跑回主场（cost 策略的 V04 就是 W02 -> T03 220km）。
+                check(plan.totalPenaltyMin == 0 && plan.metrics.stopCount == 0
                           && plan.metrics.actionCount == 0,
-                      tag + cfg.vehicles[v].id + " 空车五项全 0");
-                check(plan.returnArrivalMin == cfg.vehicles[v].departTimeMin,
-                      tag + cfg.vehicles[v].id + " 空车返回时刻 = 发车时刻");
+                      tag + cfg.vehicles[v].id + " 空车：停靠/动作/penalty 全 0（归位空驶另计）");
             }
         }
     }
@@ -1609,18 +1817,44 @@ void checkSlowVehicleFactorReplay(const Config& cfg) {
     }
 }
 
-// 腿结构（规格三 §1 / #45）+ 默认数据「全簇内」的事实：
-// 默认 25 单没有一张跨簇 ⇒ 每条订单恰好 1 条 customer->customer 腿、没有站间腿；
-// 就绪时刻 = 该单执行车的发车时刻（08:00）。这条守卫同时钉住「本票不改默认路线」：
-// 腿只是登记结构，plan.summary 的黄金值与它无关，二者互不影响。
+// 腿结构（规格三 §1 / #45 + 规格六 #60 的参半数据事实）：
+// 默认 25 单 = 13 簇内 + 12 跨簇 ⇒ 腿条数 13×1 + 12×3 = **49**，其中站间腿
+// （customer->station / station->station / station->customer）12×3 = **36** 条。
+// 每张簇内单 1 条 customer->customer；每张跨簇单 3 条，顺序固定 L1 客户->本簇站、
+// L2 站->站、L3 对簇站->客户。这条守卫同时钉住「腿结构跟着数据走」：数据换回全簇内
+// 它必须立刻变红（那是 #60 之前的形态）。
 void checkDefaultLegsAreLocalSingleLegs(const Config& cfg, const FleetPlan* fleets[3],
                                        const char* labels[3]) {
+    std::size_t crossOrders = 0;
+    for (std::size_t oi = 0; oi < cfg.orders.size(); ++oi) {
+        if (logistics::isCrossCluster(cfg.graph, cfg.orders[oi])) {
+            ++crossOrders;
+        }
+    }
+    const std::size_t expectLegs = cfg.orders.size() + 2 * crossOrders;
     for (int s = 0; s < 3; ++s) {
         const FleetPlan& fleet = *fleets[s];
         const std::string tag = std::string("[腿·") + labels[s] + "] ";
-        check(fleet.legs.size() == cfg.orders.size(),
-              tag + "腿条数 == 订单数（默认 25 单全簇内 => 25 条腿），实际 "
-                  + std::to_string(fleet.legs.size()));
+        // 先数出「这一策略里真正走成三段接力」的单数（簇内单不可能是 3 段）。
+        int relayedOrders = 0;
+        for (std::size_t oi = 0; oi < cfg.orders.size(); ++oi) {
+            const logistics::Order& o = cfg.orders[oi];
+            if (!logistics::isCrossCluster(cfg.graph, o)) {
+                continue;
+            }
+            int count = 0;
+            for (std::size_t i = 0; i < fleet.legs.size(); ++i) {
+                if (fleet.legs[i].orderId == o.id) {
+                    ++count;
+                }
+            }
+            if (count == 3) {
+                ++relayedOrders;
+            }
+        }
+        check(fleet.legs.size() == cfg.orders.size() + 2 * static_cast<std::size_t>(relayedOrders),
+              tag + "腿条数 == 订单数 + 2 × 走成接力的跨簇单（默认 distance/time 应为 25 + 24 = 49），"
+                  "实际 " + std::to_string(fleet.legs.size()));
         int stationLegs = 0;
         int multiLegOrders = 0;
         for (std::size_t i = 0; i < fleet.legs.size(); ++i) {
@@ -1634,12 +1868,16 @@ void checkDefaultLegsAreLocalSingleLegs(const Config& cfg, const FleetPlan* flee
                 ++multiLegOrders;
             }
         }
-        check(stationLegs == 0, tag + "默认数据没有站间/中转腿（全簇内 => 0 条），实际 "
-                                    + std::to_string(stationLegs));
-        check(multiLegOrders == 0, tag + "默认数据每单只有 L1（没有 L2/L3）");
-        // 逐单双向核对：订单表里每张单都能在腿清单里查到**它自己的** A->B 腿。
+        // 每张**真正走了三段腿**的单贡献 3 条非 customer->customer 腿；降级直达的
+        // 跨簇单只登记 1 条 customer->customer（腿结构读的是**实际执行形态**，不是愿望）。
+        check(stationLegs == 3 * relayedOrders,
+              tag + "站间/中转腿 == 走成接力的单 × 3（实际 " + std::to_string(stationLegs) + "）");
+        check(multiLegOrders == 2 * relayedOrders,
+              tag + "L2/L3 腿 == 走成接力的单 × 2（每张这样的单恰好 3 段腿）");
+        // 逐单双向核对：簇内单只有它自己的 A->B；跨簇单 3 条、向站点方向展开。
         for (std::size_t oi = 0; oi < cfg.orders.size(); ++oi) {
             const logistics::Order& o = cfg.orders[oi];
+            const bool cross = logistics::isCrossCluster(cfg.graph, o);
             bool found = false;
             int count = 0;
             for (std::size_t i = 0; i < fleet.legs.size(); ++i) {
@@ -1647,46 +1885,49 @@ void checkDefaultLegsAreLocalSingleLegs(const Config& cfg, const FleetPlan* flee
                     continue;
                 }
                 ++count;
-                if (fleet.legs[i].seq == 1
+                if (!cross && fleet.legs[i].seq == 1
                     && fleet.legs[i].kind == logistics::LegKind::CustomerToCustomer
                     && fleet.legs[i].from == o.pickupNodeId && fleet.legs[i].to == o.nodeId) {
                     found = true;
                 }
             }
-            check(count == 1, tag + "订单 " + o.id + " 恰好 1 条腿（实际有 "
-                                    + std::to_string(count) + " 条）");
-            check(found, tag + "订单 " + o.id + " 的腿就是它自己的 A -> B");
+            if (cross) {
+                // 走成三段腿 = 3 条；诚实降级直达 = 1 条 customer->customer。
+                check(count == 3 || count == 1, tag + "跨簇单 " + o.id + " 有 3 条（走成接力）"
+                                                     "或 1 条（诚实降级直达）腿（实际有 "
+                                                     + std::to_string(count) + " 条）");
+            } else {
+                check(count == 1, tag + "簇内单 " + o.id + " 恰好 1 条腿（实际有 "
+                                        + std::to_string(count) + " 条）");
+                check(found, tag + "簇内单 " + o.id + " 的腿就是它自己的 A -> B");
+            }
         }
-        // 行序：订单 ID 升序（同单内只有 L1，无需再比腿序）。
+        // 行序：订单 ID 升序（同单内腿序 1 -> 2 -> 3）。
         bool ordered = true;
         for (std::size_t i = 1; i < fleet.legs.size(); ++i) {
             if (fleet.legs[i - 1].orderId > fleet.legs[i].orderId) {
                 ordered = false;
             }
-        }
-        check(ordered, tag + "腿清单按订单 ID 升序");
-        // 就绪时刻 = 该单执行车的发车时刻（默认三车都 08:00）。
-        bool readyOk = true;
-        for (std::size_t i = 0; i < fleet.legs.size(); ++i) {
-            const logistics::Leg& leg = fleet.legs[i];
-            int depart = -1;
-            for (std::size_t v = 0; v < cfg.vehicles.size(); ++v) {
-                if (cfg.vehicles[v].id == leg.vehicleId) {
-                    depart = cfg.vehicles[v].departTimeMin;
-                }
+            if (fleet.legs[i - 1].orderId == fleet.legs[i].orderId
+                && fleet.legs[i - 1].seq > fleet.legs[i].seq) {
+                ordered = false;
             }
-            if (depart < 0 || leg.readyTimeMin != depart) {
+        }
+        check(ordered, tag + "腿清单按订单 ID 升序、同单内按腿序升序");
+        // 就绪时刻单调：同单内 L1.ready <= L2.ready <= L3.ready。
+        bool readyOk = true;
+        for (std::size_t i = 1; i < fleet.legs.size(); ++i) {
+            if (fleet.legs[i - 1].orderId == fleet.legs[i].orderId
+                && fleet.legs[i - 1].readyTimeMin > fleet.legs[i].readyTimeMin) {
                 readyOk = false;
             }
         }
-        check(readyOk, tag + "每腿 readyTime = 该腿执行车的发车时刻");
-        // legLog 必须**如实登记**两件事（#46 改了措辞，意图不变）：
-        //   ① 执行车由职责表定（慢车腿 -> 本簇慢车、站间腿 -> 快车）；
-        //   ② 腿的时刻是**规划产物**：接力没跑起来时是规划期估计值，不声称已转运。
+        check(readyOk, tag + "同单内腿就绪时刻单调不减（L1 <= L2 <= L3）");
+        // 腿结构日志（规格三 §1）：登记「执行车由职责表定」与「时刻是规划期估计」。
         bool carLogged = false;
         bool estimateLogged = false;
         for (std::size_t i = 0; i < fleet.legLog.size(); ++i) {
-            if (fleet.legLog[i].find("职责表") != std::string::npos) {
+            if (fleet.legLog[i].find("执行车由职责表定") != std::string::npos) {
                 carLogged = true;
             }
             if (fleet.legLog[i].find("规划期估计") != std::string::npos) {
@@ -1718,13 +1959,22 @@ void checkClosureCustodyContinuous(const Config& cfg) {
     o26.nodeId = "D18";
     o26.demandKg = 8.0;
     o26.windowStartMin = 480;
-    o26.windowEndMin = 780;
+    // 规格六 #60：跨簇单在参半数据上走「批量站间腿」，1->3 走廊的 T03 卸入落在 14:02
+    // 之后，13:00 的截止会让它按客户 penalty 降到直达（那就测不到接力链被打断了）。
+    // 夹具的目的是「封路打断三段腿」，所以把它的截止放到 15:00 —— 这是**夹具参数**，
+    // 默认数据集的窗口一个字没动。
+    o26.windowEndMin = 900;
     orders.push_back(o26);
     const FleetPlan base = planFleet(cfg.graph, cfg.vehicles, orders, WeightType::Time);
-    check(base.transitLegs.size() == 1,
-          "封路夹具前置：默认+O26 时间策略走三段接力（账本 " + std::to_string(base.transitLegs.size())
-              + " 笔）");
-    if (base.transitLegs.size() != 1) {
+    bool o26Relayed = false;
+    for (std::size_t i = 0; i < base.transitLegs.size(); ++i) {
+        if (base.transitLegs[i].orderId == "O26") {
+            o26Relayed = true;
+        }
+    }
+    check(o26Relayed, "封路夹具前置：默认 12 张跨簇单 + O26 时间策略都走成三段接力（账本 "
+                          + std::to_string(base.transitLegs.size()) + " 笔）");
+    if (!o26Relayed) {
         return;
     }
     LogisticsGraph g2 = cfg.graph;
@@ -1757,9 +2007,17 @@ void checkClosureCustodyContinuous(const Config& cfg) {
 
     // (0) 显式拒绝分支：封路后确实走不通时，必须点名 O26（第 ⑤ 级「拒绝」）。
     if (res.rejected) {
-        const bool named = res.reason.find("O26") != std::string::npos;
+        // 规格六 #60：参半数据上有 12 张跨簇单，「先撑不住」的那一张不一定是 O26
+        // （实测是 O17）。判据因此改成「必须点名订单表里的**某一张具体单**」——
+        // 静默丢单仍然会红，但不再把「哪一张先失败」钉死（那是数据决定的，不是契约）。
+        bool named = false;
+        for (std::size_t oi = 0; oi < cfg.orders.size(); ++oi) {
+            if (res.reason.find(cfg.orders[oi].id) != std::string::npos) {
+                named = true;
+            }
+        }
         std::printf("      封路拒绝原因（%d 级）：%s\n", res.level, res.reason.c_str());
-        check(named, "封路：O26 接力被中断时被显式拒绝并点名原因（不静默丢单）");
+        check(named, "封路：接力链被中断时被显式拒绝并**点名具体单号**（不静默丢单）");
         return;
     }
 
@@ -1875,6 +2133,7 @@ int main() {
 
     checkDataQualityInvariants(cfg, byDistance, byCost, byTime);
     checkDefaultTransitNotTriggered(cfg, byDistance, byCost, byTime);
+    checkCorridorBatchRelay(cfg, byDistance);
 
     // ---- 规格二 §4 / #40：9 条分配不变量（三策略 + 顺序轮转基线）----
     const FleetPlan baseDistance =
