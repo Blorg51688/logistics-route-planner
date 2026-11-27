@@ -2,6 +2,7 @@
 
 #include <QGraphicsItem>
 #include <QString>
+#include <string>
 #include <vector>
 
 #include "core/Node.h"
@@ -30,6 +31,7 @@ public:
     // 一个节点上可能同时停多台车（例如都在 W01 发车）：slot 把环错开，
     // 否则两个环完全重合、看起来只有一台车。slot = 该节点上第几台（0 起，按行序）。
     struct VehicleMark {
+        std::string vehicleId; // #62：车号，写进节点 tooltip 让用户区分叠在一起的环
         bool fast = false;   // true = 快车环（另一种颜色），false = 慢车环
         int  slot = 0;       // 同一节点上的错开序号
     };
@@ -50,4 +52,5 @@ private:
     std::vector<EdgeItem*> edges_;
     bool vehicleHere_ = false;   // 兼容旧接口：单环、慢车色
     std::vector<VehicleMark> vehicleMarks_;
+    QString baseTooltip_;        // 节点自身说明；车辆环信息追加在其后
 };

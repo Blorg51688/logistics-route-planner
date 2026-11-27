@@ -25,8 +25,9 @@ NodeItem::NodeItem(const logistics::Node& node) : node_(node) {
     setFlag(ItemIsMovable);
     setFlag(ItemSendsGeometryChanges);   // 位置变化时通知相邻边
     setZValue(1.0);
-    setToolTip(QString::fromStdString(node_.id + " " + node_.name + "（"
-                                      + std::string(logistics::toString(node_.type)) + "）"));
+    baseTooltip_ = QString::fromStdString(node_.id + " " + node_.name + "（"
+                                           + std::string(logistics::toString(node_.type)) + "）");
+    setToolTip(baseTooltip_);
 }
 
 void NodeItem::addEdge(EdgeItem* edge) {
@@ -61,12 +62,26 @@ void NodeItem::setVehicleHere(bool on) {
 void NodeItem::setVehicleMarks(const std::vector<VehicleMark>& marks) {
     bool same = marks.size() == vehicleMarks_.size();
     for (std::size_t i = 0; same && i < marks.size(); ++i) {
-        same = marks[i].fast == vehicleMarks_[i].fast && marks[i].slot == vehicleMarks_[i].slot;
+        same = marks[i].vehicleId == vehicleMarks_[i].vehicleId
+               && marks[i].fast == vehicleMarks_[i].fast
+               && marks[i].slot == vehicleMarks_[i].slot;
     }
     if (same) {
         return;
     }
     vehicleMarks_ = marks;
+    // #62：同站多环（如 T03 上 V01 快车 + V04 慢车）看上去像「慢车越簇」。
+    // tooltip 逐环写车号与角色——用户悬停即知是两个合法角色叠在一起，而不是一台慢车跑错簇。
+    QString tip = baseTooltip_;
+    if (!marks.empty()) {
+        tip += QStringLiteral("\n车辆环：");
+        for (std::size_t i = 0; i < marks.size(); ++i) {
+            tip += QStringLiteral(" %1（%2）")
+                       .arg(QString::fromStdString(marks[i].vehicleId))
+                       .arg(marks[i].fast ? QStringLiteral("快车") : QStringLiteral("慢车"));
+        }
+    }
+    setToolTip(tip);
     update();
 }
 

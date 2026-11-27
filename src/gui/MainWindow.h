@@ -218,6 +218,9 @@ public:
     // 供 --ui-probe 校验表头与 --self-check-actions 校验「两端非空 / in≠out / dwell≤60 / 期末0」。
     QString     transitLedgerSummary() const;
     QStringList transitLedgerHeaders() const;
+    // #62：账本「状态」列的**用户可见值**（逐行读表格第 7 列单元格，不重算公式）。
+    // 三态守卫直接读这里：在站 / 在途（Vxx HH:MM 取走） / 已送达。
+    QStringList transitLedgerStatuses() const;
     int         transitLedgerRowCount() const;
     // 账本空态提示（#56）：无行时在面板里明写「本次运行未发生入站转运（默认数据无跨簇单）」。
     // 目的不是装饰，而是**把空表解释掉**——否则下一个人会把它当"面板坏了"再立一张票。
@@ -238,9 +241,18 @@ public:
     // （一张跨簇单在接力中会被多台车的计划各排一段，按车计数会重复），
     // 供 --ui-probe 校验「订单表超时行数 == 迟到订单数」（G10 并入订单表后的原意）。
     int lateOrderCount() const;
-    // 停靠明细面板的文本快照（供 --ui-probe）
+    // #62：底部「路线与停靠」页退役后的守卫载体——两个对象仍填充、但**不在界面上**。
+    // --ui-probe 的 G8/G9 改成「若存在则格式正确」；以下 isVisible() 守卫禁止它们被
+    // 重新挂回界面。路线关键信息的可读性改由 logPanelText() 证明。
+    bool routePanelVisible() const;
+    bool stopPanelVisible() const;
+    // 日志 dock 的**用户可见文本**（不是导出文件），供「汇总信息没丢」守卫读取。
+    QString logPanelText() const;
+    // #62：节点 tooltip（含车辆环车号）供探针核对，读的是真实图元。
+    QString vehicleRingTooltip(const std::string& nodeId) const;
+    // 停靠明细面板的文本快照（供 --ui-probe；退役后仍在隐藏对象上保持格式可核）
     QString stopPanelSummary() const;
-    // 路线信息面板的文本快照（供 --ui-probe 校验三项新指标与「停靠·动作」片段）
+    // 路线信息面板的文本快照（供 --ui-probe；退役后仍在隐藏对象上保持格式可核）
     QString routePanelSummary() const;
     // 停靠明细面板**真实表头**（供 --ui-probe 校验表头与数据不错位）。
     // 守卫必须读界面上真正的列名，而不是把预期列表再背一遍——本项目
@@ -486,7 +498,7 @@ private:
     // 送达：把该点的货从**该车**卸下、记账（含超时惩罚与已送达计数）
     void deliverAt(std::size_t v, const logistics::Stop& stop);
 
-    QTextBrowser*  routeInfo_ = nullptr;
+    QTextBrowser*  routeInfo_ = nullptr;   // #62 起隐藏：仅为 G9 格式守卫保留
     // 车辆表（#56 重设计）：**一车一行**，取代原来的「每车一个页签 + 两块标签」。
     // 为什么合并：原布局把同一台车的「载货/额定/利用率」拆在页签里，用户要切页才能
     // 逐车比；改成表格后四台车同屏并排，正是用户说的「各个车辆的载货量/总货量」。
@@ -500,10 +512,9 @@ private:
     QTableWidget*  transitLedgerTable_ = nullptr;
     // 已实际执行的转运账本（跨重规划保留；计划期候选不在这里）。
     std::vector<TransitLedgerEntry> transitLedger_;
-    QTableWidget*  stopTable_ = nullptr;
-    // #59：右侧「信息」dock 的三页标签（车辆 / 订单 / 中转与配送网）与底部
-    // 「日志」dock 的两页标签（日志 / 路线与停靠）。表格对象的指针与填充逻辑不变，
-    // 只是父容器从多个 dock 换成 QTabWidget 的页。
+    QTableWidget*  stopTable_ = nullptr;   // #62 起隐藏：仅为 G8 格式守卫保留
+    // #62 起：右侧「信息」dock 三页（车辆 / 订单 / 中转与配送网），
+    // 底部「日志」dock **一页**（日志）。路线与停靠页已退役。
     QTabWidget*    rightTabs_ = nullptr;
     QTabWidget*    bottomTabs_ = nullptr;
     // #59：「同一时刻只有一页可见」守卫读这三页的**真实可见状态**。
