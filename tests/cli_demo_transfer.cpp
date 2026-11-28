@@ -17,6 +17,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -62,6 +63,85 @@ std::string readFile(const std::string& path) {
     std::string out((std::istreambuf_iterator<char>(f)),
                     std::istreambuf_iterator<char>());
     return out;
+}
+
+// 跑一条命令并收 stdout（退出码经 outRc 带出）。守卫要读**程序自己打印的**审计结论，
+// 不能只看 exit code：审计整段被删掉时 exit 仍是 0，那样守卫就是假的。
+std::string captureCommand(const std::string& cmd, int& outRc) {
+    std::string out;
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (pipe == nullptr) {
+        outRc = -1;
+        return out;
+    }
+    char buf[4096];
+    while (std::fgets(buf, sizeof(buf), pipe) != nullptr) {
+        out += buf;
+    }
+    const int rc = pclose(pipe);
+    outRc = (rc >= 0) ? WEXITSTATUS(rc) : -1;
+    return out;
+}
+
+// ---- 规格七 #63：慢车物理断路的**动态**守卫 ----
+//
+// 跑 22 轮演示（推进一站 / 路况 / 插单 / 封路），然后读程序自己打印的逐帧审计结论：
+//   [断路审计] 慢车物理断路：审计 N 帧，违规 M 处
+// 三条断言：
+//   ① exit 0（有违规时程序自己返回 1）；
+//   ② M == 0 且 N 足够大（审计真的逐帧跑过，不是空转）；
+//   ③ 演示日志里**确实发生过跨簇接力**（否则「慢车没越界」只是因为压根没有跨簇活动）。
+// 反向验证：把 reachAllowsEdge 改成「一律放行」⇒ ②立刻红（见提交信息里的实测摘录）。
+void checkSlowIsolationDuringDemo(const std::string& appPath) {
+    const std::string tag = "/tmp/cli_demo_isolation_"
+                            + std::to_string(static_cast<long long>(getpid()));
+    const std::string png = tag + ".png";
+    const std::string log = tag + ".log";
+    const std::string cmd = std::string("QT_QPA_PLATFORM=offscreen '") + appPath
+                            + "' --demo 22 --render-window '" + png + "' --export-log '" + log
+                            + "' 2>/dev/null";
+    int rc = -1;
+    const std::string out = captureCommand(cmd, rc);
+    check(rc == 0, "#63：--demo 22 --render-window 必须 exit 0（实际 " + std::to_string(rc) + "）");
+
+    int frames = -1;
+    int violations = -1;
+    bool seen = false;
+    for (const std::string& line : splitLines(out)) {
+        const std::string marker = "[断路审计] 慢车物理断路：审计 ";
+        if (line.find(marker) == std::string::npos) {
+            continue;
+        }
+        seen = true;
+        const std::size_t at = line.find(marker) + marker.size();
+        frames = std::atoi(line.c_str() + at);
+        const std::size_t vAt = line.find("违规 ", at);
+        if (vAt != std::string::npos) {
+            violations = std::atoi(line.c_str() + vAt + std::strlen("违规 "));
+        }
+    }
+    check(seen, "#63：演示结束后必须打印逐帧断路审计结论"
+                "（[断路审计] 慢车物理断路：审计 N 帧，违规 M 处）");
+    check(frames >= 22, "#63：审计帧数应覆盖全部演示动作（实际 " + std::to_string(frames)
+                            + " 帧，下界 22）");
+    check(violations == 0, "#63：慢车不得出现在别簇节点或跨簇边上（违规 "
+                               + std::to_string(violations) + " 处）");
+
+    // ③ 守卫必须证明「真的测到了东西」：日志里要有跨簇接力的实际执行记录。
+    int relayLines = 0;
+    if (fileExists(log)) {
+        for (const std::string& line : splitLines(readFile(log))) {
+            if (line.find("三段腿成立") != std::string::npos) {
+                ++relayLines;
+            }
+        }
+    }
+    check(relayLines > 0, "#63：演示确实发生了跨簇三段接力（三段腿成立行数 "
+                              + std::to_string(relayLines) + "），慢车不越界才有意义");
+    std::printf("    断路审计：%d 帧 / 违规 %d 处 / 跨簇接力 %d 行\n", frames, violations,
+                relayLines);
+    std::remove(png.c_str());
+    std::remove(log.c_str());
 }
 
 // M2 演示的可执行形式：默认配置 + 一张跨簇普通单（O26：D08→D18 8kg）。
@@ -270,6 +350,9 @@ int main(int argc, char** argv) {
 
     std::remove(png.c_str());
     std::remove(log.c_str());
+
+    // ---- 规格七 #63：慢车物理断路的动态守卫（22 轮演示逐帧审计）----
+    checkSlowIsolationDuringDemo(appPath);
 
     // ---- M2：默认数据上「插一张跨簇普通单 → 账本一笔三段接力」----
     checkM2RelayOnDefaultData(appPath);

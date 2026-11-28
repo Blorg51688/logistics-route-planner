@@ -667,6 +667,13 @@ void MainWindow::arriveAt(std::size_t v, const std::string& nodeId, int timeMin)
     VehicleRuntime& rt = veh(v);
     rt.state.atNodeId = nodeId;
     rt.state.atTimeMin = timeMin;
+    // 慢车断路审计（规格七 #63）：**走过的路**是物理事实 —— 计划会被换掉，走过的节点不会。
+    if (slowVisited_.size() != fleet_.size()) {
+        slowVisited_.assign(fleet_.size(), std::vector<std::string>());
+    }
+    if (v < slowVisited_.size()) {
+        slowVisited_[v].push_back(nodeId);
+    }
     // 单条连续路线（规格一 MC-A01）：没有"趟"这回事，回仓库只是路线终点。
     // `departed` 是**物理事实**（是否已驶离出发点）：回仓库（路线终点）后置 false，
     // 重规划不得改写；唯一消费者是 fleetPristine()（判断「这一局还没动过」）。
@@ -833,11 +840,16 @@ void MainWindow::replanFleet() {
             current[v] = fleet_[v].plan;
         }
         assigned = logistics::vehicleOrdersFromPlans(current, remainingOrders());
+        // 边准入（规格七 #63）：途中重规划也按**该车**的断路口径走 —— 否则事件/手动
+        // 重规划会把慢车送到别簇（静态计划合规、运行态越界，正是本票要堵的洞）。
+        const std::vector<logistics::ReachScope> scopes =
+            logistics::reachScopesOf(config_.graph, config_.vehicles);
         for (std::size_t v = 0; v < k; ++v) {
             VehicleRuntime& rt = fleet_[v];
             rt.plan = logistics::replan(config_.graph, config_.vehicles[v], assigned[v],
                                         rt.state.atNodeId, rt.state.atTimeMin, planWeight_,
-                                        rt.state.onboard, starts[v].stash);
+                                        rt.state.onboard, starts[v].stash, true,
+                                        v < scopes.size() ? &scopes[v] : nullptr);
             afterVehiclePlanReplaced(v);
             plans[v] = rt.plan;
         }
@@ -1000,6 +1012,41 @@ void MainWindow::afterVehiclePlanReplaced(std::size_t v) {
     veh(v).stopCursor = 0;
     if (!vehAtEnd(v)) {
         routeFinishedReported_ = false;
+    }
+    // 每一份新计划都要过一遍慢车断路审计（规格七 #63）：坏计划不许悄悄进运行态。
+    auditSlowIsolationNow();
+}
+
+// ---- 慢车物理断路审计（规格七 #63）----
+//
+// 逐帧读**运行态的真实计划 + 已走过的节点**，交给 core 的独立审计函数判
+// 「慢车是否出现在别簇节点 / 跨簇边 / 仓库边 / 站间边」。判据本体在 core
+// （auditSlowIsolation），这里只负责喂数据与去重 —— 界面不另写一份规则。
+void MainWindow::auditSlowIsolationNow() {
+    ++slowAuditFrames_;
+    if (config_.vehicles.empty() || fleet_.size() != config_.vehicles.size()) {
+        return;
+    }
+    if (slowVisited_.size() != fleet_.size()) {
+        slowVisited_.assign(fleet_.size(), std::vector<std::string>());
+    }
+    std::vector<logistics::RoutePlan> plans(fleet_.size());
+    for (std::size_t v = 0; v < fleet_.size(); ++v) {
+        plans[v] = fleet_[v].plan;
+    }
+    const std::vector<logistics::SlowIsolationViolation> bad =
+        logistics::auditSlowIsolation(config_.graph, config_.vehicles, plans, &slowVisited_);
+    for (std::size_t i = 0; i < bad.size(); ++i) {
+        const std::string line = bad[i].vehicleId + " " + bad[i].detail;
+        bool seen = false;
+        for (std::size_t k = 0; k < slowViolations_.size(); ++k) {
+            if (slowViolations_[k] == line) {
+                seen = true;
+            }
+        }
+        if (!seen) {
+            slowViolations_.push_back(line);
+        }
     }
 }
 
@@ -1290,9 +1337,12 @@ std::string MainWindow::insertOrderAt(const std::string& a, const std::string& b
     stashIns.station = active().state.stashStation;
     stashIns.items = active().state.stashItems;
     // R8：紧急 -> 紧急段尾插（FIFO）；普通 -> 普通段 pair-insertion。urgent 由订单自己带。
+    const std::vector<logistics::ReachScope> scopes =
+        logistics::reachScopesOf(config_.graph, config_.vehicles);
     const logistics::InsertResult inserted = logistics::insertOrder(
         config_.graph, config_.vehicles[activeVehicle_], pending, order, currentPositionId(),
-        currentTimeMin(), planWeight_, onboardGoods(), stashIns);
+        currentTimeMin(), planWeight_, onboardGoods(), stashIns,
+        activeVehicle_ < scopes.size() ? &scopes[activeVehicle_] : nullptr);
 
     // R9：通过输入校验即并入订单集合（插入失败也不丢单，保留未服务，后续事件/重规划再试）。
     config_.orders.push_back(order);
@@ -2750,9 +2800,13 @@ void MainWindow::updatePanels() {
                            ? here
                            : here + QStringLiteral("（已归位 %1）")
                                         .arg(QString::fromStdString(rt.plan.homeNodeId)))
-                    : here + QStringLiteral("→") + QString::fromStdString(nextNode)};
+                    // 规格七 #63：慢车出生在本簇站，下一次停靠可能就在脚下（在站里等货）。
+                    // 「T03→T03」是一支零长度箭头，写成「原地待命」才如实。
+                    : (nextNode == rt.state.atNodeId
+                           ? here + QStringLiteral("（原地待命）")
+                           : here + QStringLiteral("→") + QString::fromStdString(nextNode))};
             const QString tooltip =
-                QStringLiteral("固定信息\nID：%1\n起始仓库：%2\n载重上限：%3 kg\n发车时刻：%4\n"
+                QStringLiteral("固定信息\nID：%1\n起始节点：%2\n载重上限：%3 kg\n发车时刻：%4\n"
                                "耗时倍率：%5\n成本倍率：%6\n运行状态\n阶段：%7\n"
                                "已送达 %8 单 · 剩余待送 %9 kg\n已发生 penalty：%10 min")
                     .arg(QString::fromStdString(vehicle.id))
@@ -3331,6 +3385,8 @@ void MainWindow::runDemoActions(int rounds) {
             banner(QStringLiteral("封闭道路"));
             onCloseRandomRoad();
         }
+        // 每一步都审一次（规格七 #63 的「逐帧」）：计划与已走节点都看。
+        auditSlowIsolationNow();
         QCoreApplication::processEvents();
     }
 }

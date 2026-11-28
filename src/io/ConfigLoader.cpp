@@ -326,8 +326,12 @@ bool loadVehicles(const IniFile& ini, const LogisticsGraph& graph,
             fail(error, row.rec->lineNo, "vehicles", "起始节点不存在: " + vehicle.startNodeId);
             return false;
         }
-        if (start->type != NodeType::Warehouse) {
-            fail(error, row.rec->lineNo, "vehicles", "起始节点必须是仓库: " + vehicle.startNodeId);
+        // 起始节点 = 仓库 **或** 中转站（规格七 #63）：慢车出生在**本簇中转站**上，
+        // 这是「慢车不出簇」的前提 —— 出生在仓库就意味着每天先要一段跨簇通勤，
+        // 而断路之后那段路根本不存在。客户节点仍然不许当起点（车不能驻在客户门口）。
+        if (start->type != NodeType::Warehouse && start->type != NodeType::Transit) {
+            fail(error, row.rec->lineNo, "vehicles",
+                 "起始节点必须是仓库或中转站: " + vehicle.startNodeId);
             return false;
         }
         if (!parseDouble(row.fields[2], vehicle.capacityKg)) {

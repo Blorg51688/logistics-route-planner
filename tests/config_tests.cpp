@@ -248,18 +248,20 @@ void testLoadDefaultConfig() {
             const char* startNode;   // 规格四 #54：慢车就近驻场，不再全部 W01
             int         departMin;   // 规格四 #54：V03 提前发车覆盖跨城通勤
         };
-        // 起始仓库与发车时刻是**数据事实**，随规格六 #60 改动：
-        //   · V02 守簇 1，从 W01（本国仓）出发，08:00；
-        //   · V03 守簇 2，从 W02 出发，08:00（规格四的 06:30 在参半数据上不再需要，
-        //     反而会让它在 T02 空等快车 82min ⇒ 改回四台同班）；
-        //   · V04 守簇 3，从 W02 出发，**10:30**（簇 3 没有簇内单，它的第一件活是
-        //     13:40 在 T03 接跨簇货 —— 班次跟着接货时刻走）。
-        // 为什么这些要写进测试而不是"随便哪个仓库都行"：它们直接决定黄金值，
-        // 漂了就是真回归（每台车跑哪片区域、什么时候出发，都是可核对的承诺）。
+        // 起始节点与发车时刻是**数据事实**，随规格七 #63 改动（慢车出生在本簇中转站）：
+        //   · V01 是快车，仍从中央仓库 A（W01）出发，08:00；
+        //   · V02 守簇 1，出生在**本簇中转站 T01**，08:00；
+        //   · V03 守簇 2，出生在 **T02**，08:00；
+        //   · V04 守簇 3，出生在 **T03**，**14:00**（簇 3 没有簇内单，它的第一件活是
+        //     在 T03 接跨簇货 —— 班次跟着 L2 到站时刻走：1->3 与 2->3 两条走廊的货
+        //     14:02~14:37 才到站，班次落在它前面 60min 窗口内才接得住）。
+        // 为什么这些要写进测试而不是"随便哪个站都行"：它们直接决定黄金值，
+        // 漂了就是真回归（每台车驻在哪片区域、什么时候出发，都是可核对的承诺）。
+        // 断路的后果：出生点必须是**本簇**的站，否则慢车连第一段路都走不出去。
         const ExpectVehicle expect[4] = {{"V01", 400.0, 1.00, 1.50, "W01", 8 * 60},
-                                         {"V02", 160.0, 1.25, 0.80, "W01", 8 * 60},
-                                         {"V03", 160.0, 1.25, 0.80, "W02", 8 * 60},
-                                         {"V04", 160.0, 1.25, 0.80, "W02", 10 * 60 + 30}};
+                                         {"V02", 160.0, 1.25, 0.80, "T01", 8 * 60},
+                                         {"V03", 160.0, 1.25, 0.80, "T02", 8 * 60},
+                                         {"V04", 160.0, 1.25, 0.80, "T03", 14 * 60}};
         for (int i = 0; i < 4; ++i) {
             const logistics::Vehicle& v = cfg.vehicles[static_cast<std::size_t>(i)];
             const std::string tag = std::string("默认车辆 ") + expect[i].id + "：";
@@ -268,9 +270,20 @@ void testLoadDefaultConfig() {
             check(v.departTimeMin == expect[i].departMin, tag + "发车时刻");
             check(v.timeFactor == expect[i].timeFactor, tag + "耗时倍率");
             check(v.costFactor == expect[i].costFactor, tag + "成本倍率");
-            check(v.startNodeId == expect[i].startNode, tag + "起始仓库");
+            check(v.startNodeId == expect[i].startNode, tag + "起始节点");
             const logistics::Node* start = cfg.graph.findNode(v.startNodeId);
-            check(start != nullptr && start->type == NodeType::Warehouse, tag + "起始节点是仓库");
+            // 规格七 #63：快车从仓库出发，慢车从**本簇中转站**出发（客户节点一律不许当起点）。
+            const bool startOk =
+                start != nullptr
+                && (start->type == NodeType::Warehouse || start->type == NodeType::Transit);
+            check(startOk, tag + "起始节点是仓库或中转站");
+            if (start != nullptr && start->type == NodeType::Transit) {
+                // 慢车的出生站必须**在本簇**：T01->簇1 / T02->簇2 / T03->簇3。
+                const int expectCluster = i;   // 车队表：V02=簇1、V03=簇2、V04=簇3（V01 是快车）
+                check(start->subNetworkId == expectCluster,
+                      tag + "出生站属于本簇（站 " + std::to_string(start->subNetworkId)
+                          + " vs 期望 " + std::to_string(expectCluster) + "）");
+            }
         }
         // §3.1 生成器自检在数据上的**结果**（契约层不强制，但默认数据集必须满足）：
         // 两型车真的分化；快车容量 >= 2 × 最小容量。
@@ -563,7 +576,32 @@ void testErrorCases() {
         "[vehicles] 起始节点不存在");
     expectParseFailureAtLineWithMessage(
         configWithVehicleRow("V01, D01, 100, 08:00, 1.00, 1.00"), 10,
-        "起始节点必须是仓库: D01", "[vehicles] 起始节点不是仓库");
+        "起始节点必须是仓库或中转站: D01", "[vehicles] 起始节点不能是客户节点");
+    // 正例（规格七 #63）：慢车可以出生在**中转站**上（快车仍从仓库出发）。
+    // 反向验证：把 ConfigLoader 的判据退回「必须是仓库」⇒ 本条立刻红，默认数据也加载不了。
+    {
+        const std::string text =
+            "[nodes]\n"
+            "W01, warehouse, 0, 0, 仓库, 0\n"
+            "T01, transit, 5, 5, 中转站甲, 1\n"
+            "D01, delivery, 10, 10, 客户一, 1\n"
+            "D02, delivery, 20, 10, 客户二, 1\n"
+            "[edges]\n"
+            "W01, T01, 1.0, 2.0, 1.5\n"
+            "T01, D01, 1.0, 2.0, 1.5\n"
+            "D01, D02, 1.0, 2.0, 1.5\n"
+            "[vehicles]\n"
+            "V01, W01, 100, 08:00, 1.00, 1.00\n"
+            "V02, T01, 100, 08:00, 1.00, 1.00\n"
+            "[orders]\n"
+            "O01, D01, D02, 10, 09:00, 18:00, 0\n";
+        Config cfg;
+        std::string error;
+        const bool ok = ConfigLoader::parse(text, cfg, error);
+        check(ok, "起始节点可以是中转站（规格七 #63）：" + error);
+        check(cfg.vehicles.size() == 2 && cfg.vehicles[1].startNodeId == "T01",
+              "从 T01 出发的车辆被正确读入");
+    }
     expectParseFailureAtLineWithMessage(
         configWithVehicleRow("V01, W01, abc, 08:00, 1.00, 1.00"), 10,
         "载重上限不是合法数值", "[vehicles] 载重不是合法数值");

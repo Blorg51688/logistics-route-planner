@@ -256,11 +256,68 @@ struct RoutePlan {
     double warehouseReturnKm = -1.0;
 };
 
+// ---- 慢车物理断路（规格七 §5.15 / #63）----
+//
+// 用户的原始要求（票面「用户原话」）：慢车只该在自己负责的簇里活动；
+// 跨簇的路（高速与国道）对它**物理断路**，它不可能出现在仓库或别簇的节点上。
+//
+// 判据（**唯一过滤点**，全项目只此一处定义「这台车能走哪条边」）：
+//   · 快车（容量最大者，relayVehicleIndex）：全部边（高速 + 国道 + 城内）；
+//   · 慢车：只允许**两端都在本簇**的边（站↔客户、客户↔客户），并显式禁掉
+//       - 站↔站 trunk（即使两端同簇：站间腿是快车的活）；
+//       - 仓↔站 / 仓↔客户（仓库 sub=0 不属于任何簇）。
+//
+// 为什么必须在这一层做，而不是在各处零散判断：路径搜索的入口有六处
+// （代价矩阵 / 展平 / 腿估计 / 归位 / 重规划 / 插单），任何一处漏判都会让慢车
+// 「从另一个入口」跑出簇；口径一漂，静态审计与动态执行就会互相矛盾。
+// 这里把「角色 → 簇」只算一次（reachScopeOf），「边能不能走」只判一次
+// （reachAllowsEdge），所有入口都调这两个函数。
+struct ReachScope {
+    bool             slow = false;   // false = 快车（不限边）
+    std::vector<int> clusters;       // 慢车守的簇（通常 1 个；慢车数 < 簇数时多簇，仍只放同簇边）
+    // 出生点不在本簇（旧配置 / 夹具）⇒ 断路的前提不成立，慢车退回「不限边」的旧口径。
+    // 默认数据（慢车出生在本簇站）恒为 false；调用方据此在日志里点名，不静默放开。
+    bool             legacyStart = false;
+};
+
+// 车辆 -> 可达范围。角色判据与职责表**同一份**（relayVehicleIndex / slowVehicleOfCluster），
+// 不硬编码车号；簇列表由「簇 ID 升序 × 慢车 ID 升序逐位配对」反查得出。
+// 既不是快车、也没配对到任何簇的慢车 ⇒ clusters 为空 ⇒ 任何边都不许走
+// （它本来也不该有活；空车 planRoute 原地不动，不会伪造行驶）。
+ReachScope reachScopeOf(const LogisticsGraph& graph, const std::vector<Vehicle>& vehicles,
+                        std::size_t vehicleIndex);
+// 车队 -> 每车一份（下标与 vehicles 对齐）。车队层唯一取用入口。
+std::vector<ReachScope> reachScopesOf(const LogisticsGraph& graph,
+                                      const std::vector<Vehicle>& vehicles);
+
+// 一条**有向**边对这台车是否开放（判据见上）。端点不存在 ⇒ 不开放（不伪造）。
+bool reachAllowsEdge(const LogisticsGraph& graph, const ReachScope& scope,
+                     const std::string& fromId, const std::string& toId);
+
+// 慢车越簇审计（规格七 #63 的守卫读法）：逐车检查慢车是否出现在别簇节点 / 跨簇边 /
+// 仓库边 / 站间边上。读的是**计划里的节点序列**（= 用户在地图与车辆表上看到的路线），
+// 不重算路径、不读内部中间量。
+// 返回空 = 全部合规；每条违规点名车辆、边/节点与原因。
+struct SlowIsolationViolation {
+    std::string vehicleId;
+    std::string kind;    // node-outside-cluster / cross-cluster-edge / trunk-edge / warehouse-edge
+    std::string detail;  // 可读说明（含节点/边）
+};
+// visited（可选、逐车）= 车辆**已经走过**的节点序列（界面逐帧审计传它：计划会被换掉，
+// 走过的路不会）。为空 = 只审计计划里的节点序列。
+std::vector<SlowIsolationViolation> auditSlowIsolation(
+    const LogisticsGraph& graph, const std::vector<Vehicle>& vehicles,
+    const std::vector<RoutePlan>& plans,
+    const std::vector<std::vector<std::string> >* visited = nullptr);
+
 // 从车辆起始仓库出发、按其发车时刻规划，服务完全部订单后返回该仓库。
+// reach 非空 ⇒ 该车的边准入（慢车物理断路）；为空 = 不限制（单车入口/单元测试的旧口径，
+// 车队层一律传 reachScopesOf 的结果，见 planFleet / rescheduleFleet）。
 RoutePlan planRoute(const LogisticsGraph& graph,
                     const Vehicle& vehicle,
                     const std::vector<Order>& orders,
-                    WeightType weight);
+                    WeightType weight,
+                    const ReachScope* reach = nullptr);
 
 // ---- 类型感知分配（规格二 §4 / #40）：日志与度量类型 ----
 
@@ -559,7 +616,8 @@ RoutePlan replan(const LogisticsGraph& graph,
                  WeightType weight,
                  const std::vector<OnboardItem>& onboard = std::vector<OnboardItem>(),
                  const StashState& stash = StashState(),
-                 bool allowOffload = true);
+                 bool allowOffload = true,
+                 const ReachScope* reach = nullptr);
 
 struct InsertResult {
     RoutePlan   plan;
@@ -586,7 +644,8 @@ InsertResult insertOrder(const LogisticsGraph& graph,
                           WeightType weight,
                           const std::vector<OnboardItem>& onboard
                               = std::vector<OnboardItem>(),
-                          const StashState& stash = StashState());
+                          const StashState& stash = StashState(),
+                          const ReachScope* reach = nullptr);
 
 // ===========================================================================
 // 动态事件复调度（规格二 §6 / #27）
@@ -688,7 +747,8 @@ LocalReplanOutcome localReplanTwoVersion(const LogisticsGraph& graph, const Vehi
                                          const std::string& startNodeId, int startTimeMin,
                                          WeightType weight,
                                          const std::vector<OnboardItem>& onboard,
-                                         const StashState& stash);
+                                         const StashState& stash,
+                                         const ReachScope* reach = nullptr);
 
 // §6.5 受影响车集合（路况）：存在被改动的边 e 使「e 在该车剩余路线上（有向、相邻两站）」
 // 且 e.increaseRatio >= thresholdRatio。返回车辆**行下标**升序。
@@ -775,7 +835,9 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
                             // 回报本次是否用了「顺序不变版重放」（false = 退回全量）
                             bool* usedIncremental = nullptr,
                             // 与 replan 一致：跨重规划保住中转站暂存货
-                            const StashState& stash = StashState());
+                            const StashState& stash = StashState(),
+                            // 与 replan 一致：慢车物理断路的边准入
+                            const ReachScope* reach = nullptr);
 
 // 判断某条有向边是否落在给定路线序列的**相邻两站**之间。
 // GUI 的路径高亮与路况重规划的触发判定共用这一条逻辑。

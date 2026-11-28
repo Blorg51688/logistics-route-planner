@@ -10,7 +10,8 @@ namespace logistics {
 // 距离 / 等待 / penalty 均不乘；图表示继续显示基础边权。
 struct Vehicle {
     std::string id;
-    std::string startNodeId;          // 起始仓库 ID
+    // 起始节点 ID：快车 = 起始仓库；慢车 = 本簇中转站（规格七 #63：慢车出生在自己簇里）。
+    std::string startNodeId;
     double      capacityKg = 0.0;     // 载重上限
     int         departTimeMin = 0;    // 发车时刻，相对当日 00:00 的分钟数
     double      timeFactor = 1.0;     // 耗时倍率（> 1 = 更慢）

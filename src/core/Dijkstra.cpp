@@ -17,6 +17,14 @@ PathResult shortestPath(const LogisticsGraph& graph,
                         const std::string& sourceId,
                         const std::string& targetId,
                         WeightType weight) {
+    return shortestPath(graph, sourceId, targetId, weight, EdgeAllowed());
+}
+
+PathResult shortestPath(const LogisticsGraph& graph,
+                        const std::string& sourceId,
+                        const std::string& targetId,
+                        WeightType weight,
+                        const EdgeAllowed& allowEdge) {
     PathResult result;
 
     const int source = graph.indexOf(sourceId);
@@ -50,6 +58,12 @@ PathResult shortestPath(const LogisticsGraph& graph,
         }
 
         for (const Edge& edge : adjacency[static_cast<std::size_t>(current)]) {
+            // 边准入（规格七 #63）：被本车禁行的边**视同不存在**。
+            // 过滤只在这一处发生（松弛点）——调用方要给的是策略，不是另一份搜索。
+            if (allowEdge
+                && !allowEdge(graph.nodes()[static_cast<std::size_t>(current)].id, edge.toId)) {
+                continue;
+            }
             // 节点数很小（30 量级），线性查找下标足够；不为此引入额外的索引结构
             const int next = graph.indexOf(edge.toId);
             if (next < 0) {
