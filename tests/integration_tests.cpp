@@ -635,9 +635,11 @@ void checkDefaultTransitNotTriggered(const Config& cfg, const FleetPlan& byDista
     // 快车 -> 对簇慢车）。它和「跨车转运层」不是同一层：前者由接力层按职责表构造，
     // 后者是 §5 的三判据打分。所以这里分两件事核：
     //   · 转运层本身：**一行候选都不接受**（日志里只有判据①退役那一句）；
-    //   · 接力账本：距离/时间策略 12 笔（12 张跨簇单全部走完三段腿）、成本策略 0 笔
-    //     （它走国道把到手时刻推过 12h，链条接不住 ⇒ 全部诚实降级，见 P44）。
-    const std::size_t kExpectRelayLedger[3] = {12, 0, 12};
+    //   · 接力账本：距离/时间策略 12 笔（12 张跨簇单全部走完三段腿）；成本策略 **5 笔**
+    //     （规格八 #65 第八轮实测：L2 走国道 17:12/19:42 到站，V03 在 T02 的取货档期
+    //      被 1->2 与 2->3 两条走廊共用一个位置 ⇒ O25 排不进去、custody 断，其余同档位
+    //      的单连带降级。这是**当前架构的边界**，P47「多班次 L3」落地后必须同步改写）。
+    const std::size_t kExpectRelayLedger[3] = {12, 5, 12};
     for (int i = 0; i < 3; ++i) {
         check(fleets[i]->transitLegs.size() == kExpectRelayLedger[i],
               std::string(labels[i]) + "：接力账本笔数应为 "

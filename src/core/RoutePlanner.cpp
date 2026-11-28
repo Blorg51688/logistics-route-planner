@@ -554,13 +554,18 @@ bool replay(const Ctx& ctx, const std::vector<StopSpec>& specs, bool detail, Eva
         //   · 货在**过去**（raw > ready）：货物在站停留最多 kTransferMaxDwellMin。
         // 等待只进 elapsed（⇒ 计入该车耗时、完工耗时），**不进 penalty**：penalty 逐单
         // 只由送达窗口决定（下面那段一行不动），否则等待会冤枉客户。
+        // ---- 主场待命豁免（规格八 §5.14 / #65）----
+        // 车辆在**自己的出生点**上等货不算「在途中等货」：车 08:00 就激活，没活就停在本簇
+        // 中转站里待命，这时来单它立刻就能取 —— 这与「开到站上再干等」是两件事。所以停车
+        // == 出发点的这次停靠，就绪等待不计入 W 上限（dwell 方向**不豁免**：货压站仍然要管）。
+        const bool homeWait = (s.nodeId == ctx.startPos && ctx.onboard.empty());
         for (const std::string& oid : s.transitPickups) {
             const int ready = ctx.readyTimeOf(oid, s.nodeId);
             if (ready < 0) {
                 continue;
             }
             const double need = static_cast<double>(ready) - raw;
-            if (need > static_cast<double>(kLookaheadWindowMin) + kEps) {
+            if (!homeWait && need > static_cast<double>(kLookaheadWindowMin) + kEps) {
                 out.reason = "在 " + s.nodeId + " 等订单 " + oid + " 就绪需 "
                              + std::to_string(static_cast<int>(std::lround(need)))
                              + "min，超出前瞻窗口 " + std::to_string(kLookaheadWindowMin)
@@ -5918,11 +5923,22 @@ bool relayStripFromVehicle(RelayWork& w, std::size_t v, const std::string& order
     removeOrderFromRoute(specs, orderId);
     RoutePlan plan;
     if (!finishSpecs((*w.ctxs)[v], specs, plan)) {
-        if (logFailure) {
-            w.log.push_back("[接力] 订单 " + orderId + " 从车 " + (*w.vehicles)[v].id
-                            + " 摘除后路线不可行（" + plan.reason + "）");
+        // 规格八 #65：拆链时**不能用仍在链上的其它单的 readyAt 挡路**。
+        // 典型：V03 在 T02 同一次停靠既卸入 2->3 的货、又取走 1->2 的货
+        //（preferCrossDock），合并停靠要等最晚那笔的 readyAt（实测 1182min）；
+        // 把 2->3 的某单摘掉后快车重放仍看到「T02 等它 394min > W」⇒ strip 失败
+        // ⇒ 该单转运动作残留、降级直达又追加取送 ⇒ 同一单既转运又直达。
+        // 拆链是撤销交接，不是新建交接；用一份**清空 readyAt** 的上下文副本重放。
+        // 判据没放宽：正常建链一律走原 ctx，只有拆链这一条路径用副本。
+        Ctx stripped = (*w.ctxs)[v];
+        stripped.readyAt.clear();
+        if (!finishSpecs(stripped, specs, plan)) {
+            if (logFailure) {
+                w.log.push_back("[接力] 订单 " + orderId + " 从车 " + (*w.vehicles)[v].id
+                                + " 摘除后路线不可行（" + plan.reason + "）");
+            }
+            return false;
         }
-        return false;
     }
     w.plans[v] = plan;
     return true;
