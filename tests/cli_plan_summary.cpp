@@ -1412,6 +1412,109 @@ void checkIdleHomingRows(const std::string& appPath) {
                 homeKm["V04"]);
 }
 
+// ---- 规格七 #63：慢车物理断路的**静态**守卫（读 --plan-summary 的 ROUTE 行）----
+//
+// 判据在测试里**独立实现**（不复用规划器的 reachAllowsEdge / auditSlowIsolation）：
+// 这样把断路谓词改成「一律放行」时，这条守卫必须立刻变红 —— 反向验证才算数。
+// 读的对象是用户看得见的那四行「路线 <VID> ...」，不重算任何路径。
+// 单条慢车路线是否合规（纯判据，便于「植入违规必须被抓住」的自证）。
+bool slowRouteIsolated(const logistics::Config& cfg, std::size_t vi,
+                       const std::vector<std::string>& nodes, std::string& why) {
+    why.clear();
+    if (nodes.empty()) {
+        why = "路线为空";
+        return false;
+    }
+    const logistics::Node* home = cfg.graph.findNode(
+        logistics::homeNodeOf(cfg.graph, cfg.vehicles, vi));
+    const int cluster = (home != nullptr && home->type != logistics::NodeType::Warehouse)
+                            ? home->subNetworkId
+                            : 0;
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+        const logistics::Node* n = cfg.graph.findNode(nodes[i]);
+        if (n == nullptr) {
+            why = "节点不存在 " + nodes[i];
+            return false;
+        }
+        if (n->type == logistics::NodeType::Warehouse) {
+            why = "慢车出现在仓库 " + nodes[i];
+            return false;
+        }
+        if (cluster > 0 && n->subNetworkId != cluster) {
+            why = "慢车出现在别簇节点 " + nodes[i] + "（本簇 " + std::to_string(cluster)
+                  + "，该节点 " + std::to_string(n->subNetworkId) + "）";
+            return false;
+        }
+        if (i == 0) {
+            continue;
+        }
+        const logistics::Node* prev = cfg.graph.findNode(nodes[i - 1]);
+        if (prev == nullptr || prev->id == n->id) {
+            continue;
+        }
+        if (prev->type == logistics::NodeType::Transit && n->type == logistics::NodeType::Transit) {
+            why = "慢车走站间高速 " + prev->id + " -> " + n->id;
+            return false;
+        }
+        if (prev->subNetworkId != n->subNetworkId) {
+            why = "慢车走跨簇边 " + prev->id + " -> " + n->id;
+            return false;
+        }
+    }
+    return true;
+}
+
+void checkSlowIsolationRoutes(const logistics::Config& cfg,
+                              const std::vector<std::string>& lines, int vehicleCount,
+                              const std::string& tag) {
+    const std::vector<bool> fast = logistics::fastVehicleFlags(cfg.vehicles);
+    // ---- 自证（反向验证的常驻形态）：把**截图里那种越界路线**喂给同一判据，必须被抓住。
+    // 判据一旦退化成「恒 true」，下面三段立刻红 —— 静态守卫因此不是空断言。
+    {
+        std::string why;
+        const std::vector<std::string> crossTrunk{"T01", "T02", "D08"};
+        const std::vector<std::string> atDepot{"W01", "D08", "T01"};
+        const std::vector<std::string> otherCluster{"T01", "D08", "D18"};
+        check(!slowRouteIsolated(cfg, 1, crossTrunk, why),
+              tag + "·#63 自证：慢车走站间高速必须被抓住（实际判合规）");
+        check(!slowRouteIsolated(cfg, 1, atDepot, why),
+              tag + "·#63 自证：慢车出现在仓库必须被抓住（实际判合规）");
+        check(!slowRouteIsolated(cfg, 1, otherCluster, why),
+              tag + "·#63 自证：慢车走跨簇边必须被抓住（实际判合规）");
+        const std::vector<std::string> selfOnly{"T01", "D08", "T01"};
+        check(slowRouteIsolated(cfg, 1, selfOnly, why),
+              tag + "·#63 自证：慢车只在本簇内跑应判合规（实际判违规：" + why + "）");
+    }
+    for (int vi = 0; vi < vehicleCount; ++vi) {
+        const bool isFast = (vi < static_cast<int>(fast.size())) && fast[static_cast<std::size_t>(vi)];
+        if (isFast) {
+            continue;   // 快车本来就该跨簇
+        }
+        const logistics::Vehicle& vehicle = cfg.vehicles[static_cast<std::size_t>(vi)];
+        const std::string want = "路线 " + vehicle.id;
+        const std::string& line = lines[static_cast<std::size_t>(3 + vehicleCount + vi)];
+        if (line.rfind(want + " ", 0) != 0) {
+            check(false, tag + "·#63 慢车 " + vehicle.id + " 的路线行应以「" + want + " 」开头");
+            continue;
+        }
+        const std::string body = line.substr(want.size() + 1);
+        std::vector<std::string> nodes;
+        std::size_t pos = 0;
+        while (pos < body.size()) {
+            const std::size_t sp = body.find(' ', pos);
+            nodes.push_back(body.substr(pos, sp == std::string::npos ? std::string::npos : sp - pos));
+            if (sp == std::string::npos) {
+                break;
+            }
+            pos = sp + 1;
+        }
+        std::string why;
+        const bool ok = slowRouteIsolated(cfg, static_cast<std::size_t>(vi), nodes, why);
+        check(ok, tag + "·#63 慢车 " + vehicle.id + " 的路线节点与边全在本簇"
+                       + (why.empty() ? std::string() : "（" + why + "）"));
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::printf("用法: cli_plan_summary <app 路径> <策略|all>\n");
@@ -1544,6 +1647,11 @@ int main(int argc, char** argv) {
                     check(false, tag + "·G1 路线行节点之间用单个空格分隔");
                 }
             }
+        }
+
+        // ---- 规格七 #63 静态守卫：慢车路线节点/边全在本簇（读 ROUTE 行）----
+        if (lines.size() >= static_cast<std::size_t>(3 + 2 * vehicleCount)) {
+            checkSlowIsolationRoutes(cfg, lines, vehicleCount, tag);
         }
 
         // ---- G2：**123 个常量**（车队 13×3 + 每车 7×4×3，§7.2 容差）----

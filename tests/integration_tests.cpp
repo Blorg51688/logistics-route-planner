@@ -17,6 +17,7 @@
 using logistics::Config;
 using logistics::LogisticsGraph;
 using logistics::ConfigLoader;
+using logistics::NodeType;
 using logistics::PlanStatus;
 using logistics::RoutePlan;
 using logistics::Vehicle;
@@ -129,10 +130,18 @@ void checkPlanInvariants(const Config& cfg, const Vehicle& vehicle,
     check(stopFlags == plan.stops.size(), tag + "停靠标记的 true 数 = stops 数（展平视图与真源一致）");
 
     // 单条连续路线：仓库只作为首个停靠出现（起点就地取货），中途不得回仓装货。
+    // 规格七 #63：这条判据只对**从仓库出发**的车有意义（默认数据里只剩快车 V01）；
+    // 慢车出生在本簇中转站，它在站上多次停靠是正常的（L1 卸入 / L3 取走 / 回站待命），
+    // 不是「回仓装货」。
+    const logistics::Node* startNode = cfg.graph.findNode(vehicle.startNodeId);
+    const bool startsAtWarehouse =
+        (startNode != nullptr && startNode->type == NodeType::Warehouse);
     bool depotOnce = true;
-    for (std::size_t i = 0; i < plan.stops.size(); ++i) {
-        if (plan.stops[i].nodeId == vehicle.startNodeId) {
-            depotOnce = false;
+    if (startsAtWarehouse) {
+        for (std::size_t i = 0; i < plan.stops.size(); ++i) {
+            if (plan.stops[i].nodeId == vehicle.startNodeId) {
+                depotOnce = false;
+            }
         }
     }
     check(depotOnce, tag + "中途不停靠仓库（单条连续路线，仓库装货语义已退役）");
@@ -1172,8 +1181,18 @@ void checkAllocationInvariants(const Config& cfg, const FleetPlan* fleets[3],
             // 规格五 #57：末节点 = 该车**主场**（慢车本簇中转站 / 快车起始仓库）。
             check(plan.nodes.back() == homeNodeOf(cfg.graph, cfg.vehicles, v),
                   tag + cfg.vehicles[v].id + " 跑完后回到主场");
+            // 规格七 #63：慢车出生在本簇中转站后，**第一次停靠就可能落在出生站上**
+            // （在站里等 L2 把货送到）。展平视图对「原地停靠」写的是那次停靠的时刻
+            // ⇒ 首节点到达 = 停靠时刻（≥ depart_time），而不是发车时刻本身。
+            const bool firstStopAtStart = !plan.stops.empty()
+                                          && plan.stops.front().nodeId
+                                                 == cfg.vehicles[v].startNodeId;
+            const int firstArrival =
+                plan.nodeArrivalMin.empty() ? -1 : plan.nodeArrivalMin.front();
             check(!plan.nodeArrivalMin.empty()
-                      && plan.nodeArrivalMin.front() == cfg.vehicles[v].departTimeMin,
+                      && (firstStopAtStart
+                              ? (firstArrival >= cfg.vehicles[v].departTimeMin)
+                              : (firstArrival == cfg.vehicles[v].departTimeMin)),
                   tag + cfg.vehicles[v].id + " 按自己的 depart_time 出发");
             // 规格六 #60：**跨簇单**在接力下由两台慢车 + 快车分段执行，所以这台的
             // 「动作数 = 2 × 分配单数」只对**不参与接力**的车逐字成立；参与接力的车

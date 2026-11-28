@@ -94,7 +94,9 @@ struct CostMatrix {
     std::vector<double>                timeBy[3];
     std::vector<double>                costBy[3];
 
-    void build(const LogisticsGraph& graph) {
+    // scope = 该车的边准入（规格七 #63 慢车物理断路）。矩阵是**逐车**的，
+    // 所以「不可达」在这里就是「这台车走不到」，与执行期的展平/腿估计同一判据。
+    void build(const LogisticsGraph& graph, const ReachScope& scope = ReachScope()) {
         ids.clear();
         index.clear();
         for (const Node& n : graph.nodes()) {
@@ -108,10 +110,17 @@ struct CostMatrix {
             timeBy[w].assign(v * v, -1.0);
             costBy[w].assign(v * v, -1.0);
         }
+        // 快车（scope.slow == false）不传谓词：既有口径逐字不变（也不多一次函数调用）。
+        EdgeAllowed allow;
+        if (scope.slow) {
+            allow = [&graph, &scope](const std::string& from, const std::string& to) {
+                return reachAllowsEdge(graph, scope, from, to);
+            };
+        }
         for (std::size_t i = 0; i < v; ++i) {
             for (std::size_t j = 0; j < v; ++j) {
                 for (int w = 0; w < 3; ++w) {
-                    const PathResult r = shortestPath(graph, ids[i], ids[j], weights[w]);
+                    const PathResult r = shortestPath(graph, ids[i], ids[j], weights[w], allow);
                     if (!r.found) {
                         continue;   // 保持负数：不可达
                     }
@@ -335,6 +344,9 @@ struct Ctx {
     Vehicle               vehicle;
     WeightType            weight = WeightType::Distance;
     CostMatrix            matrix;
+    // 该车的边准入（规格七 #63）：矩阵与展平都由它过滤，**一次构造内不变**。
+    // 默认值 = 快车（不限边），只有车队层显式传 reachScopeOf 时才收紧。
+    ReachScope            reach;
     std::string           startPos;
     int                   startTimeMin = 0;
     double                initialLoadKg = 0.0;
@@ -2406,6 +2418,19 @@ bool buildAll(const Ctx& ctx, Outcome& out, bool multiStart, bool allowOffload) 
     return false;
 }
 
+// 按该车的边准入求最短路（规格七 #63）。快车直通（不装谓词），慢车只走本簇边。
+// 这是「展平 / 归位 / 腿估计」共用的唯一包装：这些入口不给每个调用点各判一遍边类型。
+PathResult scopePath(const LogisticsGraph& graph, const ReachScope& scope,
+                     const std::string& from, const std::string& to, WeightType weight) {
+    if (!scope.slow) {
+        return shortestPath(graph, from, to, weight);
+    }
+    return shortestPath(graph, from, to, weight,
+                        [&graph, &scope](const std::string& a, const std::string& b) {
+                            return reachAllowsEdge(graph, scope, a, b);
+                        });
+}
+
 // 把构造结果落成 RoutePlan：一次展平 nodes / nodeArrivalMin / nodeIsStop / stops / offloads。
 void finalize(const Ctx& ctx, const Outcome& out, RoutePlan& plan) {
     plan = RoutePlan();
@@ -2454,7 +2479,7 @@ void finalize(const Ctx& ctx, const Outcome& out, RoutePlan& plan) {
     double elapsed = static_cast<double>(ctx.startTimeMin);
     for (const Stop& s : plan.stops) {
         if (pos != s.nodeId) {
-            const PathResult path = shortestPath(*ctx.graph, pos, s.nodeId, ctx.weight);
+            const PathResult path = scopePath(*ctx.graph, ctx.reach, pos, s.nodeId, ctx.weight);
             if (!path.found) {
                 plan.status = PlanStatus::Unreachable;
                 plan.reason = "无法从 " + pos + " 到达 " + s.nodeId;
@@ -2493,7 +2518,7 @@ void finalize(const Ctx& ctx, const Outcome& out, RoutePlan& plan) {
     // 回仓库。
     if (pos != ctx.vehicle.startNodeId) {
         const PathResult path =
-            shortestPath(*ctx.graph, pos, ctx.vehicle.startNodeId, ctx.weight);
+            scopePath(*ctx.graph, ctx.reach, pos, ctx.vehicle.startNodeId, ctx.weight);
         if (!path.found) {
             plan.status = PlanStatus::Unreachable;
             plan.reason = "无法从 " + pos + " 返回仓库";
@@ -2618,7 +2643,13 @@ void finalize(const Ctx& ctx, const Outcome& out, RoutePlan& plan) {
         om.penaltyMin = om.late ? (om.deliveryArrivalMin - om.windowEndMin) : 0;
         om.deliveryOnTime = !om.late;
         // 取货准时：取到货的那一刻，即使立刻直达也还赶得上窗口。
-        const double abBase = ctx.matrix.shortestTime(r.pickup, r.delivery);
+        //
+        // 这里问的是「**假设**这台车拿到货就直奔 B」要多久 —— 它是**参照量**，不是
+        // 这台车真能开的路（规格七 #63 之后慢车的 A->B 可能整条都是断路）。所以
+        // 参照必须按**基础图**算：矩阵是逐车过滤过的，拿它算会把慢车的跨簇单判成
+        // 「A->B 不可达 ⇒ 必准时」，两率随即虚高（oracle 对拍会立刻发现）。
+        const PathResult abRef = shortestPath(*ctx.graph, r.pickup, r.delivery, WeightType::Time);
+        const double abBase = abRef.found ? abRef.totalWeight : -1.0;
         const double abScaled = (abBase < 0.0) ? 0.0 : abBase * ctx.vehicle.timeFactor;
         om.pickupOnTime =
             (static_cast<double>(om.pickupArrivalMin) + abScaled
@@ -2660,7 +2691,7 @@ void finalize(const Ctx& ctx, const Outcome& out, RoutePlan& plan) {
 bool makeCtx(const LogisticsGraph& graph, const Vehicle& vehicle,
              const std::vector<Order>& orders, const std::string& startPos, int startTimeMin,
              WeightType weight, const std::vector<OnboardItem>& onboard, const StashState& stash,
-             Ctx& ctx, std::string& reason) {
+             Ctx& ctx, std::string& reason, const ReachScope* reach = nullptr) {
     ctx = Ctx();
     ctx.graph = &graph;
     ctx.vehicle = vehicle;
@@ -2670,7 +2701,10 @@ bool makeCtx(const LogisticsGraph& graph, const Vehicle& vehicle,
     ctx.capacityKg = vehicle.capacityKg;
     ctx.onboard = onboard;
     ctx.stashStation = stash.station;
-    ctx.matrix.build(graph);
+    if (reach != nullptr) {
+        ctx.reach = *reach;
+    }
+    ctx.matrix.build(graph, ctx.reach);
 
     if (!ctx.matrix.known(startPos)) {
         reason = "出发位置不存在: " + startPos;
@@ -2782,12 +2816,13 @@ RoutePlan replan(const LogisticsGraph& graph,
                  WeightType weight,
                  const std::vector<OnboardItem>& onboard,
                  const StashState& stash,
-                 bool allowOffload) {
+                 bool allowOffload,
+                 const ReachScope* reach) {
     RoutePlan plan;
     Ctx ctx;
     std::string reason;
     if (!makeCtx(graph, vehicle, remainingOrders, currentPositionId, currentTimeMin, weight,
-                 onboard, stash, ctx, reason)) {
+                 onboard, stash, ctx, reason, reach)) {
         plan.status = (reason.find("超过载重上限") != std::string::npos)
                           ? PlanStatus::OrderExceedsCapacity
                           : PlanStatus::Unreachable;
@@ -2816,9 +2851,10 @@ RoutePlan replan(const LogisticsGraph& graph,
 RoutePlan planRoute(const LogisticsGraph& graph,
                     const Vehicle& vehicle,
                     const std::vector<Order>& orders,
-                    WeightType weight) {
+                    WeightType weight,
+                    const ReachScope* reach) {
     return replan(graph, vehicle, orders, vehicle.startNodeId, vehicle.departTimeMin, weight,
-                  std::vector<OnboardItem>(), StashState());
+                  std::vector<OnboardItem>(), StashState(), true, reach);
 }
 
 // ---- 类型感知分配的公共小件（规格二 §4 / #40）----
@@ -3224,9 +3260,12 @@ FleetPlan planFleetSequentialBaseline(const LogisticsGraph& graph,
     for (std::size_t i = 0; i < orderIndex.size(); ++i) {
         assigned[i % k].push_back(orders[orderIndex[i]]);
     }
+    // 对照组也遵守**物理断路**（规格七 #63）：慢车走不到别簇的单，就如实判该车不可行。
+    // 不这样做的话，基线会靠"让慢车越界"跑出好看的数字，与正式入口的比较失去意义。
+    const std::vector<ReachScope> scopes = reachScopesOf(graph, vehicles);
     std::vector<RoutePlan> plans(k);
     for (std::size_t v = 0; v < k; ++v) {
-        plans[v] = planRoute(graph, vehicles[v], assigned[v], weight);
+        plans[v] = planRoute(graph, vehicles[v], assigned[v], weight, &scopes[v]);
     }
     FleetPlan fleet = aggregateFleet(vehicles, plans);
     fillAllocationFields(fleet, graph, vehicles, orders, assigned);
@@ -3297,7 +3336,17 @@ double timeFactorOf(const std::vector<Vehicle>& vehicles, const std::string& veh
 // #48 有了接力执行后，用实际执行时刻覆盖 Leg::plannedArrivalMin，本函数只留给规划期。
 int legTravelMin(const LogisticsGraph& graph, const std::vector<Vehicle>& vehicles,
                  const std::string& vehicleId, const std::string& from, const std::string& to) {
-    const PathResult path = shortestPath(graph, from, to, WeightType::Time);
+    // 腿估计与真执行**同一判据**（规格七 #63）：慢车的 L1/L3 也只能在本簇内走，
+    // 否则「估计说能接力、执行时走不到」会变成一类新的假报。
+    std::size_t idx = vehicles.size();
+    for (std::size_t i = 0; i < vehicles.size(); ++i) {
+        if (vehicles[i].id == vehicleId) {
+            idx = i;
+        }
+    }
+    const ReachScope scope =
+        (idx < vehicles.size()) ? reachScopeOf(graph, vehicles, idx) : ReachScope();
+    const PathResult path = scopePath(graph, scope, from, to, WeightType::Time);
     if (!path.found) {
         return -1;
     }
@@ -3574,6 +3623,185 @@ std::string homeNodeOf(const LogisticsGraph& graph, const std::vector<Vehicle>& 
     return vehicles[vehicleIndex].startNodeId;
 }
 
+// ---- 慢车物理断路（规格七 #5.15 / #63）：角色 -> 可达范围 ----
+ReachScope reachScopeOf(const LogisticsGraph& graph, const std::vector<Vehicle>& vehicles,
+                        std::size_t vehicleIndex) {
+    ReachScope scope;
+    if (vehicles.empty() || vehicleIndex >= vehicles.size()) {
+        return scope;
+    }
+    // 角色判据与职责表**同一份**：快车 = relayVehicleIndex，其余全是慢车。
+    scope.slow = (vehicleIndex != relayVehicleIndex(vehicles));
+    if (!scope.slow) {
+        return scope;
+    }
+    // 慢车守哪些簇：簇 ID 升序 × 慢车 ID 升序逐位配对的**反查**（slowVehicleOfCluster 唯一实现）。
+    // 慢车数 < 簇数时一台慢车守多簇：簇列表都收下，但边准入仍要求**两端同簇**，
+    // 所以它也不可能「在两簇之间穿行」——只会得到一张不可行的计划（如实拒绝）。
+    const std::vector<int> clusters = clusterIdsSorted(graph);
+    for (std::size_t i = 0; i < clusters.size(); ++i) {
+        if (slowVehicleOfCluster(graph, vehicles, clusters[i]) != vehicleIndex) {
+            continue;
+        }
+        bool seen = false;
+        for (std::size_t k = 0; k < scope.clusters.size(); ++k) {
+            if (scope.clusters[k] == clusters[i]) {
+                seen = true;
+            }
+        }
+        if (!seen) {
+            scope.clusters.push_back(clusters[i]);
+        }
+    }
+    // 无簇数据（全部 sub_network_id = 0 的历史夹具）：『跨簇』无从表达，断路没有意义。
+    // 这时退回「不限边」，并在 scope 里如实标记（不是偷偷放宽：这种图上根本没有第二个簇）。
+    if (clusters.empty()) {
+        scope.slow = false;
+        return scope;
+    }
+    // 断路的前提（规格七 #63 §A）：慢车**出生在本簇中转站**。数据不满足这个前提时
+    // （旧配置 / 单元测试夹具：慢车从仓库或别处出发），断路无从建立 —— 那种车上路的第一步
+    // 就已经在簇外，硬套只会让整台车一步也动不了。这时按旧口径（不限边）执行，
+    // 并把 legacyStart 交给调用方**点名**（不静默：planFleet / rescheduleFleet 会写日志）。
+    // 默认数据（config/default.ini：V02->T01 / V03->T02 / V04->T03）满足前提，这条永不触发。
+    const Node* start = graph.findNode(vehicles[vehicleIndex].startNodeId);
+    bool startInCluster = false;
+    if (start != nullptr) {
+        for (std::size_t i = 0; i < clusters.size(); ++i) {
+            if (start->subNetworkId == clusters[i]) {
+                startInCluster = true;
+            }
+        }
+    }
+    if (!startInCluster) {
+        scope.slow = false;
+        scope.legacyStart = true;
+    }
+    return scope;
+}
+
+std::vector<ReachScope> reachScopesOf(const LogisticsGraph& graph,
+                                      const std::vector<Vehicle>& vehicles) {
+    std::vector<ReachScope> scopes(vehicles.size());
+    for (std::size_t v = 0; v < vehicles.size(); ++v) {
+        scopes[v] = reachScopeOf(graph, vehicles, v);
+    }
+    return scopes;
+}
+
+bool reachAllowsEdge(const LogisticsGraph& graph, const ReachScope& scope,
+                     const std::string& fromId, const std::string& toId) {
+    if (!scope.slow) {
+        return true;   // 快车：高速 + 国道 + 城内，全部开放
+    }
+    const Node* a = graph.findNode(fromId);
+    const Node* b = graph.findNode(toId);
+    if (a == nullptr || b == nullptr) {
+        return false;
+    }
+    // 站↔站 trunk：慢车不走（即使两端同簇 —— 站间腿是快车的活）。
+    if (a->type == NodeType::Transit && b->type == NodeType::Transit) {
+        return false;
+    }
+    // 仓库边（仓↔站 / 仓↔客户）：仓库 sub_network_id = 0，不属于任何簇 ⇒ 一律断路
+    // （用户的原话：「更不可能看到慢车出现在仓库」）。显式禁掉，免得哪天给仓库也发一个
+    // 簇号时这条边界悄悄放宽。「慢车从仓库出发」的旧数据不在这里通融 —— 那种数据在
+    // reachScopeOf 里就判「断路前提不成立」（legacyStart），不会走到这里。
+    if (a->type == NodeType::Warehouse || b->type == NodeType::Warehouse) {
+        return false;
+    }
+    // 只允许**两端都在本簇**的边（站↔客户、客户↔客户）：跨簇客户↔客户国道也在这一步被否。
+    if (a->subNetworkId != b->subNetworkId) {
+        return false;
+    }
+    for (std::size_t i = 0; i < scope.clusters.size(); ++i) {
+        if (scope.clusters[i] == a->subNetworkId) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 慢车越簇审计（守卫读法）：**独立实现**，不调用 reachAllowsEdge / reachScopeOf ——
+// 否则把断路关掉时守卫会跟着一起放行，"反向验证"就变成自证。
+// 判据只用三样用户可见的事实：车辆角色（fastVehicleFlags）、计划节点序列、节点的
+// 类型与 sub_network_id。慢车的主场簇由 homeNodeOf 给出的站推出。
+std::vector<SlowIsolationViolation> auditSlowIsolation(
+    const LogisticsGraph& graph, const std::vector<Vehicle>& vehicles,
+    const std::vector<RoutePlan>& plans,
+    const std::vector<std::vector<std::string> >* visited) {
+    std::vector<SlowIsolationViolation> bad;
+    const std::vector<bool> fast = fastVehicleFlags(vehicles);
+    // 逐车检查一个**节点序列**：每个节点是否越簇，以及相邻两点之间那条边的形态。
+    // 计划节点序列与「已经走过的节点」共用这一份判据（两处不能各判一遍）。
+    const auto checkSequence = [&](std::size_t v, int homeCluster,
+                                   const std::vector<std::string>& seq) {
+        for (std::size_t i = 0; i < seq.size(); ++i) {
+            const Node* n = graph.findNode(seq[i]);
+            if (n == nullptr) {
+                continue;
+            }
+            if (n->type == NodeType::Warehouse) {
+                SlowIsolationViolation x;
+                x.vehicleId = vehicles[v].id;
+                x.kind = "warehouse-node";
+                x.detail = "慢车出现在仓库 " + n->id + "（仓↔站 / 仓↔客户 对慢车断路）";
+                bad.push_back(x);
+            } else if (homeCluster > 0 && n->subNetworkId != homeCluster) {
+                SlowIsolationViolation x;
+                x.vehicleId = vehicles[v].id;
+                x.kind = "node-outside-cluster";
+                x.detail = "慢车出现在别簇节点 " + n->id + "（本簇 " + std::to_string(homeCluster)
+                           + "，该节点 " + std::to_string(n->subNetworkId) + "）";
+                bad.push_back(x);
+            }
+            if (i == 0) {
+                continue;
+            }
+            const Node* prev = graph.findNode(seq[i - 1]);
+            if (prev == nullptr || prev->id == n->id) {
+                continue;   // 同点连续两次停靠：没有边
+            }
+            SlowIsolationViolation x;
+            x.vehicleId = vehicles[v].id;
+            if (prev->type == NodeType::Transit && n->type == NodeType::Transit) {
+                x.kind = "trunk-edge";
+                x.detail = "慢车走站间高速 " + prev->id + " -> " + n->id;
+                bad.push_back(x);
+            } else if (prev->type == NodeType::Warehouse || n->type == NodeType::Warehouse) {
+                x.kind = "warehouse-edge";
+                x.detail = "慢车走仓库边 " + prev->id + " -> " + n->id;
+                bad.push_back(x);
+            } else if (prev->subNetworkId != n->subNetworkId) {
+                x.kind = "cross-cluster-edge";
+                x.detail = "慢车走跨簇边 " + prev->id + " -> " + n->id + "（"
+                           + std::to_string(prev->subNetworkId) + " -> "
+                           + std::to_string(n->subNetworkId) + "）";
+                bad.push_back(x);
+            }
+        }
+    };
+    for (std::size_t v = 0; v < vehicles.size(); ++v) {
+        const bool isFast = (v < fast.size()) && fast[v];
+        if (isFast) {
+            continue;   // 快车本来就该跨簇
+        }
+        const std::string homeId = homeNodeOf(graph, vehicles, v);
+        const Node* home = homeId.empty() ? nullptr : graph.findNode(homeId);
+        // 主场簇：主场站点的 sub_network_id。主场缺失/是仓库（旧数据或夹具）⇒ 只查边形态。
+        const int homeCluster = (home != nullptr && home->type != NodeType::Warehouse)
+                                    ? home->subNetworkId
+                                    : 0;
+        if (v < plans.size() && plans[v].status == PlanStatus::Ok && !plans[v].nodes.empty()) {
+            checkSequence(v, homeCluster, plans[v].nodes);
+        }
+        if (visited != nullptr && v < visited->size()) {
+            checkSequence(v, homeCluster, (*visited)[v]);
+        }
+    }
+    return bad;
+}
+
 namespace {
 
 // 一条最短路的三项（距离不缩放、耗时 x timeFactor、成本 x costFactor，与 replay 同口径）。
@@ -3661,7 +3889,10 @@ void applyIdleHoming(const LogisticsGraph& graph, const std::vector<Vehicle>& ve
         double newTime = 0.0;
         double newCost = 0.0;
         if (from != home) {
-            const PathResult path = shortestPath(graph, from, home, weight);
+            // 归位也走该车的边准入（规格七 #63）：慢车归位 = 本簇内回到本站，
+            // 不可能「先跑一趟高速回仓再回来」。
+            const PathResult path =
+                scopePath(graph, reachScopeOf(graph, vehicles, v), from, home, weight);
             if (!sumPath(graph, vehicle, path, newDist, newTime, newCost)) {
                 if (log != nullptr) {
                     log->push_back("[归位] 车辆 " + vehicle.id + " 无法从 " + from + " 归位到 "
@@ -3676,7 +3907,9 @@ void applyIdleHoming(const LogisticsGraph& graph, const std::vector<Vehicle>& ve
 
         // 对照口径：若仍回起始仓库，末段多少公里（报告「归位省/多跑」用）。
         {
-            const PathResult back = shortestPath(graph, from, vehicle.startNodeId, weight);
+            const PathResult back =
+                scopePath(graph, reachScopeOf(graph, vehicles, v), from, vehicle.startNodeId,
+                          weight);
             double d = 0.0;
             double t = 0.0;
             double c = 0.0;
@@ -5030,13 +5263,15 @@ FleetTransitResult applyTransitLayer(const LogisticsGraph& graph,
             }
         }
     }
-    // 每车构造上下文（起点/在车货/暂存 + 全局订单表）。矩阵每车一份（与 planRoute 同口径）。
+    // 每车构造上下文（起点/在车货/暂存 + 全局订单表）。矩阵每车一份（与 planRoute 同口径），
+    // 边准入也每车一份（规格七 #63：转运候选不得让慢车跨簇）。
+    const std::vector<ReachScope> scopes = reachScopesOf(graph, vehicles);
     std::vector<Ctx> ctxs(vehicles.size());
     for (std::size_t v = 0; v < vehicles.size(); ++v) {
         std::string reason;
         if (!makeCtx(graph, vehicles[v], vehicleOrders[v], starts[v].startNodeId,
                      starts[v].startTimeMin, weight, starts[v].onboard, starts[v].stash, ctxs[v],
-                     reason)) {
+                     reason, &scopes[v])) {
             return result;
         }
         appendFleetOrders(ctxs[v], allOrders);
@@ -5944,10 +6179,37 @@ void relayTripStage1(RelayWork& w, CorridorTrip& trip) {
     // 和别的走廊的趟次共享路线，「远端最早」这种近视口径会为了早 100min 多绕 160km
     // （实测：T01->T03 的单为了早卸 100min 把车塞成 T01->T03->T02，多跑 160km）。
     // 卸入时刻的可用性由第三遍的 L3 锚定 + 收口复核兜底。
-    if (!buildRelayOnwardSpecs(ctxs[w.relayIdx], specsFromPlan(w.plans[w.relayIdx]),
+    bool l2Ok = buildRelayOnwardSpecs(ctxs[w.relayIdx], specsFromPlan(w.plans[w.relayIdx]),
                                trip.batchIds, trip.stationA, trip.stationB, true, true, l2Specs,
-                               haveL2, LegAnchor::KeyOnly)
-        || !haveL2) {
+                               haveL2, LegAnchor::KeyOnly);
+    if ((!l2Ok || !haveL2) && !trip.batchIds.empty()) {
+        // ---- 备用口径（规格七 #63 引入，理由见下） ----
+        //
+        // 第一遍喂给 L2 的就绪时刻是 L1 的「**最早**能到站」估计；而真正的卸入时刻由
+        // 第二遍锚定到 tA（快车在这个站的取走时刻）。慢车出生在本簇中转站之后，它 08:00
+        // 就能把货卸到站（实测 T02 615min），比快车到站（692min）早 77min ⇒ 按「货就等在
+        // 那」构造 L2 会判「货在站里干等 77min > 60min」，整趟走廊在**构造期**就被废掉，
+        // 而第二遍本可以把 L1 往后挪到贴着 tA（那才是真实计划）。
+        //
+        // 因此这里退一步：去掉这批单的就绪约束重建 L2（等价于「货什么时候到，由 L1 去锚」）。
+        // **判据一点没放宽**：第二遍会拿真正的 L1 时刻与 tA 再判两条窗口（早 60 / 晚 60），
+        // 超了就诚实降级；收口复核再核一次 custody。放宽的只是"候选搜索的起点"。
+        for (std::size_t k = 0; k < trip.orders.size(); ++k) {
+            if (trip.ok[k] == 0) {
+                continue;
+            }
+            ctxs[w.relayIdx].readyAt[trip.orders[k].id].erase(trip.stationA);
+        }
+        l2Specs.clear();
+        haveL2 = false;
+        l2Ok = buildRelayOnwardSpecs(ctxs[w.relayIdx], specsFromPlan(w.plans[w.relayIdx]),
+                                     trip.batchIds, trip.stationA, trip.stationB, true, true,
+                                     l2Specs, haveL2, LegAnchor::KeyOnly);
+        w.log.push_back("[接力] " + trip.stationA + " -> " + trip.stationB + " 的站间腿按"
+                        "「最早到站」口径构造不成（货等车超 " + std::to_string(kTransferMaxDwellMin)
+                        + "min），改用「L1 锚定后」口径重试");
+    }
+    if (!l2Ok || !haveL2) {
         relayDropTrip(w, trip,
                       "L2 站间腿不可行（就绪差超前瞻窗口 "
                           + std::to_string(kLookaheadWindowMin) + "min、站内停留超 "
@@ -6538,6 +6800,8 @@ static void relayLayerOnce(const LogisticsGraph& graph, const std::vector<Vehicl
 
     // 每车一份 Ctx（与 applyTransitLayer 同口径：仓库起点、发车时刻、车队全部订单入表——
     // 接送力的 kg/窗口查询要看得见别人的单）。
+    // 边准入每车一份（规格七 #63）：L1/L3 由本簇慢车执行 ⇒ 它们的路径搜索只能在本簇内。
+    const std::vector<ReachScope> scopes = reachScopesOf(graph, vehicles);
     std::vector<Ctx> ctxs(vehicles.size());
     for (std::size_t v = 0; v < vehicles.size(); ++v) {
         std::string reason;
@@ -6550,7 +6814,7 @@ static void relayLayerOnce(const LogisticsGraph& graph, const std::vector<Vehicl
             (starts != nullptr) ? (*starts)[v].onboard : std::vector<OnboardItem>();
         const StashState stash = (starts != nullptr) ? (*starts)[v].stash : StashState();
         if (!makeCtx(graph, vehicles[v], vehicleOrders[v], startPos, startTime, weight,
-                     onboard, stash, ctxs[v], reason)) {
+                     onboard, stash, ctxs[v], reason, &scopes[v])) {
             out.log.push_back("[接力] 跳过整层：车辆 " + vehicles[v].id + " 的上下文建不起来（"
                               + reason + "）");
             return;
@@ -7057,9 +7321,20 @@ FleetPlan planFleet(const LogisticsGraph& graph,
         }
     }
 
+    // 边准入每车一份（规格七 #63）：慢车只跑本簇边，快车不限。
+    // 静态计划因此**构造上**合规，不靠事后审计纠偏。
+    const std::vector<ReachScope> reachScopes = reachScopesOf(graph, vehicles);
+    for (std::size_t v = 0; v < k; ++v) {
+        if (reachScopes[v].legacyStart) {
+            fleet.allocationLog.push_back(
+                "慢车 " + vehicles[v].id + " 的出生点 " + vehicles[v].startNodeId
+                + " 不在本簇 ⇒ 慢车断路不成立（数据不合规：慢车应出生在本簇中转站，"
+                  "按旧口径不限边执行）");
+        }
+    }
     std::vector<RoutePlan> plans(k);
     for (std::size_t v = 0; v < k; ++v) {
-        plans[v] = planRoute(graph, vehicles[v], vehicleOrders[v], weight);
+        plans[v] = planRoute(graph, vehicles[v], vehicleOrders[v], weight, &reachScopes[v]);
     }
     int infeasibleVehicles = 0;
     for (std::size_t v = 0; v < k; ++v) {
@@ -7235,8 +7510,10 @@ InsertResult insertOrder(const LogisticsGraph& graph,
                           int currentTimeMin,
                           WeightType weight,
                           const std::vector<OnboardItem>& onboard,
-                          const StashState& stash) {
+                          const StashState& stash,
+                          const ReachScope* reach) {
     InsertResult result;
+    const ReachScope scope = (reach != nullptr) ? *reach : ReachScope();
 
     // urgent 标记**由调用方给出、本函数照用**（MC-B04 退役了「强制 urgent」）。
     // 紧急单 -> 紧急段尾插；普通单 -> 普通段 pair-insertion；两条链都在 replan 的构造器里。
@@ -7249,10 +7526,12 @@ InsertResult insertOrder(const LogisticsGraph& graph,
     if (inserted.pickupNodeId.empty()) {
         result.warning = "取送单 " + inserted.id + " 缺少取货点 A";
     } else {
-        const PathResult toA =
-            shortestPath(graph, currentPositionId, inserted.pickupNodeId, WeightType::Time);
+        // 可达性也按该车的边准入判（规格七 #63）：慢车看跨簇单就是「A 不可达」，
+        // 这正是物理断路对插单入口的表现（真实分配由复调度选车，不看这条提示）。
+        const PathResult toA = scopePath(graph, scope, currentPositionId,
+                                         inserted.pickupNodeId, WeightType::Time);
         const PathResult ab =
-            shortestPath(graph, inserted.pickupNodeId, inserted.nodeId, WeightType::Time);
+            scopePath(graph, scope, inserted.pickupNodeId, inserted.nodeId, WeightType::Time);
         if (!toA.found) {
             result.warning = "取货点 A 不可达: " + inserted.pickupNodeId;
         } else if (!ab.found) {
@@ -7271,7 +7550,7 @@ InsertResult insertOrder(const LogisticsGraph& graph,
     }
 
     result.plan = replan(graph, vehicle, all, currentPositionId, currentTimeMin, weight, onboard,
-                         stash);
+                         stash, true, reach);
     return result;
 }
 
@@ -7322,7 +7601,8 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
                             WeightType weight,
                             const std::vector<OnboardItem>& onboard,
                             bool* usedIncremental,
-                            const StashState& stash) {
+                            const StashState& stash,
+                            const ReachScope* reach) {
     if (usedIncremental != nullptr) {
         *usedIncremental = false;
     }
@@ -7333,15 +7613,15 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
     if (previous.status != PlanStatus::Ok || previous.nodes.size() < 2
         || previous.stops.empty()) {
         return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin, weight, onboard,
-                      stash);
+                      stash, true, reach);
     }
 
     Ctx ctx;
     std::string reason;
     if (!makeCtx(graph, vehicle, remainingOrders, startPos, currentTimeMin, weight, onboard, stash,
-                 ctx, reason)) {
+                 ctx, reason, reach)) {
         return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin, weight, onboard,
-                      stash);
+                      stash, true, reach);
     }
 
     // 把上一版停靠原样搬成 StopSpec（顺序不变）。
@@ -7364,7 +7644,7 @@ RoutePlan replanIncremental(const LogisticsGraph& graph,
     if (!replay(ctx, specs, false, ev)) {
         // 重放不可行（leg 不可达 / 载重破坏）=> 退回全量重规划。
         return replan(graph, vehicle, remainingOrders, startPos, currentTimeMin, weight, onboard,
-                      stash);
+                      stash, true, reach);
     }
 
     if (usedIncremental != nullptr) {
@@ -7509,7 +7789,8 @@ RoutePlan replayPreservingOrder(const LogisticsGraph& graph, const Vehicle& vehi
                                 const RoutePlan& previousRemaining,
                                 const std::string& startNodeId, int startTimeMin,
                                 WeightType weight, const std::vector<OnboardItem>& onboard,
-                                const StashState& stash, std::string& why) {
+                                const StashState& stash, std::string& why,
+                                const ReachScope* reach = nullptr) {
     why.clear();
     RoutePlan out;
     out.status = PlanStatus::Unreachable;
@@ -7531,7 +7812,7 @@ RoutePlan replayPreservingOrder(const LogisticsGraph& graph, const Vehicle& vehi
     Ctx ctx;
     std::string reason;
     if (!makeCtx(graph, vehicle, remainingOrders, startNodeId, startTimeMin, weight, onboard,
-                 stash, ctx, reason)) {
+                 stash, ctx, reason, reach)) {
         why = reason;
         out.reason = reason;
         return out;
@@ -7558,11 +7839,13 @@ RoutePlan replayPreservingOrder(const LogisticsGraph& graph, const Vehicle& vehi
 }
 
 // 从各车**当前状态**重规划（已执行前缀不重排）。allowOffload 只由升级链的分级决定。
+// reach = 该车的边准入（规格七 #63；由复调度按 reachScopesOf 逐车给出）。
 RoutePlan replanFromState(const LogisticsGraph& graph, const Vehicle& vehicle,
                           const std::vector<Order>& orders, const VehicleStartState& start,
-                          WeightType weight, bool allowOffload) {
+                          WeightType weight, bool allowOffload,
+                          const ReachScope* reach = nullptr) {
     return replan(graph, vehicle, orders, start.startNodeId, start.startTimeMin, weight,
-                  start.onboard, start.stash, allowOffload);
+                  start.onboard, start.stash, allowOffload, reach);
 }
 
 // 复调度里「要挪走的订单」的尝试顺序：紧急单整体优先（FIFO：窗口起点、订单 ID），
@@ -7663,6 +7946,9 @@ std::vector<std::size_t> vehiclesByMarginal(const LogisticsGraph& graph,
         MarginalCost mc;
         bool feasible = false;
     };
+    // Δkey 也按**该车的边准入**算（规格七 #63）：否则慢车会被排到跨簇单的候选首位，
+    // 白构造一次再判不可行。口径与真正的落位（replanFromState）同一份。
+    const std::vector<ReachScope> scopes = reachScopesOf(graph, vehicles);
     std::vector<Row> rows;
     for (std::size_t v = 0; v < vehicles.size(); ++v) {
         if (v == exclude) {
@@ -7674,7 +7960,7 @@ std::vector<std::size_t> vehiclesByMarginal(const LogisticsGraph& graph,
         if (!containsOrderId(candOrders, order.id)) {
             candOrders.push_back(order);
         }
-        const RoutePlan cand = planRoute(graph, vehicles[v], candOrders, weight);
+        const RoutePlan cand = planRoute(graph, vehicles[v], candOrders, weight, &scopes[v]);
         row.feasible = planUsable(cand);
         row.mc = row.feasible ? marginalCostBetween(plans[v], cand, vehicles[v], weight)
                               : MarginalCost{std::numeric_limits<double>::infinity(),
@@ -7760,18 +8046,20 @@ LocalReplanOutcome localReplanTwoVersion(const LogisticsGraph& graph, const Vehi
                                          const std::string& startNodeId, int startTimeMin,
                                          WeightType weight,
                                          const std::vector<OnboardItem>& onboard,
-                                         const StashState& stash) {
+                                         const StashState& stash,
+                                         const ReachScope* reach) {
     LocalReplanOutcome r;
     std::string why;
     r.byReplay = replayPreservingOrder(graph, vehicle, remainingOrders, previousRemaining,
-                                       startNodeId, startTimeMin, weight, onboard, stash, why);
+                                       startNodeId, startTimeMin, weight, onboard, stash, why,
+                                       reach);
     r.replayFeasible = planUsable(r.byReplay);
 
     // R2：对该车剩余订单重跑规格一构造器（pair-insertion + repair R≤3）。
     // **不带降载**：降载属第 ④ 级（改变货物路径的重手段），这里传 false。
     r.byRebuild = replanFromState(graph, vehicle, remainingOrders,
                                   VehicleStartState{startNodeId, startTimeMin, onboard, stash},
-                                  weight, false);
+                                  weight, false, reach);
     r.rebuildFeasible = planUsable(r.byRebuild);
 
     if (r.replayFeasible) {
@@ -7856,6 +8144,7 @@ NewOrderAssignment chooseVehicleForNewOrder(const LogisticsGraph& graph,
     }
     res.candidates = vehiclesByMarginal(graph, vehicles, vehicleOrders, currentPlans, weight, order,
                                         vehicles.size());
+    const std::vector<ReachScope> scopes = reachScopesOf(graph, vehicles);
     for (std::size_t i = 0; i < res.candidates.size(); ++i) {
         const std::size_t v = res.candidates[i];
         std::vector<Order> candOrders = vehicleOrders[v];
@@ -7863,7 +8152,7 @@ NewOrderAssignment chooseVehicleForNewOrder(const LogisticsGraph& graph,
             candOrders.push_back(order);
         }
         const RoutePlan cand = replanFromState(graph, vehicles[v], candOrders, starts[v], weight,
-                                              /*allowOffload=*/false);
+                                              /*allowOffload=*/false, &scopes[v]);
         if (!planUsable(cand)) {
             continue;   // 不可行 ⇒ 试下一台（Δkey 升序）
         }
@@ -7966,6 +8255,7 @@ bool inheritExecutedInStation(const LogisticsGraph& graph, const std::vector<Veh
         bool done = false;
         const std::vector<std::size_t> cands = vehiclesByMarginal(
             graph, vehicles, work, plans, weight, entry.order, vehicles.size());
+        const std::vector<ReachScope> scopes = reachScopesOf(graph, vehicles);
         for (std::size_t c = 0; c < cands.size() && !done; ++c) {
             const std::size_t d = cands[c];
             VehicleStartState st = input.starts[d];
@@ -7993,7 +8283,7 @@ bool inheritExecutedInStation(const LogisticsGraph& graph, const std::vector<Veh
             }
             const RoutePlan cand =
                 replan(graph, vehicles[d], candOrders, st.startNodeId, st.startTimeMin, weight,
-                       st.onboard, st.stash, /*allowOffload=*/true);
+                       st.onboard, st.stash, /*allowOffload=*/true, &scopes[d]);
             if (!planUsable(cand)) {
                 continue;
             }
@@ -8338,6 +8628,16 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
     }
     const Order pending = (event.trigger == RescheduleTrigger::NewOrder) ? event.newOrder : Order();
     const bool hasPending = (event.trigger == RescheduleTrigger::NewOrder) && !pending.id.empty();
+    // 边准入（规格七 #63）：复调度的每一条重规划路径都按**该车**的 scope 走，
+    // 否则「事件把跨簇单塞给慢车」会从这条入口回来（静态审计看不见）。
+    const std::vector<ReachScope> scopes = reachScopesOf(graph, vehicles);
+    for (std::size_t v = 0; v < k; ++v) {
+        if (scopes[v].legacyStart) {
+            res.log.push_back("[复调度] 慢车 " + vehicles[v].id + " 的出生点 "
+                              + vehicles[v].startNodeId
+                              + " 不在本簇 ⇒ 慢车断路不成立（数据不合规，按旧口径不限边）");
+        }
+    }
 
     // 事件后重建腿结构要用「未送达订单全集 + 新单」（buildLegs 按订单展开腿）。
     std::vector<Order> legOrders;
@@ -8476,7 +8776,8 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
             local[v] = localReplanTwoVersion(graph, vehicles[v], input.remainingPlans[v], work[v],
                                              input.starts[v].startNodeId,
                                              input.starts[v].startTimeMin, weight,
-                                             input.starts[v].onboard, input.starts[v].stash);
+                                             input.starts[v].onboard, input.starts[v].stash,
+                                             &scopes[v]);
             if (!local[v].feasible) {
                 allOk = false;
             }
@@ -8539,7 +8840,8 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
                 candOrders.push_back(pending);
             }
             const RoutePlan cand =
-                replanFromState(graph, vehicles[d], candOrders, input.starts[d], weight, false);
+                replanFromState(graph, vehicles[d], candOrders, input.starts[d], weight, false,
+                                &scopes[d]);
             // §6.6：新单的接受判据是**可行插入**（Δkey 只决定"先试哪台车"），
             // 不是「比该车现状更优」——否则任何让路线变长的单都永远插不进去。
             if (!planUsable(cand)) {
@@ -8575,9 +8877,11 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
                         dOrders.push_back(o);
                     }
                     const RoutePlan candV = replanFromState(graph, vehicles[v], vOrders,
-                                                           input.starts[v], weight, false);
+                                                           input.starts[v], weight, false,
+                                                           &scopes[v]);
                     const RoutePlan candD = replanFromState(graph, vehicles[d], dOrders,
-                                                           input.starts[d], weight, false);
+                                                           input.starts[d], weight, false,
+                                                           &scopes[d]);
                     if (!planUsable(candV) || !planUsable(candD)) {
                         continue;
                     }
@@ -8675,7 +8979,7 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
         if (ok3) {
             for (std::size_t v = 0; v < k && ok3; ++v) {
                 plans3[v] = replanFromState(graph, vehicles[v], work3[v], input.starts[v], weight,
-                                           false);
+                                           false, &scopes[v]);
                 if (!planUsable(plans3[v])) {
                     ok3 = false;
                 }
@@ -8726,7 +9030,8 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
                     candOrders.push_back(pending);
                 }
                 const RoutePlan cand = replanFromState(graph, vehicles[d], candOrders,
-                                                       input.starts[d], weight, true);
+                                                       input.starts[d], weight, true,
+                                                       &scopes[d]);
                 if (!planUsable(cand)) {
                     continue;
                 }
@@ -8752,7 +9057,7 @@ FleetRescheduleResult rescheduleFleet(const LogisticsGraph& graph,
         bool offloadOk = true;
         for (std::size_t v = 0; v < k && offloadOk; ++v) {
             offloadPlans[v] = replanFromState(graph, vehicles[v], work[v], input.starts[v], weight,
-                                              /*allowOffload=*/true);
+                                              /*allowOffload=*/true, &scopes[v]);
             if (!planUsable(offloadPlans[v])) {
                 offloadOk = false;
             }

@@ -174,11 +174,22 @@ EVENT_LEVELS = [
 #   W02→T03 220km，都短于从 W01 出发）。
 #   为什么这是「最小改动」而不是「为了让数字好看」：它修的是**运力部署与职责分区不一致**
 #   这个结构问题；如果只是把 12h 判据放宽，那才是真的粉饰（票面明令禁止）。
+# **规格七 #63 的改动：慢车出生在「本簇中转站」，不再从任何仓库发车。**
+#
+# 为什么必须改（本轮的结构性前提）：规格七把「跨簇的路（高速与国道）」对慢车**物理断路**，
+# 慢车只允许走「两端都在本簇」的边。既然它一天都出不了簇，出生在仓库就意味着
+# 它必须先跑一段**跨簇通勤**才能开始干活 —— 而那段路在断路之后根本不存在。
+# 所以出生点必须落在本簇内：簇 1 -> T01、簇 2 -> T02、簇 3 -> T03。
+# 快车 V01 仍从中央仓库 A（W01）出发：它本来就该跨簇（站间腿 + 紧急直达）。
+# 这条不变量由 self_check 直接守（「慢车 %s 的起始节点 %s 不是簇 %s 的中转站」）。
 VEHICLES = [
-    ("V01", "W01", 400, "08:00", 1.00, 1.50),
-    ("V02", "W01", 160, "08:00", 1.25, 0.80),   # 守簇 1（W01 本国簇，2km 城内）
-    ("V03", "W02", 160, "08:00", 1.25, 0.80),   # 守簇 2（W02 本国簇，但 V02 先占着 W01）
-    ("V04", "W02", 160, "10:30", 1.25, 0.80),   # 守簇 3：班次按「站上接货时刻」定（见下）
+    ("V01", "W01", 400, "08:00", 1.00, 1.50),   # 快车：站间腿 + 跨簇紧急直达
+    ("V02", "T01", 160, "08:00", 1.25, 0.80),   # 守簇 1，出生在本簇站
+    ("V03", "T02", 160, "08:00", 1.25, 0.80),   # 守簇 2，出生在本簇站
+    # 守簇 3：班次按「L2 到站时刻」定（簇 3 没有簇内单，它的唯一活是 14:02~14:37
+    # 到站的跨簇货；出生点挪到 T03 之后，10:30 出发等于在自家站空等 3h47，
+    # 超过前瞻窗口 60min ⇒ 1->3 / 2->3 两条走廊会在构造期就废掉）。
+    ("V04", "T03", 160, "14:00", 1.25, 0.80),
 ]
 
 # 慢车的发车时刻：**规格六 #60 把 V03 从 06:30 改回 08:00（四台同班）**。
@@ -506,7 +517,10 @@ def build_text():
         out.append("%s, %s, %s, %s, %s" % (a, b, d, t, c))
 
     out += ["", "[vehicles]",
-            "# ID, start_node, capacity_kg, depart_time, time_factor, cost_factor"]
+            "# ID, start_node, capacity_kg, depart_time, time_factor, cost_factor",
+            "# 规格七 #63：慢车**出生在本簇中转站**（物理断路的前提）——",
+            "# 出生在仓库就意味着每天要先跑一段跨簇通勤，断路之后那段路根本不存在。",
+            "# V01 是快车，仍从中央仓库 A 出发（站间腿 + 紧急直达）。"]
     for vid, start, cap, depart, tf, cf in VEHICLES:
         out.append("%s, %s, %d, %s, %.2f, %.2f" % (vid, start, cap, depart, tf, cf))
     out += ["", "[orders]",
@@ -784,8 +798,10 @@ def self_check(text):
         if f[0] in vehicle_ids:
             problems.append("[vehicles] 车辆 ID 重复: %s" % f[0])
         vehicle_ids.add(f[0])
-        if f[1] not in nodes or nodes.get(f[1]) != "warehouse":
-            problems.append("起始节点不是仓库: %s" % f[1])
+        # 规格七 #63：起始节点 = 仓库 **或** 中转站（慢车出生在本簇站；客户节点仍不许当起点）。
+        # 「慢车必须出生在**本簇**站」这条更严的不变量在下面的职责封闭小节里判。
+        if nodes.get(f[1]) not in ("warehouse", "transit"):
+            problems.append("起始节点必须是仓库或中转站: %s" % f[1])
         try:
             cap = float(f[2])
             to_minutes(f[3])
@@ -839,6 +855,15 @@ def self_check(text):
         if len(slow) != len(cluster_ids):
             problems.append("[vehicles] 慢车 %d 台 != 簇 %d 个（每簇恰有一台慢车不成立）"
                             % (len(slow), len(cluster_ids)))
+        # 规格七 #63：慢车必须**出生在本簇中转站**（物理断路的前提，见 §5.15）。
+        # 判据与规划器同源：簇 ID 升序 × 慢车 ID 升序逐位配对，反查该慢车守哪个簇。
+        slow_sorted = sorted(slow, key=lambda v: v[0])
+        for idx, sv in enumerate(slow_sorted):
+            cid = cluster_ids[idx % len(cluster_ids)] if cluster_ids else None
+            if cid is None or nodes.get(sv[1]) != "transit" or sub_of.get(sv[1]) != cid:
+                problems.append("[vehicles] 慢车 %s 的起始节点 %s 不是簇 %s 的中转站"
+                                "（规格七 #63：慢车出生在本簇站，断路才有前提）"
+                                % (sv[0], sv[1], cid))
         for fv in fast:
             for sv in slow:
                 if fv[2] < 2.0 * sv[2] - 1e-9:

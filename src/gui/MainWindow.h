@@ -298,6 +298,19 @@ public:
     int runActionSelfCheck();
     // 供无头验证交互后的状态：按顺序触发推进 / 路况 / 插单
     void runDemoActions(int rounds);
+    // ---- 慢车物理断路审计（规格七 #63）----
+    //
+    // 每次「计划被换掉」与每次演示动作之后都跑一遍（逐帧），检查慢车是否出现在
+    // 别簇节点 / 跨簇边 / 仓库边 / 站间边上。读的是**运行态的真实计划与已走节点**
+    // （= 车辆表「位置→下一站」与地图上看到的路线），不重算路径。
+    // 判据本体在 core 的 auditSlowIsolation（独立于规划器里的断路谓词，能反向验证）。
+    int slowIsolationViolationCount() const {
+        return static_cast<int>(slowViolations_.size());
+    }
+    const std::vector<std::string>& slowIsolationViolations() const { return slowViolations_; }
+    // 审计过多少「帧」（演示动作数 + 计划替换次数），随摘要行一起打印，证明守卫真的跑过。
+    int slowIsolationFrameCount() const { return slowAuditFrames_; }
+    void auditSlowIsolationNow();
 
 private slots:
     void onStrategyChanged();
@@ -353,6 +366,13 @@ private:
     void recordRun(const QString& text, int atMin = -1);
     QStringList runLog_;
     int         runEventCount_ = 0;   // 本次模拟抽到的事件次数（供汇总行）
+
+    // ---- 慢车物理断路审计（规格七 #63）----
+    // 已走过的节点（逐车）：计划会被换掉，走过的路不会 —— 「慢车出现在别簇节点」
+    // 的物理证据必须留在这里，不能只看当前计划。
+    std::vector<std::vector<std::string> > slowVisited_;
+    std::vector<std::string> slowViolations_;   // 去重后的违规行（车辆 + 边/节点 + 原因）
+    int slowAuditFrames_ = 0;                   // 审计帧数（演示动作 + 计划替换）
     int         autoSaveCount_ = 0;   // 自动保存次数（仅自检观察用）
 
     // ---- 软件内时间的事件模型（设计 §7 / D24）----

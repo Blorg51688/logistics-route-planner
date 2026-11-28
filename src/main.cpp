@@ -1006,7 +1006,8 @@ int main(int argc, char** argv) {
                 };
                 const QRegularExpression idRe(QStringLiteral("ID：([^\n：]+)"));
                 const QRegularExpressionMatch idm = idRe.match(tip);
-                const QRegularExpression startRe(QStringLiteral("起始仓库：([^\n：]+)"));
+                // 规格七 #63：慢车出生在本簇中转站，标签从「起始仓库」改为「起始节点」。
+                const QRegularExpression startRe(QStringLiteral("起始节点：([^\n：]+)"));
                 const QRegularExpressionMatch startm = startRe.match(tip);
                 bool tipOk = idm.hasMatch()
                              && idm.captured(1).trimmed() == QString::fromStdString(v.id)
@@ -1765,14 +1766,52 @@ int main(int argc, char** argv) {
             std::printf("[ui-probe] #62 慢车越簇核查：慢车全在本簇、快车跨簇；"
                         "T03 = V01(快)+V04(慢)，tooltip 逐车号可见：%s\n",
                         t03Tip.toUtf8().constData());
+
+            // ---- 规格七 #63：慢车物理断路的**静态**审计 ----
+            // 读的仍然是「用户能看到的路线」（--plan-summary 的 ROUTE 行同一份规划结果），
+            // 判据本体在 core 的 auditSlowIsolation（独立于规划器的断路谓词）。
+            {
+                const std::vector<logistics::SlowIsolationViolation> iso =
+                    logistics::auditSlowIsolation(config.graph, config.vehicles, audit.vehicles);
+                if (!iso.empty()) {
+                    std::fprintf(stderr,
+                                 "[ui-probe] #63：慢车断路静态审计有 %zu 处违规，首条：%s\n",
+                                 iso.size(), iso.front().detail.c_str());
+                    return 1;
+                }
+                int slowCount = 0;
+                for (std::size_t v = 0; v < fastFlags.size(); ++v) {
+                    if (!fastFlags[v]) {
+                        ++slowCount;
+                    }
+                }
+                std::printf("[ui-probe] #63 慢车断路静态审计：%d 台慢车的路线节点与边全在本簇"
+                            "（0 处越界；快车 %d 台跨簇）\n",
+                            slowCount, static_cast<int>(fastFlags.size()) - slowCount);
+            }
         }
 
         std::printf("[ui-probe] 通过\n");
         return 0;
     }
 
+    bool slowIsolationFailed = false;
     if (opt.demoRounds > 0) {
         window.runDemoActions(opt.demoRounds);
+        // ---- 规格七 #63：慢车物理断路的**动态**审计 ----
+        // runDemoActions 的每一步、以及每一次「计划被换掉」都审过一遍（逐帧）：
+        // 慢车出现在别簇节点 / 跨簇边 / 仓库边 / 站间边都算违规。
+        std::printf("[断路审计] 慢车物理断路：审计 %d 帧，违规 %d 处\n",
+                    window.slowIsolationFrameCount(), window.slowIsolationViolationCount());
+        const std::vector<std::string>& viol = window.slowIsolationViolations();
+        for (std::size_t i = 0; i < viol.size() && i < 10; ++i) {
+            std::printf("[断路审计] 违规 %s\n", viol[i].c_str());
+        }
+        if (window.slowIsolationViolationCount() > 0) {
+            std::fprintf(stderr, "[断路审计] 慢车越簇 %d 处：物理断路失效\n",
+                         window.slowIsolationViolationCount());
+            slowIsolationFailed = true;
+        }
         if (!opt.exportLogPath.empty()) {
             const bool ok = window.exportRunLogTo(QString::fromStdString(opt.exportLogPath));
             if (!ok) {
@@ -1786,7 +1825,10 @@ int main(int argc, char** argv) {
     if (!opt.windowRenderPath.empty()) {
         window.renderToFile(QString::fromStdString(opt.windowRenderPath), opt.width, opt.height);
         std::printf("已渲染窗口 -> %s\n", opt.windowRenderPath.c_str());
-        return 0;
+        return slowIsolationFailed ? 1 : 0;
+    }
+    if (slowIsolationFailed) {
+        return 1;
     }
 
     window.showInteractive();
