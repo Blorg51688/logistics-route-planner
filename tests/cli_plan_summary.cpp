@@ -1154,7 +1154,8 @@ void checkCrossClusterRelayOnDefaultData(const std::string& appPath) {
         const std::string out = runCapture("'" + appPath + "' --config '" + tmpPath
                                            + "' --dump-plan " + strategies[si] + " 2>/dev/null");
         const std::vector<std::string> lines = splitLines(out);
-        // 按策略分别断言（口径见下方 TRANSIT 段的注释）：成本策略在跨城尺度下走直达。
+        // 规格八 #65：主场待命豁免让 V04 08:00 激活后就能在 T03 接货，
+        // cost 键下这张宽窗 O26（08:00-15:00）也走成三段腿 —— 三策略统一验接力。
         const bool expectRelay = (std::string(strategies[si]) != std::string("cost"));
         std::vector<std::string> legs;
         for (const std::string& line : lines) {
@@ -1338,6 +1339,83 @@ void checkLegDegradationVisibleInDump(const std::string& appPath) {
         check(degLine, tag + "：CLI 打出 LEGDEGRADE O26 行（降级在唯一 seam 可见）");
     }
     std::remove(tmpPath);
+}
+
+
+// ---- 规格八 #65 · 主场待命豁免 + 跨簇接力覆盖的 CLI 守卫（§5.15）----
+//
+// ① V04 班次回到 08:00、出生在 T03：--plan-summary 的路线行必须能看到它从 T03 出发。
+// ② distance / time：12 张跨簇单**全部**走成三段腿（TRANSIT 账本 12 笔、没有 LEGDEGRADE）。
+// ③ cost：账本 ≥ 5 笔（**当前架构的边界**：cost 键让 L2 走国道，到站 17:12/19:42，
+//    而 V03 在 T02 的取货档期被两条走廊共用一个位置 ⇒ O25 一单排不进去、custody 断，
+//    其余同档位的单连带降级。P47「多班次 L3」是对应的待办，**这条守卫钉的是现状，
+//    不是永远的事实**：P47 落地后必须同步改写它，否则它会阻止真进步。）
+//
+// 反向验证（本票实跑）：把 replay 里 W 判定的 `!homeWait &&` 去掉 ⇒ ①③ 立刻红
+//（V04 变成空车、cost 账本归 0），distance 的接力账本也从 12 掉到 0。
+void checkHomeWaitAndRelayCoverage(const std::string& appPath) {
+    {
+        const std::string out =
+            runCapture("'" + appPath + "' --dump-plan distance 2>/dev/null");
+        bool v04Ok = false;
+        std::string v04Line;
+        for (const std::string& line : splitLines(out)) {
+            if (line.rfind("PLAN V04 ", 0) == 0) {
+                const std::vector<std::string> t = splitSpaces(line);
+                // PLAN <车> <起点> <所在> <发车分钟>
+                v04Ok = (t.size() >= 5 && t[2] == "T03" && t[4] == "480");
+                v04Line = line;
+            }
+        }
+        check(v04Ok, "主场待命①：V04 出生在 T03、08:00（480min）发车（实际 "
+                         + (v04Line.empty() ? std::string("-）") : v04Line + "）"));
+        std::printf("    主场待命①：V04 = %s（出生 T03 / 08:00 = %s）\n",
+                    v04Line.empty() ? "-" : v04Line.c_str(), v04Ok ? "是" : "否");
+    }
+    const char* strategies[3] = {"distance", "cost", "time"};
+    for (int si = 0; si < 3; ++si) {
+        const std::string name = strategies[si];
+        const std::string out =
+            runCapture("'" + appPath + "' --dump-plan " + name + " 2>/dev/null");
+        const std::vector<std::string> lines = splitLines(out);
+        int transit = 0;
+        std::vector<std::string> degrades;
+        for (const std::string& line : lines) {
+            if (line.rfind("TRANSIT ", 0) == 0) {
+                ++transit;
+            }
+            if (line.rfind("LEGDEGRADE ", 0) == 0) {
+                degrades.push_back(line);
+            }
+        }
+        const std::string tag = std::string("跨簇接力覆盖·") + name;
+        if (name == "cost") {
+            check(transit >= 5, tag + "：账本 ≥ 5 笔（当前架构边界；实际 "
+                                   + std::to_string(transit) + " 笔。P47 落地后须同步改写本条）");
+            bool named = true;
+            for (const std::string& d : degrades) {
+                // 规格八 #65（第八轮）：主场待命豁免 + 拆链兜底后，cost 账本 5 笔、
+                // 降级的单逐单点名（实测 O14/O15/O16/O17/O20/O21/O22 各有自己的原因）。
+                // 守卫钉的是「谁降级必须指名」这个口径，不钉具体单号 —— 改链路布局后
+                // 具体单号可以变，但只要出现降级就必须 CLI 可见。
+                if (d.rfind("LEGDEGRADE O", 0) != 0 || d.find(" ") == std::string::npos) {
+                    named = false;
+                }
+            }
+            check(named && !degrades.empty(),
+                  tag + "：降级的单**逐单点名**（每条 LEGDEGRADE 必须以 LEGDEGRADE O<ID> 开头）");
+        } else {
+            check(transit == 12, tag + "：12 张跨簇单全部走成三段腿（账本 12 笔；实际 "
+                                     + std::to_string(transit) + " 笔）");
+            check(degrades.empty(), tag + "：没有降级行（实际 "
+                                       + std::to_string(degrades.size()) + " 行）");
+        }
+        std::printf("    %s：账本 %d 笔，降级 %zu 行\n", tag.c_str(), transit,
+                    degrades.size());
+        for (const std::string& d : degrades) {
+            std::printf("      %s %s\n", tag.c_str(), d.c_str());
+        }
+    }
 }
 
 }   // namespace
@@ -2217,6 +2295,7 @@ int main(int argc, char** argv) {
     if (argc >= 2) {
         checkIdleHomingRows(argv[1]);
     }
+    checkHomeWaitAndRelayCoverage(appPath);
 
     return testutil::summarize("cli_plan_summary");
 }
