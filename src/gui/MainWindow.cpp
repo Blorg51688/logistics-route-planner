@@ -2067,8 +2067,10 @@ void MainWindow::onSimTick() {
     if (atRouteEnd()) {
         // 两种模拟模式共用这一条停机路径（停表 + 清除勾选）；
         // 但**播报要分两种**：不可行不是"完成"，播成完成就是假成功。
+        // 自动停止 = 下班（用户 2026-11-28 裁定），不再播报「配送已完成」——
+        // 那只在车回场时成立，订单表里未送达的单还很多，播完成就是假成功。
         stopSim(routeTrulyFinished()
-                    ? QStringLiteral("本次配送已完成，模拟结束")
+                    ? QStringLiteral("本次模拟结束（下班），未送达订单保留至下次继续")
                     : QStringLiteral("计划不可行或为空，模拟停止"));
     }
 }
@@ -2207,8 +2209,22 @@ void MainWindow::reportRouteFinishedOnce() {
                      .arg(QString::fromStdString(config_.vehicles[v].id))
                      .arg(minutesToClock(veh(v).state.atTimeMin));
     }
-    appendLog(QStringLiteral("本次配送已完成：全部车辆已回到仓库（%1）")
-                  .arg(homes.join(QStringLiteral("、"))));
+    // 「下班」口径（2026-11-28 用户裁定）：自动停止 = 到点收工，**不是**配送完成。
+    // 车辆回场只说明今天的班次跑完了；未送达的单留到下次继续。
+    // 旧文案「本次配送已完成」在订单表还有 U002/O17–O25/N004/N005 时播报，是假成功。
+    // 未送达数 = 订单集合里 !served 的张数（含在车上、在站内、待取三种状态）。
+    int undelivered = 0;
+    for (const Order& o : config_.orders) {
+        if (!o.served) {
+            ++undelivered;
+        }
+    }
+    const QString tail = undelivered > 0
+                             ? QStringLiteral("，未送达订单 %1 张保留至下次继续").arg(undelivered)
+                             : QStringLiteral("，全部订单已送达");
+    appendLog(QStringLiteral("本次模拟结束（下班）：车辆已全部回场（%1）%2")
+                  .arg(homes.join(QStringLiteral("、")))
+                  .arg(tail));
 }
 
 void MainWindow::stopSim(const QString& reason) {
@@ -2225,7 +2241,7 @@ void MainWindow::stopSim(const QString& reason) {
     if (timeSimAction_ != nullptr) {
         timeSimAction_->setChecked(false);
     }
-    // 播报**一次**（调用方把整句文案传进来，如「本次配送已完成，模拟结束」）
+    // 播报**一次**（调用方把整句文案传进来，如「本次模拟结束（下班），未送达订单保留至下次继续」）
     appendLog(reason);
 }
 
@@ -5344,6 +5360,32 @@ int MainWindow::runActionSelfCheck() {
                               "（实际订单=%1 窗口=%2）")
                    .arg(firstCells.size() >= 4 ? firstCells[0] : QString(),
                         firstCells.size() >= 4 ? firstCells[3] : QString()));
+    }
+
+    // ---- 13. 下班播报（2026-11-28 用户裁定）----
+    // 自动停止 = 下班，不是配送完成。守卫读用户能看到的日志文本：
+    // ① 必须出现「本次模拟结束（下班）」；② 不得再出现旧文案「本次配送已完成」；
+    // ③ 未送达订单 > 0 时，播报里必须点名张数（不是空泛一句「模拟结束」）。
+    {
+        // 用一份独立窗口实例把「回场播报」真实跑一遍，再读它**实际写进日志**的文本。
+        // 不重算播报公式、不背预期字符串以外的东西：只查用户看得见的那一行。
+        logistics::Config offCfg = reloadInitialConfig();
+        MainWindow offWin(offCfg, configPath_);
+        // 造「车已回场、但有 1 张单没送完」的下班状态：
+        // 把第一张单标为未送达（初始配置本来全未送达，这里确保至少 1 张）。
+        offWin.config_.orders.front().served = false;
+        offWin.reportRouteFinishedOnce();
+        const QString offText = offWin.runLogText();
+        expect(offText.contains(QStringLiteral("本次模拟结束（下班）")),
+               QStringLiteral("下班播报应含「本次模拟结束（下班）」（实际：%1）")
+                   .arg(offText.right(160)));
+        expect(!offText.contains(QStringLiteral("本次配送已完成")),
+               QStringLiteral("下班播报不得再出现旧文案「本次配送已完成」（实际：%1）")
+                   .arg(offText.right(160)));
+        const int undelivered = static_cast<int>(offWin.config_.orders.size());
+        expect(offText.contains(QStringLiteral("未送达订单 %1 张保留至下次继续").arg(undelivered)),
+               QStringLiteral("下班播报应点名未送达 %1 张（实际：%2）")
+                   .arg(undelivered).arg(offText.right(160)));
     }
 
     return failures;
